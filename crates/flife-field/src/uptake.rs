@@ -388,14 +388,21 @@ impl Grants {
     }
 
     fn reset(&mut self) {
-        self.grid = None;
+        self.begin_resolve();
         self.packets.clear();
+        self.staged.clear();
+    }
+
+    /// Prepare for a new resolution while preserving `packets` and `staged`
+    /// lengths so parallel overwrite paths avoid redundant single-threaded
+    /// zero-fills; every error path still calls [`Self::reset`].
+    fn begin_resolve(&mut self) {
+        self.grid = None;
         self.debits.clear();
         self.totals.clear();
         self.summary = UptakeSummary::default();
         self.applied = false;
         self.identities.clear();
-        self.staged.clear();
         self.bins.clear();
     }
 }
@@ -552,7 +559,7 @@ pub fn resolve_uptake_with_on_workers(
     grants: &mut Grants,
     workers: usize,
 ) -> Result<UptakeSummary, CoreError> {
-    grants.reset();
+    grants.begin_resolve();
     let result = resolve_into(field, kernel, demands, grants, workers);
     if result.is_err() {
         grants.reset();
@@ -730,16 +737,20 @@ fn stage_on(
                 .ok_or(CoreError::Overflow {
                     quantity: UPTAKE_PACKETS,
                 })?;
-            grants.staged.resize(
-                max_packets,
-                GrantPacket {
-                    cell: 0,
-                    organism: OrganismId::new(0),
-                    demand: 0,
-                    requested: 0.0,
-                    granted: 0.0,
-                },
-            );
+            if grants.staged.len() >= max_packets {
+                grants.staged.truncate(max_packets);
+            } else {
+                grants.staged.resize(
+                    max_packets,
+                    GrantPacket {
+                        cell: 0,
+                        organism: OrganismId::new(0),
+                        demand: 0,
+                        requested: 0.0,
+                        granted: 0.0,
+                    },
+                );
+            }
             let tile_count = workers
                 .saturating_mul(4)
                 .min(64)
@@ -819,6 +830,7 @@ fn stage_on(
             grants.staged.truncate(total_written);
             return Ok(());
         }
+        grants.staged.clear();
         for (index, demand) in demands.iter().enumerate() {
             stage_demand(
                 grid,
@@ -831,6 +843,7 @@ fn stage_on(
         }
         return Ok(());
     }
+    grants.staged.clear();
     stage_unsorted(grid, kernel, demands, grants)
 }
 
@@ -916,22 +929,27 @@ fn group_packets(grid: &FieldGrid, grants: &mut Grants, workers: usize) -> Resul
     let items = order.len();
     let runs = workers.min(items / UPTAKE_PACKETS_PER_RUN).max(1);
     if runs == 1 {
+        packets.clear();
         packets.extend(
             order
                 .iter()
                 .filter_map(|&at| staged.get(at as usize).copied()),
         );
     } else {
-        packets.resize(
-            items,
-            GrantPacket {
-                cell: 0,
-                organism: OrganismId::new(0),
-                demand: 0,
-                requested: 0.0,
-                granted: 0.0,
-            },
-        );
+        if packets.len() >= items {
+            packets.truncate(items);
+        } else {
+            packets.resize(
+                items,
+                GrantPacket {
+                    cell: 0,
+                    organism: OrganismId::new(0),
+                    demand: 0,
+                    requested: 0.0,
+                    granted: 0.0,
+                },
+            );
+        }
         let staged_ref: &[GrantPacket] = staged;
         flife_core::pool::parallel_chunks_mut(
             workers,

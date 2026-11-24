@@ -5,7 +5,7 @@
 //! outputs are the reference's bits in shards of any size and at slots far
 //! past 32 bits.
 
-use flife_backend_metal::{BackendBudget, MetalBackend, SHARD_BYTES};
+use flife_backend_metal::{BackendBudget, INITIAL_SHARD_SLOTS, MetalBackend, SHARD_BYTES};
 use flife_core::CoreError;
 use flife_core::binary16::F16;
 use flife_core::ids::GenomeId;
@@ -356,21 +356,129 @@ fn an_f16_shard_holds_half_the_bytes_and_is_admitted_at_that_size() -> Result<()
         budget.bytes
     );
 
-    // A default shard is `SHARD_BYTES` in either dtype, so it holds twice
-    // the binary16 slots: one genome of the preset's topology allocates a
-    // whole shard of each.
+    // A default shard caps at `SHARD_BYTES` in either dtype (6,718 F32 vs
+    // 13,437 F16 slots for the preset topology), but starts at
+    // `INITIAL_SHARD_SLOTS` (64) so a single rare-topology genome allocates
+    // ~1.3 MiB (F16) / ~2.6 MiB (F32) instead of 256 MiB, with F16 taking
+    // exactly half the parameter bytes of F32.
     let (Some(mut wide), Some(mut half)) = (backend(u64::MAX), backend(u64::MAX)) else {
         return Ok(());
     };
     wide.evaluate(&wide_jobs[2..3], &mut outputs)?;
     half.evaluate(&half_jobs[2..3], &mut outputs)?;
     let parameters = topologies[2].parameter_count() as u64;
-    let slots = |bytes: u64| SHARD_BYTES / (bytes * parameters);
-    assert_eq!((slots(4), slots(2)), (6_718, 13_437));
+    let max_slots = |bytes: u64| SHARD_BYTES / (bytes * parameters);
+    assert_eq!((max_slots(4), max_slots(2)), (6_718, 13_437));
+    let initial = INITIAL_SHARD_SLOTS as u64;
     assert_eq!(
-        half.owner().usage().bytes as i64 - wide.owner().usage().bytes as i64,
-        (slots(2) * parameters * 2) as i64 - (slots(4) * parameters * 4) as i64
+        wide.owner().usage().bytes - half.owner().usage().bytes,
+        initial * parameters * 2,
+        "initial shard parameter bytes must be half in F16 vs F32"
     );
+    assert!(
+        half.owner().usage().bytes < (4 << 20),
+        "single rare-topology F16 genome must stay small, held {} B",
+        half.owner().usage().bytes
+    );
+    Ok(())
+}
+
+#[test]
+fn growable_shards_start_small_and_grow_bit_identically_within_budget() -> Result<(), CoreError> {
+    let Some(mut device) = backend(u64::MAX) else {
+        return Ok(());
+    };
+    let topology = DenseTopology::new(&[32])?;
+    let topologies = [topology];
+    // 300 distinct genomes on one topology: spans initial 64 -> 128 -> 256 -> 512.
+    let cases = cases(&topologies, 300);
+    let all_jobs = jobs(&topologies, &cases, 0);
+    let want = reference(&all_jobs);
+    let mut outputs = Vec::new();
+
+    // 1. Start with a single genome at slot 0: allocates INITIAL_SHARD_SLOTS.
+    device.evaluate(&all_jobs[0..1], &mut outputs)?;
+    assert_eq!(bits(&outputs), &want[0..1]);
+    assert_eq!(device.shards(), 1);
+    assert_eq!(device.uploads(), 1);
+    let small_bytes = device.owner().usage().bytes;
+    assert!(
+        small_bytes < (2 << 20),
+        "single-genome shard should stay well below 2 MiB, held {small_bytes} B"
+    );
+
+    // 2. Grow incrementally across power-of-two tiers while re-evaluating
+    //    earlier slots: earlier residents must stay bit-identical with zero
+    //    re-uploads!
+    for end in [64_usize, 65, 130, 300] {
+        device.evaluate(&all_jobs[..end], &mut outputs)?;
+        assert_eq!(
+            bits(&outputs),
+            &want[..end],
+            "mismatch after growth to {end}"
+        );
+        assert_eq!(device.shards(), 1);
+        assert_eq!(
+            device.uploads(),
+            end as u64,
+            "growing a shard must not re-upload existing slots (end={end})"
+        );
+    }
+    let grown_bytes = device.owner().usage().bytes;
+    assert!(
+        grown_bytes > small_bytes,
+        "grown 512-slot shard ({grown_bytes} B) must exceed initial 64-slot shard ({small_bytes} B)"
+    );
+
+    // 3. Tight device-owner limit where 64 slots fit, simultaneous 64+128 does
+    //    NOT fit, but dropping old 64-slot buffer before allocating 128 slots
+    //    DOES fit (exercises the tight-limit growth branch with zero re-uploads).
+    let stride = topologies[0].parameter_count() as u64;
+    let one_tier_bytes = INITIAL_SHARD_SLOTS as u64 * stride * 4;
+    let tight_grow_limit = 2 * one_tier_bytes + (512 << 10);
+    let tight_grow_owner = flife_backend_metal::DeviceOwner::open(flife_backend_metal::Limits {
+        bytes: tight_grow_limit,
+        leases_per_purpose: u32::MAX,
+    })?;
+    let mut tight_grow =
+        MetalBackend::with_owner(tight_grow_owner, u64::MAX, BackendBudget::UNBOUNDED)?;
+    tight_grow.evaluate(&all_jobs[..64], &mut outputs)?;
+    assert_eq!(bits(&outputs), &want[..64]);
+    assert_eq!(tight_grow.uploads(), 64);
+    assert_eq!(tight_grow.shards(), 1);
+    tight_grow.evaluate(&all_jobs[..100], &mut outputs)?;
+    assert_eq!(bits(&outputs), &want[..100]);
+    assert_eq!(tight_grow.shards(), 1);
+    assert_eq!(
+        tight_grow.uploads(),
+        100,
+        "tight-limit shard growth must preserve 0..64 without re-uploading"
+    );
+    assert!(tight_grow.owner().usage().bytes <= tight_grow_limit);
+
+    // 4. Even tighter device-owner limit where 64 slots fit (+ staging), but
+    //    128-slot growth cannot fit at all: slots 0..64 remain served from the
+    //    device while slots 64..100 defer cleanly without disturbing 0..64.
+    let refuse_grow_limit = one_tier_bytes + (one_tier_bytes / 2) + (256 << 10);
+    let refuse_owner = flife_backend_metal::DeviceOwner::open(flife_backend_metal::Limits {
+        bytes: refuse_grow_limit,
+        leases_per_purpose: u32::MAX,
+    })?;
+    let mut refuse = MetalBackend::with_owner(refuse_owner, u64::MAX, BackendBudget::UNBOUNDED)?;
+    refuse.evaluate(&all_jobs[..64], &mut outputs)?;
+    assert_eq!(bits(&outputs), &want[..64]);
+    assert_eq!(refuse.uploads(), 64);
+    assert_eq!(refuse.shards(), 1);
+
+    refuse.evaluate(&all_jobs[..100], &mut outputs)?;
+    assert_eq!(bits(&outputs[..64]), &want[..64]);
+    assert!(
+        outputs[64..].iter().all(Option::is_none),
+        "slots past budget-capped shard growth must defer cleanly"
+    );
+    assert_eq!(refuse.uploads(), 64, "earlier 64 slots stay resident");
+    assert_eq!(refuse.shards(), 1);
+    assert!(refuse.owner().usage().bytes <= refuse_grow_limit);
     Ok(())
 }
 

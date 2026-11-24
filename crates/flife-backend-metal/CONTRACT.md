@@ -269,9 +269,11 @@ offsets hold. A command's kernels run one after another, so each shard a batch t
 latency; that is why a shard is large (the shard-size measurements below). A job's `ArenaSlot` locates
 its parameters (`ShardGeometry::locate`: shard, offset and extent, checked in 64 bits). A genome is uploaded once,
 into its slot, and used only while that slot holds the same generation and genome; a newborn at the next
-generation of a dead genome's slot is uploaded in its place. A parameter shard is allocated at its full size when
-first touched, so a topology's first genome allocates a whole shard, and it is never rebuilt or dropped before
-`forget`. Each shard has its own job words (row, offset,
+generation of a dead genome's slot is uploaded in its place. A parameter shard starts at `INITIAL_SHARD_SLOTS` (64 slots, clamped to `geometry.slots_per_shard()`) — or directly
+at the power-of-two tier needed by the batch creating it — and grows by powers of two up to `geometry.slots_per_shard()`
+(`SHARD_BYTES`) as higher arena slots arrive, preserving every `0..old_cap` resident slot bit-for-bit without
+re-uploading existing genomes; it is reclaimed once every occupant retires (`release_slots`) or `forget` drops it. Each
+shard has its own job words (row, offset,
 hidden width, layer widths), and a tick submits one kernel per touched shard in one command buffer. Each tick
 writes only the inputs and job words in place (`SharedBuffer::write_f32/write_u32`, FrankenTorch `1c4febfb`). The
 buffers are `Owned` by its `DeviceOwner`: two per shard, plus the inputs, outputs and fault flags. A job buffer, or
@@ -1461,9 +1463,10 @@ per-pass thread spawning (6%).
   occupants have all retired at tick commit (dropping both its parameter and job device buffers;
   `tests/residency.rs::empty_shards_are_reclaimed_on_device_when_slots_retire`,
   `tests/world.rs::deaths_reclaim_emptied_device_shards_in_a_world`). Partially occupied shards remain resident
-  until their last occupant retires or `forget` runs. A topology's first genome still allocates a whole 256 MiB
-  shard, so the five catalog members can hold up to 1.25 GiB while at least one organism of each topology lives.
-  Admission charges the backend its budget (FL-043), so this stays within it.
+  until their last occupant retires or `forget` runs, and now start at `INITIAL_SHARD_SLOTS` (64 slots, ~1.3 MiB F16
+  / ~2.6 MiB F32 for `[64, 32]`) and grow by powers of two up to `SHARD_BYTES`
+  (`tests/residency.rs::growable_shards_start_small_and_grow_bit_identically_within_budget`), avoiding the 1.25 GiB
+  eager reservation across five rare catalog topologies while honoring `BackendBudget` strictly.
 - A command's kernels run serially, so a population past one shard per topology pays 0.1–0.2 ms a tick per extra
   shard. Dispatching shards concurrently, since they write disjoint rows, would remove that; FrankenTorch's batch has
   only a serial encoder.

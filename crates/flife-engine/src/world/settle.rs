@@ -435,7 +435,6 @@ fn settle_on(
         if let Some(byproducts) = lane.byproducts.as_mut() {
             byproducts.clear();
         }
-        lane.emission_paid = flife_core::CompensatedSum::ZERO;
         lane.transactions = None;
     }
     settled.extend(working.iter().map(Settled::of));
@@ -460,7 +459,6 @@ fn settle_on(
                     emissions,
                     trail_emissions,
                     byproducts,
-                    emission_paid,
                     transactions,
                     ..
                 } = lane;
@@ -497,7 +495,6 @@ fn settle_on(
                         emissions,
                         trail_emissions.as_mut(),
                         byproducts.as_mut(),
-                        emission_paid,
                         exchange,
                         record,
                     )?;

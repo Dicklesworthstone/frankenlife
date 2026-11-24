@@ -981,10 +981,6 @@ struct DecisionLane {
     /// Dedicated symplectic metabolic waste staging (`V2-11`); `None` (0 bytes)
     /// when disabled.
     byproducts: Option<Deposits>,
-    /// Compensated sum of exact emission payments `Σ paid` settled by this
-    /// lane, so combined dual-carrier `Transfer::Emission` debits the exact
-    /// energy deducted from organisms.
-    emission_paid: CompensatedSum,
     transactions: Option<Transactions>,
 }
 
@@ -1245,6 +1241,10 @@ struct Working {
     secretory_readiness: f32,
     emission_cooldown_deadline: Tick,
     emitted: bool,
+    /// Exact emission payment settled by phase 7 for this organism, summed in
+    /// canonical ascending identity order when dual-carrier trails are active
+    /// so `Transfer::Emission` is independent of worker count and tiling.
+    emission_paid: f64,
     /// Residual energy captured by `V2-11` viability-floor lysis in Phase 8
     /// `clear_tiny`, handed to `Recycling` without `Flow::TinyReservoir`.
     lysed_residual: f64,
@@ -2899,6 +2899,7 @@ impl World {
                 secretory_readiness: 0.0,
                 emission_cooldown_deadline: Tick::new(0),
                 emitted: false,
+                emission_paid: 0.0,
                 lysed_residual: 0.0,
                 intent: None,
             };
@@ -2966,6 +2967,7 @@ impl World {
                             secretory_readiness: organism.secretory_readiness,
                             emission_cooldown_deadline: organism.emission_cooldown_deadline,
                             emitted: false,
+                            emission_paid: 0.0,
                             lysed_residual: 0.0,
                             intent: None,
                         };
@@ -3003,6 +3005,7 @@ impl World {
                     secretory_readiness: organism.secretory_readiness,
                     emission_cooldown_deadline: organism.emission_cooldown_deadline,
                     emitted: false,
+                    emission_paid: 0.0,
                     lysed_residual: 0.0,
                     intent: None,
                 });
@@ -3060,6 +3063,13 @@ impl World {
             settle_state,
         )?;
         let mut total_emission_paid = CompensatedSum::ZERO;
+        if trail_emissions.is_some() {
+            for organism in working.iter() {
+                if organism.emission_paid > 0.0 {
+                    total_emission_paid.add(organism.emission_paid);
+                }
+            }
+        }
         if lanes.len() > 1 && working.len() >= 512 {
             let mut lane_emissions: Vec<&mut Deposits> = Vec::with_capacity(lanes.len());
             let mut lane_trails: Vec<&mut Deposits> = if trail_emissions.is_some() {
@@ -3073,7 +3083,7 @@ impl World {
                 Vec::new()
             };
             let merge_workers = lanes.len();
-            let mut lane_flows: Vec<(&mut LedgerLog, f64, Option<Transactions>)> =
+            let mut lane_flows: Vec<(&mut LedgerLog, Option<Transactions>)> =
                 Vec::with_capacity(merge_workers);
             for lane in lanes.iter_mut() {
                 lane_emissions.push(&mut lane.emissions);
@@ -3083,11 +3093,7 @@ impl World {
                 if let Some(src) = lane.byproducts.as_mut() {
                     lane_byproducts.push(src);
                 }
-                lane_flows.push((
-                    &mut lane.flows,
-                    lane.emission_paid.value(),
-                    lane.transactions.take(),
-                ));
+                lane_flows.push((&mut lane.flows, lane.transactions.take()));
             }
             let mut em_res: Result<(), CoreError> = Ok(());
             let mut tr_res: Result<(), CoreError> = Ok(());
@@ -3128,12 +3134,11 @@ impl World {
                         }
                     });
                 }
-                for (flows, paid, tx) in lane_flows {
+                for (flows, tx) in lane_flows {
                     if let Err(err) = flows.replay(&mut tick_ledger) {
                         flow_res = Err(err);
                         break;
                     }
-                    total_emission_paid.add(paid);
                     if let Some(record) = tx {
                         transactions = Some(record);
                     }
@@ -3155,7 +3160,6 @@ impl World {
                 if let (Some(dst), Some(src)) = (byproducts.as_mut(), lane.byproducts.as_mut()) {
                     dst.append(src)?;
                 }
-                total_emission_paid.add(lane.emission_paid.value());
                 if let Some(record) = lane.transactions.take() {
                     transactions = Some(record);
                 }
@@ -4646,7 +4650,6 @@ fn fit_lanes(
         } else {
             lane.byproducts = None;
         }
-        lane.emission_paid = CompensatedSum::ZERO;
         lane.transactions = None;
         if batched {
             fit(&mut lane.observed, rows, "observations")?;
@@ -5874,11 +5877,13 @@ fn settle_all(
         if let Some(byproducts) = lane.byproducts.as_mut() {
             byproducts.clear();
         }
-        lane.emission_paid = CompensatedSum::ZERO;
         lane.transactions = None;
     }
     let worker_budget = lanes.len();
-    if worker_budget > 1 && working.len() >= 24_576 {
+    if worker_budget > 1
+        && working.len() >= 24_576
+        && matches!(rules.exchange, ExchangeKernel::GridCicV1)
+    {
         let has_trail = lanes.first().is_some_and(|l| l.trail_emissions.is_some());
         let has_byproducts = lanes.first().is_some_and(|l| l.byproducts.is_some());
         let used = worker_budget
@@ -5897,7 +5902,6 @@ fn settle_all(
             emissions: Deposits,
             trail_emissions: Option<Deposits>,
             byproducts: Option<Deposits>,
-            emission_paid: CompensatedSum,
             transactions: Option<Transactions>,
         }
         let mut tiles: Vec<SettleTile<'_>> =
@@ -5906,15 +5910,32 @@ fn settle_all(
             let lane_base = lane_index * lane_len;
             let sub_len = lane_run.len().div_ceil(tiles_per_lane).max(1);
             for (sub_idx, sub_run) in lane_run.chunks_mut(sub_len).enumerate() {
+                let mut flows = LedgerLog::new();
+                flows.fit(sub_run.len().saturating_mul(FLOWS_PER_ORGANISM))?;
+                let mut emissions = Deposits::new();
+                emissions.fit_staging(sub_run.len())?;
+                let trail_emissions = if has_trail {
+                    let mut deposits = Deposits::new();
+                    deposits.fit_staging(sub_run.len())?;
+                    Some(deposits)
+                } else {
+                    None
+                };
+                let byproducts = if has_byproducts {
+                    let mut deposits = Deposits::new();
+                    deposits.fit_staging(sub_run.len())?;
+                    Some(deposits)
+                } else {
+                    None
+                };
                 tiles.push(SettleTile {
                     lane_index,
                     start: lane_base + sub_idx * sub_len,
                     run: sub_run,
-                    flows: LedgerLog::new(),
-                    emissions: Deposits::new(),
-                    trail_emissions: has_trail.then(Deposits::new),
-                    byproducts: has_byproducts.then(Deposits::new),
-                    emission_paid: CompensatedSum::ZERO,
+                    flows,
+                    emissions,
+                    trail_emissions,
+                    byproducts,
                     transactions: None,
                 });
             }
@@ -5972,7 +5993,6 @@ fn settle_all(
                         &mut tile.emissions,
                         tile.trail_emissions.as_mut(),
                         tile.byproducts.as_mut(),
-                        &mut tile.emission_paid,
                         exchange,
                         record,
                     )?
@@ -6016,7 +6036,6 @@ fn settle_all(
                     {
                         dst.append(src)?;
                     }
-                    lane.emission_paid.add(tile.emission_paid.value());
                     if let Some(record) = tile.transactions.take() {
                         lane.transactions = Some(record);
                     }
@@ -6034,7 +6053,6 @@ fn settle_all(
             emissions,
             trail_emissions,
             byproducts,
-            emission_paid,
             transactions,
             ..
         } = lane;
@@ -6076,7 +6094,6 @@ fn settle_all(
                 emissions,
                 trail_emissions.as_mut(),
                 byproducts.as_mut(),
-                emission_paid,
                 exchange,
                 record,
             )?
@@ -7031,9 +7048,10 @@ fn decide_batched_flat_f32(
         merged
     };
 
-    flat_outputs.clear();
     let mut device_nanoseconds = 0_u64;
-    if !flat_jobs.is_empty() {
+    if flat_jobs.is_empty() {
+        flat_outputs.clear();
+    } else {
         if let Err(error) = device.evaluate_flat_f32(
             &flat_jobs,
             input_width,
@@ -7041,6 +7059,7 @@ fn decide_batched_flat_f32(
             flat_inputs_finite,
             flat_outputs,
         ) {
+            flat_outputs.clear();
             return Ok(Batched::Device(error));
         }
         device_nanoseconds = device.last_device_nanoseconds();
@@ -7707,6 +7726,7 @@ struct Settled {
     secretory_readiness: f32,
     emission_cooldown_deadline: Tick,
     emitted: bool,
+    emission_paid: f64,
     intent: Option<BirthIntent>,
 }
 
@@ -7721,6 +7741,7 @@ impl Settled {
             secretory_readiness: organism.secretory_readiness,
             emission_cooldown_deadline: organism.emission_cooldown_deadline,
             emitted: organism.emitted,
+            emission_paid: organism.emission_paid,
             intent: organism.intent,
         }
     }
@@ -7734,6 +7755,7 @@ impl Settled {
         organism.secretory_readiness = self.secretory_readiness;
         organism.emission_cooldown_deadline = self.emission_cooldown_deadline;
         organism.emitted = self.emitted;
+        organism.emission_paid = self.emission_paid;
         organism.intent = self.intent;
     }
 }
@@ -8456,7 +8478,7 @@ fn contact_displacements(
 /// returned [`Settled`].
 #[expect(
     clippy::too_many_arguments,
-    reason = "ordered phases 6 and 7 stage runner including optional V2-11 byproducts, V2-15 trail deposits and paid accumulator"
+    reason = "ordered phases 6 and 7 stage runner including optional V2-11 byproducts and V2-15 trail deposits"
 )]
 fn settle_stages(
     rules: &Rules,
@@ -8468,7 +8490,6 @@ fn settle_stages(
     emissions: &mut Deposits,
     trail_emissions: Option<&mut Deposits>,
     byproducts: Option<&mut Deposits>,
-    emission_paid: &mut CompensatedSum,
     exchange_scratch: &mut ExchangeScratch,
     record: Option<&mut Option<Transactions>>,
 ) -> Result<Settled, CoreError> {
@@ -8574,9 +8595,7 @@ fn settle_stages(
         exchange_scratch,
         &mut footprint,
     )?;
-    if emission.cost.paid > 0.0 {
-        emission_paid.add(emission.cost.paid);
-    }
+    settled.emission_paid = emission.cost.paid;
     settled.emitted = emission.emitted();
     settled.secretory_readiness = next_readiness;
     settled.emission_cooldown_deadline = next_cooldown_deadline;

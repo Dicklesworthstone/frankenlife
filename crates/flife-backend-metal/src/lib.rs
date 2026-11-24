@@ -651,10 +651,18 @@ impl MetalControllers {
 /// Parameter bytes per device shard, at most; [`MetalBackend::with_shard_slots`]
 /// may also bound its slots. A command's kernels run one after another, one
 /// per shard a batch touches, and each adds a fixed latency (about 0.2 ms on
-/// the preset), so a shard is large: 6,718 genomes of the preset's
-/// 9,988-parameter topology. A topology's first genome allocates a whole
-/// shard.
+/// the preset), so a full shard is large: 6,718 F32 (13,437 F16) genomes of
+/// the preset's 9,988-parameter topology. Shards start at
+/// [`INITIAL_SHARD_SLOTS`] (clamped to the shard's maximum slots) and grow by
+/// powers of two up to `SHARD_BYTES` as higher arena slots arrive.
 pub const SHARD_BYTES: u64 = 256 << 20;
+
+/// Initial slot capacity allocated when a device shard is first created
+/// (clamped to `geometry.slots_per_shard()`). Shards grow by powers of two up
+/// to `geometry.slots_per_shard()` (`SHARD_BYTES`) as higher arena slots
+/// arrive, so rare mutated topologies consume ~1 MiB instead of eagerly
+/// reserving the full 256 MiB slab.
+pub const INITIAL_SHARD_SLOTS: usize = 64;
 
 /// Under a budget, a shard holds at most this fraction of what a full
 /// batch's staging leaves of it (FL-043): room for the five catalog
@@ -664,6 +672,205 @@ pub const SHARD_SHARE: u64 = 8;
 /// The host bytes one shard holds beside its occupants: its job list and
 /// its places in a batch's touched shards and kernel bindings.
 const SHARD_HOST_BYTES: u64 = 256;
+
+/// Target allocated slot capacity for a shard accommodating `max_local` within
+/// a geometry holding at most `slots_per_shard` slots.
+fn target_shard_slots(max_local: usize, slots_per_shard: usize) -> usize {
+    let needed = max_local.saturating_add(1);
+    let rounded = needed
+        .checked_next_power_of_two()
+        .unwrap_or(slots_per_shard)
+        .max(INITIAL_SHARD_SLOTS);
+    rounded.min(slots_per_shard)
+}
+
+/// Compute `(element_count, total_charged_bytes, device_bytes)` for a shard
+/// holding `slot_capacity` slots of stride `stride` in `dtype`.
+fn shard_accounting(
+    slot_capacity: usize,
+    stride: u64,
+    dtype: WeightDtype,
+) -> Result<(usize, u64, u64), CoreError> {
+    let cap_u64 = u64::try_from(slot_capacity).map_err(|_| CoreError::Overflow {
+        quantity: "arena shard slots",
+    })?;
+    let elements_u64 = cap_u64.checked_mul(stride).ok_or(CoreError::Overflow {
+        quantity: "arena shard elements",
+    })?;
+    let elements = usize::try_from(elements_u64).map_err(|_| CoreError::Overflow {
+        quantity: "arena shard elements",
+    })?;
+    let device_bytes = elements_u64.saturating_mul(dtype.bytes());
+    let total_bytes = device_bytes
+        .saturating_add(bytes_for::<Option<(u32, GenomeId)>>(slot_capacity))
+        .saturating_add(SHARD_HOST_BYTES);
+    Ok((elements, total_bytes, device_bytes))
+}
+
+/// Allocate a zeroed device parameter buffer for `elements` elements of `dtype`.
+fn allocate_shard_parameters(
+    owner: &DeviceOwner,
+    dtype: WeightDtype,
+    elements: usize,
+) -> Result<ShardParameters, CoreError> {
+    match dtype {
+        WeightDtype::F32 => owner
+            .zeroed_owned::<f32>(elements)
+            .map(ShardParameters::F32),
+        // F16 slot stride is a multiple of 4 elements, so `elements` is
+        // always even and fills whole `u32` words.
+        WeightDtype::F16 => owner
+            .zeroed_owned::<u32>(elements / 2)
+            .map(ShardParameters::F16),
+    }
+}
+
+/// Highest `local` slot index in `&jobs[start_index..]` belonging to
+/// `(topology_u32, shard_key)` for a shard covering `slots_per_shard` slots.
+/// Invoked only when a shard is created or grown, so steady-state ticks pay
+/// zero scan overhead.
+fn batch_max_local_for_shard<J: JobView>(
+    jobs: &[J],
+    finite_flags: &[u8],
+    start_index: usize,
+    topology_u32: u32,
+    shard_key: u64,
+    slots_per_shard: u64,
+    initial_local: usize,
+) -> usize {
+    let Ok(max_possible) = usize::try_from(slots_per_shard) else {
+        return initial_local;
+    };
+    if max_possible <= INITIAL_SHARD_SLOTS || initial_local.saturating_add(1) >= max_possible {
+        return initial_local;
+    }
+    let Some(shard_base) = shard_key.checked_mul(slots_per_shard) else {
+        return initial_local;
+    };
+    let shard_end = shard_base.checked_add(slots_per_shard);
+    let mut max_local = initial_local;
+    for (job, &is_finite) in jobs[start_index..].iter().zip(&finite_flags[start_index..]) {
+        if is_finite == 0 {
+            continue;
+        }
+        let s = job.slot();
+        if s.topology() != topology_u32 {
+            continue;
+        }
+        let raw = s.slot();
+        if raw >= shard_base
+            && shard_end.is_none_or(|end| raw < end)
+            && let Ok(local) = usize::try_from(raw - shard_base)
+            && local > max_local
+        {
+            max_local = local;
+            if max_local.saturating_add(1) >= max_possible {
+                break;
+            }
+        }
+    }
+    max_local
+}
+
+/// Pick the largest power-of-two (or full-shard) slot capacity between
+/// `target_shard_slots(local, slots_per_shard)` and
+/// `target_shard_slots(batch_max_local, slots_per_shard)` that fits both
+/// `budget_bytes` and `owner_limit`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "self-contained shard capacity admission against both backend and device budgets"
+)]
+fn choose_fitting_capacity(
+    local: usize,
+    batch_max_local: usize,
+    slots_per_shard: usize,
+    stride: u64,
+    dtype: WeightDtype,
+    held_base: u64,
+    staging: u64,
+    budget_bytes: u64,
+    owner_usage_base: u64,
+    owner_limit: u64,
+) -> Result<Option<(usize, usize, u64, u64)>, CoreError> {
+    let min_cap = target_shard_slots(local, slots_per_shard);
+    let mut cap = target_shard_slots(batch_max_local.max(local), slots_per_shard);
+    loop {
+        let (elements, total_bytes, device_bytes) = shard_accounting(cap, stride, dtype)?;
+        let fits_budget = held_base
+            .saturating_add(total_bytes)
+            .saturating_add(staging)
+            <= budget_bytes;
+        let fits_owner = owner_usage_base.saturating_add(device_bytes) <= owner_limit;
+        if fits_budget && fits_owner {
+            return Ok(Some((cap, elements, total_bytes, device_bytes)));
+        }
+        if cap <= min_cap {
+            return Ok(None);
+        }
+        let next = if cap.is_power_of_two() {
+            cap / 2
+        } else {
+            1_usize << (usize::BITS - 1 - cap.leading_zeros())
+        };
+        cap = next.max(min_cap);
+    }
+}
+
+/// Host snapshot of an existing shard's parameter buffer used to preserve all
+/// `0..old_cap` resident weights bit-for-bit across power-of-two shard growth.
+enum ShardSnapshot {
+    F32(Vec<f32>),
+    F16(Vec<u32>),
+}
+
+impl ShardSnapshot {
+    fn read_from(
+        owner: &DeviceOwner,
+        parameters: &ShardParameters,
+        old_elements: usize,
+    ) -> Result<Self, CoreError> {
+        match parameters {
+            ShardParameters::F32(buf) => {
+                let mut copy = Vec::new();
+                copy.try_reserve_exact(old_elements)
+                    .map_err(|_| CoreError::AllocationFailed {
+                        buffer: "metal shard growth copy",
+                        bytes: bytes_for::<f32>(old_elements),
+                    })?;
+                copy.resize(old_elements, 0.0);
+                owner.read_back(buf.buffer(), &mut copy)?;
+                Ok(Self::F32(copy))
+            }
+            ShardParameters::F16(buf) => {
+                let old_words = old_elements / 2;
+                let mut copy = Vec::new();
+                copy.try_reserve_exact(old_words)
+                    .map_err(|_| CoreError::AllocationFailed {
+                        buffer: "metal shard growth copy",
+                        bytes: bytes_for::<u32>(old_words),
+                    })?;
+                copy.resize(old_words, 0);
+                owner.read_back(buf.buffer(), &mut copy)?;
+                Ok(Self::F16(copy))
+            }
+        }
+    }
+
+    fn write_to(&self, owner: &DeviceOwner, parameters: &ShardParameters) -> Result<(), CoreError> {
+        match (self, parameters) {
+            (Self::F32(copy), ShardParameters::F32(buf)) => {
+                owner.write_slice(buf.buffer(), 0, copy)
+            }
+            (Self::F16(copy), ShardParameters::F16(buf)) => {
+                owner.write_slice(buf.buffer(), 0, copy)
+            }
+            _ => Err(CoreError::StateConflict {
+                operation: "grow metal shard",
+                detail: "shard parameter dtype changed during growth".to_owned(),
+            }),
+        }
+    }
+}
 
 /// The most a batch's staging holds, device and host, for at most
 /// `organisms` jobs over `shards` shards (FL-043): the per-organism device
@@ -717,17 +924,23 @@ impl ShardParameters {
     }
 }
 
-/// One shard of a topology's slots on the device: a whole shard's buffer,
-/// made when its first slot is needed, kept until every occupant retires
+/// One shard of a topology's slots on the device: starts at
+/// [`INITIAL_SHARD_SLOTS`] (clamped to `geometry.slots_per_shard()`), grows by
+/// powers of two up to `geometry.slots_per_shard()` (`SHARD_BYTES`) as higher
+/// slots arrive, and stays resident until every occupant retires
 /// (`release_slots`, FL-043) or `forget` drops it.
 struct DeviceShard {
     parameters: ShardParameters,
-    /// Each slot's uploaded occupant, its generation and genome, or `None`
-    /// before its first or after retirement.
+    /// Each allocated slot's uploaded occupant, its generation and genome, or
+    /// `None` before its first upload or after retirement. Length equals
+    /// `slot_capacity`.
     occupants: Vec<Option<(u32, GenomeId)>>,
+    /// Currently allocated slot capacity (`<= geometry.slots_per_shard()`).
+    slot_capacity: usize,
     /// Live uploaded occupants in `occupants`.
     live_count: usize,
-    /// Exact bytes charged to `MetalBackend::held` when this shard was created.
+    /// Exact bytes charged to `MetalBackend::held` for this shard's current
+    /// `slot_capacity`.
     bytes: u64,
     /// This shard's job words for the batch, and their capacity in jobs.
     jobs: Option<Owned<u32>>,
@@ -1360,71 +1573,202 @@ impl MetalBackend {
             let local = usize::try_from(local_u64).map_err(|_| CoreError::Overflow {
                 quantity: "arena slot",
             })?;
-            let shard = if let Some(shard) = bucket.shards.get_mut(shard_key) {
-                shard
-            } else {
-                active_lease = None;
-                let elements = usize::try_from(geometry.shard_elements()).map_err(|_| {
-                    CoreError::Overflow {
-                        quantity: "arena shard elements",
-                    }
-                })?;
-                let slots = usize::try_from(slots_per_shard).map_err(|_| CoreError::Overflow {
+            let slots_per_shard_usize =
+                usize::try_from(slots_per_shard).map_err(|_| CoreError::Overflow {
                     quantity: "arena shard slots",
                 })?;
-                let bytes = geometry
-                    .shard_elements()
-                    .saturating_mul(dtype.bytes())
-                    .saturating_add(bytes_for::<Option<(u32, GenomeId)>>(slots))
-                    .saturating_add(SHARD_HOST_BYTES);
-                let staging = staging_bytes(budget.organisms, shard_count.saturating_add(1));
-                if held.saturating_add(bytes).saturating_add(staging) > budget.bytes {
+            let needs_create_or_grow = match bucket.shards.get(shard_key) {
+                None => Some(None),
+                Some(shard) if local >= shard.slot_capacity => Some(Some(shard.slot_capacity)),
+                Some(_) => None,
+            };
+            if let Some(existing_cap) = needs_create_or_grow {
+                active_lease = None;
+                if local >= slots_per_shard_usize {
                     all_dispatched = false;
                     continue;
                 }
-                let made = match dtype {
-                    WeightDtype::F32 => owner
-                        .zeroed_owned::<f32>(elements)
-                        .map(ShardParameters::F32),
-                    // F16 slot stride is a multiple of 4 elements, so `elements`
-                    // is always even and fills whole `u32` words.
-                    WeightDtype::F16 => owner
-                        .zeroed_owned::<u32>(elements / 2)
-                        .map(ShardParameters::F16),
-                };
-                let parameters = match made {
-                    Ok(parameters) => parameters,
-                    Err(CoreError::BudgetExhausted { .. }) => {
+                let batch_max_local = batch_max_local_for_shard(
+                    jobs,
+                    finite_flags,
+                    index,
+                    slot.topology(),
+                    shard_key,
+                    slots_per_shard,
+                    local,
+                );
+                let owner_limit = owner.limits().bytes;
+                if let Some(old_cap) = existing_cap {
+                    // Grow an existing shard by powers of two, preserving all
+                    // `0..old_cap` resident weights bit-for-bit.
+                    let (old_elements, old_bytes, old_device_bytes) =
+                        match bucket.shards.get(shard_key) {
+                            Some(shard) => {
+                                let (old_elems, _, old_dev) =
+                                    shard_accounting(old_cap, stride, dtype)?;
+                                (old_elems, shard.bytes, old_dev)
+                            }
+                            None => {
+                                all_dispatched = false;
+                                continue;
+                            }
+                        };
+                    let staging = staging_bytes(budget.organisms, *shard_count);
+                    let Some((new_cap, new_elements, new_bytes, new_device_bytes)) =
+                        choose_fitting_capacity(
+                            local,
+                            batch_max_local,
+                            slots_per_shard_usize,
+                            stride,
+                            dtype,
+                            held.saturating_sub(old_bytes),
+                            staging,
+                            budget.bytes,
+                            owner.usage().bytes.saturating_sub(old_device_bytes),
+                            owner_limit,
+                        )?
+                    else {
                         all_dispatched = false;
                         continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                let mut occupants = Vec::new();
-                occupants
-                    .try_reserve_exact(slots)
-                    .map_err(|_| CoreError::AllocationFailed {
-                        buffer: "metal controller slots",
-                        bytes: bytes_for::<Option<(u32, GenomeId)>>(slots),
+                    };
+                    let mut new_occupants = Vec::new();
+                    new_occupants.try_reserve_exact(new_cap).map_err(|_| {
+                        CoreError::AllocationFailed {
+                            buffer: "metal controller slots",
+                            bytes: bytes_for::<Option<(u32, GenomeId)>>(new_cap),
+                        }
                     })?;
-                occupants.resize(slots, None);
-                // Commit VRAM accounting atomically with shard insertion so an
-                // early `?` on a later write/reserve can never desync `held`
-                // or `shard_count` from `buckets`.
-                *held = held.saturating_add(bytes);
-                *shard_count = shard_count.saturating_add(1);
-                bucket.shards.insert(
-                    shard_key,
-                    DeviceShard {
-                        parameters,
-                        occupants,
-                        live_count: 0,
-                        bytes,
-                        jobs: None,
-                        job_capacity: 0,
-                        staged: Vec::new(),
-                    },
-                )
+                    let snapshot = {
+                        let Some(shard) = bucket.shards.get(shard_key) else {
+                            all_dispatched = false;
+                            continue;
+                        };
+                        new_occupants.extend_from_slice(&shard.occupants);
+                        new_occupants.resize(new_cap, None);
+                        ShardSnapshot::read_from(owner, &shard.parameters, old_elements)?
+                    };
+                    if owner.usage().bytes.saturating_add(new_device_bytes) <= owner_limit {
+                        let new_parameters =
+                            match allocate_shard_parameters(owner, dtype, new_elements) {
+                                Ok(parameters) => parameters,
+                                Err(CoreError::BudgetExhausted { .. }) => {
+                                    all_dispatched = false;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
+                        snapshot.write_to(owner, &new_parameters)?;
+                        if let Some(shard) = bucket.shards.get_mut(shard_key) {
+                            shard.parameters = new_parameters;
+                            shard.occupants = new_occupants;
+                            shard.slot_capacity = new_cap;
+                            shard.bytes = new_bytes;
+                            *held = held.saturating_sub(old_bytes).saturating_add(new_bytes);
+                        }
+                    } else if let Some(removed) = bucket.shards.remove(shard_key) {
+                        // Tight device limit: release the old parameter buffer
+                        // before allocating the larger replacement while
+                        // preserving `staged`, `jobs`, `live_count`, and
+                        // `occupants[0..old_cap]`.
+                        let DeviceShard {
+                            parameters: old_parameters,
+                            occupants: _old_occupants,
+                            slot_capacity: _,
+                            live_count,
+                            bytes: removed_bytes,
+                            jobs: shard_jobs,
+                            job_capacity,
+                            staged,
+                        } = removed;
+                        *held = held.saturating_sub(removed_bytes);
+                        *shard_count = shard_count.saturating_sub(1);
+                        drop(old_parameters);
+                        let new_parameters =
+                            match allocate_shard_parameters(owner, dtype, new_elements) {
+                                Ok(parameters) => parameters,
+                                Err(CoreError::BudgetExhausted { .. }) => {
+                                    if live_count > 0 {
+                                        overwrote_existing = true;
+                                    }
+                                    all_dispatched = false;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
+                        snapshot.write_to(owner, &new_parameters)?;
+                        *held = held.saturating_add(new_bytes);
+                        *shard_count = shard_count.saturating_add(1);
+                        bucket.shards.insert(
+                            shard_key,
+                            DeviceShard {
+                                parameters: new_parameters,
+                                occupants: new_occupants,
+                                slot_capacity: new_cap,
+                                live_count,
+                                bytes: new_bytes,
+                                jobs: shard_jobs,
+                                job_capacity,
+                                staged,
+                            },
+                        );
+                    }
+                } else {
+                    let staging = staging_bytes(budget.organisms, shard_count.saturating_add(1));
+                    let Some((cap, elements, bytes, _device_bytes)) = choose_fitting_capacity(
+                        local,
+                        batch_max_local,
+                        slots_per_shard_usize,
+                        stride,
+                        dtype,
+                        *held,
+                        staging,
+                        budget.bytes,
+                        owner.usage().bytes,
+                        owner_limit,
+                    )?
+                    else {
+                        all_dispatched = false;
+                        continue;
+                    };
+                    let parameters = match allocate_shard_parameters(owner, dtype, elements) {
+                        Ok(parameters) => parameters,
+                        Err(CoreError::BudgetExhausted { .. }) => {
+                            all_dispatched = false;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let mut occupants = Vec::new();
+                    occupants
+                        .try_reserve_exact(cap)
+                        .map_err(|_| CoreError::AllocationFailed {
+                            buffer: "metal controller slots",
+                            bytes: bytes_for::<Option<(u32, GenomeId)>>(cap),
+                        })?;
+                    occupants.resize(cap, None);
+                    // Commit VRAM accounting atomically with shard insertion so
+                    // an early `?` on a later write/reserve can never desync
+                    // `held` or `shard_count` from `buckets`.
+                    *held = held.saturating_add(bytes);
+                    *shard_count = shard_count.saturating_add(1);
+                    bucket.shards.insert(
+                        shard_key,
+                        DeviceShard {
+                            parameters,
+                            occupants,
+                            slot_capacity: cap,
+                            live_count: 0,
+                            bytes,
+                            jobs: None,
+                            job_capacity: 0,
+                            staged: Vec::new(),
+                        },
+                    );
+                }
+            }
+            let Some(shard) = bucket.shards.get_mut(shard_key) else {
+                all_dispatched = false;
+                continue;
             };
             let own = Some((slot.generation(), job.genome()));
             let Some(occupant) = shard.occupants.get_mut(local) else {

@@ -105,9 +105,18 @@ impl FlatOutputs {
                 })?;
         }
         self.output_width = output_width;
-        self.values.resize(total, 0.0);
-        self.valid.clear();
-        self.valid.resize(jobs, 0);
+        if self.values.len() >= total {
+            self.values.truncate(total);
+        } else {
+            self.values.resize(total, 0.0);
+        }
+        if self.valid.len() >= jobs {
+            self.valid.truncate(jobs);
+            self.valid.fill(0);
+        } else {
+            self.valid.fill(0);
+            self.valid.resize(jobs, 0);
+        }
         Ok(())
     }
 
@@ -441,5 +450,39 @@ mod tests {
         assert_eq!(flat.valid, [0, 1]);
         assert!(flat.row(0).is_none());
         assert!(flat.row(1).is_some());
+    }
+
+    #[test]
+    fn flat_outputs_prepare_reuses_capacity_and_clears_valid_flags() {
+        let mut flat = FlatOutputs::default();
+        flat.prepare(4, 6).expect("initial prepare");
+        for (i, slot) in flat.values.iter_mut().enumerate() {
+            *slot = (i + 1) as f32;
+        }
+        flat.valid.fill(1);
+        let initial_cap = flat.values.capacity();
+        let initial_ptr = flat.values.as_ptr();
+
+        // Shrinking reuses existing allocation without reallocation, while
+        // clearing every validity flag so unwritten rows cannot be observed.
+        flat.prepare(2, 6).expect("shrink prepare");
+        assert_eq!(flat.values.capacity(), initial_cap);
+        assert_eq!(flat.values.as_ptr(), initial_ptr);
+        assert_eq!(flat.values.len(), 12);
+        assert_eq!(flat.valid, [0, 0]);
+        assert!(flat.row(0).is_none());
+        assert!(flat.row(1).is_none());
+
+        // Growing back within existing capacity also avoids reallocation and
+        // still keeps every untouched row invalid.
+        flat.valid[0] = 1;
+        flat.prepare(4, 6).expect("regrow within capacity");
+        assert_eq!(flat.values.capacity(), initial_cap);
+        assert_eq!(flat.values.as_ptr(), initial_ptr);
+        assert_eq!(flat.values.len(), 24);
+        assert_eq!(flat.valid, [0, 0, 0, 0]);
+        for idx in 0..4 {
+            assert!(flat.row(idx).is_none());
+        }
     }
 }

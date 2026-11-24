@@ -291,7 +291,6 @@ impl Bins {
                 .collect();
             let mut rem = staged.as_mut_slice();
             for s in 0..stripe_count {
-                let _stripe_end = stripe_bases[s + 1];
                 for (chunk, task) in chunk_counts.iter().zip(&mut scatter_tasks) {
                     let count = chunk.counts[s];
                     let (slice, tail) = rem.split_at_mut(count);
@@ -366,7 +365,8 @@ impl Bins {
             });
         }
 
-        flife_core::pool::parallel_tasks(
+        let name = self.name;
+        flife_core::pool::try_parallel_tasks(
             workers,
             "bins stripe sort",
             &mut stripe_tasks,
@@ -379,13 +379,20 @@ impl Bins {
                 let base_u32 = task.item_base as u32;
                 if task.staged.is_empty() {
                     task.offsets_out.fill(base_u32);
-                    return;
+                    return Ok(());
                 }
                 let mut stack_counts = [0_u32; STACK_STRIPE_BUCKETS];
                 let mut heap_counts = Vec::new();
                 let counts: &mut [u32] = if b_len <= STACK_STRIPE_BUCKETS {
                     &mut stack_counts[..b_len]
                 } else {
+                    heap_counts.try_reserve_exact(b_len).map_err(|_| {
+                        CoreError::AllocationFailed {
+                            buffer: name,
+                            bytes: u64::try_from(b_len.saturating_mul(std::mem::size_of::<u32>()))
+                                .unwrap_or(u64::MAX),
+                        }
+                    })?;
                     heap_counts.resize(b_len, 0);
                     &mut heap_counts
                 };
@@ -398,7 +405,13 @@ impl Bins {
                 for &c in counts.iter() {
                     nonempty += usize::from(c > 0);
                 }
-                task.occupied.reserve_exact(nonempty);
+                task.occupied.try_reserve_exact(nonempty).map_err(|_| {
+                    CoreError::AllocationFailed {
+                        buffer: name,
+                        bytes: u64::try_from(nonempty.saturating_mul(std::mem::size_of::<u32>()))
+                            .unwrap_or(u64::MAX),
+                    }
+                })?;
                 for (local_b, (count_slot, out_off)) in counts
                     .iter_mut()
                     .zip(task.offsets_out.iter_mut())
@@ -424,6 +437,7 @@ impl Bins {
                     task.order_out[dst] = item_u32;
                 }
                 task.largest = largest;
+                Ok(())
             },
         )?;
 

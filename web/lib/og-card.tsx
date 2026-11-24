@@ -2,9 +2,10 @@
 // drawn at build time by next/og (Satori, not a browser: inline styles, flex
 // on every element, PNG or JPEG images only).
 //
-// Its picture is the film's social card, a crop of one film frame that
-// `flife render` drew (scripts/media.ts records which); the card only darkens
-// it beside the words. Every figure it shows is lib/media.json's.
+// Its picture is the tissue film's social card, a crop of one film frame
+// that `flife render` drew (scripts/media.ts records which); the card only
+// darkens it beside the words. Every figure it shows is that film's manifest's
+// (lib/films/tissue.json).
 
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -12,9 +13,12 @@ import { join } from "node:path";
 
 import { ImageResponse } from "next/og";
 
-import { film } from "@/lib/media";
+import { filmById } from "@/lib/media";
 import { LINEAGE } from "@/lib/palette";
 import { SHARE_IMAGE_TYPE } from "@/lib/share";
+
+// The share card is cut from the tissue film: a close view of v2 tissue.
+const film = filmById("tissue");
 
 const INK = "#020a02";
 

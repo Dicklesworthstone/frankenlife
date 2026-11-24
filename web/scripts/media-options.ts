@@ -75,6 +75,8 @@ export const V2_FEATURE_ALIASES = ["all-v2", "bundle-a", "bundle-b"] as const;
 
 const FEATURE_TOKENS = new Set<string>([...V2_FEATURE_SLUGS, ...V2_FEATURE_ALIASES]);
 const COMPONENT_FIELD = /^component-(?:0|[1-9]|[12]\d|3[01])$/;
+/** A film id: it names lib/films/<id>.json and prefixes the film's files in public/media/. */
+export const FILM_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 /** Validate a comma-separated `--disable` or `--enable` token list against V2Feature slugs and aliases. */
 export function validateFeatureTokens(raw: string, flag: "--disable" | "--enable"): string[] {
@@ -98,6 +100,10 @@ export function isValidFieldChoice(value: string): boolean {
 export type SegmentMode = "auto" | number;
 
 export type MediaOptions = {
+  /** The film's id: its manifest is lib/films/<id>.json and its files are named <id>-…; default `film`. */
+  film: string;
+  /** The commit `--flife` was built from, when not HEAD (scripts/source-revision.ts); null for HEAD. */
+  revision: string | null;
   flife: string;
   runDir: string | null;
   config: string | null;
@@ -124,6 +130,8 @@ export type MediaOptions = {
 };
 
 const MEDIA_VALUE_FLAGS = new Set([
+  "film",
+  "revision",
   "flife",
   "run-dir",
   "config",
@@ -216,6 +224,10 @@ export function parseMediaArgs(argv: readonly string[], publicMediaDir?: string)
     return resolve(value);
   };
 
+  const film = single.get("film") ?? "film";
+  if (!FILM_ID.test(film)) {
+    throw new Error(`--film must be a lower-case id of letters, digits and hyphens (it names lib/films/<id>.json), got "${film}"`);
+  }
   const flife = required("flife");
   const work = required("work");
   const runDir = single.has("run-dir") ? resolve(single.get("run-dir") as string) : null;
@@ -302,6 +314,8 @@ export function parseMediaArgs(argv: readonly string[], publicMediaDir?: string)
     : null;
 
   return {
+    film,
+    revision: single.get("revision") ?? null,
     flife,
     runDir,
     config,

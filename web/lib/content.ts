@@ -1,14 +1,17 @@
 // Every word and number on the site outside the explainers (components/explain/,
 // whose figures cite their sources in their own captions). Each figure here is
 // one the repository itself states (README.md, the plan, the crates'
-// CONTRACT.md files, experiments/fl048 and experiments/showcase), one the
-// film's manifest records (lib/media.json), or, in `branchObservation`, one
+// CONTRACT.md files, experiments/fl048, experiments/showcase and
+// experiments/v2-emergence), one a film's or still's manifest records
+// (lib/films/*.json, lib/stills.json), or, in `branchObservation`, one
 // this page observed and dates; none is a target dressed as a result.
 
-import { film } from "@/lib/media";
+import { filmById, films } from "@/lib/media";
 
-/** The film's organisms on its first frame, from flife render's record of that frame. */
-const filmAlive = (film.world.live[0] ?? 0).toLocaleString("en-US");
+// Chapter 1 zooms into the confluent film; its organisms on its first frame, from flife render's record of that frame.
+const filmAlive = (filmById("confluent").world.live[0] ?? 0).toLocaleString("en-US");
+// The films, counted for the words that name them.
+const filmCount = films.length;
 
 export const siteConfig = {
   name: "FrankenLife",
@@ -22,6 +25,7 @@ export const siteConfig = {
   readme: "https://github.com/Dicklesworthstone/frankenlife#readme",
   fl048: "https://github.com/Dicklesworthstone/frankenlife/blob/main/experiments/fl048/README.md",
   showcase: "https://github.com/Dicklesworthstone/frankenlife/blob/main/experiments/showcase/README.md",
+  v2Report: "https://github.com/Dicklesworthstone/frankenlife/blob/main/experiments/v2-emergence/README.md",
   license: "https://github.com/Dicklesworthstone/frankenlife/blob/main/LICENSE",
   agents: "https://github.com/Dicklesworthstone/frankenlife/blob/main/AGENTS.md",
 };
@@ -35,12 +39,49 @@ export const filmChoice = {
     "Nothing the search measured feeds back into a run. The organisms have no aesthetic fitness: they feed, emit, split and die by energy alone. The seed is the Desktop preset's 42, not a pick. On three seeds the search never saw, the world scores 0.81 to 1.57, against 1.92 to 2.68 for the coarser world on the same seeds.",
     "Emission, chosen by the neural networks, makes the structure, and contact shapes it at the scale of bodies. Organisms return about half of what they eat to the field, in a chemical composition their networks choose and kin choose alike, so each lineage paints its surroundings with its own chemistry. Adhesion then sorts lineages by that chemistry, as real tissues sort by adhesion, into domains of labyrinths, foam and packed spheres. With every controller's decisions zeroed, nothing is emitted and the bodies settle into a uniform mottled haze, with no domains, labyrinths or foam. With every newborn's genome drawn fresh instead of inherited, the population falls from its ceiling to about 1,200.",
   ],
+  v2: [
+    "The v2 films show the two v2 presets exactly as committed, at their own seed, 42; no parameter was tuned for the camera. Each world was first run to tick 8,192 and drawn every 256 ticks; the starting tick was then chosen by eye from those frames, where colonies or tissue islands had formed: 2,048 for the supercolony and 3,072 for the tissue. The supercolony film's first digest is the one the Stage-2 campaign recorded for the same preset and seed at that tick.",
+    "The colouring was chosen by eye from single 4K test frames of five looks: founder lineage lit by each organism's energy, over the field's energy, for both. The tissue's cell-state colouring was nearly uniform at these ticks, so it appears only as a still. The veins film draws the same supercolony with the field coloured by vascular conductance, the whole torus, without a camera.",
+    "The camera is the director's described below, with its zooms given by hand: 1.3× to 1.8× for the supercolony, whose organisms are drawn at a fixed size that coarsens beyond that, and 2.6× to 3.6× for the tissue, whose bodies are 0.25 world units across.",
+  ],
   camera:
-    "The camera is chosen from the run, not by hand. The same ticks are first rendered small; each shot then eases into the region where the organisms changed most during it, and the film opens and closes on the whole torus. The camera changes no result: the preview and the film end on the same digest.",
+    "Where the camera looks is chosen from the run, not by hand; each shot's zoom is given. The same ticks are first rendered small; each shot then eases into the region where the organisms changed most during it, and the film opens and closes on the whole torus. The camera changes no result: the preview and the film end on the same digest.",
 };
 
 /**
- * The page's five chapters, in order. Each wears one colour of the film's
+ * What each film is, for its tab and the line beneath it (lib/films/index.ts
+ * lists the films; each manifest records how it was made). The numbers are the
+ * presets' and the manifests'.
+ */
+export const filmNotes: Record<string, { tab: string; chip: string; title: string; line: string }> = {
+  supercolony: {
+    tab: "Supercolony",
+    chip: "v2 · Bundle B",
+    title: "Supercolony",
+    line: "The supercolony-v2 preset: 16,384 founders and 11 v2 mechanisms, with no forces between organisms. Colonies hold together only through the field they share: food sources bloom and fade, emitters fire in bursts, trails and veins form in the field. Colour is founder lineage, lit by each organism's energy, over the field's energy.",
+  },
+  tissue: {
+    tab: "Tissue",
+    chip: "v2 · Bundle A",
+    title: "Tissue",
+    line: "The morphogenesis-tissue-v2 preset: 10,954 founders with bodies and 14 v2 mechanisms. Crowding stops division, polarity orients cells, inherited tags decide who sticks to whom, and kin pass food. The camera holds 2.6× to 3.6× closer than the whole torus; bright cells are well fed, dark ones starving.",
+  },
+  veins: {
+    tab: "Veins",
+    chip: "v2 · overlay",
+    title: "Veins",
+    line: "The supercolony again, with the field drawn as vascular conductance instead of energy: bright where energy has kept flowing between cells and the faces have widened, dark seams where they have pruned back. The network is the field's own; no organism builds it on purpose. The whole torus, without a camera.",
+  },
+  confluent: {
+    tab: "Confluent",
+    chip: "v1 · contact",
+    title: "Confluent world",
+    line: "The site's first film: field-ecology-v1-contact at its population ceiling of 262,144, drawn as spheres coloured by lineage. No v2 mechanism is on.",
+  },
+};
+
+/**
+ * The page's six chapters, in order. Each wears one colour of the film's
  * lineage palette (`LINEAGE[colour]`, lib/palette.ts), as the film colours each
  * founder's descendants; `short` is the phone dock's label.
  */
@@ -63,7 +104,7 @@ export const chapters: Chapter[] = [
     label: "The world",
     title: "Every speck is [someone].",
     thesis:
-      `The film shows ${filmAlive} organisms at once, and each is an individual: a body, an energy budget, offspring and its own neural network. Zoom in until you reach one, watch what it does in a tick, then run a small world of your own.`,
+      `The confluent world shows ${filmAlive} organisms at once, and each is an individual: a body, an energy budget, offspring and its own neural network. Zoom in until you reach one, watch what it does in a tick, then run a small world of your own.`,
     colour: 0,
     sections: [
       { id: "zoom", label: "From the world to one brain" },
@@ -83,7 +124,7 @@ export const chapters: Chapter[] = [
     sections: [
       { id: "different", label: "Four forbidden shortcuts" },
       { id: "controls", label: "Remove a cause" },
-      { id: "film", label: "What the film is" },
+      { id: "film", label: "What the films are" },
     ],
   },
   {
@@ -100,12 +141,29 @@ export const chapters: Chapter[] = [
       { id: "world", label: "The model" },
       { id: "rules", label: "Check it by hand" },
       { id: "tick", label: "One tick" },
-      { id: "v2", label: "Modular V2 extension" },
+    ],
+  },
+  {
+    id: "v2",
+    number: "04",
+    short: "V2",
+    label: "Version 2",
+    title: "Tissue and [supercolonies].",
+    thesis:
+      "Twenty-one new mechanisms, each a switch: food that blooms and fades, membranes, veins the field grows for itself, trails no one can eat, ageing, bodies that stop dividing in a crowd, sort by kind and feed their kin. Two presets combine them into a tissue and a supercolony, and 104 runs measured what each part does.",
+    colour: 1,
+    sections: [
+      { id: "bundles", label: "Two worlds" },
+      { id: "atlas", label: "Twenty-one mechanisms" },
+      { id: "views", label: "Seeing the hidden state" },
+      { id: "ablations", label: "Take one away" },
+      { id: "configure", label: "Compose your own" },
+      { id: "unshown", label: "What is not shown yet" },
     ],
   },
   {
     id: "evidence",
-    number: "04",
+    number: "05",
     short: "Evidence",
     label: "What it can show",
     title: "Claims, [kept apart].",
@@ -122,7 +180,7 @@ export const chapters: Chapter[] = [
   },
   {
     id: "lab",
-    number: "05",
+    number: "06",
     short: "Lab",
     label: "Use it",
     title: "Your [laboratory].",
@@ -304,9 +362,9 @@ export const heroStats: Stat[] = [
     note: "The default network, 104 → 64 → 32 → 36. No two organisms share one.",
   },
   {
-    value: "104 → 36",
-    label: "senses to decisions",
-    note: "Field energy, 32 chemical channels and their gradients in; reproduction, emission and spending out.",
+    value: "21",
+    label: "v2 mechanisms, each a switch",
+    note: "Set when a world is founded. All off, a v2 run is v1 bit for bit; 104 of 104 Stage-2 runs balanced their ledger to 10⁻⁸.",
   },
   {
     value: "Bit for bit",
@@ -403,7 +461,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "pure-field",
     abi: "none",
-    summary: "Phase-staggered ephemeral oasis resource blooms on the periodic field.",
+    summary: "Sixteen food sources bloom and fade on staggered phases of a 24 s cycle; total power is constant.",
   },
   {
     slug: "senescence",
@@ -411,7 +469,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "pure-field",
     abi: "none",
-    summary: "Gompertz metabolic maintenance ramp with organism age.",
+    summary: "Upkeep grows with the square of age, up to 64× the young rate; a cost, never a dice roll.",
   },
   {
     slug: "surplus-emission",
@@ -419,7 +477,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "pure-field",
     abi: "none",
-    summary: "Surplus-gated emission floor so starving organisms cannot spend down to zero.",
+    summary: "Emission spends only the energy above a 0.45 floor, so no organism signals itself to death.",
   },
   {
     slug: "excitable-relay",
@@ -427,7 +485,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "pure-field",
     abi: "none",
-    summary: "Vesicle-readiness refractory pulse relay for propagating chemical waves.",
+    summary: "Emission comes in bursts when a recovering readiness passes one half, so signals travel as waves.",
   },
   {
     slug: "wake-offset",
@@ -435,7 +493,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "pure-field",
     abi: "+1 action (neural pump mode)",
-    summary: "Wake-velocity or polarized-pump emission offset behind the emitter.",
+    summary: "Deposits land a little behind the emitter's motion, or on the side its polarity points.",
   },
   {
     slug: "so2-motor",
@@ -443,7 +501,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "pure-field",
     abi: "+4 actions",
-    summary: "4-output SO(2)-equivariant neural chemotaxis, chiral contour and propulsion.",
+    summary: "Four outputs steer along food and chemical gradients, around contours and along the heading.",
   },
   {
     slug: "so2-budding",
@@ -451,7 +509,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "pure-field",
     abi: "+2 actions",
-    summary: "2-output SO(2)-equivariant oriented offspring budding and dispersal.",
+    summary: "Two outputs choose where, relative to the gradients, a daughter is placed.",
   },
   {
     slug: "hippo-crowding",
@@ -459,7 +517,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: false,
     boundary: "mode-dependent",
     abi: "+1 sensor (if exposed)",
-    summary: "Hippo-YAP local crowding birth arrest (pure-field occupancy or contact neighbours).",
+    summary: "Division stops as neighbours crowd in: the birth gate reaches zero at four.",
   },
   {
     slug: "pcp-polarity",
@@ -467,7 +525,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: false,
     boundary: "contact",
     abi: "none",
-    summary: "Persistent apical-basal planar cell polarity, wedge curvature and lateral mitosis.",
+    summary: "Each body keeps a polarity that aligns with its neighbours; daughters are placed beside it.",
   },
   {
     slug: "emt-gate",
@@ -475,7 +533,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: false,
     boundary: "contact",
     abi: "+1 action",
-    summary: "Neural epithelial-to-mesenchymal transition gate modulating tissue adhesion.",
+    summary: "One output scales the organism's own adhesion, so a cell can leave its tissue.",
   },
   {
     slug: "tight-junctions",
@@ -483,7 +541,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "pure-field",
     abi: "none",
-    summary: "Passive symmetric flux-form diffusion barrier modulated by local cell density.",
+    summary: "Occupied field cells let chemistry through more slowly: 48% with one organism, 32% with two.",
   },
   {
     slug: "lysis-recycling",
@@ -491,7 +549,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "pure-field",
     abi: "none",
-    summary: "Viability-floor corpse lysis recycling energy and negated affinity back to the field.",
+    summary: "Below 0.10 energy an organism lyses; its energy returns carrying the opposite of its diet.",
   },
   {
     slug: "symplectic-waste",
@@ -499,7 +557,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "pure-field",
     abi: "none",
-    summary: "Obligate symplectic metabolic byproduct deposited to the field under the ledger.",
+    summary: "45% of unconverted food returns as a byproduct turned a right angle from the eater's own diet.",
   },
   {
     slug: "epigenetic-recurrence",
@@ -507,7 +565,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: false,
     boundary: "pure-field",
     abi: "+S sensors, +2S raw outputs",
-    summary: "Heritable recurrent cell-state vector driving reversible fate differentiation.",
+    summary: "Two inherited state values, rewritten slowly by the network; the first turns the diet.",
   },
   {
     slug: "notch-delta",
@@ -515,7 +573,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: false,
     boundary: "contact",
     abi: "+1 sensor (neighbor-mean mode)",
-    summary: "Juxtacrine Notch-Delta lateral inhibition coupling adjacent cell states.",
+    summary: "A sense of the kin-weighted mean of the neighbours' first state value.",
   },
   {
     slug: "trophallaxis",
@@ -523,7 +581,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: false,
     boundary: "contact",
     abi: "none",
-    summary: "Passive exact-quantum kin energy sharing across contacting tissue neighbours.",
+    summary: "Touching kin pass energy from richer to poorer, in exact quanta, losing 5% of each transfer.",
   },
   {
     slug: "cadherin-4d",
@@ -531,7 +589,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: false,
     boundary: "contact",
     abi: "none",
-    summary: "Decoupled 4-D heritable cadherin adhesion tag sorting tissues independently of diet.",
+    summary: "An inherited 4-D tag decides who sticks to whom, separately from diet.",
   },
   {
     slug: "velocity-alignment",
@@ -539,7 +597,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: false,
     boundary: "contact",
     abi: "none",
-    summary: "Dissipative kin velocity alignment across local tissue neighbours.",
+    summary: "Each body's velocity is pulled toward its kin neighbours' mean; it never speeds anyone up.",
   },
   {
     slug: "vascular-field",
@@ -547,7 +605,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "pure-field",
     abi: "none",
-    summary: "4-neighbour Murray/Physarum flux-reinforced vascular pipe conductances.",
+    summary: "Field faces widen where energy keeps flowing and shrink back where it stops: self-carved veins.",
   },
   {
     slug: "dual-carrier-trails",
@@ -555,7 +613,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "pure-field",
     abi: "+4 sensors, 34 field planes",
-    summary: "34-plane two-carrier field separating metabolic food from persistent pheromone trails.",
+    summary: "A fifth of emission goes into a second carrier no one can eat: a slow trail with 4 new senses.",
   },
   {
     slug: "v2-visual-mappings",
@@ -563,43 +621,12 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "presentation",
     abi: "none (INV-09 read-only)",
-    summary: "Pure read-only cell-state, polarity, trail-carrier and vascular-conductance overlays.",
+    summary: "Four read-only views: cell state, polarity, trail carrier and vascular conductance.",
   },
 ];
 
-// V2-16 pure read-only visual mappings (crates/flife-manim/CONTRACT.md).
-export const v2VisualMappings = [
-  {
-    name: "cell-state-v1",
-    flag: "--color cell-state",
-    key: "8",
-    kind: "Organism colour",
-    body: "Preserves founder lineage OKLab hue while modulating lightness ([0.36, 0.93]), chroma and ±0.30 rad hue twist from epigenetic state h₀.",
-  },
-  {
-    name: "polarity-v1",
-    flag: "--color polarity",
-    key: "9",
-    kind: "Organism colour",
-    body: "Cyclic OKLab hue wheel for apical-basal orientation, neutral grey when unpolarized, plus bulk apical orientation ticks in sphere mode.",
-  },
-  {
-    name: "trail-carrier",
-    flag: "--field-mapping trail-carrier",
-    key: "C",
-    kind: "Field overlay",
-    body: "Carrier-1 persistent pheromone trail energy e₁ (log palette in glow look, linear grey in raw/sphere; dark fallback when absent).",
-  },
-  {
-    name: "vascular-conductance",
-    flag: "--field-mapping vascular-conductance",
-    key: "C",
-    kind: "Field overlay",
-    body: "4-neighbour Murray/Physarum mean incident conductance gₑ (log palette in glow look, linear grey in raw/sphere; dark fallback when absent).",
-  },
-];
-
-// Honest branch-level build ledger for `field-ecology-v2` (AGENTS.md Four Claims & Status Labels).
+// The field-ecology-v2 ledger, claim by claim (AGENTS.md: the Four Claims are
+// never conflated). Source: experiments/v2-emergence/README.md (V2-17).
 export const v2BuildStatus: {
   stage: string;
   claim: string;
@@ -607,25 +634,152 @@ export const v2BuildStatus: {
   detail: string;
 }[] = [
   {
-    stage: "Landed and verified",
-    claim: "Rules & Implementation",
+    stage: "Rules",
+    claim: "Observed",
     tone: "built",
     detail:
-      "All 18 of 18 V2 beads verified and closed across all 21 feature slugs (V2-01 through V2-17 + V2-EPIC): 104/104 Stage-2 320² × 2,048-tick runs across Discovery [42, 43] and Held-Out [101, 102] seeds reached target horizon with 0 extinct, 0 paused, 0 failed, 0 refused births (INV-12), and max |INV-03| = 7.17e-9. Automated E2E suites verify all 21 features composed simultaneously (112/44/48/34, 0 Metal F16 deferrals) and leave-one-out sweeps across every slug.",
+      "All 104 Stage-2 runs (13 conditions × 4 seeds × 2 presets, 2,048 ticks on a 320² field) reached their horizon: none extinct, paused, failed or refusing a birth at the ceiling. The largest energy-ledger residual was 7.2 × 10⁻⁹ against a tolerance of 10⁻⁵. The supercolony preset ran with no forces between organisms (INV-08).",
   },
   {
-    stage: "Observed (G5 & G9 Stage-2)",
-    claim: "Visual & Ecological",
+    stage: "Implementation",
+    claim: "Observed",
     tone: "built",
     detail:
-      "Human Gate G5 inspection (raw + aesthetic + V2-16 overlays on Discovery 42 & Held-Out 101) and 104-run Stage-2 ablations establish 429× (Bundle A) and 67× (Bundle B) heritable survival over fresh-offspring, 4.0× anti-jamming + +0.135..+0.144 coherence + 79,910 E kin trophallaxis (4/4 seeds) on Bundle A, and INV-08 pure-field bimodal Murray vascular networks (Sarle b = 0.608, +50–58% organism alignment, 4/4) with decoupled Carrier-1 pheromone wakes (MaxZ = 10.24, decoupling = 0.948) and +10.0% held-out neural evolution lift over fixed-controller on Bundle B.",
+      "End-to-end tests run both presets, all 21 features at once (112 inputs, 44 outputs, 48 raw outputs, 34 field planes) and every feature left out in turn, and check reference, CPU and Metal controllers bit for bit, checkpoints, branches and transplants. With every feature off, a v2 run is field-ecology-v1 bit for bit.",
   },
   {
-    stage: "Honest residuals",
-    claim: "Open tradeoffs & follow-ups",
+    stage: "Visual",
+    claim: "Observed, not the G5 gate",
     tone: "partial",
     detail:
-      "Bundle A within-clone radial h_0 vs crowding correlation remains modest at 2,048 ticks (+0.069 despite +0.038 clonal W/T lift), kin trophallaxis and Carrier-1 trails carry real metabolic costs against ablated live counts, and Bundle A lesion-assay H4 follow-up + longer-horizon (8,192t+) runs remain open. Performance: Bundle B adds +3.1% per organism-tick vs --v1-compat (within the <8% pure-field target), while Round 1–2b optimizations delivered 1.35×–1.79× simulation speedups and 3.4×–10× checkpoint speedups with bit-exact parity.",
+      "The campaign's report records a visual review of raw and aesthetic renders of both presets on a discovery and a held-out seed. The plan's G5 gate, a human review against the reference screenshots, is still not run (README).",
+  },
+  {
+    stage: "Ecological",
+    claim: "Observed, 4 seeds",
+    tone: "built",
+    detail:
+      "Inheritance matters on every seed: removing it leaves 36 organisms of the tissue's 15,446 and 317 of the supercolony's 21,308. The tissue jams 4.0× less than with v2 off; the supercolony's veins raise alignment by half. Each figure is a mean over 2 discovery and 2 held-out seeds at 2,048 ticks.",
+  },
+  {
+    stage: "Not yet shown",
+    claim: "Open",
+    tone: "open",
+    detail:
+      "Distinct core and sheath cell types (the memory state barely tracks crowding at 2,048 ticks), a gain in population from food sharing or from trails, and the lesion assay on the new tissue. No run past 2,048 ticks has been scored.",
+  },
+];
+
+/** The two v2 presets, side by side (presets/*.toml; `flife validate`; experiments/v2-emergence/README.md). */
+export const v2Bundles = [
+  {
+    id: "tissue",
+    film: "tissue",
+    name: "Bundle A · tissue",
+    preset: "presets/morphogenesis-tissue-v2.toml",
+    founders: 10954,
+    features: 14,
+    abi: "108 inputs → 40 decisions (44 raw outputs), 33 field planes",
+    bodies: "0.25 world units across; they push apart and adhere ([contact]).",
+    picture:
+      "Porous islands of tissue, each sorted by lineage, with well-fed cores and starving rims. Cells stop dividing in a crowd, orient, stick to their own kind and pass food to kin.",
+    measured: [
+      { label: "Alive at tick 2,048", value: "15,446", note: "mean of 4 seeds" },
+      { label: "Jamming vs v2 off", value: "4.0× less", note: "overlapping neighbour pairs, 4/4" },
+      { label: "Food shared with kin", value: "79,910", note: "energy per run, every window" },
+    ],
+  },
+  {
+    id: "supercolony",
+    film: "supercolony",
+    name: "Bundle B · supercolony",
+    preset: "presets/supercolony-v2.toml",
+    founders: 16384,
+    features: 11,
+    abi: "108 inputs → 40 decisions (40 raw outputs), 34 field planes",
+    bodies: "Points: no organism pushes or pulls another (INV-08).",
+    picture:
+      "Compact, moving colonies with bright, bursting rims, between food sources that bloom and fade. Everything they share passes through the field: pulses, slow trails and the veins that flow carves in it.",
+    measured: [
+      { label: "Alive at tick 2,048", value: "21,308", note: "mean of 4 seeds" },
+      { label: "Alignment from veins", value: "+50%", note: "0.378 vs 0.252 without, 4/4" },
+      { label: "From bursting", value: "+58%", note: "alive vs without the relay, 4/4" },
+    ],
+  },
+] as const;
+
+/**
+ * Stage-2 ablations: mean live count at tick 2,048 over 4 seeds, per condition
+ * (experiments/v2-emergence/README.md §4.1, §4.2). `kind` says what changed.
+ */
+export type AblationRow = { condition: string; live: number; kind: "treatment" | "control" | "minus" | "plus"; note?: string };
+
+export const v2Ablations: { bundle: string; preset: string; rows: AblationRow[] }[] = [
+  {
+    bundle: "Tissue (Bundle A)",
+    preset: "morphogenesis-tissue-v2",
+    rows: [
+      { condition: "as committed", live: 15446, kind: "treatment" },
+      { condition: "every v2 feature off", live: 34489, kind: "control", note: "jammed slabs, 4.0× more overlaps" },
+      { condition: "decisions removed", live: 27603, kind: "control", note: "less coherent on all 4 seeds" },
+      { condition: "networks cannot evolve", live: 15186, kind: "control" },
+      { condition: "inheritance removed", live: 36, kind: "control", note: "429× fewer" },
+      { condition: "− cadherin-4d", live: 13950, kind: "minus" },
+      { condition: "− pcp-polarity", live: 15708, kind: "minus" },
+      { condition: "− symplectic-waste", live: 16695, kind: "minus" },
+      { condition: "− trophallaxis", live: 15579, kind: "minus" },
+      { condition: "− epigenetic state and notch", live: 15286, kind: "minus" },
+      { condition: "− notch-delta", live: 15725, kind: "minus" },
+      { condition: "− lysis-recycling", live: 15591, kind: "minus" },
+      { condition: "+ velocity-alignment", live: 9574, kind: "plus", note: "streams, but overshoots its food" },
+    ],
+  },
+  {
+    bundle: "Supercolony (Bundle B)",
+    preset: "supercolony-v2",
+    rows: [
+      { condition: "as committed", live: 21308, kind: "treatment" },
+      { condition: "every v2 feature off", live: 21075, kind: "control", note: "no fronts, no trails, no veins" },
+      { condition: "decisions removed", live: 20436, kind: "control", note: "no trails at all" },
+      { condition: "networks cannot evolve", live: 19942, kind: "control", note: "+10.0% on held-out seeds" },
+      { condition: "inheritance removed", live: 317, kind: "control", note: "67× fewer" },
+      { condition: "− vascular-field", live: 20113, kind: "minus", note: "alignment falls by a third" },
+      { condition: "− dual-carrier-trails", live: 25695, kind: "minus", note: "trails cost 17%" },
+      { condition: "− excitable-relay", live: 13458, kind: "minus" },
+      { condition: "− oases", live: 32517, kind: "minus", note: "more alive, less structure" },
+      { condition: "− so2-motor", live: 19034, kind: "minus" },
+      { condition: "− lysis-recycling", live: 22047, kind: "minus" },
+      { condition: "− tight-junctions", live: 21050, kind: "minus" },
+      { condition: "+ so2-budding, symplectic-waste", live: 18420, kind: "plus" },
+    ],
+  },
+];
+
+/** What the v2 report says is not shown, or costs (experiments/v2-emergence/README.md §4.4). */
+export const v2Residuals = [
+  {
+    title: "No separate cell types yet",
+    body: "Clones do vary in their memory state, but at 2,048 ticks that state barely tracks how crowded a cell is (r = +0.069). Distinct core and sheath cells would need it near 0.3; longer runs may or may not get there.",
+  },
+  {
+    title: "Sharing food does not raise the count",
+    body: "Kin pass 79,910 units of energy per run, yet without trophallaxis as many are alive (15,579 against 15,446). Each transfer loses 5%.",
+  },
+  {
+    title: "Organisms without decisions do well in the tissue",
+    body: "With every network output zeroed, 27,603 are alive against 15,446: they spend nothing on emission or motion and are fed by kin. They are less coherent on every alignment measure, on all 4 seeds, and twice as crowded.",
+  },
+  {
+    title: "Smoother gliders align more",
+    body: "In the supercolony, worlds without bursts or trails show higher short-range alignment than the committed preset (0.493 to 0.672 against 0.378). Within the committed dynamics, veins and oases raise it.",
+  },
+  {
+    title: "Trails cost a sixth of the colony",
+    body: "A fifth of emission goes into an uneatable carrier; without it 25,695 are alive against 21,308.",
+  },
+  {
+    title: "Not yet rerun on the new tissue",
+    body: "The lesion assay (H4), which removes a disc of organisms and compares the wound's edge with the interior, ran on an earlier, confluent version of the tissue, not on these islands.",
   },
 ];
 
@@ -690,7 +844,7 @@ export const gates: { id: string; name: string; state: GateState; detail: string
     id: "G5",
     name: "Visual review",
     state: "open",
-    detail: "Needs a human review against the references. Not yet run.",
+    detail: "Needs a human review against the reference screenshots. Not yet run. (The v2 campaign's report records a visual review of its own renders; that is not this gate.)",
   },
   {
     id: "G6",
@@ -931,7 +1085,7 @@ export const presets: {
     dt: "1/32",
     kind: "v2",
     chosen: "V2-17 verified · 52 Stage-2 runs",
-    body: "Bundle A (tissue, 14 active features, [contact]): 108 inputs, 40 actions, 44 raw outputs on a 320² × 33 field, drawn in cell-state-v1. Stage-2 verified (4/4 seeds): 4.0× fewer jammed overlaps vs v1-compat, +0.135..+0.144 coherence lift, 79,910 E active kin trophallaxis, and 429× heritable survival over fresh-offspring.",
+    body: "Bodies that touch, with 14 v2 mechanisms: crowding stops division, polarity orients, inherited tags sort lineages, kin share food. 108 inputs and 40 decisions per brain. Over 4 seeds at tick 2,048 it jams 4.0× less than with v2 off, and without inheritance only 36 of its 15,446 survive.",
   },
   {
     file: "supercolony-v2",
@@ -943,7 +1097,7 @@ export const presets: {
     dt: "1/32",
     kind: "v2",
     chosen: "V2-17 verified · 52 Stage-2 runs",
-    body: "Bundle B (supercolony, 11 active features, no [contact]): 108 inputs, 40 actions on a 320² × 34 dual-carrier field with Murray vascular conductances. Stage-2 verified (4/4 seeds): bimodal vascular networks (Sarle b = 0.608, +50–58% organism alignment), decoupled Carrier-1 trails (MaxZ = 10.24), +10.0% held-out neural lift vs fixed-controller, and +3.1% per organism-tick vs v1-compat.",
+    body: "No forces between organisms, 11 v2 mechanisms: blooming oases, bursting emitters, an uneatable trail carrier and veins the field carves for itself, on 34 field planes. Over 4 seeds the veins raise alignment by half, and evolving networks keep 10% more alive than fixed ones on the held-out seeds. It costs 3.1% more per organism-tick than v1.",
   },
 ];
 
@@ -955,7 +1109,7 @@ export const milestones = [
   { id: "M3", name: "Qualified acceleration", deliverable: "CPU/Metal parity, persistent buffers, fused population inference, variable topology", gates: ["G4"] },
   { id: "M4", name: "Screenshot-scale world", deliverable: "400k independent networks near 10k parameters on a 1024² field, interactive, honest clocks", gates: ["G7", "G8"] },
   { id: "M5", name: "Scientific and visual release", deliverable: "A seed gallery, ablations, experiment reports, reliable Cinema export", gates: ["G9", "G10"] },
-  { id: "M6", name: "Additional model families", deliverable: "Modular field-ecology-v2 (21 toggleable mechanisms, Bundles A & B): all 18/18 V2 beads closed with 104-run Stage-2 G5/G9 verification and honest residuals recorded in experiments/v2-emergence/README.md", gates: [] },
+  { id: "M6", name: "Additional model families", deliverable: "field-ecology-v2, 21 mechanisms each switched at founding, in two presets: all 18 of its beads closed, 104 Stage-2 runs observed, residuals kept in experiments/v2-emergence/README.md", gates: [] },
 ];
 
 export const stack = [
@@ -1006,7 +1160,7 @@ export const commands = [
     command: "cargo run --release -p flife-studio -- presets/reference-small-world.toml --width 960 --height 540",
   },
   {
-    comment: "The film's world in the Studio, from its 10,954 founders to the 262,144 ceiling, drawn as the film draws it",
+    comment: "The confluent world in the Studio, from its 10,954 founders to the 262,144 ceiling, drawn as its film draws it",
     command:
       "cargo run --release -p flife-studio -- presets/confluent-world.toml --color lineage-energy --look sphere --no-field",
   },
@@ -1025,16 +1179,27 @@ export const commands = [
       "for run in my-run control brushed; do cargo run --release -q -p flife-cli -- resume $run --until 1024 | tail -1; done",
   },
   {
-    comment: "List all 21 modular field-ecology-v2 feature slugs, bundle defaults, INV-08 status and ABI impact",
+    comment: "List the 21 field-ecology-v2 mechanisms, which bundle turns each on, and what each adds to the brain",
     command: "cargo run --release -p flife-cli -- --list-features",
   },
   {
-    comment: "Validate or ablate an authored V2 preset at founding time (--disable, --enable, --v1-compat; refused on resume per INV-14)",
+    comment: "Found a v2 world with one mechanism removed, or with every one off (switches are fixed at founding; resume refuses them)",
     command: [
       "cargo run --release -p flife-cli -- validate presets/supercolony-v2.toml",
-      "cargo run --release -p flife-cli -- run presets/supercolony-v2.toml --ticks 1024 --disable vascular-field",
-      "cargo run --release -p flife-cli -- run presets/morphogenesis-tissue-v2.toml --ticks 1024 --v1-compat",
+      "cargo run --release -p flife-cli -- run presets/supercolony-v2.toml --ticks 2048 --disable vascular-field",
+      "cargo run --release -p flife-cli -- run presets/morphogenesis-tissue-v2.toml --ticks 2048 --v1-compat",
     ].join("\n"),
+  },
+  {
+    comment: "The supercolony film's world: run to tick 2,048 (its digest is Stage-2's 3041ca43…), then draw its veins",
+    command: [
+      "cargo run --release -p flife-cli -- run presets/supercolony-v2.toml --ticks 2048 --run-dir colony",
+      "cargo run --release -p flife-cli -- render --run-dir colony --ticks 3200 --every 4 --width 2160 --height 2160 --field-mapping vascular-conductance --out veins",
+    ].join("\n"),
+  },
+  {
+    comment: "Watch the tissue live in the Studio, coloured by polarity (key 9) or memory state (key 8)",
+    command: "cargo run --release -p flife-studio -- presets/morphogenesis-tissue-v2.toml --look sphere --no-field",
   },
   {
     comment: "Render 4K at 60 fps (2160 × 2160 square or 3840 × 2160 widescreen) from a kept run, or export a Studio timeline in 4K Cinema mode",

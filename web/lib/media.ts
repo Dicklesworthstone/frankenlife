@@ -1,11 +1,13 @@
-// The film's manifest, written by `bun run media` (scripts/media.ts), and the
-// controls' (lib/controls.json, written by scripts/controls.ts), both
-// committed. The files they name live in public/media/, outside git, and
-// `bun run build` refuses to build unless each one is there with its
-// manifest's SHA-256 (scripts/check-media.ts).
+// The films' manifests (lib/films/<id>.json, each written by `bun run media`,
+// scripts/media.ts, and listed in lib/films/index.ts) and the stills'
+// (lib/stills.json, written by scripts/stills.ts), all committed. The files
+// they name live in public/media/, outside git, and `bun run build` refuses to
+// build unless each one is there with its manifest's SHA-256
+// (scripts/check-media.ts).
 
 import controlsManifest from "./controls.json";
-import manifest from "./media.json";
+import { FILM_MANIFESTS } from "./films";
+import stillsManifest from "./stills.json";
 
 export const MEDIA_SCHEMA = "frankenlife.website-media.v1";
 
@@ -39,6 +41,8 @@ export type VideoSegment = MediaFile & {
 
 export type FilmManifest = {
   schema: typeof MEDIA_SCHEMA;
+  /** The film's id: lib/films/<id>.json, and the prefix of its files (scripts/media.ts --film). */
+  id: string;
   video: MediaFile & {
     width: number;
     height: number;
@@ -66,6 +70,8 @@ export type FilmManifest = {
     seed: number;
     founders: number;
     grid: [number, number];
+    /** The torus's extent in world units (the run's [world] width and height). */
+    torus: [number, number];
     timestep: [number, number];
     /** The registered model the world runs (flife-core's registry). */
     model?: string;
@@ -101,13 +107,28 @@ export type FilmManifest = {
     /** `energy`, `composition`, `component-C`, `trail-carrier`, `vascular-conductance`, or `none` when hidden. */
     field_mapping: string;
     controllers: string;
-    /** `git rev-parse HEAD` of a clean source tree when it rendered. */
+    /** The commit the flife binary was built from: HEAD of a clean tree, or `--revision` (scripts/source-revision.ts). */
     revision: string;
     flife_sha256: string;
   };
 };
 
-export const film = manifest as FilmManifest;
+/** Every film the page shows, in lib/films/index.ts's order; the first is the hero's opening film. */
+export const films: FilmManifest[] = FILM_MANIFESTS;
+
+/** The lead film: the hero opens on it, and the zoom ladder and share card are cut from it. */
+export const film: FilmManifest = (() => {
+  const lead = films[0];
+  if (!lead) throw new Error("lib/films/index.ts lists no film");
+  return lead;
+})();
+
+/** A film by id; the page names only films lib/films/index.ts lists. */
+export function filmById(id: string): FilmManifest {
+  const found = films.find((entry) => entry.id === id);
+  if (!found) throw new Error(`no film ${id} in lib/films/index.ts`);
+  return found;
+}
 
 export const CONTROLS_SCHEMA = "frankenlife.website-controls.v1";
 
@@ -165,21 +186,65 @@ export type ControlsManifest = {
 // A JSON import types each array as a list, not a pair; scripts/controls.ts writes the shape above.
 export const controls = controlsManifest as unknown as ControlsManifest;
 
-/** Every file a film + controls manifest pair serves from /media/, deduplicated by path. */
-export function collectMediaFiles(filmManifest: FilmManifest, controlsManifest: ControlsManifest): MediaFile[] {
+/** The files one film serves: its video (every segment), poster and social card. */
+export function filmFiles(filmManifest: FilmManifest): MediaFile[] {
   const videoFiles: MediaFile[] =
     filmManifest.video.segments && filmManifest.video.segments.length > 0
       ? [filmManifest.video, ...filmManifest.video.segments]
       : [filmManifest.video];
+  return [...videoFiles, filmManifest.poster, filmManifest.social];
+}
+
+/** Every file the films and the still sets serve from /media/, deduplicated by path. */
+export function collectMediaFiles(
+  filmManifests: readonly FilmManifest[],
+  stillSets: readonly { stills: readonly MediaFile[] }[],
+): MediaFile[] {
   return [
     ...new Map(
-      [...videoFiles, filmManifest.poster, filmManifest.social, ...controlsManifest.stills].map((file) => [
-        file.src,
-        file,
-      ]),
+      [...filmManifests.flatMap(filmFiles), ...stillSets.flatMap((set) => set.stills)].map((file) => [file.src, file]),
     ).values(),
   ];
 }
 
+/** One v2 still (scripts/stills.ts): a world from a v2 preset or one of its controls, drawn at the Stage-2 tick. */
+export type V2Still = MediaFile & {
+  id: string;
+  set: "v2-controls" | "v2-views";
+  bundle: "tissue" | "supercolony";
+  condition: "treatment" | "v1-compat" | "fresh-offspring";
+  label: string;
+  caption: string;
+  preset: string;
+  model: string;
+  seed: number;
+  config_hash: string;
+  features: string[];
+  width: number;
+  height: number;
+  tick: number;
+  live: number;
+  digest: string;
+  view: { center: [number, number]; zoom: number };
+  command: string;
+  meaning: string;
+  /** The Stage-2 record this world's digest and live count equal, when the script was given the summary. */
+  stage2: { bundle: string; condition: string; seed: number; live: number } | null;
+};
+
+export type StillsManifest = {
+  schema: "frankenlife.website-stills.v1";
+  tick: number;
+  jpeg: string[];
+  stage2: string | null;
+  flife_sha256: string;
+  /** The commit the flife binary was built from (scripts/source-revision.ts). */
+  revision: string;
+  stills: V2Still[];
+};
+
+/** The v2 stills (lib/stills.json, written by scripts/stills.ts). */
+export const stills = stillsManifest as unknown as StillsManifest;
+
 /** Every file the site serves from /media/, once each, as the manifests name them. */
-export const mediaFiles: MediaFile[] = collectMediaFiles(film, controls);
+export const mediaFiles: MediaFile[] = collectMediaFiles(films, [controls, stills]);

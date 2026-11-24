@@ -1,5 +1,6 @@
 {
   "schema": "frankenlife.website-media.v1",
+  "id": "confluent",
   "video": {
     "src": "/media/film-seg00-2a5343805b5b.mp4",
     "sha256": "2a5343805b5b3683dda6734e737ccfc7af1d066de0c437d031c0e25b99cf3995",
@@ -134,6 +135,10 @@
     "grid": [
       320,
       320
+    ],
+    "torus": [
+      80,
+      80
     ],
     "timestep": [
       1,
@@ -1759,7 +1764,7 @@
   "render": {
     "command": "flife render --run-dir RUN --ticks 3200 --every 4 --width 2160 --height 2160 --no-field --look sphere --color lineage-energy --camera CAMERA --out FRAMES",
     "camera": {
-      "rule": "activity |blur(L[t+1] − L[t−1])| of a whole-world raw preview, blurred to each shot's view; each shot looks where that activity was greatest over the shot, discounting regions already shown",
+      "rule": "activity |blur(L[t+1] \u2212 L[t\u22121])| of a whole-world raw preview, blurred to each shot's view; each shot looks where that activity was greatest over the shot, discounting regions already shown",
       "options": {
         "opening": 64,
         "transition": 56,

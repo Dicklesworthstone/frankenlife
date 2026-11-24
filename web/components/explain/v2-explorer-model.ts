@@ -37,7 +37,8 @@ export type V2ExplorerFeature = {
  *
  * Verification status reflects the observed branch state (AGENTS.md):
  * - Verified & closed (18/18 V2 beads — all 21 feature slugs + V2-10/V2-17 Stage-2): V2-01..V2-17 + V2-EPIC.
- * - Stage-2 G5/G9 results and honest residuals are recorded in `experiments/v2-emergence/README.md`.
+ * - The 104 Stage-2 runs (G9) and their residuals are recorded in `experiments/v2-emergence/README.md`;
+ *   the plan's G5 visual gate is not run (README.md).
  */
 export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
   {
@@ -50,7 +51,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: true,
     bundleBPreset: true,
     abiNote: "none",
-    summary: "Phase-staggered ephemeral oasis resource blooms on the periodic field.",
+    summary: "Sixteen food sources bloom and fade on staggered phases of a 24 s cycle; total power is constant.",
   },
   {
     slug: "senescence",
@@ -62,7 +63,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: true,
     bundleBPreset: true,
     abiNote: "none",
-    summary: "Gompertz metabolic maintenance ramp with organism age.",
+    summary: "Upkeep grows with the square of age, up to 64× the young rate; a cost, never a dice roll.",
   },
   {
     slug: "surplus-emission",
@@ -74,7 +75,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: true,
     bundleBPreset: true,
     abiNote: "none",
-    summary: "Surplus-gated emission floor so starving organisms cannot spend down to zero.",
+    summary: "Emission spends only the energy above a 0.45 floor, so no organism signals itself to death.",
   },
   {
     slug: "excitable-relay",
@@ -86,7 +87,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: true,
     bundleBPreset: true,
     abiNote: "none",
-    summary: "Vesicle-readiness refractory pulse relay for propagating chemical waves.",
+    summary: "Emission comes in bursts when a recovering readiness passes one half, so signals travel as waves.",
   },
   {
     slug: "wake-offset",
@@ -98,7 +99,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: true,
     bundleBPreset: true,
     abiNote: "+1 action (neural pump mode)",
-    summary: "Wake-velocity or polarized-pump emission offset behind the emitter.",
+    summary: "Deposits land a little behind the emitter's motion, or on the side its polarity points.",
   },
   {
     slug: "so2-motor",
@@ -110,7 +111,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: true,
     bundleBPreset: true,
     abiNote: "+4 actions",
-    summary: "4-output SO(2)-equivariant neural chemotaxis, chiral contour and propulsion.",
+    summary: "Four outputs steer along food and chemical gradients, around contours and along the heading.",
   },
   {
     slug: "so2-budding",
@@ -122,7 +123,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: true,
     bundleBPreset: false,
     abiNote: "+2 actions",
-    summary: "2-output SO(2)-equivariant oriented offspring budding and dispersal.",
+    summary: "Two outputs choose where, relative to the gradients, a daughter is placed.",
   },
   {
     slug: "hippo-crowding",
@@ -134,7 +135,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: false,
     bundleBPreset: false,
     abiNote: "+1 sensor (if exposed)",
-    summary: "Hippo-YAP local crowding birth arrest (pure-field occupancy or contact neighbours).",
+    summary: "Division stops as neighbours crowd in: the birth gate reaches zero at four.",
   },
   {
     slug: "pcp-polarity",
@@ -146,7 +147,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: false,
     bundleBPreset: false,
     abiNote: "none",
-    summary: "Persistent apical-basal planar cell polarity, wedge curvature and lateral mitosis.",
+    summary: "Each body keeps a polarity that aligns with its neighbours; daughters are placed beside it.",
   },
   {
     slug: "emt-gate",
@@ -158,7 +159,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: false,
     bundleBPreset: false,
     abiNote: "+1 action",
-    summary: "Neural epithelial-to-mesenchymal transition gate modulating tissue adhesion.",
+    summary: "One output scales the organism's own adhesion, so a cell can leave its tissue.",
   },
   {
     slug: "tight-junctions",
@@ -170,7 +171,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: true,
     bundleBPreset: true,
     abiNote: "none",
-    summary: "Passive symmetric flux-form diffusion barrier modulated by local cell density.",
+    summary: "Occupied field cells let chemistry through more slowly: 48% with one organism, 32% with two.",
   },
   {
     slug: "lysis-recycling",
@@ -182,7 +183,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: true,
     bundleBPreset: true,
     abiNote: "none",
-    summary: "Viability-floor corpse lysis recycling energy and negated affinity back to the field.",
+    summary: "Below 0.10 energy an organism lyses; its energy returns carrying the opposite of its diet.",
   },
   {
     slug: "symplectic-waste",
@@ -194,7 +195,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: true,
     bundleBPreset: false,
     abiNote: "none",
-    summary: "Obligate symplectic metabolic byproduct deposited to the field under the ledger.",
+    summary: "45% of unconverted food returns as a byproduct turned a right angle from the eater's own diet.",
   },
   {
     slug: "epigenetic-recurrence",
@@ -206,7 +207,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: false,
     bundleBPreset: false,
     abiNote: "+S sensors, +2S raw outputs",
-    summary: "Heritable recurrent cell-state vector driving reversible fate differentiation.",
+    summary: "Two inherited state values, rewritten slowly by the network; the first turns the diet.",
   },
   {
     slug: "notch-delta",
@@ -218,7 +219,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: false,
     bundleBPreset: false,
     abiNote: "+1 sensor (neighbor-mean)",
-    summary: "Juxtacrine Notch-Delta lateral inhibition coupling adjacent cell states.",
+    summary: "A sense of the kin-weighted mean of the neighbours' first state value.",
   },
   {
     slug: "trophallaxis",
@@ -230,7 +231,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: false,
     bundleBPreset: false,
     abiNote: "none",
-    summary: "Passive exact-quantum kin energy sharing across contacting tissue neighbours.",
+    summary: "Touching kin pass energy from richer to poorer, in exact quanta, losing 5% of each transfer.",
   },
   {
     slug: "cadherin-4d",
@@ -242,7 +243,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: false,
     bundleBPreset: false,
     abiNote: "none",
-    summary: "Decoupled 4-D heritable cadherin adhesion tag sorting tissues independently of diet.",
+    summary: "An inherited 4-D tag decides who sticks to whom, separately from diet.",
   },
   {
     slug: "velocity-alignment",
@@ -254,7 +255,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: false,
     bundleBPreset: false,
     abiNote: "none",
-    summary: "Dissipative kin velocity alignment across local tissue neighbours.",
+    summary: "Each body's velocity is pulled toward its kin neighbours' mean; it never speeds anyone up.",
   },
   {
     slug: "vascular-field",
@@ -266,7 +267,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: true,
     bundleBPreset: true,
     abiNote: "none",
-    summary: "4-neighbour Murray/Physarum flux-reinforced vascular pipe conductances.",
+    summary: "Field faces widen where energy keeps flowing and shrink back where it stops: self-carved veins.",
   },
   {
     slug: "dual-carrier-trails",
@@ -278,7 +279,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: true,
     bundleBPreset: true,
     abiNote: "+4 sensors, 34 planes",
-    summary: "34-plane two-carrier field separating metabolic food from persistent pheromone trails.",
+    summary: "A fifth of emission goes into a second carrier no one can eat: a slow trail with 4 new senses.",
   },
   {
     slug: "v2-visual-mappings",
@@ -290,7 +291,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: true,
     bundleBPreset: true,
     abiNote: "none (INV-09 read-only)",
-    summary: "Pure read-only cell-state, polarity, trail-carrier and vascular-conductance overlays.",
+    summary: "Four read-only views: cell state, polarity, trail carrier and vascular conductance.",
   },
 ];
 

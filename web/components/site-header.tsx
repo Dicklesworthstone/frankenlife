@@ -1,6 +1,6 @@
 "use client";
 
-import { Cog, ExternalLink, FlaskConical, type LucideIcon, Microscope, ShieldCheck, Terminal } from "lucide-react";
+import { Cog, Dna, ExternalLink, FlaskConical, type LucideIcon, Microscope, ShieldCheck, Terminal } from "lucide-react";
 import { type CSSProperties, useEffect, useRef, useState } from "react";
 
 import { chapters, siteConfig } from "@/lib/content";
@@ -11,6 +11,7 @@ const ICONS: Record<string, LucideIcon> = {
   world: Microscope,
   different: ShieldCheck,
   machinery: Cog,
+  v2: Dna,
   evidence: FlaskConical,
   lab: Terminal,
 };
@@ -18,7 +19,7 @@ const ICONS: Record<string, LucideIcon> = {
 const chapterColour = (index: number) => LINEAGE[index % LINEAGE.length] ?? "#4ade80";
 
 /**
- * The page's chrome. Wide screens: a floating pill with the five chapters, the one in view marked, and a
+ * The page's chrome. Wide screens: a floating pill with the chapters, the one in view marked, and a
  * hairline that fills as the page is read. Phones: the name and the code at the top, and the chapters in a
  * dock at the bottom, where a thumb reaches them.
  */
@@ -161,7 +162,10 @@ export function SiteHeader() {
         aria-label="Chapters"
         className="fixed inset-x-0 bottom-0 z-50 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] md:hidden"
       >
-        <ul className="glass-modern mx-auto grid max-w-md grid-cols-5 rounded-2xl p-1">
+        <ul
+          className="glass-modern mx-auto grid max-w-md rounded-2xl p-1"
+          style={{ gridTemplateColumns: `repeat(${chapters.length}, minmax(0, 1fr))` }}
+        >
           {chapters.map((chapter) => {
             const Icon = ICONS[chapter.id] ?? Microscope;
             const on = active === chapter.id;

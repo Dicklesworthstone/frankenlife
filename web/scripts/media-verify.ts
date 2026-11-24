@@ -1,11 +1,12 @@
-// Pure verification of lib/media.json + lib/controls.json against public/media/
-// (used by scripts/check-media.ts and tested directly by bun test).
+// Pure verification of the films' manifests (lib/films/*.json) and the still
+// sets' (lib/controls.json, lib/stills.json) against public/media/ (used by
+// scripts/check-media.ts and tested directly by bun test).
 
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { type ControlsManifest, type FilmManifest, collectMediaFiles } from "../lib/media";
+import { type FilmManifest, type MediaFile, collectMediaFiles } from "../lib/media";
 import { ASSET_LIMIT } from "./media-options";
 
 /** Validate structural contiguity and Cloudflare size bounds on optional `film.video.segments`. */
@@ -54,17 +55,23 @@ export function validateSegmentsManifest(filmManifest: FilmManifest, assetLimit 
 }
 
 /**
- * Verify that `publicDir/media/` holds byte-for-byte every file named by `filmManifest`
- * (including every multi-segment MP4) and `controlsManifest`, and nothing extra.
+ * Verify that `publicDir/media/` holds byte-for-byte every file named by `filmManifests`
+ * (including every multi-segment MP4) and `stillSets`, and nothing extra.
  */
 export function verifyMediaDirectory(
-  filmManifest: FilmManifest,
-  controlsManifest: ControlsManifest,
+  filmManifests: readonly FilmManifest[],
+  stillSets: readonly { stills: readonly MediaFile[] }[],
   publicDir: string,
   assetLimit = ASSET_LIMIT,
 ): string[] {
-  const errors = validateSegmentsManifest(filmManifest, assetLimit);
-  const files = collectMediaFiles(filmManifest, controlsManifest);
+  const errors: string[] = [];
+  const ids = new Set<string>();
+  for (const filmManifest of filmManifests) {
+    if (ids.has(filmManifest.id)) errors.push(`two films have the id ${filmManifest.id}`);
+    ids.add(filmManifest.id);
+    errors.push(...validateSegmentsManifest(filmManifest, assetLimit).map((error) => `${filmManifest.id}: ${error}`));
+  }
+  const files = collectMediaFiles(filmManifests, stillSets);
 
   for (const file of files) {
     if (file.bytes > assetLimit) {
@@ -72,7 +79,7 @@ export function verifyMediaDirectory(
     }
     const path = join(publicDir, file.src);
     if (!existsSync(path)) {
-      errors.push(`${file.src} is missing; run \`bun run media\` or scripts/controls.ts (web/README.md)`);
+      errors.push(`${file.src} is missing; run \`bun run media\` or scripts/stills.ts (web/README.md)`);
       continue;
     }
     const bytes = readFileSync(path);
@@ -86,7 +93,7 @@ export function verifyMediaDirectory(
   const media = join(publicDir, "media");
   for (const name of existsSync(media) ? readdirSync(media) : []) {
     if (!named.has(name)) {
-      errors.push(`public/media/${name} is in neither lib/media.json nor lib/controls.json; move it out before building`);
+      errors.push(`public/media/${name} is named by no manifest (lib/films/*.json, lib/stills.json); move it out before building`);
     }
   }
 

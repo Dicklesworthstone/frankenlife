@@ -15,7 +15,10 @@ import {
   stopViews,
   viewAt,
 } from "@/components/explain/zoom-ladder-geometry";
-import { film } from "@/lib/media";
+import { filmById } from "@/lib/media";
+
+// The confluent film: the ladder is cut from its poster and share card.
+const film = filmById("confluent");
 
 describe("the film's pictures on the torus", () => {
   test("the poster is frame 0 at tick 2,400: the whole 80-unit torus", () => {

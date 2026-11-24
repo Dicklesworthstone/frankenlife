@@ -155,7 +155,7 @@ export function V2Explorer() {
           <code className="text-slate-300">V2Config::abi</code>, <code className="text-slate-300">validate_v2</code>)
           and <code className="text-slate-300">flife --list-features</code>. Configuration and ABI calculator only —
           not simulation output. Verified &amp; closed (18/18 V2 beads — all 21 slugs + V2-10/V2-17 Stage-2):
-          V2-01..V2-17 + V2-EPIC. Stage-2 G5/G9 outcomes and honest residuals are recorded in{" "}
+          V2-01..V2-17 + V2-EPIC. The 104 Stage-2 runs and their residuals are recorded in{" "}
           <code className="text-slate-300">experiments/v2-emergence/README.md</code>; this widget makes no ecological
           claims.
         </>
@@ -394,13 +394,13 @@ export function V2Explorer() {
 
       {/* Verification legend */}
       <div className="mt-5 flex flex-wrap items-center justify-between gap-2 border-t border-white/[0.06] pt-4 text-[11px] text-slate-400">
-        <span>Click any of the 21 registered slugs to toggle it and recompute minimal CLI flags &amp; ABI:</span>
+        <span>Click any of the 21 mechanisms to switch it and recompute the command and the brain&apos;s inputs and outputs:</span>
         <div className="flex flex-wrap items-center gap-3 font-mono text-[10px]">
           <span className="inline-flex items-center gap-1.5 text-green-300">
             <span aria-hidden="true" className="h-2 w-2 rounded-full bg-green-400" />
             Verified &amp; closed (all 21 slugs, 18/18 V2 beads: V2-01..V2-17 + V2-EPIC)
           </span>
-          <span className="text-slate-400">104-run Stage-2 G5/G9 recorded</span>
+          <span className="text-slate-400">104 Stage-2 runs recorded</span>
         </div>
       </div>
 

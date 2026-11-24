@@ -1,7 +1,7 @@
-// Render the site's film from a FrankenLife run directory (or configuration)
-// and write its manifest (lib/media.json).
+// Render one of the site's films from a FrankenLife run directory (or
+// configuration) and write its manifest (lib/films/<id>.json).
 //
-//   bun scripts/media.ts --flife PATH (--run-dir DIR | --config PATH) --work DIR
+//   bun scripts/media.ts [--film ID] --flife PATH (--run-dir DIR | --config PATH) --work DIR
 //     [--ticks 9600] [--every 32] [--size 1080 | --width 3840 --height 2160]
 //     [--fps 30|60] [--crf 24] [--segments auto|N] [--segment-max-mib 22]
 //     [--master-out PATH] [--master-crf 16]
@@ -38,11 +38,17 @@
 //   `public/media/`) to also encode an unconstrained high-quality archival
 //   4K60 MP4 from the exact same rendered PNG frames.
 //
+// - `--film ID` (default `film`) names the manifest, lib/films/<ID>.json, and
+//   prefixes every file the film publishes (<ID>-seg00-<hash>.mp4,
+//   <ID>-poster-<hash>.jpg, <ID>-social-<hash>.jpg). lib/films/index.ts lists
+//   the films the page shows; add a new id there.
 // - Each web file is named by its SHA-256 and copied into public/media/, which
 //   is outside git like every FrankenLife recording (AGENTS.md); the
 //   committed manifest records each hash and how it was made.
-// - The Rust sources must be committed: the manifest names the revision, and
-//   a dirty tree would make that a guess. Build `--flife` from that revision.
+// - The manifest names the commit `--flife` was built from: HEAD, whose Rust
+//   sources and presets must then be committed, or `--revision REV`, an
+//   ancestor of HEAD whose presets equal the working tree's
+//   (scripts/source-revision.ts).
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -71,6 +77,7 @@ import {
   planSegmentRanges,
   splitSegmentRange,
 } from "./media-options";
+import { sourceRevision } from "./source-revision";
 
 const WEB = fileURLToPath(new URL("..", import.meta.url));
 const REPO = resolve(WEB, "..");
@@ -128,6 +135,8 @@ try {
 }
 
 const {
+  film: filmId,
+  revision: revisionArg,
   flife,
   runDir,
   config,
@@ -193,6 +202,15 @@ const renderArgs = [
 const cameraFile = join(work, "camera.json");
 const sourceTarget = runDir !== null ? ["--run-dir", runDir] : [config as string, ...featureFlags];
 const sourceConfigPath = runDir !== null ? join(runDir, "config.toml") : (config as string);
+// The torus in world units: [world] width and height of the run's configuration.
+const torusExtent: [number, number] = (() => {
+  const section = /^\[world\]\s*$([\s\S]*?)(?=^\[)/m.exec(readFileSync(sourceConfigPath, "utf8"))?.[1] ?? "";
+  const dimension = (key: string) => {
+    const value = Number(new RegExp(`^${key}\\s*=\\s*([0-9.eE+-]+)`, "m").exec(section)?.[1]);
+    return Number.isFinite(value) && value > 0 ? value : fail(`the run's [world] ${key} is not a positive number`);
+  };
+  return [dimension("width"), dimension("height")];
+})();
 
 let provenance: Provenance;
 if (existsSync(made)) {
@@ -207,8 +225,8 @@ if (existsSync(made)) {
   console.error(`media: encoding the finished render in ${work} again (its run; input is not re-simulated)`);
 } else {
   if (existsSync(frames)) fail(`${frames} exists without a finished render; choose another --work`);
-  const dirty = run("git", ["status", "--porcelain", "--", "crates", "presets", "Cargo.toml", "Cargo.lock"]);
-  if (dirty.trim() !== "") fail(`commit the Rust sources first; uncommitted:\n${dirty}`);
+  const source = sourceRevision(REPO, revisionArg);
+  if ("error" in source) fail(source.error);
   const world: Validation = JSON.parse(run(flife, ["validate", sourceConfigPath, ...featureFlags]));
   const presetPath = join("presets", `${world.name}.toml`);
   let preset: string | null = null;
@@ -256,13 +274,7 @@ if (existsSync(made)) {
     const shots = previewed.filter((record) => record.record === "frame");
     const maps = activities(shots.map((record) => luminance(record.path ?? fail("a preview frame without a path"))));
     const frameCount = shots.length;
-    // The torus in world units: [world] width and height of the run's configuration.
-    const section = /^\[world\]\s*$([\s\S]*?)(?=^\[)/m.exec(readFileSync(sourceConfigPath, "utf8"))?.[1] ?? "";
-    const dimension = (key: string) => {
-      const value = Number(new RegExp(`^${key}\\s*=\\s*([0-9.eE+-]+)`, "m").exec(section)?.[1]);
-      return Number.isFinite(value) && value > 0 ? value : fail(`the run's [world] ${key} is not a positive number`);
-    };
-    const extent: [number, number] = [dimension("width"), dimension("height")];
+    const extent = torusExtent;
     // The shots' zooms were chosen for a 256-unit torus; each is scaled to this one so that a shot spans the
     // same 51–102 world units on any torus of 128 units or more (a 128-unit torus zooms half as far); no zoom
     // goes below 1.25.
@@ -291,7 +303,7 @@ if (existsSync(made)) {
     records,
   );
   provenance = {
-    revision: run("git", ["rev-parse", "HEAD"]).trim(),
+    revision: source.revision,
     flife_sha256: sha256(flife),
     render: renderArgs,
     ...(featureFlags.length > 0 ? { features: featureFlags } : {}),
@@ -437,7 +449,7 @@ if (segmentMode === 1) {
     ...encode,
     video,
   ]);
-  primaryVideo = publish(video, "film", "mp4");
+  primaryVideo = publish(video, filmId, "mp4");
 } else if (segmentMode === "auto") {
   // Encode cleanly at CRF without starving bitrate first; if it fits in one Cloudflare-safe file,
   // keep a single file, otherwise split across natural camera cuts at full quality.
@@ -457,7 +469,7 @@ if (segmentMode === 1) {
   const wholeBytes = readFileSync(video).length;
   if (wholeBytes <= HARD_SEGMENT_LIMIT) {
     encode = probeEncode;
-    primaryVideo = publish(video, "film", "mp4");
+    primaryVideo = publish(video, filmId, "mp4");
   } else {
     const targetCount = Math.max(2, Math.ceil(wholeBytes / HARD_SEGMENT_LIMIT));
     console.error(
@@ -468,7 +480,7 @@ if (segmentMode === 1) {
     for (const range of planned) encodeRangeChecked(range, encoded);
     encode = encoded[0]?.encode ?? probeEncode;
     publishedSegments = encoded.map((item, idx) => {
-      const pub = publish(item.path, `film-seg${String(idx).padStart(2, "0")}`, "mp4");
+      const pub = publish(item.path, `${filmId}-seg${String(idx).padStart(2, "0")}`, "mp4");
       return {
         ...pub,
         start_frame: item.range.startFrame,
@@ -486,7 +498,7 @@ if (segmentMode === 1) {
   for (const range of planned) encodeRangeChecked(range, encoded);
   encode = encoded[0]?.encode ?? buildSegmentEncodeArgs(crf, fps);
   publishedSegments = encoded.map((item, idx) => {
-    const pub = publish(item.path, `film-seg${String(idx).padStart(2, "0")}`, "mp4");
+    const pub = publish(item.path, `${filmId}-seg${String(idx).padStart(2, "0")}`, "mp4");
     return {
       ...pub,
       start_frame: item.range.startFrame,
@@ -542,6 +554,7 @@ const commandSource =
     : "--run-dir RUN";
 const manifest = {
   schema: "frankenlife.website-media.v1",
+  id: filmId,
   video: {
     ...primaryVideo,
     width,
@@ -552,8 +565,8 @@ const manifest = {
     ...(publishedSegments && publishedSegments.length > 1 ? { segments: publishedSegments } : {}),
     ...(master ? { master } : {}),
   },
-  poster: { ...publish(poster, "poster", "jpg"), frame: 0 },
-  social: { ...publish(social, "social", "jpg"), width: 1200, height: 630, frame: card },
+  poster: { ...publish(poster, `${filmId}-poster`, "jpg"), frame: 0 },
+  social: { ...publish(social, `${filmId}-social`, "jpg"), width: 1200, height: 630, frame: card },
   world: {
     preset,
     name: world.name,
@@ -561,6 +574,7 @@ const manifest = {
     seed: world.seed,
     founders: world.founders,
     grid: world.grid,
+    torus: torusExtent,
     timestep: world.timestep,
     model: world.model,
     from: { tick: from.tick, digest: from.digest },
@@ -588,7 +602,10 @@ const manifest = {
     flife_sha256: provenance.flife_sha256,
   },
 };
-writeFileSync(join(WEB, "lib", "media.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+mkdirSync(join(WEB, "lib", "films"), { recursive: true });
+const manifestPath = join(WEB, "lib", "films", `${filmId}.json`);
+writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+console.error(`media: wrote ${manifestPath}; lib/films/index.ts must list "${filmId}" for the page to show it`);
 const totalBytes = publishedSegments
   ? publishedSegments.reduce((sum, seg) => sum + seg.bytes, 0)
   : manifest.video.bytes;

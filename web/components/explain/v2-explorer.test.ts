@@ -197,22 +197,21 @@ describe("minimal CLI override synthesis & exact round-trip", () => {
     );
   });
 
-  test("keeps content.ts v2BuildStatus synced with the 18/18 closed V2 beads and supports radiogroup arrow navigation", () => {
-    const builtRows = v2BuildStatus.filter((row) => row.tone === "built");
-    const landed = builtRows[0]?.detail ?? "";
-    const observed = builtRows[1]?.detail ?? "";
-    const residuals = v2BuildStatus.find((row) => row.tone === "partial")?.detail ?? "";
-
-    expect(builtRows).toHaveLength(2);
-    expect(landed).toContain("18 of 18 V2 beads");
-    expect(landed).toContain("V2-01 through V2-17");
-    expect(landed).toContain("104/104 Stage-2");
-    expect(observed).toContain("Gate G5");
-    expect(observed).toContain("104-run Stage-2");
-    expect(observed).toContain("429×");
-    expect(observed).toContain("Sarle b = 0.608");
-    expect(residuals).toContain("8,192t+");
-    expect(residuals).toContain("+3.1%");
+  test("keeps content.ts v2BuildStatus to the V2-17 report's claims and supports radiogroup arrow navigation", () => {
+    const row = (stage: string) => v2BuildStatus.find((entry) => entry.stage === stage);
+    // experiments/v2-emergence/README.md: the Four Claims, each its own row.
+    expect(v2BuildStatus.map((entry) => entry.stage)).toEqual(["Rules", "Implementation", "Visual", "Ecological", "Not yet shown"]);
+    expect(row("Rules")?.detail).toContain("All 104 Stage-2 runs");
+    expect(row("Rules")?.detail).toContain("7.2 × 10⁻⁹");
+    expect(row("Implementation")?.detail).toContain("all 21 features at once");
+    expect(row("Implementation")?.detail).toContain("field-ecology-v1 bit for bit");
+    // The report's own visual review is not the plan's G5 gate, which README.md lists as not run.
+    expect(row("Visual")?.tone).toBe("partial");
+    expect(row("Visual")?.detail).toContain("G5 gate");
+    expect(row("Visual")?.detail).toContain("still not run");
+    expect(row("Ecological")?.detail).toContain("36 organisms of the tissue's 15,446");
+    expect(row("Ecological")?.detail).toContain("317 of the supercolony's 21,308");
+    expect(row("Not yet shown")?.tone).toBe("open");
 
     // WAI-ARIA radiogroup keyboard wrapping (ArrowRight/Left/Up/Down, Home, End).
     expect(nextRadioIndex(0, 4, "ArrowRight")).toBe(1);

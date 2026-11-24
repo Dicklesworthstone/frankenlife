@@ -6,7 +6,7 @@
 // - The torus is 80 × 80 world units with a 320 × 320 field, and a body is
 //   0.25 units across: presets/confluent-world.toml, [world] and [contact].
 // - The poster is film frame 0 and the card is cut from frame `social.frame`
-//   (lib/media.json). A frame is 2160 × 2160 and shows 80/zoom world units
+//   (lib/films/confluent.json). A frame is 2160 × 2160 and shows 80/zoom world units
 //   across, y down as the world's (crates/flife-cli/src/camera.rs).
 // - The card is that frame scaled to 1200 wide and centre-cropped to 1200 × 630
 //   (scripts/media.ts: `scale=1200:-1,crop=1200:630`).

@@ -7,7 +7,10 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { controls, film, mediaFiles } from "../lib/media";
+import { controls, filmById, mediaFiles } from "../lib/media";
+
+// The controls are the confluent world's.
+const film = filmById("confluent");
 
 const REPO = fileURLToPath(new URL("../..", import.meta.url));
 const trials = (

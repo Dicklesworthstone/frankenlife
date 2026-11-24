@@ -13,27 +13,15 @@ import {
   segmentLocationForGlobalFrame,
 } from "@/components/film-segments";
 import { Reticle } from "@/components/franken";
-import { controls, film } from "@/lib/media";
+import { type FilmManifest, film as leadFilm } from "@/lib/media";
 import { cn, grouped } from "@/lib/utils";
-
-const { video, poster, world, render } = film;
-/** The torus's extent in world units (the preset's [world], recorded in lib/controls.json). */
-const torusExtent: [number, number] = controls.torus;
-const frameSize: [number, number] = [video.width, video.height];
-const isSquare = video.width === video.height;
-const SEGMENTS = resolveSegments(video, world);
-const MULTI_SEGMENT = SEGMENTS.length > 1;
-const last = video.frames - 1;
-const secondsPerTick = world.timestep[0] / world.timestep[1];
-// flife render's own words for the colours, up to its colon: "founder lineage".
-const colour = render.meaning.split(":")[0]?.trim() || render.mapping;
 
 /**
  * The frame shown at `time` seconds into a single-file video. A frame's own time reaches the page in whole microseconds
  * (e.g. 0.033333 at 30 fps or 0.016667 at 60 fps), just short of the frame when rounded down, so a thousandth of a
  * frame is allowed.
  */
-export function frameAt(time: number, fps = video.fps, frames = video.frames): number {
+export function frameAt(time: number, fps = leadFilm.video.fps, frames = leadFilm.video.frames): number {
   const maxFrame = Math.max(0, frames - 1);
   return Math.min(maxFrame, Math.max(0, Math.floor(time * fps + 1e-3)));
 }
@@ -48,8 +36,8 @@ export function frameAt(time: number, fps = video.fps, frames = video.frames): n
 export function scaleBarWidthCqw(
   barUnits: number,
   zoom: number,
-  torus: readonly [number, number] = torusExtent,
-  frame: readonly [number, number] = frameSize,
+  torus: readonly [number, number],
+  frame: readonly [number, number],
 ): number {
   const [torusW, torusH] = torus;
   const [frameW, frameH] = frame;
@@ -59,49 +47,89 @@ export function scaleBarWidthCqw(
 
 type Shot = { from: number; to: number; label: string; hold: boolean };
 
-/**
- * The film's shots, from the camera keys in the manifest: a hold between two
- * keys of one zoom, a move between holds. A film without a camera is one shot.
- */
-const SHOTS: Shot[] = (() => {
-  const keys = render.camera?.keys ?? [];
-  if (keys.length < 2) return [{ from: world.from.tick, to: world.to.tick, label: "whole torus", hold: true }];
-  return keys.slice(1).map((key, index) => {
-    const start = keys[index]!;
-    const hold = start.zoom === key.zoom;
-    return {
-      from: start.tick,
-      to: key.tick,
-      hold,
-      label: !hold ? "" : key.zoom < 1.05 ? "whole" : `×${key.zoom}`,
-    };
-  });
-})();
-const span = world.to.tick - world.from.tick || 1;
-const position = (tick: number) => `${((tick - world.from.tick) / span) * 100}%`;
-const HOLDS = SHOTS.filter((shot) => shot.hold);
 const HOLD_NOW = "absolute inset-y-0 rounded-full bg-green-300/80";
 const HOLD_THEN = "absolute inset-y-0 rounded-full bg-green-500/35";
 
-/** What the readout says of frame `frame`, each from flife render's own record of it. */
-function readings(frame: number) {
-  const tick = world.ticks[frame] ?? world.from.tick;
-  const zoom = render.zoom?.[frame] ?? 1;
-  // A scale bar in world units: the view spans torus / zoom units across the frame.
-  const barUnits = zoom >= 2 ? 5 : 10;
+/** Everything the player derives from one film's manifest, computed once per film. */
+function filmModel(manifest: FilmManifest) {
+  const { video, poster, world, render } = manifest;
+  /** The torus's extent in world units (the run's [world] width and height, recorded by scripts/media.ts). */
+  const torusExtent: [number, number] = world.torus;
+  const frameSize: [number, number] = [video.width, video.height];
+  const segments = resolveSegments(video, world);
+  const secondsPerTick = world.timestep[0] / world.timestep[1];
+  // flife render's own words for the colours, up to its colon: "founder lineage".
+  const colour = render.meaning.split(":")[0]?.trim() || render.mapping;
+
+  /**
+   * The film's shots, from the camera keys in the manifest: a hold between two
+   * keys of one zoom, a move between holds. A film without a camera is one shot.
+   */
+  const shots: Shot[] = (() => {
+    const keys = render.camera?.keys ?? [];
+    if (keys.length < 2) return [{ from: world.from.tick, to: world.to.tick, label: "whole torus", hold: true }];
+    return keys.slice(1).map((key, index) => {
+      const start = keys[index]!;
+      const hold = start.zoom === key.zoom;
+      return {
+        from: start.tick,
+        to: key.tick,
+        hold,
+        label: !hold ? "" : key.zoom < 1.05 ? "whole" : `×${key.zoom}`,
+      };
+    });
+  })();
+  const span = world.to.tick - world.from.tick || 1;
+  const position = (tick: number) => `${((tick - world.from.tick) / span) * 100}%`;
+
+  /** What the readout says of frame `frame`, each from flife render's own record of it. */
+  const readings = (frame: number) => {
+    const tick = world.ticks[frame] ?? world.from.tick;
+    const zoom = render.zoom?.[frame] ?? 1;
+    // A scale bar in world units: the view spans torus / zoom units across the frame.
+    const barUnits = zoom >= 2 ? 5 : 10;
+    return {
+      tick,
+      tickText: grouped(tick),
+      simulated: `+${((tick - world.from.tick) * secondsPerTick).toFixed(1)} s`,
+      live: grouped(world.live[frame] ?? 0),
+      view: zoom < 1.05 ? "whole" : `×${zoom.toFixed(1)}`,
+      barWidth: `${scaleBarWidthCqw(barUnits, zoom, torusExtent, frameSize)}cqw`,
+      barText: `${barUnits} world units`,
+      elapsed: (tick - world.from.tick) / span,
+      described: `tick ${grouped(tick)}, ${zoom < 1.05 ? "the whole torus" : `zoom ${zoom.toFixed(1)}`}`,
+    };
+  };
+
   return {
-    tick,
-    tickText: grouped(tick),
-    simulated: `+${((tick - world.from.tick) * secondsPerTick).toFixed(1)} s`,
-    live: grouped(world.live[frame] ?? 0),
-    view: zoom < 1.05 ? "whole" : `×${zoom.toFixed(1)}`,
-    barWidth: `${scaleBarWidthCqw(barUnits, zoom, torusExtent, frameSize)}cqw`,
-    barText: `${barUnits} world units`,
-    elapsed: (tick - world.from.tick) / span,
-    described: `tick ${grouped(tick)}, ${zoom < 1.05 ? "the whole torus" : `zoom ${zoom.toFixed(1)}`}`,
+    video,
+    poster,
+    world,
+    render,
+    isSquare: video.width === video.height,
+    segments,
+    multiSegment: segments.length > 1,
+    last: video.frames - 1,
+    colour,
+    holds: shots.filter((shot) => shot.hold),
+    position,
+    readings,
+    first: readings(0),
+    label: `The ${world.name} preset, seed ${world.seed}, from tick ${grouped(world.from.tick)} to ${grouped(world.to.tick)}: organisms coloured by ${colour}${render.field_mapping === "none" ? "" : ` over the field's ${render.field_mapping}`}`,
   };
 }
-const FIRST = readings(0);
+
+type FilmModel = ReturnType<typeof filmModel>;
+const MODELS = new Map<FilmManifest, FilmModel>();
+/** One film's model, computed the first time the film is shown. */
+function modelOf(manifest: FilmManifest): FilmModel {
+  let model = MODELS.get(manifest);
+  if (!model) {
+    model = filmModel(manifest);
+    MODELS.set(manifest, model);
+  }
+  return model;
+}
 
 /** The live dot's opacity at `now`: 1 to 0.35 and back every 2.2 s, eased at both ends, as `.pulse-dot` does it. */
 function pulse(now: number): number {
@@ -124,7 +152,31 @@ const SEEK_EVERY_MS = 250;
  * The readout changes with every frame, so it is written to the page directly
  * (`show`), never through a React render: React only renders slot state changes.
  */
-export function Film({ className, feather = false }: { className?: string; feather?: boolean }) {
+export function Film({
+  className,
+  feather = false,
+  manifest = leadFilm,
+}: {
+  className?: string;
+  feather?: boolean;
+  /** The film to play; the player keeps one film for its lifetime, so a caller that switches films keys it by id. */
+  manifest?: FilmManifest;
+}) {
+  const {
+    video,
+    poster,
+    world,
+    isSquare,
+    segments: SEGMENTS,
+    multiSegment: MULTI_SEGMENT,
+    last,
+    colour,
+    holds: HOLDS,
+    position,
+    readings,
+    first: FIRST,
+    label,
+  } = modelOf(manifest);
   const containerRef = useRef<HTMLDivElement>(null);
   const slotRefs = useRef<[HTMLVideoElement | null, HTMLVideoElement | null]>([null, null]);
   const [playing, setPlaying] = useState(false);
@@ -392,8 +444,6 @@ export function Film({ className, feather = false }: { className?: string; feath
     primeSlot(nextSlot, plan.activeSegment, localTime, plan.shouldPlay);
     primeSlot(plan.standbySlot, plan.standbySegment, 0, false);
   };
-
-  const label = `The ${world.name} preset, seed ${world.seed}, from tick ${grouped(world.from.tick)} to ${grouped(world.to.tick)}: organisms coloured by ${colour}${render.field_mapping === "none" ? "" : ` over the field's ${render.field_mapping}`}`;
 
   const renderSlot = (slot: SlotIndex) => {
     const isActive = !MULTI_SEGMENT || activeSlot === slot;

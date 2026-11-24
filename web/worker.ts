@@ -9,7 +9,8 @@
 // 9110 byte serving. Everything else is the static export, served as it is.
 //
 // An asset's Response from the binding carries no Content-Length, so each
-// file's size comes from its manifest (lib/media.json, lib/controls.json),
+// file's size comes from its manifest (lib/films/*.json, lib/controls.json,
+// lib/stills.json),
 // which `bun run build` has checked against the file byte for byte
 // (scripts/check-media.ts).
 

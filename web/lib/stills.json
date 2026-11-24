@@ -1,0 +1,473 @@
+{
+  "schema": "frankenlife.website-stills.v1",
+  "tick": 2048,
+  "jpeg": [
+    "-q:v",
+    "3"
+  ],
+  "stage2": "experiments/v2-emergence/README.md: each digest and live count equals the V2-17 Stage-2 summary's record (stage2_summary_FINAL_104.json, kept outside git) for the same bundle, condition and seed",
+  "flife_sha256": "326f4e4aca74ab7ca504784b4a8f3f6e8ef606021239ed697625aead5b743d96",
+  "revision": "262f06769474c71c9d6bbfaedfd2b02a769b360a",
+  "stills": [
+    {
+      "id": "tissue-treatment",
+      "set": "v2-controls",
+      "bundle": "tissue",
+      "condition": "treatment",
+      "label": "Tissue, as committed",
+      "caption": "Every Bundle A mechanism on: porous islands of tissue, each lineage holding its own.",
+      "preset": "presets/morphogenesis-tissue-v2.toml",
+      "model": "field-ecology-v2",
+      "seed": 42,
+      "config_hash": "b8faa1ec09fd7d0cc9448df940a2bdcde3ff671701828592e1a9756a260783ce",
+      "features": [
+        "cadherin-4d",
+        "epigenetic-recurrence",
+        "hippo-crowding",
+        "lysis-recycling",
+        "notch-delta",
+        "pcp-polarity",
+        "senescence",
+        "so2-motor",
+        "surplus-emission",
+        "symplectic-waste",
+        "tight-junctions",
+        "trophallaxis",
+        "wake-offset"
+      ],
+      "src": "/media/v2-controls-tissue-treatment-820168bc79d2.jpg",
+      "sha256": "820168bc79d20a0010d1108487efdc87b158360d7259d05492f602dce7679d60",
+      "bytes": 450919,
+      "width": 2160,
+      "height": 2160,
+      "tick": 2048,
+      "live": 12090,
+      "digest": "79e0f9d51cb39a9075505d8a220829d7c03bc1c3315be3e61a6e94b6fab948ec",
+      "view": {
+        "center": [
+          40,
+          40
+        ],
+        "zoom": 1
+      },
+      "command": "flife render presets/morphogenesis-tissue-v2.toml --ticks 2048 --every 2048 --width 2160 --height 2160 --look glow --color lineage-energy --field-mapping energy --out FRAMES",
+      "meaning": "founder lineage lit by energy: the lineage's colour (lineage-energy), lighter as the organism holds more of the energy it needs to divide, black with none, white with 1.8 times it",
+      "stage2": {
+        "bundle": "a",
+        "condition": "treatment",
+        "seed": 42,
+        "live": 12090
+      }
+    },
+    {
+      "id": "tissue-v1-compat",
+      "set": "v2-controls",
+      "bundle": "tissue",
+      "condition": "v1-compat",
+      "label": "Every v2 feature off",
+      "caption": "The same preset with --v1-compat: nothing stops division in a crowd, and bodies jam into packed slabs.",
+      "preset": "presets/morphogenesis-tissue-v2.toml",
+      "model": "field-ecology-v2",
+      "seed": 42,
+      "config_hash": "f92f8309cd538e002a359b9d89ee202e028c9d4990afd619794698cfde3b4329",
+      "features": [],
+      "src": "/media/v2-controls-tissue-v1-compat-66584b33766a.jpg",
+      "sha256": "66584b33766a0f0f1db0bccd82186bd1add6f53b547a1db7e96912eac4c58c17",
+      "bytes": 533880,
+      "width": 2160,
+      "height": 2160,
+      "tick": 2048,
+      "live": 32784,
+      "digest": "4d745ed2656f58eaa17f4cb3715e4d063e93b42d8cca31cfaa769a582ae51018",
+      "view": {
+        "center": [
+          40,
+          40
+        ],
+        "zoom": 1
+      },
+      "command": "flife render presets/morphogenesis-tissue-v2.toml --ticks 2048 --every 2048 --width 2160 --height 2160 --look glow --color lineage-energy --field-mapping energy --v1-compat --out FRAMES",
+      "meaning": "founder lineage lit by energy: the lineage's colour (lineage-energy), lighter as the organism holds more of the energy it needs to divide, black with none, white with 1.8 times it",
+      "stage2": {
+        "bundle": "a",
+        "condition": "v1-compat",
+        "seed": 42,
+        "live": 32784
+      }
+    },
+    {
+      "id": "tissue-fresh-offspring",
+      "set": "v2-controls",
+      "bundle": "tissue",
+      "condition": "fresh-offspring",
+      "label": "Inheritance removed",
+      "caption": "Each newborn gets a founder's genome instead of its parent's: the population all but dies out.",
+      "preset": "presets/morphogenesis-tissue-v2.toml",
+      "model": "field-ecology-v2-fresh-offspring",
+      "seed": 42,
+      "config_hash": "8d888d632b1cd19eeffd28f9bc7bb6e50d9b7d7987552a07573054201e614241",
+      "features": [
+        "cadherin-4d",
+        "epigenetic-recurrence",
+        "hippo-crowding",
+        "lysis-recycling",
+        "notch-delta",
+        "pcp-polarity",
+        "senescence",
+        "so2-motor",
+        "surplus-emission",
+        "symplectic-waste",
+        "tight-junctions",
+        "trophallaxis",
+        "wake-offset"
+      ],
+      "src": "/media/v2-controls-tissue-fresh-offspring-8bb066160423.jpg",
+      "sha256": "8bb066160423770a19a1e7fc4386110bfe322f1dee5627216cfa63c27034f739",
+      "bytes": 110456,
+      "width": 2160,
+      "height": 2160,
+      "tick": 2048,
+      "live": 20,
+      "digest": "0da2d66745b9f3100d26c25ca9ac19c65060af45a49788c1da89cc9e2fb9757b",
+      "view": {
+        "center": [
+          40,
+          40
+        ],
+        "zoom": 1
+      },
+      "command": "flife render CONFIG --ticks 2048 --every 2048 --width 2160 --height 2160 --look glow --color lineage-energy --field-mapping energy --out FRAMES",
+      "meaning": "founder lineage lit by energy: the lineage's colour (lineage-energy), lighter as the organism holds more of the energy it needs to divide, black with none, white with 1.8 times it",
+      "stage2": {
+        "bundle": "a",
+        "condition": "fresh-offspring",
+        "seed": 42,
+        "live": 20
+      }
+    },
+    {
+      "id": "supercolony-treatment",
+      "set": "v2-controls",
+      "bundle": "supercolony",
+      "condition": "treatment",
+      "label": "Supercolony, as committed",
+      "caption": "Every Bundle B mechanism on: compact colonies with bright, bursting rims, between blooming oases.",
+      "preset": "presets/supercolony-v2.toml",
+      "model": "field-ecology-v2",
+      "seed": 42,
+      "config_hash": "ea5b99760b8e0ff0d7f7bb8db9203a730174bb7775f8ef99c0eb37c985dbd307",
+      "features": [
+        "dual-carrier-trails",
+        "excitable-relay",
+        "lysis-recycling",
+        "oases",
+        "senescence",
+        "so2-motor",
+        "surplus-emission",
+        "tight-junctions",
+        "vascular-field",
+        "wake-offset"
+      ],
+      "src": "/media/v2-controls-supercolony-treatment-83ae8ef0738f.jpg",
+      "sha256": "83ae8ef0738f7aca6d8a0b076e8b25d316da7983810b96642a6b9a559c1f0467",
+      "bytes": 363085,
+      "width": 2160,
+      "height": 2160,
+      "tick": 2048,
+      "live": 16701,
+      "digest": "3041ca43decd5a56c145f784a7aaa8d64f7d2c211aec4ac675753b85c11d2595",
+      "view": {
+        "center": [
+          40,
+          40
+        ],
+        "zoom": 1
+      },
+      "command": "flife render presets/supercolony-v2.toml --ticks 2048 --every 2048 --width 2160 --height 2160 --look glow --color lineage-energy --field-mapping energy --out FRAMES",
+      "meaning": "founder lineage lit by energy: the lineage's colour (lineage-energy), lighter as the organism holds more of the energy it needs to divide, black with none, white with 1.8 times it",
+      "stage2": {
+        "bundle": "b",
+        "condition": "treatment",
+        "seed": 42,
+        "live": 16701
+      }
+    },
+    {
+      "id": "supercolony-v1-compat",
+      "set": "v2-controls",
+      "bundle": "supercolony",
+      "condition": "v1-compat",
+      "label": "Every v2 feature off",
+      "caption": "The same preset with --v1-compat: colonies still form, but nothing bursts, so their rims stay dark, and no trails or veins are laid.",
+      "preset": "presets/supercolony-v2.toml",
+      "model": "field-ecology-v2",
+      "seed": 42,
+      "config_hash": "0491663947bfa411d071ce2ca0145fa29fc8382ce55707991cb74d47fc712a2e",
+      "features": [],
+      "src": "/media/v2-controls-supercolony-v1-compat-c361fdebb0db.jpg",
+      "sha256": "c361fdebb0dbebfe56becd2b398938e13a386d387ff0227fe3d0867445477ce8",
+      "bytes": 350564,
+      "width": 2160,
+      "height": 2160,
+      "tick": 2048,
+      "live": 15762,
+      "digest": "b8c55727132b1f38ae87671b38e7fdbd24848f7627a7c4a73fc88ffb7285614d",
+      "view": {
+        "center": [
+          40,
+          40
+        ],
+        "zoom": 1
+      },
+      "command": "flife render presets/supercolony-v2.toml --ticks 2048 --every 2048 --width 2160 --height 2160 --look glow --color lineage-energy --field-mapping energy --v1-compat --out FRAMES",
+      "meaning": "founder lineage lit by energy: the lineage's colour (lineage-energy), lighter as the organism holds more of the energy it needs to divide, black with none, white with 1.8 times it",
+      "stage2": {
+        "bundle": "b",
+        "condition": "v1-compat",
+        "seed": 42,
+        "live": 15762
+      }
+    },
+    {
+      "id": "supercolony-fresh-offspring",
+      "set": "v2-controls",
+      "bundle": "supercolony",
+      "condition": "fresh-offspring",
+      "label": "Inheritance removed",
+      "caption": "Each newborn gets a founder's genome instead of its parent's: a few dozen organisms remain.",
+      "preset": "presets/supercolony-v2.toml",
+      "model": "field-ecology-v2-fresh-offspring",
+      "seed": 42,
+      "config_hash": "706a5ea4ca62ab66605e5caddae8516070c7d44d34ee7cb9637643f54502dec9",
+      "features": [
+        "dual-carrier-trails",
+        "excitable-relay",
+        "lysis-recycling",
+        "oases",
+        "senescence",
+        "so2-motor",
+        "surplus-emission",
+        "tight-junctions",
+        "vascular-field",
+        "wake-offset"
+      ],
+      "src": "/media/v2-controls-supercolony-fresh-offspring-319cf4126868.jpg",
+      "sha256": "319cf41268687c3bedc79812863acc780c991e7bacda96debd60f712a6a73708",
+      "bytes": 125180,
+      "width": 2160,
+      "height": 2160,
+      "tick": 2048,
+      "live": 63,
+      "digest": "07df213378737ec44ca54c417b1e16cc13e6ee3f9102789698c516506aaea75c",
+      "view": {
+        "center": [
+          40,
+          40
+        ],
+        "zoom": 1
+      },
+      "command": "flife render CONFIG --ticks 2048 --every 2048 --width 2160 --height 2160 --look glow --color lineage-energy --field-mapping energy --out FRAMES",
+      "meaning": "founder lineage lit by energy: the lineage's colour (lineage-energy), lighter as the organism holds more of the energy it needs to divide, black with none, white with 1.8 times it",
+      "stage2": {
+        "bundle": "b",
+        "condition": "fresh-offspring",
+        "seed": 42,
+        "live": 63
+      }
+    },
+    {
+      "id": "tissue-polarity",
+      "set": "v2-views",
+      "bundle": "tissue",
+      "condition": "treatment",
+      "label": "Polarity",
+      "caption": "--color polarity, sphere look: each cell's hue is the direction its polarity points, with a short tick on its apical side; grey cells have none. Patches of neighbouring cells point alike.",
+      "preset": "presets/morphogenesis-tissue-v2.toml",
+      "model": "field-ecology-v2",
+      "seed": 42,
+      "config_hash": "b8faa1ec09fd7d0cc9448df940a2bdcde3ff671701828592e1a9756a260783ce",
+      "features": [
+        "cadherin-4d",
+        "epigenetic-recurrence",
+        "hippo-crowding",
+        "lysis-recycling",
+        "notch-delta",
+        "pcp-polarity",
+        "senescence",
+        "so2-motor",
+        "surplus-emission",
+        "symplectic-waste",
+        "tight-junctions",
+        "trophallaxis",
+        "wake-offset"
+      ],
+      "src": "/media/v2-views-tissue-polarity-fca2162146a3.jpg",
+      "sha256": "fca2162146a3bce5e2d4a213404ee09f2c33e64087b7e0cb37b762d19c0c25c5",
+      "bytes": 1342893,
+      "width": 2160,
+      "height": 2160,
+      "tick": 2048,
+      "live": 12090,
+      "digest": "79e0f9d51cb39a9075505d8a220829d7c03bc1c3315be3e61a6e94b6fab948ec",
+      "view": {
+        "center": [
+          11,
+          41
+        ],
+        "zoom": 3
+      },
+      "command": "flife render presets/morphogenesis-tissue-v2.toml --ticks 2048 --every 2048 --width 2160 --height 2160 --look sphere --color polarity --no-field --camera CAMERA --out FRAMES",
+      "meaning": "apical polarity: cyclic perceptual OKLab hue wheel by apical angle, grey when unpolarized",
+      "stage2": {
+        "bundle": "a",
+        "condition": "treatment",
+        "seed": 42,
+        "live": 12090
+      }
+    },
+    {
+      "id": "tissue-cell-state",
+      "set": "v2-views",
+      "bundle": "tissue",
+      "condition": "treatment",
+      "label": "Cell state",
+      "caption": "--color cell-state: each cell keeps its lineage's hue; its lightness, and a small twist of hue, follow its first memory value h₀. At this tick h₀ varies little within a lineage, so the colours barely shift: no separate cell types yet (below).",
+      "preset": "presets/morphogenesis-tissue-v2.toml",
+      "model": "field-ecology-v2",
+      "seed": 42,
+      "config_hash": "b8faa1ec09fd7d0cc9448df940a2bdcde3ff671701828592e1a9756a260783ce",
+      "features": [
+        "cadherin-4d",
+        "epigenetic-recurrence",
+        "hippo-crowding",
+        "lysis-recycling",
+        "notch-delta",
+        "pcp-polarity",
+        "senescence",
+        "so2-motor",
+        "surplus-emission",
+        "symplectic-waste",
+        "tight-junctions",
+        "trophallaxis",
+        "wake-offset"
+      ],
+      "src": "/media/v2-views-tissue-cell-state-6be6cd6063ce.jpg",
+      "sha256": "6be6cd6063ce76f4ef7c2e0a670f4aea9a670453b6e559274c3410cc44384c84",
+      "bytes": 441540,
+      "width": 2160,
+      "height": 2160,
+      "tick": 2048,
+      "live": 12090,
+      "digest": "79e0f9d51cb39a9075505d8a220829d7c03bc1c3315be3e61a6e94b6fab948ec",
+      "view": {
+        "center": [
+          58.5,
+          35
+        ],
+        "zoom": 3
+      },
+      "command": "flife render presets/morphogenesis-tissue-v2.toml --ticks 2048 --every 2048 --width 2160 --height 2160 --look glow --color cell-state --field-mapping energy --camera CAMERA --out FRAMES",
+      "meaning": "cell-state: founder lineage hue darkened for h0 < 0 and lightened for h0 > 0",
+      "stage2": {
+        "bundle": "a",
+        "condition": "treatment",
+        "seed": 42,
+        "live": 12090
+      }
+    },
+    {
+      "id": "supercolony-trail-carrier",
+      "set": "v2-views",
+      "bundle": "supercolony",
+      "condition": "treatment",
+      "label": "Trail carrier",
+      "caption": "--field-mapping trail-carrier: the uneatable second carrier, plum through amber to gold as more lies on the field. It halves in 23 s, so it marks where colonies passed in the last minute.",
+      "preset": "presets/supercolony-v2.toml",
+      "model": "field-ecology-v2",
+      "seed": 42,
+      "config_hash": "ea5b99760b8e0ff0d7f7bb8db9203a730174bb7775f8ef99c0eb37c985dbd307",
+      "features": [
+        "dual-carrier-trails",
+        "excitable-relay",
+        "lysis-recycling",
+        "oases",
+        "senescence",
+        "so2-motor",
+        "surplus-emission",
+        "tight-junctions",
+        "vascular-field",
+        "wake-offset"
+      ],
+      "src": "/media/v2-views-supercolony-trail-carrier-7d47d70c8ecd.jpg",
+      "sha256": "7d47d70c8ecd321c3a4b1615658c2efd2481132df85aaf226c434e7a11077694",
+      "bytes": 443554,
+      "width": 2160,
+      "height": 2160,
+      "tick": 2048,
+      "live": 16701,
+      "digest": "3041ca43decd5a56c145f784a7aaa8d64f7d2c211aec4ac675753b85c11d2595",
+      "view": {
+        "center": [
+          40,
+          40
+        ],
+        "zoom": 1
+      },
+      "command": "flife render presets/supercolony-v2.toml --ticks 2048 --every 2048 --width 2160 --height 2160 --look glow --color lineage-energy --field-mapping trail-carrier --out FRAMES",
+      "meaning": "founder lineage lit by energy: the lineage's colour (lineage-energy), lighter as the organism holds more of the energy it needs to divide, black with none, white with 1.8 times it",
+      "stage2": {
+        "bundle": "b",
+        "condition": "treatment",
+        "seed": 42,
+        "live": 16701
+      }
+    },
+    {
+      "id": "supercolony-vascular-conductance",
+      "set": "v2-views",
+      "bundle": "supercolony",
+      "condition": "treatment",
+      "label": "Vascular conductance",
+      "caption": "--field-mapping vascular-conductance: the field's faces, bright where flux has widened them, dark seams where they have pruned back.",
+      "preset": "presets/supercolony-v2.toml",
+      "model": "field-ecology-v2",
+      "seed": 42,
+      "config_hash": "ea5b99760b8e0ff0d7f7bb8db9203a730174bb7775f8ef99c0eb37c985dbd307",
+      "features": [
+        "dual-carrier-trails",
+        "excitable-relay",
+        "lysis-recycling",
+        "oases",
+        "senescence",
+        "so2-motor",
+        "surplus-emission",
+        "tight-junctions",
+        "vascular-field",
+        "wake-offset"
+      ],
+      "src": "/media/v2-views-supercolony-vascular-conductance-18d68da84cd1.jpg",
+      "sha256": "18d68da84cd103ad4b50cd8a2e6d545b6fd4ba1c50af16dd6e81ef77b18df2a1",
+      "bytes": 515211,
+      "width": 2160,
+      "height": 2160,
+      "tick": 2048,
+      "live": 16701,
+      "digest": "3041ca43decd5a56c145f784a7aaa8d64f7d2c211aec4ac675753b85c11d2595",
+      "view": {
+        "center": [
+          40,
+          40
+        ],
+        "zoom": 1
+      },
+      "command": "flife render presets/supercolony-v2.toml --ticks 2048 --every 2048 --width 2160 --height 2160 --look glow --color lineage-energy --field-mapping vascular-conductance --out FRAMES",
+      "meaning": "founder lineage lit by energy: the lineage's colour (lineage-energy), lighter as the organism holds more of the energy it needs to divide, black with none, white with 1.8 times it",
+      "stage2": {
+        "bundle": "b",
+        "condition": "treatment",
+        "seed": 42,
+        "live": 16701
+      }
+    }
+  ]
+}

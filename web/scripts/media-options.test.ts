@@ -427,6 +427,7 @@ describe("multi-segment 4K60 splitting and manifest verification", () => {
 
       const filmManifest: FilmManifest = {
         schema: "frankenlife.website-media.v1",
+        id: "film",
         video: {
           ...seg0,
           width: 2160,
@@ -448,6 +449,7 @@ describe("multi-segment 4K60 splitting and manifest verification", () => {
           seed: 42,
           founders: 10954,
           grid: [320, 320],
+          torus: [80, 80],
           timestep: [1, 32],
           model: "field-ecology-v1-contact",
           from: { tick: 100, digest: "a".repeat(64) },
@@ -478,7 +480,7 @@ describe("multi-segment 4K60 splitting and manifest verification", () => {
       } as unknown as ControlsManifest;
 
       // Worker & check-media collect EVERY segment + shared 4K poster (deduplicated once!) + social + 2 control stills.
-      const collected = collectMediaFiles(filmManifest, controls4k);
+      const collected = collectMediaFiles([filmManifest], [controls4k]);
       expect(collected.map((f) => f.src)).toEqual([
         seg0.src,
         seg1.src,
@@ -487,7 +489,7 @@ describe("multi-segment 4K60 splitting and manifest verification", () => {
         chemStill.src,
         freshStill.src,
       ]);
-      expect(verifyMediaDirectory(filmManifest, controls4k, temp)).toEqual([]);
+      expect(verifyMediaDirectory([filmManifest], [controls4k], temp)).toEqual([]);
 
       // Defect 1: frame gap in segments caught by validateSegmentsManifest.
       const gapped: FilmManifest = {
@@ -515,9 +517,30 @@ describe("multi-segment 4K60 splitting and manifest verification", () => {
       };
       expect(validateSegmentsManifest(oversized).some((e) => e.includes("asset limit"))).toBe(true);
 
+      // A second film shares public/media/: its files are named by its own manifest, not strays.
+      const tissue = writeAsset("tissue-777777777777.mp4", "tissue-film");
+      const tissuePoster = writeAsset("tissue-poster-888888888888.jpg", "tissue-poster");
+      const tissueSocial = writeAsset("tissue-social-999999999999.jpg", "tissue-social");
+      const second: FilmManifest = {
+        ...filmManifest,
+        id: "tissue",
+        video: { ...filmManifest.video, ...tissue, segments: undefined },
+        poster: { ...tissuePoster, frame: 0 },
+        social: { ...tissueSocial, width: 1200, height: 630, frame: 5 },
+      };
+      expect(verifyMediaDirectory([filmManifest], [controls4k], temp).some((e) => e.includes("tissue-777777777777.mp4"))).toBe(true);
+      expect(verifyMediaDirectory([filmManifest, second], [controls4k], temp)).toEqual([]);
+      expect(collectMediaFiles([filmManifest, second], [controls4k]).map((f) => f.src)).toContain(tissue.src);
+      // Two films may not share an id: each names lib/films/<id>.json and prefixes its files.
+      expect(
+        verifyMediaDirectory([filmManifest, { ...second, id: "film" }], [controls4k], temp).some((e) =>
+          e.includes("two films have the id film"),
+        ),
+      ).toBe(true);
+
       // Defect 3: unlisted stray file in public/media/ caught.
       writeFileSync(join(mediaDir, "stray-old.mp4"), "junk");
-      expect(verifyMediaDirectory(filmManifest, controls4k, temp).some((e) => e.includes("stray-old.mp4"))).toBe(true);
+      expect(verifyMediaDirectory([filmManifest], [controls4k], temp).some((e) => e.includes("stray-old.mp4"))).toBe(true);
     } finally {
       rmSync(temp, { recursive: true, force: true });
     }

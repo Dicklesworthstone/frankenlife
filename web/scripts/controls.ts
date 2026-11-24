@@ -3,8 +3,8 @@
 //
 //   bun scripts/controls.ts --flife PATH --work DIR [--size 1080|2160] [--cpu-workers N] [--parallel 2]
 //
-// - The world is presets/confluent-world.toml, the film's (lib/media.json's
-//   world.preset), at its seed. The controls are that preset with only its
+// - The world is presets/confluent-world.toml, the confluent film's
+//   (lib/films/confluent.json's world.preset), at its seed. The controls are that preset with only its
 //   `model` changed to the model's two registered controls (plan §5.4;
 //   flife-core's registry): `field-ecology-v1-contact-chemistry-only`, whose
 //   networks are evaluated and charged but whose actions decode from an
@@ -20,7 +20,7 @@
 // - The guard is the record: each world's digest at that tick must equal the
 //   digest experiments/showcase/confluent.json records for the trial it
 //   repeats (w80-o25, cw-chem, cw-fresh), and the full world's must equal the
-//   film's starting digest (lib/media.json world.from). So each still is the
+//   film's starting digest (lib/films/confluent.json world.from). So each still is the
 //   recorded run, drawn; the script refuses otherwise. The record's distance
 //   and live count, and the README's words for each frame, are copied with
 //   their source.
@@ -151,7 +151,7 @@ const { flife, work, size, cpuWorkers, parallel } = opts;
 const RENDER = ["--ticks", String(TICK), "--every", String(TICK), "--width", String(size), "--height", String(size), ...STYLE];
 const workers = cpuWorkers !== null ? ["--cpu-workers", String(cpuWorkers)] : [];
 
-const film = JSON.parse(readFileSync(join(WEB, "lib", "media.json"), "utf8")) as {
+const film = JSON.parse(readFileSync(join(WEB, "lib", "films", "confluent.json"), "utf8")) as {
   video?: { width?: number; height?: number };
   world: { preset: string | null; seed: number; from: { tick: number; digest: string } };
   poster: { src: string; sha256: string };
@@ -164,7 +164,7 @@ if (
   film.video.width !== size
 ) {
   console.error(
-    `controls: warning: rendering ${size}×${size} stills while lib/media.json is ${film.video.width}×${film.video.height}; pass --size ${film.video.width} to match and reuse the poster byte for byte`,
+    `controls: warning: rendering ${size}×${size} stills while lib/films/confluent.json is ${film.video.width}×${film.video.height}; pass --size ${film.video.width} to match and reuse the poster byte for byte`,
   );
 }
 const trials = (JSON.parse(readFileSync(join(REPO, RECORD_JSON), "utf8")) as {

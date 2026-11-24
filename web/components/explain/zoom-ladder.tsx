@@ -46,11 +46,14 @@ import {
 } from "@/components/explain/zoom-ladder-geometry";
 import { GreenTitle, MicroLabel } from "@/components/franken";
 import { useInView, useReducedMotion } from "@/lib/hooks";
-import { film } from "@/lib/media";
+import { filmById } from "@/lib/media";
+
+// The confluent film: the ladder is cut from its poster and share card.
+const film = filmById("confluent");
 import { LINEAGE } from "@/lib/palette";
 import { cn, grouped } from "@/lib/utils";
 
-// ─── The figures, all from lib/media.json, the preset and the plan ─────────────
+// ─── The figures, all from lib/films/confluent.json, the preset and the plan ──
 
 const SHAPE = widths(CATALOG[DEFAULT_TOPOLOGY] ?? { hidden: [64, 32] });
 const PARAMETERS = parameterCount(SHAPE);
@@ -805,7 +808,7 @@ export function ZoomLadder({ index }: { index?: string }) {
                 <img
                   ref={posterRef}
                   src={film.poster.src}
-                  alt={`The film's first frame: the whole torus at tick ${grouped(POSTER.tick)}, ${grouped(LIVE_POSTER)} organisms coloured by founder lineage.`}
+                  alt={`The confluent film's first frame: the whole torus at tick ${grouped(POSTER.tick)}, ${grouped(LIVE_POSTER)} organisms coloured by founder lineage.`}
                   width={film.video.width}
                   height={film.video.height}
                   decoding="async"
@@ -817,7 +820,7 @@ export function ZoomLadder({ index }: { index?: string }) {
                 <img
                   ref={cardRef}
                   src={film.social.src}
-                  alt={`A patch of the film's closest shot at tick ${grouped(CARD.tick)}: single bodies, each a sphere, coloured by lineage.`}
+                  alt={`A patch of the confluent film's closest shot at tick ${grouped(CARD.tick)}: single bodies, each a sphere, coloured by lineage.`}
                   width={film.social.width}
                   height={film.social.height}
                   loading="lazy"
@@ -1016,7 +1019,7 @@ export function ZoomLadder({ index }: { index?: string }) {
       </ol>
 
       <figcaption className="mt-8 border-t border-white/5 pt-4 font-mono text-[11px] leading-relaxed [overflow-wrap:anywhere] text-slate-500">
-        Steps 1–3 are flife&apos;s pixels, from lib/media.json: the poster (frame {film.poster.frame}, tick{" "}
+        Steps 1–3 are flife&apos;s pixels, from the confluent film&apos;s manifest (lib/films/confluent.json): the poster (frame {film.poster.frame}, tick{" "}
         {grouped(POSTER.tick)}, camera zoom 1, the whole torus) and the social card (frame {film.social.frame}, tick{" "}
         {grouped(CARD.tick)}, camera zoom {fmt(CARD.zoom, 2)} centred at ({fmt(CARD.center[0], 3)},{" "}
         {fmt(CARD.center[1], 3)}): the {film.video.width}² frame scaled to 1,200 wide and cropped to 1,200 × 630, whose

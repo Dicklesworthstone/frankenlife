@@ -1,13 +1,15 @@
 # FrankenLife website
 
 The project's page: Next.js 16 as a static export, served by Cloudflare as an assets-only Worker
-(`wrangler.jsonc`). It shows a film rendered by `flife render` from a committed world, with a readout of
-each frame's tick and live organisms taken from the render's own records. The Rust workspace does not
+(`wrangler.jsonc`). It shows films rendered by `flife render` from committed worlds (the two
+field-ecology-v2 presets, the supercolony's veins, and the v1 confluent world), with a readout of each
+frame's tick and live organisms taken from the render's own records. The Rust workspace does not
 build or read this directory (`.rchignore` keeps it out of remote builds too).
 
 Every word and figure outside the explainers is in `lib/content.ts`. Each one is stated by the
 repository (README.md, the plan, the crates' CONTRACT.md files, experiments/fl048 and
-experiments/showcase) or recorded in the film's manifest (`lib/media.json`); `branchObservation` is the
+experiments/showcase, experiments/v2-emergence) or recorded in a manifest (`lib/films/<id>.json`,
+`lib/controls.json`, `lib/stills.json`); `branchObservation` is the
 one figure the page observed itself, with its date, host and binary. Change the page's claims when the
 repository's change.
 
@@ -65,12 +67,40 @@ bun run build        # refuses unless public/media/ holds exactly the manifest's
 bun run deploy       # build, then `wrangler deploy` (needs `wrangler login`)
 ```
 
-## The film
+## The films
 
-The video, poster and social card stay out of git, like every FrankenLife recording (AGENTS.md). The
-committed `lib/media.json` names each file by its SHA-256 and records how it was made: the world (preset,
-configuration hash, seed, the starting tick and digest), every frame's tick and live count, the render
-command, flife's revision and binary hash, and the ffmpeg arguments. A fresh checkout renders them again:
+The videos, posters and social cards stay out of git, like every FrankenLife recording (AGENTS.md). Each
+film has a committed manifest, `lib/films/<id>.json`, written by `bun run media --film <id>`; it names
+each file by its SHA-256 and records how it was made: the world (preset, configuration hash, seed, torus,
+the starting tick and digest), every frame's tick and live count, the render command, flife's revision and
+binary hash, and the ffmpeg arguments. `lib/films/index.ts` lists the films the page shows, in the hero's
+order; the first opens the page. The confluent film keeps the explainers cut from it (the zoom ladder, the
+controls); the share card is cut from the tissue film.
+
+The v2 films, all 801 frames at 60 fps, 2160 × 2160, CRF 20, split into segments of at most 22 MiB:
+
+```bash
+# From the repository root: each preset as committed, seed 42, kept in a run directory.
+target/release/flife run presets/supercolony-v2.toml --ticks 2048 --run-dir RUN-B
+target/release/flife run presets/morphogenesis-tissue-v2.toml --ticks 3072 --run-dir RUN-A
+
+# From web/: 3,200 ticks, a frame every 4, founder lineage lit by energy over the field's energy.
+bun run media -- --film supercolony --flife ../target/release/flife --run-dir ../RUN-B --work WORK-B \
+  --ticks 3200 --every 4 --size 2160 --fps 60 --crf 20 --look glow --color lineage-energy --field energy \
+  --zooms 1.3,1.7,1.4,1.8,1.5
+bun run media -- --film tissue --flife ../target/release/flife --run-dir ../RUN-A --work WORK-A \
+  --ticks 3200 --every 4 --size 2160 --fps 60 --crf 20 --look glow --color lineage-energy --field energy \
+  --zooms 2.6,3.4,2.8,3.6,3
+# The supercolony again, the whole torus, its field coloured by vascular conductance.
+bun run media -- --film veins --flife ../target/release/flife --run-dir ../RUN-B --work WORK-VEINS \
+  --ticks 3200 --every 4 --size 2160 --fps 60 --crf 20 --look glow --color lineage-energy \
+  --field vascular-conductance --camera none
+```
+
+Then list each new manifest in `lib/films/index.ts`. The starting ticks and the looks were chosen by eye
+from a survey of each world to tick 8,192 and from 4K test frames; the page says so beside the films.
+
+The confluent film (`lib/films/confluent.json`) was made this way:
 
 ```bash
 # From the repository root: the confluent preset run to tick 2,400, where its trial was scored,
@@ -81,7 +111,7 @@ target/release/flife run presets/confluent-world.toml --ticks 2400 --cpu-workers
 # From web/: 401 frames from tick 2,400 to 5,600, one every 8 ticks, 1080 × 1080, each organism drawn as a
 # lit sphere at its body's size and coloured by founder lineage, without the field. Paths are relative
 # to where you run it; keep WORK (several hundred MB of PNGs) outside the repository.
-bun run media --flife ../target/release/flife --run-dir ../RUN --work WORK \
+bun run media --film confluent --flife ../target/release/flife --run-dir ../RUN --work WORK \
   --ticks 3200 --every 8 --field none --look sphere --color lineage --zooms 1.6,3,2.2,5,2.6 --cpu-workers 24
 
 # Turnkey true 60 fps 4K re-render of confluent-world (`bun run media:4k60` sets --ticks 3200
@@ -90,12 +120,12 @@ bun run media --flife ../target/release/flife --run-dir ../RUN --work WORK \
 # --segments auto, --segment-max-mib 22 so every segment stays <= 25 MiB for Cloudflare Workers,
 # snapped at camera cuts, plus one unconstrained archival 4K60 master outside public/media/;
 # pass --width 3840 --height 2160 to override to 16:9 4K60):
-bun run media:4k60 -- --flife ../target/release/flife --run-dir ../RUN --work WORK-4K60 \
+bun run media:4k60 -- --film confluent --flife ../target/release/flife --run-dir ../RUN --work WORK-4K60 \
   --field none --look sphere --color lineage-energy \
   --zooms 1.6,3,2.2,5,2.6 --master-out ../exports/film-4k60-master.mp4 --cpu-workers 24
 
 # Widescreen 16:9 4K60 from a fresh field-ecology-v2 preset with V2-16 overlays and founding toggles:
-bun run media:4k60 -- --flife ../target/release/flife --config ../presets/supercolony-v2.toml --work WORK-V2 \
+bun run media:4k60 -- --film colony-wide --flife ../target/release/flife --config ../presets/supercolony-v2.toml --work WORK-V2 \
   --width 3840 --height 2160 --ticks 3200 --every 4 \
   --field vascular-conductance --look glow --color lineage \
   --disable oases --master-out ../exports/supercolony-4k60-master.mp4
@@ -111,7 +141,7 @@ order with `--config` and refused with `--run-dir` per `INV-14`. Both `--size S`
 --height H` (e.g. `2160 × 2160` or `3840 × 2160`, even integers for 4:2:0) are supported alongside arbitrary positive
 `--fps` (including `--fps 60`). With `--segments auto` (the default) or `--segments N` (`N >= 2`), any film whose full-CRF
 encode exceeds `--segment-max-mib` (default `22` MiB, strictly below Cloudflare's `25 MiB` static asset limit) is split
-at natural camera shot boundaries into closed-GOP segments (`film-seg00-<hash>.mp4`, …) — recursively subdivided if any
+at natural camera shot boundaries into closed-GOP segments (`<id>-seg00-<hash>.mp4`, …) — recursively subdivided if any
 individual shot still exceeds the cap — and played seamlessly through `<Film>`'s dual-`<video>` preloader with a single
 unified scrubber, tick readout, and Cloudflare Worker 206 Range serving. Pass `--segments 1` to force a single bitrate-capped
 web MP4, and `--master-out PATH` (outside `public/media/`) to also encode one unconstrained archival 4K60 MP4 from the
@@ -134,8 +164,11 @@ and `--color lineage|lineage-energy|affinity|energy|generation|motion|topology|c
 how the frames are drawn; `--zooms` lists the shots' zooms on the run's torus instead. The film's shots, at 1.6, 3 and 2.2, show as many
 organisms as the reference screenshots' views at zooms 3–6: a screenshot's zoom over 1.95.
 
-`scripts/media.ts` refuses a dirty `crates/`, `presets/`, `Cargo.toml` or `Cargo.lock`, since the manifest
-names the revision. It renders into `--work`. Run it again with the same `--work` to re-encode the finished
+The manifest names the commit `--flife` was built from. By default that is HEAD, and `scripts/media.ts`
+refuses a dirty `crates/`, `presets/`, `Cargo.toml` or `Cargo.lock`. A binary built earlier is named with
+`--revision COMMIT`: an ancestor of HEAD whose `presets/` equal the working tree's, since the configurations
+are read from there (`scripts/source-revision.ts`); the working tree's Rust sources may then differ, as
+they are not what runs. It renders into `--work`. Run it again with the same `--work` to re-encode the finished
 frames without rendering them, for example at another `--crf` when the video exceeds Cloudflare's 25 MiB
 limit for a static asset. Each output is copied into `public/media/` under a content-hashed name. The frames
 are reproducible, the video's bytes are not: x264 on several threads encodes the same frames differently
@@ -162,7 +195,7 @@ URL: a platform that cached the old card shows it until its own refresh tool fet
 `bun run deploy` uploads `out/` as the Worker's static assets, served at https://frankenlife.org.
 Static assets answer a Range request with the whole file and a 200, and Safari plays no video from such
 a server, so `worker.ts` runs first, and for `/media/*` it streams only the bytes asked for as a 206, sized
-from the manifests, `lib/media.json` and `lib/controls.json` (an asset's response from the binding has
+from the manifests, `lib/films/*.json`, `lib/controls.json` and `lib/stills.json` (an asset's response from the binding has
 no Content-Length). The static export
 writes the share images without an extension, so the Worker gives them their type, `image/jpeg`
 (`lib/share.ts`). It also sends www.frankenlife.org to frankenlife.org; every other request goes to the
@@ -199,3 +232,27 @@ drawn. The film's world, drawn and encoded as the poster was, is the poster byte
 manifest names the poster rather than a copy. The record's distances and the README's words for each
 frame ("### Controls" in `experiments/showcase/README.md`) are copied with their source.
 `scripts/controls.test.ts` checks the manifest against the record.
+
+## The v2 stills
+
+The Version 2 chapter shows ten stills, all 2160 × 2160, drawn at tick 2,048, the tick the V2-17 Stage-2
+campaign scored (`experiments/v2-emergence/README.md`). `scripts/stills.ts` renders them and writes their
+committed manifest, `lib/stills.json`:
+
+- `v2-controls`: each v2 preset as committed beside two controls, the same preset with every v2 mechanism
+  off (`--v1-compat`) and with inheritance removed (model `field-ecology-v2-fresh-offspring`), the whole
+  torus, glow look, founder lineage lit by energy over the field's energy.
+- `v2-views`: the four read-only v2 views, polarity and cell state of the tissue (zoomed 3× on islands
+  chosen by eye from the whole-torus still; the script records each centre), trail carrier and vascular
+  conductance of the supercolony (the whole torus).
+
+```bash
+# From the repository root; WORK outside the repository. About a minute a world on 12 workers.
+bun web/scripts/stills.ts --flife target/release/flife --work WORK --cpu-workers 12 \
+  --stage2 PATH/stage2_summary_FINAL_104.json
+```
+
+Each world runs from tick 0 inside `flife render`. With `--stage2` (the campaign's summary, kept outside
+git), the script refuses unless each world's digest and live count equal those the summary records for
+the same preset, condition and seed 42, and the manifest says so. `--only ID,ID` renders some stills
+again and keeps the others' entries; `--revision` is as for `scripts/media.ts`.

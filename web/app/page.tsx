@@ -24,10 +24,12 @@ import { Miniature } from "@/components/explain/miniature";
 import { ScaleCalculator } from "@/components/explain/scale";
 import { StudioKeys } from "@/components/explain/studio-keys";
 import { TickPipeline } from "@/components/explain/tick-pipeline";
+import { V2Atlas } from "@/components/explain/v2-atlas";
 import { V2Explorer } from "@/components/explain/v2-explorer";
 import { IndependentWeights } from "@/components/explain/weights";
 import { ZoomLadder } from "@/components/explain/zoom-ladder";
-import { Film } from "@/components/film";
+import { FilmProvenance } from "@/components/film-provenance";
+import { FilmReel } from "@/components/film-reel";
 import { GreenTitle, MicroLabel, Reticle } from "@/components/franken";
 import { Reveal } from "@/components/reveal";
 import { RevealController } from "@/components/reveal-controller";
@@ -35,6 +37,7 @@ import { SEED_TONES, SeedStrips } from "@/components/seed-strip";
 import { ChapterBlock, Section } from "@/components/section";
 import { SiteHeader } from "@/components/site-header";
 import { SkipOffscreen } from "@/components/skip-offscreen";
+import { AblationBars, BundlePanels, ControlStills, Residuals, ViewStills } from "@/components/v2-sections";
 import {
   branchObservation,
   type Chapter,
@@ -58,15 +61,13 @@ import {
   siteConfig,
   stack,
   v2BuildStatus,
-  v2VisualMappings,
   type Verdict,
   worldModel,
 } from "@/lib/content";
-import { film } from "@/lib/media";
+import { film, films, stills } from "@/lib/media";
 import { cn, grouped } from "@/lib/utils";
 
-const { world, render, video } = film;
-const seconds = (ticks: number) => (ticks * world.timestep[0]) / world.timestep[1];
+const { video } = film;
 
 const gateStyle: Record<GateState, { label: string; className: string; Icon: typeof CircleCheck }> = {
   built: { label: "Built and tested", className: "text-green-300 border-green-500/30 bg-green-500/10", Icon: CircleCheck },
@@ -100,19 +101,6 @@ function index(chapterId: string, sectionId: string): string {
 const link = "text-green-300 underline decoration-green-300/30 underline-offset-4 transition-colors hover:decoration-green-300";
 
 export default function Home() {
-  const firstLive = world.live[0] ?? 0;
-  const lastLive = world.live.at(-1) ?? 0;
-  const lowest = Math.min(...world.live);
-  const highest = Math.max(...world.live);
-  const reproduce = [
-    "# flife is `cargo run --release -p flife-cli --` in the repository",
-    `flife run ${world.preset ?? "CONFIG"} --ticks ${world.from.tick} --run-dir RUN`,
-    render.command.replace("FRAMES", "frames"),
-    ...(render.camera ? ["# CAMERA: lib/media.json's render.camera keys, as {\"keys\": [...]}"] : []),
-  ];
-  const crfAt = video.encode.indexOf("-crf");
-  const crf = crfAt >= 0 ? video.encode[crfAt + 1] : undefined;
-
   return (
     <>
       <SiteHeader />
@@ -131,7 +119,11 @@ export default function Home() {
               className="rise-in relative order-1 pt-[4.25rem] [--rise-delay:80ms] lg:order-2 lg:pt-24 lg:pr-8 lg:pb-8 xl:pr-12"
               style={{ "--film-aspect": video.width / video.height } as CSSProperties}
             >
-              <Film feather className="mx-auto w-full lg:max-w-[min(100%,calc((100svh-8rem)*var(--film-aspect)))]" />
+              <FilmReel
+                feather
+                idPrefix="hero"
+                className="mx-auto w-full lg:max-w-[min(100%,calc((100svh-11rem)*var(--film-aspect)))]"
+              />
             </div>
             <div className="rise-in relative z-10 order-2 px-5 pt-9 pb-14 sm:px-8 lg:order-1 lg:py-24 lg:pr-4 lg:pl-12 xl:pl-20">
               <p className="flex items-center gap-3">
@@ -144,10 +136,19 @@ export default function Home() {
                 <GreenTitle lit text="Evolution, [bit for bit]." />
               </h1>
               <p className="lede mt-7 max-w-[36rem]">
-                A real-time artificial-life laboratory. Every organism in this film carries its own heritable neural
+                A real-time artificial-life laboratory. Every organism in these films carries its own heritable neural
                 network; they feed, signal, move, split and die through one shared field of energy and chemistry,
                 and nothing is scripted or trained. Pause it, inspect it, branch it, replay it: the same world, to
                 the last bit, every time.
+              </p>
+              <p className="mt-4 max-w-[36rem] text-[15px] leading-relaxed text-slate-400">
+                <span className="font-semibold text-slate-200">New in version 2:</span> twenty-one switchable
+                mechanisms. Tissue that stops dividing in a crowd, sorts by kind and feeds its kin; supercolonies that
+                pulse, lay trails and grow veins in the field they share.{" "}
+                <a className={link} href="#ch-v2">
+                  What each one does
+                </a>
+                .
               </p>
               <div className="mt-9 flex flex-wrap gap-3">
                 <a
@@ -381,111 +382,49 @@ export default function Home() {
           <Section
             id="film"
             index={index("different", "film")}
+            layout="wide"
             eyebrow="Provenance"
             title="What you are [watching]."
             kicker={
               <>
-                Not an illustration: <code className="text-green-300">flife render</code> drew each frame from the
-                committed world at its tick. The world is deterministic: the same commands reach the same digests,
+                Not illustrations: <code className="text-green-300">flife render</code> drew each frame from the
+                committed world at its tick. Each world is deterministic: the same commands reach the same digests,
                 below, on any machine.
               </>
             }
           >
-            <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
-              <Reveal>
-                <div className="panel relative h-full rounded-[1.75rem] p-6 sm:p-8">
-                  <Reticle inset={9} size={12} />
-                  <MicroLabel>The world</MicroLabel>
-                  <dl className="ruled mt-5 text-sm">
-                    <Row label="Preset" value={world.preset ?? world.name} mono />
-                    {world.model ? <Row label="Model" value={world.model} mono /> : null}
-                    <Row label="Seed" value={String(world.seed)} mono />
-                    <Row label="Founders" value={`${grouped(world.founders)} on a ${world.grid[0]} × ${world.grid[1]} field`} />
-                    <Row label="Tick length" value={`${world.timestep[0]}/${world.timestep[1]} s of simulated time`} />
-                    <Row
-                      label="Evolved first"
-                      value={`${grouped(world.from.tick)} ticks (${seconds(world.from.tick).toFixed(0)} simulated seconds)`}
-                    />
-                    <Row
-                      label="Alive in the film"
-                      value={lowest === highest ? grouped(lowest) : `${grouped(lowest)} – ${grouped(highest)}`}
-                    />
-                  </dl>
-                </div>
-              </Reveal>
-              <Reveal delay={0.08}>
-                <div className="panel relative h-full rounded-[1.75rem] p-6 sm:p-8">
-                  <Reticle inset={9} size={12} />
-                  <MicroLabel>The film</MicroLabel>
-                  <dl className="ruled mt-5 text-sm">
-                    <Row label="Ticks" value={`${grouped(world.from.tick)} → ${grouped(world.to.tick)}, a frame every ${world.every}`} />
-                    <Row label="Frames" value={`${video.frames} at ${video.fps} fps, ${video.width} × ${video.height}`} />
-                    {video.segments && video.segments.length > 1 ? (
-                      <Row
-                        label="Segments"
-                        value={`${video.segments.length} × ≤25 MiB (${(
-                          video.segments.reduce((sum, seg) => sum + seg.bytes, 0) /
-                          (1024 * 1024)
-                        ).toFixed(1)} MiB total, preloaded sequentially)`}
-                      />
-                    ) : null}
-                    <Row label="Colour" value={render.meaning} />
-                    <Row
-                      label="Field"
-                      value={`${render.field_mapping === "none" ? "not drawn" : render.field_mapping}, ${render.look} look`}
-                    />
-                    <Row
-                      label="Camera"
-                      value={render.camera ? `${render.camera.keys.length} keys, chosen from the run` : "the whole torus, still"}
-                    />
-                    {render.features && render.features.length > 0 ? (
-                      <Row label="V2 toggles" value={render.features.join(" ")} mono />
-                    ) : null}
-                    <Row label="First digest" value={world.from.digest} mono />
-                    <Row label="Last digest" value={world.to.digest} mono />
-                  </dl>
-                </div>
-              </Reveal>
+            <div className="grid grid-cols-1 gap-5">
+              {films.map((each) => (
+                <Reveal key={each.id}>
+                  <FilmProvenance film={each} />
+                </Reveal>
+              ))}
             </div>
             <Reveal className="mt-5">
               <div className="panel rounded-[1.75rem] p-6 sm:p-8">
-                <MicroLabel>How this world was chosen</MicroLabel>
+                <MicroLabel>How these worlds were chosen</MicroLabel>
                 <div className="mt-4 space-y-3 text-[15px] leading-relaxed text-slate-300">
+                  <p className="font-semibold text-white">The two v2 worlds.</p>
+                  {filmChoice.v2.map((paragraph) => (
+                    <p key={paragraph.slice(0, 24)}>{paragraph}</p>
+                  ))}
+                  <p className="pt-2 font-semibold text-white">The confluent world.</p>
                   {filmChoice.world.map((paragraph) => (
                     <p key={paragraph.slice(0, 24)}>{paragraph}</p>
                   ))}
-                  {render.camera ? <p>{filmChoice.camera}</p> : null}
+                  <p className="pt-2 font-semibold text-white">The camera.</p>
+                  <p>{filmChoice.camera}</p>
                   <p>
                     <a className={link} href={siteConfig.showcase}>
-                      The search, every sample&apos;s score and the held-out seeds
+                      The confluent world&apos;s search, every sample&apos;s score and the held-out seeds
+                    </a>
+                    ;{" "}
+                    <a className={link} href={siteConfig.v2Report}>
+                      the v2 campaign&apos;s report
                     </a>
                     .
                   </p>
                 </div>
-              </div>
-            </Reveal>
-            <Reveal className="mt-5">
-              <div className="panel rounded-[1.75rem] p-6 sm:p-8">
-                <div className="flex items-center gap-2">
-                  <Terminal className="h-4 w-4 text-green-400" aria-hidden="true" />
-                  <MicroLabel>Make it yourself</MicroLabel>
-                </div>
-                <pre className="mt-4 overflow-x-auto rounded-xl border border-white/[0.06] bg-black/40 p-4 text-[13px] leading-relaxed text-green-200">
-                  <code>{reproduce.join("\n")}</code>
-                </pre>
-                <p className="mt-4 text-xs leading-relaxed text-slate-400">
-                  Rendered at revision <code className="text-slate-300">{render.revision.slice(0, 12)}</code> with
-                  controllers on {render.controllers}; no result depends on the route. The first frame shows{" "}
-                  {grouped(firstLive)} organisms and the last {grouped(lastLive)}; the render&apos;s{" "}
-                  <code className="text-slate-300">end</code> record names the last digest above. The PNG frames are
-                  flife&apos;s; this page&apos;s video encodes them with flife&apos;s own BT.709 colour chain at CRF{" "}
-                  {crf} for the web
-                  {video.segments && video.segments.length > 1
-                    ? ` across ${video.segments.length} preloaded segments (each ≤25 MiB, first SHA-256 `
-                    : ", and its SHA-256 is "}
-                  <code className="break-all text-slate-300">{video.sha256}</code>
-                  {video.segments && video.segments.length > 1 ? ")." : "."}
-                </p>
               </div>
             </Reveal>
           </Section>
@@ -578,66 +517,136 @@ export default function Home() {
               <TickPipeline />
             </Reveal>
           </Section>
+        </ChapterBlock>
 
+        {/* ─── 04 · Version 2 ─────────────────────────────────────────── */}
+        <ChapterBlock chapter={chapter("v2")}>
           <Section
-            id="v2"
-            index={index("machinery", "v2")}
+            id="bundles"
+            index={index("v2", "bundles")}
             layout="wide"
-            eyebrow="field-ecology-v2 · M6 extension"
-            title="Modular [biology], toggled clean."
+            eyebrow="field-ecology-v2 · two presets"
+            title="Two new [worlds]."
             kicker={
               <>
-                Every <code className="text-green-300">field-ecology-v1*</code> run omits <code className="text-slate-200">[v2]</code>{" "}
-                and stays byte-identical. On <code className="text-green-300">field-ecology-v2</code>, 21 mechanisms are registered as
-                individually toggleable slugs grouped into two Stage-2 verified bundles: Bundle A (<code className="text-slate-200">tissue</code>,
-                14 active features, <code className="text-slate-200">[contact]</code>) and Bundle B (<code className="text-slate-200">supercolony</code>,
-                11 active features, strictly <code className="text-slate-200">INV-08</code> pure-field). Every override materializes before
-                hashing and is locked at founding time (<code className="text-slate-200">INV-14</code>).
+                Version 2 is one model, <code className="text-green-300">field-ecology-v2</code>, with 21 mechanisms each
+                switched on or off when a world is founded. Two committed presets combine them: a tissue whose bodies
+                touch, and a supercolony where nothing touches and everything passes through the field. Every v1 world
+                is untouched: with every switch off, a v2 run is v1 bit for bit.
               </>
             }
           >
-            <div className="space-y-5">
-              <Reveal>
-                <V2Explorer />
-              </Reveal>
+            <BundlePanels />
+          </Section>
 
-              <Reveal>
-                <div className="panel rounded-[1.75rem] p-6 sm:p-8">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <MicroLabel>V2-16 · pure read-only visual mappings (INV-09)</MicroLabel>
-                    <span className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2.5 py-0.5 font-mono text-[10px] font-medium tracking-[0.1em] text-cyan-200 uppercase">
-                      Zero overhead on v1
-                    </span>
-                  </div>
-                  <dl className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-2">
-                    {v2VisualMappings.map((mapping) => (
-                      <div key={mapping.name} className="rounded-2xl border border-white/[0.06] bg-black/30 p-4">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <dt className="font-mono text-sm font-bold text-white">{mapping.name}</dt>
-                          <span className="font-mono text-[10px] text-cyan-200">
-                            {mapping.kind} · Studio key {mapping.key}
-                          </span>
-                        </div>
-                        <dd className="mt-2 text-sm leading-relaxed text-slate-400">{mapping.body}</dd>
-                        <dd className="mt-2 font-mono text-[11px] text-green-300/90">{mapping.flag}</dd>
-                      </div>
-                    ))}
-                  </dl>
-                  <p className="mt-5 text-xs leading-relaxed text-slate-500">
-                    All four overlays read optional epoch slices and never alter simulation state (INV-09). Absent planes
-                    degrade cleanly without heap allocation, and v1 runs ignore keys 8 and 9. See{" "}
-                    <a className={link} href="#status">
-                      Honest status
-                    </a>{" "}
-                    for the 104-run Stage-2 V2-17 empirical results and explicit residual tradeoffs.
-                  </p>
-                </div>
-              </Reveal>
+          <Section
+            id="atlas"
+            index={index("v2", "atlas")}
+            layout="wide"
+            eyebrow="The mechanism atlas"
+            title="Twenty-one [mechanisms]."
+            kicker={
+              <>
+                Each borrows an idea from biology and states it as a rule the ledger can check: what it does, its
+                numbers in the presets, where its energy goes, and what changed when Stage-2 took it away. The charts
+                are the rules themselves, computed in your browser from the presets&apos; numbers.
+              </>
+            }
+          >
+            <Reveal>
+              <V2Atlas />
+            </Reveal>
+          </Section>
+
+          <Section
+            id="views"
+            index={index("v2", "views")}
+            layout="wide"
+            eyebrow="Four read-only views"
+            title="Seeing the [hidden] state."
+            kicker={
+              <>
+                The new mechanisms keep state the ordinary picture cannot show: a cell&apos;s polarity and memory, the
+                trail carrier, the field&apos;s conductances. Four mappings draw them. Drawing reads the committed tick
+                only, so no view changes a digest. Each still is the committed preset at tick{" "}
+                {grouped(stills.tick)}, seed {stills.stills[0]?.seed ?? 42}, at 4K.
+              </>
+            }
+          >
+            <ViewStills />
+          </Section>
+
+          <Section
+            id="ablations"
+            index={index("v2", "ablations")}
+            layout="wide"
+            eyebrow="Stage-2 · 104 runs"
+            title="Take one [away]."
+            kicker={
+              <>
+                Each preset was run as committed, beside controls and with each mechanism removed, on two discovery
+                seeds and two held-out seeds the presets were not tuned on: 13 conditions × 4 seeds × 2 presets, 2,048
+                ticks each. Below, each preset beside two controls at the same tick and seed, then the population in
+                every condition.{" "}
+                <a className={link} href={siteConfig.v2Report}>
+                  The full report
+                </a>{" "}
+                keeps every run, including those that went against the hypothesis.
+              </>
+            }
+          >
+            <ControlStills />
+            <p className="mt-5 text-xs leading-relaxed text-slate-500">
+              Each still is the world&apos;s last frame of <code className="text-slate-300">flife render</code> from tick
+              0.{" "}
+              {stills.stage2
+                ? "Each world's digest and live count at tick 2,048 equal those the Stage-2 campaign recorded for the same preset, condition and seed."
+                : null}{" "}
+              Rendered at revision <code className="text-slate-300">{stills.revision.slice(0, 12)}</code>.
+            </p>
+            <div className="mt-10">
+              <AblationBars />
             </div>
+            <p className="mt-5 text-sm leading-relaxed text-slate-400">
+              Population is one measure; the report scores each condition on a dozen, and the atlas above gives
+              each mechanism&apos;s. Some removals leave more organisms alive and less structure: without oases the
+              supercolony grows by half, but its trails fade and its veins stop being bimodal; without the trail
+              carrier it grows by a fifth and lays no trails at all.
+            </p>
+          </Section>
+
+          <Section
+            id="configure"
+            index={index("v2", "configure")}
+            layout="wide"
+            eyebrow="Founding-time switches"
+            title="Compose your [own]."
+            kicker={
+              <>
+                Any combination is a world: pick mechanisms and see the network&apos;s new inputs and outputs and the
+                command that founds it. Switches are fixed when a world is founded and enter its configuration hash
+                (INV-14), so a checkpoint always says which rules made it.
+              </>
+            }
+          >
+            <Reveal>
+              <V2Explorer />
+            </Reveal>
+          </Section>
+
+          <Section
+            id="unshown"
+            index={index("v2", "unshown")}
+            layout="wide"
+            eyebrow="Residuals"
+            title="What is not [shown] yet."
+            kicker="The report lists what went against the hypotheses and what has not been run. So does this page."
+          >
+            <Residuals />
           </Section>
         </ChapterBlock>
 
-        {/* ─── 04 · What it can show ──────────────────────────────────── */}
+        {/* ─── 05 · What it can show ──────────────────────────────────── */}
         <ChapterBlock chapter={chapter("evidence")}>
           <Section
             id="replay"
@@ -931,7 +940,7 @@ export default function Home() {
             <Reveal className="mt-5">
               <div className="panel rounded-[1.75rem] p-6 sm:p-8">
                 <div className="flex flex-wrap items-center justify-between gap-3">
-                  <MicroLabel>field-ecology-v2 · branch status</MicroLabel>
+                  <MicroLabel>field-ecology-v2 · claim by claim</MicroLabel>
                   <span className="rounded-full border border-white/15 bg-white/5 px-2.5 py-0.5 font-mono text-[10px] font-medium tracking-[0.1em] text-slate-300 uppercase">
                     Observed · Four Claims kept apart
                   </span>
@@ -966,7 +975,7 @@ export default function Home() {
           </Section>
         </ChapterBlock>
 
-        {/* ─── 05 · Use it ────────────────────────────────────────────── */}
+        {/* ─── 06 · Use it ────────────────────────────────────────────── */}
         <ChapterBlock chapter={chapter("lab")}>
           <Section
             id="worlds"

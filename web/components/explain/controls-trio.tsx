@@ -13,7 +13,10 @@ import {
 
 import { BasisBadge, DemoFrame, fixed } from "@/components/explain/demo";
 import { siteConfig } from "@/lib/content";
-import { type ControlStill, controls, film } from "@/lib/media";
+import { type ControlStill, controls, filmById } from "@/lib/media";
+
+// The controls are the confluent world's, drawn as the confluent film is.
+const film = filmById("confluent");
 import { TONE } from "@/lib/palette";
 import { cn, grouped } from "@/lib/utils";
 

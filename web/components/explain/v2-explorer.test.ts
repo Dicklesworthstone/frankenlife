@@ -204,13 +204,13 @@ describe("minimal CLI override synthesis & exact round-trip", () => {
     expect(row("Rules")?.detail).toContain("All 104 Stage-2 runs");
     expect(row("Rules")?.detail).toContain("7.2 × 10⁻⁹");
     expect(row("Implementation")?.detail).toContain("all 21 features at once");
-    expect(row("Implementation")?.detail).toContain("field-ecology-v1 bit for bit");
+    expect(row("Implementation")?.detail).toContain("a v2 run is its v1 model (field-ecology-v1, or field-ecology-v1-contact for the tissue) bit for bit");
     // The report's own visual review is not the plan's G5 gate, which README.md lists as not run.
     expect(row("Visual")?.tone).toBe("partial");
     expect(row("Visual")?.detail).toContain("G5 gate");
     expect(row("Visual")?.detail).toContain("still not run");
-    expect(row("Ecological")?.detail).toContain("36 organisms of the tissue's 15,446");
-    expect(row("Ecological")?.detail).toContain("317 of the supercolony's 21,308");
+    expect(row("Ecological")?.detail).toContain("36 are alive against the tissue's 15,446");
+    expect(row("Ecological")?.detail).toContain("317 against the supercolony's 21,308");
     expect(row("Not yet shown")?.tone).toBe("open");
 
     // WAI-ARIA radiogroup keyboard wrapping (ArrowRight/Left/Up/Down, Home, End).

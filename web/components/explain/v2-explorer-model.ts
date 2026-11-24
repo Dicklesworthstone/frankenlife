@@ -123,7 +123,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
     bundleBDefault: true,
     bundleBPreset: false,
     abiNote: "+2 actions",
-    summary: "Two outputs choose where, relative to the gradients, a daughter is placed.",
+    summary: "Two outputs bias where, relative to the energy gradient, a daughter is placed.",
   },
   {
     slug: "hippo-crowding",

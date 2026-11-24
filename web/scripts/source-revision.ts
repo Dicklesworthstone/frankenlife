@@ -14,21 +14,24 @@ import { spawnSync } from "node:child_process";
 
 const SOURCES = ["crates", "presets", "Cargo.toml", "Cargo.lock"];
 
+/** Run git in `repo`: its exit status and its standard output (a warning on stderr is not output). */
 function git(repo: string, args: string[]): { ok: boolean; out: string } {
   const result = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
-  return { ok: result.status === 0, out: `${result.stdout ?? ""}${result.stderr ?? ""}`.trim() };
+  return { ok: result.status === 0, out: (result.stdout ?? "").trim() };
 }
 
 /** The full commit id the manifest records, or an error saying why it cannot name one. */
 export function sourceRevision(repo: string, revision: string | null): { revision: string } | { error: string } {
   if (revision === null) {
     const dirty = git(repo, ["status", "--porcelain", "--", ...SOURCES]);
+    if (!dirty.ok) return { error: "git status failed; is this the repository?" };
     if (dirty.out !== "") {
       return {
         error: `commit the Rust sources and presets first, or pass --revision with the commit --flife was built from; uncommitted:\n${dirty.out}`,
       };
     }
-    return { revision: git(repo, ["rev-parse", "HEAD"]).out };
+    const head = git(repo, ["rev-parse", "--verify", "HEAD^{commit}"]);
+    return head.ok ? { revision: head.out } : { error: "HEAD names no commit" };
   }
   const full = git(repo, ["rev-parse", "--verify", `${revision}^{commit}`]);
   if (!full.ok) return { error: `--revision ${revision} is not a commit` };
@@ -38,6 +41,7 @@ export function sourceRevision(repo: string, revision: string | null): { revisio
   // Working tree against REV, committed or not: the configurations must be REV's.
   const presets = git(repo, ["diff", "--name-only", full.out, "--", "presets"]);
   const untracked = git(repo, ["ls-files", "--others", "--exclude-standard", "--", "presets"]);
+  if (!presets.ok || !untracked.ok) return { error: `git could not compare presets/ with ${revision}` };
   const changed = [presets.out, untracked.out].filter((text) => text !== "").join("\n");
   if (changed !== "") return { error: `presets/ differs from --revision ${revision}:\n${changed}` };
   return { revision: full.out };

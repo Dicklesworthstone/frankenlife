@@ -42,7 +42,7 @@ export const filmChoice = {
   v2: [
     "The v2 films show the two v2 presets exactly as committed, at their own seed, 42; no parameter was tuned for the camera. Each world was first run to tick 8,192 and drawn every 256 ticks; the starting tick was then chosen by eye from those frames, where colonies or tissue islands had formed: 2,048 for the supercolony and 3,072 for the tissue. The supercolony film's first digest is the one the Stage-2 campaign recorded for the same preset and seed at that tick.",
     "The colouring was chosen by eye from single 4K test frames of five looks: founder lineage lit by each organism's energy, over the field's energy, for both. The tissue's cell-state colouring was nearly uniform at these ticks, so it appears only as a still. The veins film draws the same supercolony with the field coloured by vascular conductance, the whole torus, without a camera.",
-    "The camera is the director's described below, with its zooms given by hand: 1.3× to 1.8× for the supercolony, whose organisms are drawn at a fixed size that coarsens beyond that, and 2.6× to 3.6× for the tissue, whose bodies are 0.25 world units across.",
+    "The camera is the director's described below, with its zooms given by hand: 1.3× to 1.7× for the supercolony, whose organisms are drawn at a fixed size that coarsens if the camera comes closer, and 2.6× to 3.4× for the tissue, whose bodies are 0.25 world units across.",
   ],
   camera:
     "Where the camera looks is chosen from the run, not by hand; each shot's zoom is given. The same ticks are first rendered small; each shot then eases into the region where the organisms changed most during it, and the film opens and closes on the whole torus. The camera changes no result: the preview and the film end on the same digest.",
@@ -64,7 +64,7 @@ export const filmNotes: Record<string, { tab: string; chip: string; title: strin
     tab: "Tissue",
     chip: "v2 · Bundle A",
     title: "Tissue",
-    line: "The morphogenesis-tissue-v2 preset: 10,954 founders with bodies and 14 v2 mechanisms. Crowding stops division, polarity orients cells, inherited tags decide who sticks to whom, and kin pass food. The camera holds 2.6× to 3.6× closer than the whole torus; bright cells are well fed, dark ones starving.",
+    line: "The morphogenesis-tissue-v2 preset: 10,954 founders with bodies and 14 v2 mechanisms. Crowding stops division, polarity orients cells, inherited tags decide who sticks to whom, and kin pass food. The camera holds 2.6× to 3.4× closer than the whole torus; bright cells are well fed, dark ones starving.",
   },
   veins: {
     tab: "Veins",
@@ -485,7 +485,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "pure-field",
     abi: "none",
-    summary: "Emission comes in bursts when a recovering readiness passes one half, so signals travel as waves.",
+    summary: "Emission comes only in bursts, when a recovering readiness passes one half.",
   },
   {
     slug: "wake-offset",
@@ -509,7 +509,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "pure-field",
     abi: "+2 actions",
-    summary: "Two outputs choose where, relative to the gradients, a daughter is placed.",
+    summary: "Two outputs bias where, relative to the energy gradient, a daughter is placed.",
   },
   {
     slug: "hippo-crowding",
@@ -549,7 +549,7 @@ export const v2Features: V2FeatureEntry[] = [
     bundleB: true,
     boundary: "pure-field",
     abi: "none",
-    summary: "Below 0.10 energy an organism lyses; its energy returns carrying the opposite of its diet.",
+    summary: "Below 0.10 energy an organism lyses; about half its energy returns, carrying the opposite of its diet.",
   },
   {
     slug: "symplectic-waste",
@@ -645,7 +645,7 @@ export const v2BuildStatus: {
     claim: "Observed",
     tone: "built",
     detail:
-      "End-to-end tests run both presets, all 21 features at once (112 inputs, 44 outputs, 48 raw outputs, 34 field planes) and every feature left out in turn, and check reference, CPU and Metal controllers bit for bit, checkpoints, branches and transplants. With every feature off, a v2 run is field-ecology-v1 bit for bit.",
+      "End-to-end tests run both presets, all 21 features at once (112 inputs, 44 decisions, 48 raw outputs, 34 field planes) and every feature left out in turn, and check reference, CPU and Metal controllers bit for bit, checkpoints, branches and transplants. With every feature off, a v2 run is its v1 model (field-ecology-v1, or field-ecology-v1-contact for the tissue) bit for bit.",
   },
   {
     stage: "Visual",
@@ -659,14 +659,14 @@ export const v2BuildStatus: {
     claim: "Observed, 4 seeds",
     tone: "built",
     detail:
-      "Inheritance matters on every seed: removing it leaves 36 organisms of the tissue's 15,446 and 317 of the supercolony's 21,308. The tissue jams 4.0× less than with v2 off; the supercolony's veins raise alignment by half. Each figure is a mean over 2 discovery and 2 held-out seeds at 2,048 ticks.",
+      "Inheritance matters on every seed: without it 36 are alive against the tissue's 15,446, and 317 against the supercolony's 21,308. Each tissue cell has about half as many close neighbours as with v2 off; the supercolony's veins raise alignment by half. Each figure is a mean over 2 discovery and 2 held-out seeds at 2,048 ticks.",
   },
   {
     stage: "Not yet shown",
     claim: "Open",
     tone: "open",
     detail:
-      "Distinct core and sheath cell types (the memory state barely tracks crowding at 2,048 ticks), a gain in population from food sharing or from trails, and the lesion assay on the new tissue. No run past 2,048 ticks has been scored.",
+      "Distinct core and sheath cell types (the memory state barely tracks crowding at 2,048 ticks), a gain in population from food sharing or from trails, and the lesion assay on the new tissue. No run of the committed v2 presets past 2,048 ticks has been scored.",
   },
 ];
 
@@ -682,10 +682,10 @@ export const v2Bundles = [
     abi: "108 inputs → 40 decisions (44 raw outputs), 33 field planes",
     bodies: "0.25 world units across; they push apart and adhere ([contact]).",
     picture:
-      "Porous islands of tissue, each sorted by lineage, with well-fed cores and starving rims. Cells stop dividing in a crowd, orient, stick to their own kind and pass food to kin.",
+      "Porous islands of tissue, often several lineages side by side, brighter where cells are well fed. Cells stop dividing in a crowd, orient, stick to cells with matching tags and pass food to kin.",
     measured: [
       { label: "Alive at tick 2,048", value: "15,446", note: "mean of 4 seeds" },
-      { label: "Jamming vs v2 off", value: "4.0× less", note: "overlapping neighbour pairs, 4/4" },
+      { label: "Close neighbours vs v2 off", value: "½ as many", note: "per cell, 2.0 against 3.6; 4/4" },
       { label: "Food shared with kin", value: "79,910", note: "energy per run, every window" },
     ],
   },
@@ -699,7 +699,7 @@ export const v2Bundles = [
     abi: "108 inputs → 40 decisions (40 raw outputs), 34 field planes",
     bodies: "Points: no organism pushes or pulls another (INV-08).",
     picture:
-      "Compact, moving colonies with bright, bursting rims, between food sources that bloom and fade. Everything they share passes through the field: pulses, slow trails and the veins that flow carves in it.",
+      "Compact, moving colonies with well-fed, brightly lit rims, between food sources that bloom and fade. Everything they share passes through the field: bursts of emission, slow trails and the veins that flow carves in it.",
     measured: [
       { label: "Alive at tick 2,048", value: "21,308", note: "mean of 4 seeds" },
       { label: "Alignment from veins", value: "+50%", note: "0.378 vs 0.252 without, 4/4" },
@@ -720,7 +720,7 @@ export const v2Ablations: { bundle: string; preset: string; rows: AblationRow[] 
     preset: "morphogenesis-tissue-v2",
     rows: [
       { condition: "as committed", live: 15446, kind: "treatment" },
-      { condition: "every v2 feature off", live: 34489, kind: "control", note: "jammed slabs, 4.0× more overlaps" },
+      { condition: "every v2 feature off", live: 34489, kind: "control", note: "packed slabs, 1.8× the close neighbours per cell" },
       { condition: "decisions removed", live: 27603, kind: "control", note: "less coherent on all 4 seeds" },
       { condition: "networks cannot evolve", live: 15186, kind: "control" },
       { condition: "inheritance removed", live: 36, kind: "control", note: "429× fewer" },
@@ -731,7 +731,7 @@ export const v2Ablations: { bundle: string; preset: string; rows: AblationRow[] 
       { condition: "− epigenetic state and notch", live: 15286, kind: "minus" },
       { condition: "− notch-delta", live: 15725, kind: "minus" },
       { condition: "− lysis-recycling", live: 15591, kind: "minus" },
-      { condition: "+ velocity-alignment", live: 9574, kind: "plus", note: "streams, but overshoots its food" },
+      { condition: "+ velocity-alignment", live: 9574, kind: "plus", note: "streams together, 38% fewer alive" },
     ],
   },
   {
@@ -741,7 +741,7 @@ export const v2Ablations: { bundle: string; preset: string; rows: AblationRow[] 
       { condition: "as committed", live: 21308, kind: "treatment" },
       { condition: "every v2 feature off", live: 21075, kind: "control", note: "no fronts, no trails, no veins" },
       { condition: "decisions removed", live: 20436, kind: "control", note: "no trails at all" },
-      { condition: "networks cannot evolve", live: 19942, kind: "control", note: "+10.0% on held-out seeds" },
+      { condition: "networks cannot evolve", live: 19942, kind: "control", note: "evolving ones keep 10% more on held-out seeds" },
       { condition: "inheritance removed", live: 317, kind: "control", note: "67× fewer" },
       { condition: "− vascular-field", live: 20113, kind: "minus", note: "alignment falls by a third" },
       { condition: "− dual-carrier-trails", live: 25695, kind: "minus", note: "trails cost 17%" },
@@ -759,7 +759,7 @@ export const v2Ablations: { bundle: string; preset: string; rows: AblationRow[] 
 export const v2Residuals = [
   {
     title: "No separate cell types yet",
-    body: "Clones do vary in their memory state, but at 2,048 ticks that state barely tracks how crowded a cell is (r = +0.069). Distinct core and sheath cells would need it near 0.3; longer runs may or may not get there.",
+    body: "Clones do vary in their memory state, but at 2,048 ticks that state barely tracks how crowded a cell is (r = +0.069). Distinct core and sheath cells would need |r| above 0.3; longer runs may or may not get there.",
   },
   {
     title: "Sharing food does not raise the count",
@@ -767,7 +767,7 @@ export const v2Residuals = [
   },
   {
     title: "Organisms without decisions do well in the tissue",
-    body: "With every network output zeroed, 27,603 are alive against 15,446: they spend nothing on emission or motion and are fed by kin. They are less coherent on every alignment measure, on all 4 seeds, and twice as crowded.",
+    body: "With every network output zeroed, 27,603 are alive against 15,446: they spend nothing on emission or on the networks' own steering, and kin feed them. They are less coherent on every alignment measure, on all 4 seeds, and a little more crowded (1.2× the close neighbours per cell).",
   },
   {
     title: "Smoother gliders align more",
@@ -1085,7 +1085,7 @@ export const presets: {
     dt: "1/32",
     kind: "v2",
     chosen: "V2-17 verified · 52 Stage-2 runs",
-    body: "Bodies that touch, with 14 v2 mechanisms: crowding stops division, polarity orients, inherited tags sort lineages, kin share food. 108 inputs and 40 decisions per brain. Over 4 seeds at tick 2,048 it jams 4.0× less than with v2 off, and without inheritance only 36 of its 15,446 survive.",
+    body: "Bodies that touch, with 14 v2 mechanisms: crowding stops division, polarity orients, inherited tags decide who sticks to whom, kin share food. 108 inputs and 40 decisions per brain. Over 4 seeds at tick 2,048 each cell has about half as many close neighbours as with v2 off, and without inheritance 36 are alive against 15,446.",
   },
   {
     file: "supercolony-v2",

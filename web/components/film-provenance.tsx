@@ -19,6 +19,13 @@ function Row({ label, value, mono }: { label: string; value: string; mono?: bool
   );
 }
 
+/** The zooms the shots reached, in order (keys hold each zoom twice; the whole torus, 1, is not a shot). */
+function shotZooms(keys: { zoom: number }[]): string {
+  const zooms: number[] = [];
+  for (const { zoom } of keys) if (zoom > 1 && zooms.at(-1) !== zoom) zooms.push(zoom);
+  return zooms.map((zoom) => `${zoom}×`).join(", ");
+}
+
 export function FilmProvenance({ film }: { film: FilmManifest }) {
   const { world, render, video } = film;
   const note = filmNotes[film.id];
@@ -70,7 +77,7 @@ export function FilmProvenance({ film }: { film: FilmManifest }) {
             <Row label="Field" value={`${render.field_mapping === "none" ? "not drawn" : render.field_mapping}, ${render.look} look`} />
             <Row label="Camera" value={
                 render.camera
-                  ? `${render.camera.keys.length} keys; centres from the run, zooms ${render.camera.options.zooms.join(", ")}`
+                  ? `${render.camera.keys.length} keys; centres from the run, zooms ${shotZooms(render.camera.keys)}`
                   : "the whole torus, still"
               } />
             <Row label="Revision" value={render.revision.slice(0, 12)} mono />

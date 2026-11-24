@@ -204,7 +204,8 @@ const sourceTarget = runDir !== null ? ["--run-dir", runDir] : [config as string
 const sourceConfigPath = runDir !== null ? join(runDir, "config.toml") : (config as string);
 // The torus in world units: [world] width and height of the run's configuration.
 const torusExtent: [number, number] = (() => {
-  const section = /^\[world\]\s*$([\s\S]*?)(?=^\[)/m.exec(readFileSync(sourceConfigPath, "utf8"))?.[1] ?? "";
+  // The sentinel "[" ends the section when [world] is the file's last.
+  const section = /^\[world\]\s*$([\s\S]*?)(?=^\[)/m.exec(`${readFileSync(sourceConfigPath, "utf8")}\n[`)?.[1] ?? "";
   const dimension = (key: string) => {
     const value = Number(new RegExp(`^${key}\\s*=\\s*([0-9.eE+-]+)`, "m").exec(section)?.[1]);
     return Number.isFinite(value) && value > 0 ? value : fail(`the run's [world] ${key} is not a positive number`);

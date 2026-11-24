@@ -106,6 +106,14 @@ describe("the media Worker", () => {
     expect(response.body).toBeNull();
   });
 
+  test("answers a HEAD without a range with the whole file's length", async () => {
+    const response = await get(undefined, "HEAD");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Accept-Ranges")).toBe("bytes");
+    expect(response.headers.get("Content-Length")).toBe(String(SIZE));
+    expect(response.body).toBeNull();
+  });
+
   test("serves a file it has no size for whole, still a 200", async () => {
     const unsized = mediaWorker(new Map());
     const response = await unsized.fetch(

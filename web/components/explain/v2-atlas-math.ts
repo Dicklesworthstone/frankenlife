@@ -7,7 +7,7 @@
 /** The presets' tick: 1/32 simulated second ([world] timestep). */
 export const DT = 1 / 32;
 
-// ─── oases (V2-02; crates/flife-core/src/v2.rs, OasesRule) ───────────────────
+// ─── oases (V2-02; crates/flife-field/src/sources.rs, OasisSchedule::powers_at) ─
 
 export const OASES = { sources: 16, periodSeconds: 24, minimumFraction: 0.05 } as const;
 
@@ -112,7 +112,7 @@ export function steadyConductance(flux: number, rule = VASCULAR): number {
 
 // ─── dual-carrier-trails (V2-15) and the food field's own decay ──────────────
 
-/** The supercolony preset's [field] decay and [v2.carriers] trail decay, per simulated second. */
+/** The supercolony preset's [world] decay_per_second and [v2.carriers] trail_decay_per_second. */
 export const DECAY = { food: 0.0818013, trail: 0.03 } as const;
 
 /** What is left of a deposit after t seconds of first-order decay (diffusion aside). */

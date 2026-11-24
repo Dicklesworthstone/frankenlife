@@ -33,7 +33,7 @@ export function BundlePanels() {
                   height={still.height}
                   loading="lazy"
                   decoding="async"
-                  alt={`The ${bundle.name} preset at tick ${grouped(still.tick)}, seed ${still.seed}: ${grouped(still.live)} organisms, the whole torus.`}
+                  alt={`The ${bundle.name} preset at tick ${grouped(still.tick)}, seed ${still.seed}: ${grouped(still.live)} organisms, a wide band across the middle of the whole torus.`}
                   className="h-full w-full object-cover"
                 />
                 <Reticle inset={10} size={14} />

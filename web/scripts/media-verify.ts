@@ -79,7 +79,7 @@ export function verifyMediaDirectory(
     }
     const path = join(publicDir, file.src);
     if (!existsSync(path)) {
-      errors.push(`${file.src} is missing; run \`bun run media\` or scripts/stills.ts (web/README.md)`);
+      errors.push(`${file.src} is missing; run \`bun run media\`, scripts/controls.ts or scripts/stills.ts (web/README.md)`);
       continue;
     }
     const bytes = readFileSync(path);
@@ -93,7 +93,7 @@ export function verifyMediaDirectory(
   const media = join(publicDir, "media");
   for (const name of existsSync(media) ? readdirSync(media) : []) {
     if (!named.has(name)) {
-      errors.push(`public/media/${name} is named by no manifest (lib/films/*.json, lib/stills.json); move it out before building`);
+      errors.push(`public/media/${name} is named by no manifest (lib/films/*.json, lib/controls.json, lib/stills.json); move it out before building`);
     }
   }
 

@@ -222,7 +222,7 @@ function RelayChart() {
   const s = scale(ticks / 32, 1);
   return (
     <Frame
-      title="Readiness of an organism that always wants to emit: it bursts each time readiness passes one half, every 21 ticks"
+      title="Readiness of an organism that always wants to emit: it bursts each time readiness recovers past one half, every 21 ticks, and each burst drains 85% of it"
       s={s}
       xLabel="seconds"
       yLabel="readiness"
@@ -235,7 +235,7 @@ function RelayChart() {
       ))}
       <path d={line(readiness.map((r, tick) => [tick / 32, r] as [number, number]), s)} stroke={TONE.energy} strokeWidth="1.6" fill="none" />
       <text x={s.x(fired[1] !== undefined ? fired[1] / 32 : 1) + 3} y={s.y(0.97)} fontSize="7" fill={TONE.chemistry} fontFamily="var(--font-mono, ui-monospace)">
-        burst ×5
+        bursts
       </text>
     </Frame>
   );
@@ -375,7 +375,7 @@ function GateChart() {
 /** A diet vector a, its right-angle turn Ja, and the effective diet at a chosen h₀. */
 function TurnChart() {
   const [h0, setH0] = useState(0.5);
-  const id = useId();
+  const id = useId().replace(/[^a-zA-Z0-9_-]/g, "");
   const angle = affinityTurn(h0);
   const c = { x: 120, y: 64 };
   const r = 46;
@@ -427,7 +427,7 @@ function TurnChart() {
 
 /** One organism, its diet a and where each kind of deposit points: corpse −a, waste Ja, wake behind its motion. */
 function DepositChart({ slug }: { slug: AtlasEntry["slug"] }) {
-  const id = useId();
+  const id = useId().replace(/[^a-zA-Z0-9_-]/g, "");
   const c = { x: 112, y: 64 };
   const lit = (on: boolean) => (on ? 1 : 0.28);
   const isLysis = slug === "lysis-recycling";
@@ -475,7 +475,7 @@ function DepositChart({ slug }: { slug: AtlasEntry["slug"] }) {
 
 /** The motor's four terms around one organism: food gradient, chemical gradient, contour and heading. */
 function MotorChart() {
-  const id = useId();
+  const id = useId().replace(/[^a-zA-Z0-9_-]/g, "");
   const c = { x: 120, y: 66 };
   const arrows = [
     { dx: 50, dy: -22, colour: TONE.energy, label: "∇E food" },

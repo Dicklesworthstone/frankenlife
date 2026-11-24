@@ -76,7 +76,7 @@ const SPECS: Spec[] = [
     bundle: "tissue",
     condition: "treatment",
     label: "Tissue, as committed",
-    caption: "Every Bundle A mechanism on: porous islands of tissue, each lineage holding its own.",
+    caption: "Every Bundle A mechanism on: porous islands of tissue, several lineages side by side.",
     draw: WHOLE,
   },
   {
@@ -103,7 +103,7 @@ const SPECS: Spec[] = [
     bundle: "supercolony",
     condition: "treatment",
     label: "Supercolony, as committed",
-    caption: "Every Bundle B mechanism on: compact colonies with bright, bursting rims, between blooming oases.",
+    caption: "Every Bundle B mechanism on: compact colonies with well-fed, brightly lit rims, between blooming oases.",
     draw: WHOLE,
   },
   {
@@ -112,7 +112,7 @@ const SPECS: Spec[] = [
     bundle: "supercolony",
     condition: "v1-compat",
     label: "Every v2 feature off",
-    caption: "The same preset with --v1-compat: colonies still form, but nothing bursts, so their rims stay dark, and no trails or veins are laid.",
+    caption: "The same preset with --v1-compat: colonies still form, larger and without lit rims; with no trail carrier or vascular field, no trails or veins are laid.",
     draw: WHOLE,
   },
   {
@@ -226,7 +226,9 @@ function configText(spec: Spec): string {
     const line = `${key} = "${from}"`;
     const count = input.split("\n").filter((each) => each === line).length;
     if (count !== 1) fail(`${preset.path} has ${count} lines \`${line}\`, not one`);
-    return input.replace(`\n${line}\n`, `\n${key} = "${to}"\n`);
+    const lines = input.split("\n");
+    lines[lines.indexOf(line)] = `${key} = "${to}"`;
+    return lines.join("\n");
   };
   return swap(swap(text, "model", "field-ecology-v2", "field-ecology-v2-fresh-offspring"), "name", preset.name, `${preset.name}-fresh-offspring`);
 }
@@ -279,9 +281,21 @@ for (const spec of chosen) {
 
 // ─── The manifest ────────────────────────────────────────────────────────────
 
-const previous = existsSync(join(WEB, "lib", "stills.json"))
-  ? (JSON.parse(readFileSync(join(WEB, "lib", "stills.json"), "utf8")) as { stills: { id: string }[] }).stills
-  : [];
+type PreviousManifest = { flife_sha256: string; revision: string; stills: { id: string }[] };
+const previousManifest = existsSync(join(WEB, "lib", "stills.json"))
+  ? (JSON.parse(readFileSync(join(WEB, "lib", "stills.json"), "utf8")) as PreviousManifest)
+  : null;
+// The manifest names one binary and one revision for every still, so stills
+// kept from an earlier run (--only) must have been drawn by the same ones.
+if (only !== null && previousManifest && previousManifest.stills.some((still) => !only.has(still.id))) {
+  if (previousManifest.flife_sha256 !== flifeSha || previousManifest.revision !== source.revision) {
+    fail(
+      `lib/stills.json was made by flife ${previousManifest.flife_sha256.slice(0, 12)} at ${previousManifest.revision.slice(0, 12)}, ` +
+        `not ${flifeSha.slice(0, 12)} at ${source.revision.slice(0, 12)}: render every still again, without --only`,
+    );
+  }
+}
+const previous = previousManifest?.stills ?? [];
 const media = join(WEB, "public", "media");
 mkdirSync(media, { recursive: true });
 const made = chosen.map((spec) => {
@@ -350,7 +364,8 @@ const manifest = {
   schema: "frankenlife.website-stills.v1",
   tick: TICK,
   jpeg: JPEG,
-  stage2: stage2Path
+  // Claimed for the set only if every still, kept or new, was checked against the summary.
+  stage2: stills.every((still) => still.stage2 !== null)
     ? "experiments/v2-emergence/README.md: each digest and live count equals the V2-17 Stage-2 summary's record (stage2_summary_FINAL_104.json, kept outside git) for the same bundle, condition and seed"
     : null,
   flife_sha256: flifeSha,

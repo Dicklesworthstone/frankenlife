@@ -131,7 +131,11 @@ async function serve(request: Request, env: Env, sizes: ReadonlyMap<string, numb
   const plain = !whole.ok || !whole.body || !Number.isFinite(size) || out.has("Content-Encoding");
   const wanted = range === null || plain ? null : parseRange(range, size);
   if (wanted === null) {
-    if (head) await whole.body?.cancel();
+    if (head) {
+      await whole.body?.cancel();
+      // A HEAD has no body to measure, so the size is said here (the edge measures a GET's).
+      if (!plain) out.set("Content-Length", String(size));
+    }
     return new Response(head ? null : whole.body, { status: whole.status, headers: out });
   }
   if (wanted === "unsatisfiable") {

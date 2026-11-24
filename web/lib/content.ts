@@ -611,21 +611,21 @@ export const v2BuildStatus: {
     claim: "Rules & Implementation",
     tone: "built",
     detail:
-      "10 of 18 V2 beads verified and closed: V2-01 (21-slug config/registry, --list-features, --disable/--enable/--v1-compat, INV-14 resume refusal), V2-02 (oases), V2-03 (senescence), V2-04 (surplus-emission, excitable-relay, wake-offset), V2-05 (so2-motor), V2-06 (so2-budding), V2-07 (hippo-crowding), V2-09 (tight-junctions), V2-14 (vascular-field), and V2-15 (dual-carrier-trails), alongside FL-043 peak-memory admission closed; V2-10 quickies, V2-17 Stage-2 harness and presets, and FL-050 1080p/4K Cinema export authored.",
+      "15 of 18 V2 beads verified and closed across all 21 feature slugs: V2-01 (21-slug config/registry, --list-features, --disable/--enable/--v1-compat, INV-14 resume refusal), V2-02 (oases), V2-03 (senescence), V2-04 (surplus-emission, excitable-relay, wake-offset), V2-05 (so2-motor), V2-06 (so2-budding), V2-07 (hippo-crowding), V2-08 (pcp-polarity, emt-gate), V2-09 (tight-junctions), V2-11 (lysis-recycling, symplectic-waste), V2-12 (epigenetic-recurrence, notch-delta), V2-13 (trophallaxis, cadherin-4d, velocity-alignment), V2-14 (vascular-field), V2-15 (dual-carrier-trails), and V2-16 (v2-visual-mappings), alongside FL-043 peak-memory admission and FL-050 Cinema export.",
   },
   {
     stage: "In flight",
-    claim: "Implementation",
+    claim: "Empirical calibration & verification",
     tone: "partial",
     detail:
-      "Remaining Wave-1b/Wave-2 modules: V2-08 (pcp-polarity, emt-gate), V2-11 (lysis-recycling, symplectic-waste), V2-12 (epigenetic-recurrence, notch-delta), V2-13 (trophallaxis, cadherin-4d, velocity-alignment), and V2-16 (v2-visual-mappings live V2-08 polarity gate).",
+      "V2-10 128² quickies completed (Arm 2 treatment self-regulated at ~51% of cap with 1.98× wound-rim proliferation vs 0.989× v1-compat and 0.888× no-tight-junctions, while Arm 1 stayed null and exposed a real F32 INV-02 cone-drift bug); Plan §11.5 cone contraction, Rust v2_diagnostics, and V2-17 Bundle A/B calibration are in flight.",
   },
   {
     stage: "Not yet established",
     claim: "Visual & Ecological",
     tone: "open",
     detail:
-      "V2-10 multi-seed ablation quickies and V2-17 Stage-2 preset verification/calibration have not yet run. No visual (G5) or ecological (G9) claims are made for field-ecology-v2 presets.",
+      "V2-17 calibrated Stage-2 Bundle A & B multi-seed runs, G9 ecological claims, and human G5 visual review remain open. No unearned visual or ecological claims are made for field-ecology-v2 presets.",
   },
 ];
 
@@ -954,7 +954,7 @@ export const milestones = [
   { id: "M3", name: "Qualified acceleration", deliverable: "CPU/Metal parity, persistent buffers, fused population inference, variable topology", gates: ["G4"] },
   { id: "M4", name: "Screenshot-scale world", deliverable: "400k independent networks near 10k parameters on a 1024² field, interactive, honest clocks", gates: ["G7", "G8"] },
   { id: "M5", name: "Scientific and visual release", deliverable: "A seed gallery, ablations, experiment reports, reliable Cinema export", gates: ["G9", "G10"] },
-  { id: "M6", name: "Additional model families", deliverable: "Modular field-ecology-v2 (21 toggleable mechanisms, Bundles A & B): registry, field/neural crates, V2-16 visuals and harness landed; engine modules in flight; empirical verification pending", gates: [] },
+  { id: "M6", name: "Additional model families", deliverable: "Modular field-ecology-v2 (21 toggleable mechanisms, Bundles A & B): all 21 engine & visual modules verified (15/18 V2 beads closed); V2-10 & V2-17 empirical calibration and multi-seed verification in flight", gates: [] },
 ];
 
 export const stack = [

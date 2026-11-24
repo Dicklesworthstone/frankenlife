@@ -36,8 +36,8 @@ export type V2ExplorerFeature = {
  * (`crates/flife-core/src/v2.rs`, `V2Feature::ALL`).
  *
  * Verification status reflects the observed branch state (AGENTS.md):
- * - Verified & closed: V2-01..V2-07, V2-09, V2-14, V2-15.
- * - In flight: V2-08, V2-11, V2-12, V2-13, V2-16 (empirical campaigns V2-10 & V2-17 pending).
+ * - Verified & closed (15/18 V2 beads — all 21 feature slugs): V2-01..V2-09, V2-11..V2-16.
+ * - Empirical campaigns in flight: V2-10 & V2-17.
  */
 export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
   {
@@ -139,7 +139,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
   {
     slug: "pcp-polarity",
     module: "V2-08",
-    verification: "in-flight",
+    verification: "verified",
     boundary: "contact",
     requiresContact: true,
     bundleADefault: true,
@@ -151,7 +151,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
   {
     slug: "emt-gate",
     module: "V2-08",
-    verification: "in-flight",
+    verification: "verified",
     boundary: "contact",
     requiresContact: true,
     bundleADefault: false,
@@ -175,7 +175,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
   {
     slug: "lysis-recycling",
     module: "V2-11",
-    verification: "in-flight",
+    verification: "verified",
     boundary: "pure-field",
     requiresContact: false,
     bundleADefault: true,
@@ -187,7 +187,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
   {
     slug: "symplectic-waste",
     module: "V2-11",
-    verification: "in-flight",
+    verification: "verified",
     boundary: "pure-field",
     requiresContact: false,
     bundleADefault: true,
@@ -199,7 +199,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
   {
     slug: "epigenetic-recurrence",
     module: "V2-12",
-    verification: "in-flight",
+    verification: "verified",
     boundary: "pure-field",
     requiresContact: false,
     bundleADefault: true,
@@ -211,7 +211,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
   {
     slug: "notch-delta",
     module: "V2-12",
-    verification: "in-flight",
+    verification: "verified",
     boundary: "contact",
     requiresContact: true,
     bundleADefault: true,
@@ -223,7 +223,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
   {
     slug: "trophallaxis",
     module: "V2-13",
-    verification: "in-flight",
+    verification: "verified",
     boundary: "contact",
     requiresContact: true,
     bundleADefault: true,
@@ -235,7 +235,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
   {
     slug: "cadherin-4d",
     module: "V2-13",
-    verification: "in-flight",
+    verification: "verified",
     boundary: "contact",
     requiresContact: true,
     bundleADefault: true,
@@ -247,7 +247,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
   {
     slug: "velocity-alignment",
     module: "V2-13",
-    verification: "in-flight",
+    verification: "verified",
     boundary: "contact",
     requiresContact: true,
     bundleADefault: false,
@@ -283,7 +283,7 @@ export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
   {
     slug: "v2-visual-mappings",
     module: "V2-16",
-    verification: "in-flight",
+    verification: "verified",
     boundary: "presentation",
     requiresContact: false,
     bundleADefault: true,

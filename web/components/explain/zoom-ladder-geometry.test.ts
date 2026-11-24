@@ -54,13 +54,13 @@ describe("the film's pictures on the torus", () => {
     expect(cameraAt([{ tick: 0, center: [82, -4], zoom: 2 }], 10).center).toEqual([2, 76]);
   });
 
-  test("the card is frame 184 at tick 3,872, zoom 3, halfway between two keys: centre (28.125, 67.8125)", () => {
+  test("the card is frame 368 at tick 3,872, zoom 3, halfway between two keys: centre (27.8125, 67.5)", () => {
     const card = cardPlacement(film);
-    expect(film.social.frame).toBe(184);
+    expect(film.social.frame).toBe(368);
     expect(card.tick).toBe(3872);
     expect(card.zoom).toBeCloseTo(3, 12);
-    expect(card.center[0]).toBeCloseTo(28.125, 12);
-    expect(card.center[1]).toBeCloseTo(67.8125, 12);
+    expect(card.center[0]).toBeCloseTo(27.8125, 12);
+    expect(card.center[1]).toBeCloseTo(67.5, 12);
     // 80/3 units wide; 630/1200 of that tall: 14 units.
     expect(card.width).toBeCloseTo(80 / 3, 12);
     expect(card.height).toBeCloseTo(14, 12);

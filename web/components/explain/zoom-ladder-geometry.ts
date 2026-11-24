@@ -6,7 +6,7 @@
 // - The torus is 80 × 80 world units with a 320 × 320 field, and a body is
 //   0.25 units across: presets/confluent-world.toml, [world] and [contact].
 // - The poster is film frame 0 and the card is cut from frame `social.frame`
-//   (lib/media.json). A frame is 1080 × 1080 and shows 80/zoom world units
+//   (lib/media.json). A frame is 2160 × 2160 and shows 80/zoom world units
 //   across, y down as the world's (crates/flife-cli/src/camera.rs).
 // - The card is that frame scaled to 1200 wide and centre-cropped to 1200 × 630
 //   (scripts/media.ts: `scale=1200:-1,crop=1200:630`).
@@ -16,7 +16,7 @@ import type { FilmManifest } from "@/lib/media";
 export const TORUS = 80;
 export const FIELD_CELLS = 320;
 export const BODY = 0.25;
-export const FRAME_PX = 1080;
+export const FRAME_PX = 2160;
 export const CARD_W = 1200;
 export const CARD_H = 630;
 
@@ -103,7 +103,7 @@ export function cardPixelToWorld(card: Placement, x: number, y: number): [number
  * among the strongest. It belongs to the card with this SHA-256; a new film
  * needs a new pick (zoom-ladder-geometry.test.ts says so).
  */
-export const PICK = { x: 653, y: 431, cardSha256: "4ba4280e3c60eba6309d6253c5f6cb607f241179ebf3ef1a2d418993e2654607" } as const;
+export const PICK = { x: 667, y: 445, cardSha256: "8f0b33d8b0b2b68c17ccdbe0a9dc10ff61d026e67cd6f325aa12d8f11b0edbf4" } as const;
 
 /** A camera over the torus: the centre of the view and its width in world units (the view is square). */
 export type View = { cx: number; cy: number; span: number };

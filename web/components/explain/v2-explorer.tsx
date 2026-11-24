@@ -154,9 +154,9 @@ export function V2Explorer() {
           (<code className="text-slate-300">V2Feature::ALL</code>,{" "}
           <code className="text-slate-300">V2Config::abi</code>, <code className="text-slate-300">validate_v2</code>)
           and <code className="text-slate-300">flife --list-features</code>. Configuration and ABI calculator only —
-          not simulation output. Verified &amp; closed (10/18 V2 beads + FL-043): V2-01..V2-07, V2-09, V2-14, V2-15.
-          In flight: V2-08, V2-11..V2-13, V2-16. Empirical multi-seed campaigns (V2-10, V2-17) are pending; no
-          ecological claims are made here.
+          not simulation output. Verified &amp; closed (15/18 V2 beads — all 21 slugs + FL-043): V2-01..V2-09,
+          V2-11..V2-16. Empirical multi-seed campaigns (V2-10, V2-17) are in flight; no ecological claims are made
+          here.
         </>
       }
     >
@@ -397,13 +397,9 @@ export function V2Explorer() {
         <div className="flex flex-wrap items-center gap-3 font-mono text-[10px]">
           <span className="inline-flex items-center gap-1.5 text-green-300">
             <span aria-hidden="true" className="h-2 w-2 rounded-full bg-green-400" />
-            Verified &amp; closed (V2-02..07, 09, 14, 15)
+            Verified &amp; closed (all 21 slugs: V2-01..09, 11..16)
           </span>
-          <span className="inline-flex items-center gap-1.5 text-amber-200">
-            <span aria-hidden="true" className="h-2 w-2 rounded-full bg-amber-300" />
-            In flight (V2-08, 11..13, 16)
-          </span>
-          <span className="text-slate-500">Campaigns pending (V2-10, V2-17)</span>
+          <span className="text-slate-400">Empirical campaigns in flight (V2-10, V2-17)</span>
         </div>
       </div>
 

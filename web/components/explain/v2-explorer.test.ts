@@ -32,16 +32,26 @@ describe("V2 explorer canonical registry parity", () => {
     expect(v2Features.filter((f) => f.bundleB).map((f) => f.slug)).toEqual([...BUNDLE_B_DEFAULTS]);
   });
 
-  test("maps honest observed verification states (verified vs in-flight)", () => {
-    const verifiedModules = new Set(["V2-02", "V2-03", "V2-04", "V2-05", "V2-06", "V2-07", "V2-09", "V2-14", "V2-15"]);
-    const inFlightModules = new Set(["V2-08", "V2-11", "V2-12", "V2-13", "V2-16"]);
+  test("maps honest observed verification states (all 21 feature slugs verified & closed)", () => {
+    const verifiedModules = new Set([
+      "V2-02",
+      "V2-03",
+      "V2-04",
+      "V2-05",
+      "V2-06",
+      "V2-07",
+      "V2-08",
+      "V2-09",
+      "V2-11",
+      "V2-12",
+      "V2-13",
+      "V2-14",
+      "V2-15",
+      "V2-16",
+    ]);
     for (const f of V2_EXPLORER_FEATURES) {
-      if (verifiedModules.has(f.module)) {
-        expect(f.verification).toBe("verified");
-      } else {
-        expect(inFlightModules.has(f.module)).toBe(true);
-        expect(f.verification).toBe("in-flight");
-      }
+      expect(verifiedModules.has(f.module)).toBe(true);
+      expect(f.verification).toBe("verified");
     }
   });
 });
@@ -187,18 +197,33 @@ describe("minimal CLI override synthesis & exact round-trip", () => {
     );
   });
 
-  test("keeps content.ts v2BuildStatus synced with the 10/18 closed V2 beads + FL-043 and supports radiogroup arrow navigation", () => {
+  test("keeps content.ts v2BuildStatus synced with the 15/18 closed V2 beads + FL-043 and supports radiogroup arrow navigation", () => {
     const landed = v2BuildStatus.find((row) => row.tone === "built")?.detail ?? "";
     const inFlight = v2BuildStatus.find((row) => row.tone === "partial")?.detail ?? "";
     const open = v2BuildStatus.find((row) => row.tone === "open")?.detail ?? "";
 
-    for (const closed of ["V2-01", "V2-02", "V2-03", "V2-04", "V2-05", "V2-06", "V2-07", "V2-09", "V2-14", "V2-15", "FL-043"]) {
+    for (const closed of [
+      "V2-01",
+      "V2-02",
+      "V2-03",
+      "V2-04",
+      "V2-05",
+      "V2-06",
+      "V2-07",
+      "V2-08",
+      "V2-09",
+      "V2-11",
+      "V2-12",
+      "V2-13",
+      "V2-14",
+      "V2-15",
+      "V2-16",
+      "FL-043",
+    ]) {
       expect(landed).toContain(closed);
     }
-    for (const active of ["V2-08", "V2-11", "V2-12", "V2-13", "V2-16"]) {
-      expect(inFlight).toContain(active);
-    }
-    expect(open).toContain("V2-10");
+    expect(inFlight).toContain("V2-10");
+    expect(inFlight).toContain("V2-17");
     expect(open).toContain("V2-17");
 
     // WAI-ARIA radiogroup keyboard wrapping (ArrowRight/Left/Up/Down, Home, End).

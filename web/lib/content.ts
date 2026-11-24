@@ -696,7 +696,8 @@ export const gates: { id: string; name: string; state: GateState; detail: string
     id: "G6",
     name: "30 fps with p95 input latency ≤ 100 ms",
     state: "partial",
-    detail: "Offscreen only: 30.00 fps at 1080p (p95 51.6 ms) and 29.79 at 4K (p95 59.9 ms). Not yet measured in a window.",
+    detail:
+      "Small profile verified in a live 2× Retina AppKit window (M5 Ultra): 30.00 fps at 1080p CPU-16 (p95 bound 44.9 ms), 1080p live Metal-8 (p95 bound 42.8 ms, 1.69M GPU evals), and 4K Retina (p95 bound 49.3 ms, 0 B readback). 25k/100k live profiles remain under FL-034.",
   },
   {
     id: "G7",

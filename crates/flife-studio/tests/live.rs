@@ -293,11 +293,11 @@ fn live() -> Result<Vec<String>, String> {
     )?;
     let reserved = live.studio.view().cloud().reserved_bytes();
     live.check(
-        live.studio.view().scene_objects() == 4
+        live.studio.view().scene_objects() == 5
             && live.studio.view().cloud().capacity() == ceiling as usize,
         format!(
-            "four scene objects (the field, one cloud, its density layer and the selection \
-             ring), the cloud reserved once for the {ceiling}-organism ceiling"
+            "five scene objects (the field, one cloud, its density layer, the brush region and the \
+             selection ring), the cloud reserved once for the {ceiling}-organism ceiling"
         ),
     )?;
 
@@ -510,6 +510,7 @@ fn live() -> Result<Vec<String>, String> {
     for (code, text) in [
         (KEY_DIGITS[0], "1"),
         (KEY_R, "r"),
+        (KEY_R, "r"),
         (KEY_D, "d"),
         (KEY_F, "f"),
     ] {
@@ -525,8 +526,8 @@ fn live() -> Result<Vec<String>, String> {
             && shown_tick(&restored) == Some(at)
             && !live.studio.controls().running(),
         format!(
-            "1, R, D and F restore the lineage colours bit for bit; all {} restyles kept tick {at} \
-             on screen with no new epoch and no run",
+            "1, R×2 (raw -> sphere -> glow), D and F restore the lineage colours bit for bit; all \
+             {} restyles kept tick {at} on screen with no new epoch and no run",
             live.studio.tally().restyles
         ),
     )?;

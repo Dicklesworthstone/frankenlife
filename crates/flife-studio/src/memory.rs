@@ -223,6 +223,47 @@ pub fn observer_limit(memory: &MemoryAdmission) -> u64 {
         .saturating_sub(memory.backend)
 }
 
+/// Target drawable ceiling (`3840 × 2160`, 4K) reserved for live window
+/// resizing when a resizable native window opens with a batched controller
+/// backend (FL-043, INV-15).
+pub const RESIZABLE_WINDOW_TARGET: [u32; 2] = [3840, 2160];
+
+/// Reserve live-resize headroom for a resizable native window (FL-043, INV-15)
+/// by trimming `memory.backend` so [`observer_limit`] can grow up to
+/// `max(opening_drawable, RESIZABLE_WINDOW_TARGET)` at `pixels_per_point`
+/// without exceeding `memory.budget_bytes`. Never takes more than half of
+/// `memory.backend`, so a tight budget still opens with backend capacity while
+/// a roomy budget lets the user resize seamlessly up to 4K.
+pub fn reserve_resize_headroom(
+    memory: &mut MemoryAdmission,
+    feed_bytes: u64,
+    view: &WorldView,
+    opening_drawable: [u32; 2],
+    pixels_per_point: f64,
+) {
+    if memory.backend == 0 {
+        return;
+    }
+    let target = [
+        opening_drawable[0].max(RESIZABLE_WINDOW_TARGET[0]),
+        opening_drawable[1].max(RESIZABLE_WINDOW_TARGET[1]),
+    ];
+    let Ok(target_observers) =
+        observer_bytes_for_resize(feed_bytes, view, target, pixels_per_point)
+    else {
+        return;
+    };
+    let desired_extra = target_observers.saturating_sub(memory.render);
+    let reserve = desired_extra.min(memory.backend / 2);
+    if reserve > 0 {
+        memory.backend = memory.backend.saturating_sub(reserve);
+        memory.peak_bytes = memory
+            .fixed_bytes()
+            .saturating_add(memory.backend)
+            .max(memory.restoring_bytes());
+    }
+}
+
 /// Admit a live resize to `drawable` pixels at `pixels_per_point` under
 /// `memory`'s budget ceiling (FL-043, INV-15). Returns the new observer byte
 /// charge on success.

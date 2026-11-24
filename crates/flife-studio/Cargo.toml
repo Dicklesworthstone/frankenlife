@@ -60,5 +60,13 @@ name = "live"
 harness = false
 required-features = ["synthetic-input"]
 
+# Real-window G6 interactive frame-rate, latency, and HUD/tracking/measure
+# qualification (FL-024):
+# `cargo test --release -p flife-studio --features synthetic-input --test window_g6`.
+[[test]]
+name = "window_g6"
+harness = false
+required-features = ["synthetic-input"]
+
 [lints]
 workspace = true

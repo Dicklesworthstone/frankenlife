@@ -14,8 +14,9 @@ use flife_engine::{Arrangement, NumericalProfile, World};
 use flife_manim::WorldView;
 use flife_render::Epoch;
 use flife_studio::memory::{
-    DEVICE_BYTES_PER_PIXEL, admit, admit_kept_at, admit_resize, observer_bytes, observer_bytes_at,
-    observer_bytes_for_resize, observer_limit,
+    DEVICE_BYTES_PER_PIXEL, RESIZABLE_WINDOW_TARGET, admit, admit_kept_at, admit_resize,
+    observer_bytes, observer_bytes_at, observer_bytes_for_resize, observer_limit,
+    reserve_resize_headroom,
 };
 use flife_studio::{ControllerChoice, Exact, REPLAY_SLOTS, TimelineRecord, peak_observer_bytes};
 
@@ -656,4 +657,82 @@ fn v2_visual_mappings_observer_bytes_account_honestly_and_drop_to_zero_when_disa
         admitted_on.render - admitted_off.render,
         epoch_delta + view_delta
     );
+}
+
+#[test]
+fn resizable_window_headroom_admits_live_growth_up_to_4k_without_exceeding_budget() {
+    let config = preset_with(&[]);
+    let world = found(&config);
+    let founding = Epoch::standalone(&world).expect("an epoch");
+    let slots = u64::from(config.config().execution.render_queue_capacity);
+    let feed_bytes = founding.reserved_bytes() * slots;
+    let mut view = WorldView::for_epoch(&founding, [640, 400], [0, 0, 0]).expect("a view");
+    view.enable_overlay();
+
+    let mut memory = admit_kept_at(
+        &world,
+        ControllerChoice::Auto,
+        &founding,
+        &view,
+        [1280, 800],
+        2.0,
+        0,
+    )
+    .expect("admits opening Retina window");
+    let before_backend = memory.backend;
+    assert_eq!(observer_limit(&memory), memory.render);
+
+    reserve_resize_headroom(&mut memory, feed_bytes, &view, [1280, 800], 2.0);
+    assert!(memory.backend < before_backend);
+    assert!(memory.backend >= before_backend / 2);
+    assert!(memory.peak_bytes <= memory.budget_bytes);
+
+    let grown_800 = admit_resize(&memory, feed_bytes, &view, [1600, 900], 2.0)
+        .expect("800x450 @ 2x fits in resize headroom");
+    assert!(grown_800 > memory.render);
+    let grown_qhd = admit_resize(&memory, feed_bytes, &view, [2560, 1440], 2.0)
+        .expect("1280x720 @ 2x (QHD) fits in resize headroom");
+    assert!(grown_qhd >= grown_800);
+    assert!(
+        memory
+            .fixed_bytes()
+            .saturating_sub(memory.render)
+            .saturating_add(grown_qhd)
+            .saturating_add(memory.backend)
+            <= memory.budget_bytes
+    );
+
+    // With a roomier budget (2.5 GiB), resize headroom covers full 4K cleanly
+    // while still refusing impossible sizes under INV-15.
+    let roomy = preset_with(&[("maximum_total_bytes", (2560_u64) << 20)]);
+    let roomy_world = found(&roomy);
+    let roomy_epoch = Epoch::standalone(&roomy_world).expect("roomy epoch");
+    let roomy_feed = roomy_epoch.reserved_bytes() * slots;
+    let mut roomy_view =
+        WorldView::for_epoch(&roomy_epoch, [640, 400], [0, 0, 0]).expect("roomy view");
+    roomy_view.enable_overlay();
+    let mut roomy_mem = admit_kept_at(
+        &roomy_world,
+        ControllerChoice::Auto,
+        &roomy_epoch,
+        &roomy_view,
+        [1280, 800],
+        2.0,
+        0,
+    )
+    .expect("admits roomy window");
+    reserve_resize_headroom(&mut roomy_mem, roomy_feed, &roomy_view, [1280, 800], 2.0);
+    let grown_4k = admit_resize(
+        &roomy_mem,
+        roomy_feed,
+        &roomy_view,
+        RESIZABLE_WINDOW_TARGET,
+        2.0,
+    )
+    .expect("4K fits in roomy resize headroom");
+    assert!(grown_4k > roomy_mem.render);
+    assert!(matches!(
+        admit_resize(&roomy_mem, roomy_feed, &roomy_view, [16384, 16384], 2.0),
+        Err(CoreError::BudgetExhausted { .. })
+    ));
 }

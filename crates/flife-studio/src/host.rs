@@ -612,17 +612,23 @@ impl Studio {
             .surface_metrics()
             .ok()
             .filter(|metrics| metrics.drawable_width > 0 && metrics.drawable_height > 0);
-        let drawable = initial_metrics.map_or([width, height], |metrics| {
-            [metrics.drawable_width, metrics.drawable_height]
-        });
         let backing_scale = initial_metrics
             .map(|metrics| metrics.backing_scale)
             .filter(|scale| scale.is_finite() && *scale > 0.0)
             .unwrap_or(1.0);
+        // Native windows set `PixelDensity::Backing` above, so frame 1 will
+        // refit to `metrics.backing_size()` (e.g. 2x Retina backing pixels),
+        // even though `drawable_width`/`drawable_height` may still report 1x
+        // logical dimensions until the first frame presents.
+        let drawable = initial_metrics.map_or([width, height], |metrics| {
+            metrics
+                .backing_size()
+                .unwrap_or([metrics.drawable_width, metrics.drawable_height])
+        });
         let feed_bytes = founding
             .reserved_bytes()
             .saturating_mul(u64::from(model.execution.render_queue_capacity));
-        let memory = crate::memory::admit_kept_at(
+        let mut memory = crate::memory::admit_kept_at(
             &world,
             options.controllers,
             &founding,
@@ -631,6 +637,15 @@ impl Studio {
             backing_scale,
             kept.checkpoint_bytes(),
         )?;
+        if matches!(options.surface, Surface::Window) && options.resizable {
+            crate::memory::reserve_resize_headroom(
+                &mut memory,
+                feed_bytes,
+                &view,
+                drawable,
+                backing_scale,
+            );
+        }
         drop(founding);
         flife_cli::run::install(&mut world, options.controllers, memory.backend)?;
         let controllers = world

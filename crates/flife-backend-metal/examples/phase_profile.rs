@@ -27,9 +27,9 @@
 //! cargo run --release -p flife-backend-metal --example phase_profile -- \
 //!   [--workloads bundle-a,bundle-b,confluent] \
 //!   [--config path/to/preset.toml] \
-//!   [--workers 1,8,12] \
-//!   [--metal-workers 8] \
-//!   [--modes cpu,controllers,field,sensors,uptake,settle,all] \
+//!   [--workers 1,8,12,16] \
+//!   [--metal-workers 8,12,16] \
+//!   [--modes cpu,torch,controllers,field,sensors,uptake,settle,all] \
 //!   [--warmup N] [--ticks N] [--blocks N] \
 //!   [--confluent-initial 262144] \
 //!   [--json-only]
@@ -42,6 +42,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use flife_backend_cpu::{CpuBackend, SHARD_SLOTS as CPU_SHARD_SLOTS};
 use flife_backend_metal::{
     BackendBudget, ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket,
     DeviceOwner, EmissionOrganism, EmissionOutcome, Limits, MetalBackend, MetalField, MetalSensors,
@@ -58,7 +59,9 @@ use flife_field::{
     FieldStepReport, Grants, RawSample, RequestRule, SensorBackend, SensorPyramid, SensorQuery,
     Source, SourceKernel, TransportPlan, UptakeBackend, UptakeCell,
 };
-use flife_neural::{ArenaSlot, ControllerBackend, ControllerJob, RawOutputs};
+use flife_neural::{
+    ArenaSlot, ControllerBackend, ControllerJob, FlatControllerJob, FlatOutputs, RawOutputs,
+};
 
 const BUNDLE_A_TOML: &str = include_str!("../../../presets/morphogenesis-tissue-v2.toml");
 const BUNDLE_B_TOML: &str = include_str!("../../../presets/supercolony-v2.toml");
@@ -544,6 +547,87 @@ impl ControllerBackend for TimedController {
                 inner.evaluate(jobs, outputs)
             })
     }
+
+    fn supports_flat_f32(&self) -> bool {
+        self.inner.supports_flat_f32()
+    }
+
+    fn evaluate_flat_f32(
+        &mut self,
+        jobs: &[FlatControllerJob<'_>],
+        input_width: usize,
+        inputs_f32: &[f32],
+        inputs_finite: &[u8],
+        outputs: &mut FlatOutputs,
+    ) -> Result<(), CoreError> {
+        let owner = &self.owner;
+        let inner = &mut self.inner;
+        self.counters
+            .record(Subphase::ControllerEval, Some(owner), || {
+                inner.evaluate_flat_f32(jobs, input_width, inputs_f32, inputs_finite, outputs)
+            })
+    }
+}
+
+#[derive(Debug)]
+struct TimedTorchController {
+    inner: CpuBackend,
+    counters: Arc<PhaseCounters>,
+}
+
+impl ControllerBackend for TimedTorchController {
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.inner.resident_bytes()
+    }
+
+    fn forget(&mut self) {
+        self.inner.forget();
+    }
+
+    fn release_slots(&mut self, slots: &[ArenaSlot]) {
+        let inner = &mut self.inner;
+        self.counters
+            .record(Subphase::ControllerReleaseSlots, None, || {
+                inner.release_slots(slots);
+            });
+    }
+
+    fn last_device_nanoseconds(&self) -> u64 {
+        self.inner.last_device_nanoseconds()
+    }
+
+    fn evaluate(
+        &mut self,
+        jobs: &[ControllerJob<'_>],
+        outputs: &mut Vec<Option<RawOutputs>>,
+    ) -> Result<(), CoreError> {
+        let inner = &mut self.inner;
+        self.counters.record(Subphase::ControllerEval, None, || {
+            inner.evaluate(jobs, outputs)
+        })
+    }
+
+    fn supports_flat_f32(&self) -> bool {
+        self.inner.supports_flat_f32()
+    }
+
+    fn evaluate_flat_f32(
+        &mut self,
+        jobs: &[FlatControllerJob<'_>],
+        input_width: usize,
+        inputs_f32: &[f32],
+        inputs_finite: &[u8],
+        outputs: &mut FlatOutputs,
+    ) -> Result<(), CoreError> {
+        let inner = &mut self.inner;
+        self.counters.record(Subphase::ControllerEval, None, || {
+            inner.evaluate_flat_f32(jobs, input_width, inputs_f32, inputs_finite, outputs)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -572,6 +656,7 @@ impl MetalMode {
 #[derive(Debug, Clone)]
 enum RunMode {
     Cpu(usize),
+    Torch(usize),
     Metal { mode: MetalMode, cpu_workers: usize },
 }
 
@@ -579,12 +664,24 @@ impl RunMode {
     fn label(&self) -> String {
         match *self {
             Self::Cpu(w) => format!("cpu_w{w}"),
+            Self::Torch(w) => format!("torch_w{w}"),
             Self::Metal { mode, cpu_workers } => format!("{}_w{cpu_workers}", mode.label()),
+        }
+    }
+
+    const fn workers(&self) -> usize {
+        match *self {
+            Self::Cpu(w) | Self::Torch(w) => w,
+            Self::Metal { cpu_workers, .. } => cpu_workers,
         }
     }
 
     const fn is_metal(&self) -> bool {
         matches!(self, Self::Metal { .. })
+    }
+
+    const fn is_accelerated(&self) -> bool {
+        matches!(self, Self::Torch(_) | Self::Metal { .. })
     }
 }
 
@@ -603,8 +700,9 @@ struct CliOptions {
     workloads: Vec<String>,
     custom_config: Option<String>,
     cpu_workers: Vec<usize>,
-    metal_workers: usize,
+    metal_workers: Vec<usize>,
     include_cpu: bool,
+    include_torch: bool,
     metal_modes: Vec<MetalMode>,
     warmup: Option<u64>,
     ticks: Option<u64>,
@@ -629,7 +727,9 @@ fn parse_csv_usize(raw: &str) -> Result<Vec<usize>, CoreError> {
         if value == 0 {
             return Err(conflict("worker counts must be >= 1".to_owned()));
         }
-        out.push(value);
+        if !out.contains(&value) {
+            out.push(value);
+        }
     }
     if out.is_empty() {
         return Err(conflict("expected at least one worker count".to_owned()));
@@ -637,12 +737,14 @@ fn parse_csv_usize(raw: &str) -> Result<Vec<usize>, CoreError> {
     Ok(out)
 }
 
-fn parse_modes(raw: &str) -> Result<(bool, Vec<MetalMode>), CoreError> {
+fn parse_modes(raw: &str) -> Result<(bool, bool, Vec<MetalMode>), CoreError> {
     let mut include_cpu = false;
+    let mut include_torch = false;
     let mut metal_modes = Vec::new();
     for item in raw.split(',').filter(|s| !s.is_empty()) {
         match item {
             "cpu" => include_cpu = true,
+            "torch" | "cpu_torch" => include_torch = true,
             "controllers" | "controller" | "metal_controllers" => {
                 metal_modes.push(MetalMode::Controllers);
             }
@@ -653,12 +755,12 @@ fn parse_modes(raw: &str) -> Result<(bool, Vec<MetalMode>), CoreError> {
             "all" | "metal_all" => metal_modes.push(MetalMode::All),
             other => {
                 return Err(conflict(format!(
-                    "unknown mode `{other}` (expected cpu,controllers,field,sensors,uptake,settle,all)"
+                    "unknown mode `{other}` (expected cpu,torch,controllers,field,sensors,uptake,settle,all)"
                 )));
             }
         }
     }
-    Ok((include_cpu, metal_modes))
+    Ok((include_cpu, include_torch, metal_modes))
 }
 
 fn parse_args() -> Result<CliOptions, CoreError> {
@@ -670,8 +772,9 @@ fn parse_args() -> Result<CliOptions, CoreError> {
         ],
         custom_config: None,
         cpu_workers: vec![1, 8, 12],
-        metal_workers: 8,
+        metal_workers: vec![8],
         include_cpu: true,
+        include_torch: false,
         metal_modes: vec![
             MetalMode::Controllers,
             MetalMode::Field,
@@ -711,18 +814,13 @@ fn parse_args() -> Result<CliOptions, CoreError> {
             }
             "--metal-workers" => {
                 let raw = next_val("--metal-workers", &mut args)?;
-                let value = raw
-                    .parse::<usize>()
-                    .map_err(|e| conflict(format!("invalid --metal-workers `{raw}`: {e}")))?;
-                if value == 0 {
-                    return Err(conflict("--metal-workers must be >= 1".to_owned()));
-                }
-                opts.metal_workers = value;
+                opts.metal_workers = parse_csv_usize(&raw)?;
             }
             "--modes" => {
                 let raw = next_val("--modes", &mut args)?;
-                let (cpu, metal) = parse_modes(&raw)?;
+                let (cpu, torch, metal) = parse_modes(&raw)?;
                 opts.include_cpu = cpu;
+                opts.include_torch = torch;
                 opts.metal_modes = metal;
             }
             "--warmup" => {
@@ -876,6 +974,15 @@ fn build_entry(mode: RunMode, config: &ValidatedConfig) -> Result<Entry, CoreErr
         RunMode::Cpu(workers) => {
             let w = NonZeroUsize::new(workers).unwrap_or(NonZeroUsize::MIN);
             world.set_cpu_workers(w)?;
+        }
+        RunMode::Torch(workers) => {
+            let w = NonZeroUsize::new(workers).unwrap_or(NonZeroUsize::MIN);
+            world.set_cpu_workers(w)?;
+            let inner = CpuBackend::with_budget(w, CPU_SHARD_SLOTS, BackendBudget::UNBOUNDED);
+            world.set_controller_backend(Some(Box::new(TimedTorchController {
+                inner,
+                counters: Arc::clone(&counters),
+            })));
         }
         RunMode::Metal {
             mode: metal_mode,
@@ -1056,18 +1163,30 @@ fn run_workload(spec: &WorkloadSpec, opts: &CliOptions) -> Result<(), CoreError>
 
     let mut modes = Vec::new();
     if opts.include_cpu {
-        for &w in &opts.cpu_workers {
+        let mut cpu_list = opts.cpu_workers.clone();
+        if opts.include_torch || !opts.metal_modes.is_empty() {
+            for &w in &opts.metal_workers {
+                if !cpu_list.contains(&w) {
+                    cpu_list.push(w);
+                }
+            }
+        }
+        for w in cpu_list {
             modes.push(RunMode::Cpu(w));
         }
-        if !opts.metal_modes.is_empty() && !opts.cpu_workers.contains(&opts.metal_workers) {
-            modes.push(RunMode::Cpu(opts.metal_workers));
+    }
+    if opts.include_torch {
+        for &w in &opts.metal_workers {
+            modes.push(RunMode::Torch(w));
         }
     }
     for &mode in &opts.metal_modes {
-        modes.push(RunMode::Metal {
-            mode,
-            cpu_workers: opts.metal_workers,
-        });
+        for &w in &opts.metal_workers {
+            modes.push(RunMode::Metal {
+                mode,
+                cpu_workers: w,
+            });
+        }
     }
 
     let mut entries = Vec::new();
@@ -1123,7 +1242,8 @@ fn run_workload(spec: &WorkloadSpec, opts: &CliOptions) -> Result<(), CoreError>
     }
 
     let golden_digest = entries[0].world.digest().to_hex();
-    let cpu_ref_label = format!("cpu_w{}", opts.metal_workers);
+    let primary_metal_w = opts.metal_workers.first().copied().unwrap_or(8);
+    let cpu_ref_label = format!("cpu_w{primary_metal_w}");
     let cpu_ref_ms = entries
         .iter()
         .find(|e| e.label == cpu_ref_label)
@@ -1148,7 +1268,7 @@ fn run_workload(spec: &WorkloadSpec, opts: &CliOptions) -> Result<(), CoreError>
             "p95_ms",
             "cv%",
             "delta_ms",
-            "vs_ref",
+            "vs_cpu",
             "back_ms",
             "gpu_ms",
             "host_ms",
@@ -1162,8 +1282,22 @@ fn run_workload(spec: &WorkloadSpec, opts: &CliOptions) -> Result<(), CoreError>
         let med_ms = percentile(&entry.block_ms_per_tick, 0.5);
         let p95_ms = percentile(&entry.block_ms_per_tick, 0.95);
         let cv = cv_percent(&entry.block_ms_per_tick);
-        let delta_ms = med_ms - cpu_ref_ms;
+        let same_w_label = format!("cpu_w{}", entry.mode.workers());
+        let (matched_cpu_label, matched_cpu_ms) =
+            if let Some(base) = entries.iter().find(|e| e.label == same_w_label) {
+                (same_w_label, percentile(&base.block_ms_per_tick, 0.5))
+            } else {
+                (cpu_ref_label.clone(), cpu_ref_ms)
+            };
+        let delta_ref_ms = med_ms - cpu_ref_ms;
         let speedup_ref = cpu_ref_ms / med_ms;
+        let delta_matched_ms = med_ms - matched_cpu_ms;
+        let speedup_matched = matched_cpu_ms / med_ms;
+        let (display_delta_ms, display_speedup) = if entry.mode.is_accelerated() {
+            (delta_matched_ms, speedup_matched)
+        } else {
+            (delta_ref_ms, speedup_ref)
+        };
         let speedup_w1 = cpu_w1_ms.map_or(f64::NAN, |w1| w1 / med_ms);
 
         let snap = entry.counters.snapshot();
@@ -1182,20 +1316,22 @@ fn run_workload(spec: &WorkloadSpec, opts: &CliOptions) -> Result<(), CoreError>
         } else {
             0.0
         };
-        let implied_cpu_replaced_ms = if entry.mode.is_metal() {
-            back_ms - delta_ms
+        let implied_cpu_replaced_ms = if entry.mode.is_accelerated() {
+            back_ms - delta_matched_ms
         } else {
             0.0
         };
 
         let (fallbacks, failures) = fallbacks_and_failures(&entry.world);
         let deferred = entry.world.controller_report().deferred;
-        let verdict = if !entry.mode.is_metal() {
+        let verdict = if !entry.mode.is_accelerated() {
             "CPU_BASELINE"
         } else if fallbacks > 0 || !failures.is_empty() {
             "FALLBACK_DETECTED"
-        } else if delta_ms < 0.0 {
+        } else if delta_matched_ms < 0.0 {
             "BEATS_CPU"
+        } else if !entry.mode.is_metal() {
+            "SLOWER_CPU_KERNEL"
         } else if host_ms >= gpu_ms {
             "SLOWER_ROUNDTRIP_BOUND"
         } else {
@@ -1209,8 +1345,8 @@ fn run_workload(spec: &WorkloadSpec, opts: &CliOptions) -> Result<(), CoreError>
                 med_ms,
                 p95_ms,
                 cv,
-                delta_ms,
-                speedup_ref,
+                display_delta_ms,
+                display_speedup,
                 back_ms,
                 gpu_ms,
                 host_ms,
@@ -1270,9 +1406,11 @@ fn run_workload(spec: &WorkloadSpec, opts: &CliOptions) -> Result<(), CoreError>
         let t_rep = entry.world.settle_report();
 
         json_rows.push(format!(
-            "{{\"mode\":\"{}\",\"median_ms\":{med_ms:.4},\"p95_ms\":{p95_ms:.4},\
+            "{{\"mode\":\"{}\",\"workers\":{},\"median_ms\":{med_ms:.4},\"p95_ms\":{p95_ms:.4},\
              \"cv_percent\":{cv:.2},\"cv_ok\":{},\"ticks_per_s\":{:.3},\
-             \"delta_vs_ref_ms\":{delta_ms:.4},\"speedup_vs_ref\":{speedup_ref:.4},\
+             \"matched_cpu_mode\":\"{}\",\"delta_vs_matched_cpu_ms\":{delta_matched_ms:.4},\
+             \"speedup_vs_matched_cpu\":{speedup_matched:.4},\
+             \"delta_vs_ref_ms\":{delta_ref_ms:.4},\"speedup_vs_ref\":{speedup_ref:.4},\
              \"speedup_vs_w1\":{},\"backend_wall_ms\":{back_ms:.4},\
              \"gpu_compute_ms\":{gpu_ms:.4},\"host_staging_ms\":{host_ms:.4},\
              \"host_overhead_pct\":{host_pct:.2},\"commands_per_tick\":{cmds_per_tick:.2},\
@@ -1282,8 +1420,10 @@ fn run_workload(spec: &WorkloadSpec, opts: &CliOptions) -> Result<(), CoreError>
              \"sensor_ticks\":{},\"uptake_ticks\":{},\"settle_ticks\":{},\
              \"controller_batched\":{},\"verdict\":\"{verdict}\",\"subphases\":[{}]}}",
             json_escape(&entry.label),
+            entry.mode.workers(),
             cv <= 5.0,
             1e3 / med_ms,
+            json_escape(&matched_cpu_label),
             if speedup_w1.is_finite() {
                 format!("{speedup_w1:.4}")
             } else {

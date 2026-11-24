@@ -1220,12 +1220,21 @@ impl DeviceOwner {
             // `handle.index` order to eliminate any multi-buffer cycle.
             let n = guard.bound.len();
             let mut order = IndexBuf::<INLINE_BOUND>::with_expected(n);
+            let mut sorted = true;
+            let mut prev_index = 0_u32;
             for at in 0..n {
                 order.push(at);
+                let handle_idx = guard.bound.get(at).map_or(u32::MAX, |b| b.handle.index);
+                if at > 0 && handle_idx < prev_index {
+                    sorted = false;
+                }
+                prev_index = handle_idx;
             }
-            order.as_mut_slice().sort_unstable_by_key(|&at| {
-                guard.bound.get(at).map_or(u32::MAX, |b| b.handle.index)
-            });
+            if !sorted {
+                order.as_mut_slice().sort_unstable_by_key(|&at| {
+                    guard.bound.get(at).map_or(u32::MAX, |b| b.handle.index)
+                });
+            }
             let mut held = HeldBuf::with_exact_capacity(n);
             for &at in order.as_slice() {
                 let Some(buffer) = guard.bound.get(at) else {

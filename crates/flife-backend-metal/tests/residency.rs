@@ -10,8 +10,8 @@ use flife_core::CoreError;
 use flife_core::binary16::F16;
 use flife_core::ids::GenomeId;
 use flife_neural::{
-    ArenaSlot, ControllerBackend, ControllerJob, ControllerScratch, DenseTopology, RawOutputs,
-    ReferenceController, SENSOR_WIDTH,
+    ArenaSlot, ControllerBackend, ControllerJob, ControllerScratch, DenseTopology,
+    FlatControllerJob, FlatOutputs, RawOutputs, ReferenceController, SENSOR_WIDTH,
 };
 
 /// The `dense-104-36-v1` catalog's hidden widths.
@@ -1320,6 +1320,163 @@ fn recurrent_reference_torch_and_metal_f16_f32_bit_exact() -> Result<(), CoreErr
                 &ref_next_f16_v1,
             )?;
         }
+    }
+    Ok(())
+}
+
+#[expect(clippy::panic, reason = "test helper: a mismatch is a test failure")]
+fn assert_flat_matches_legacy(
+    label: &str,
+    legacy_out: &[Option<RawOutputs>],
+    flat_out: &FlatOutputs,
+) {
+    assert_eq!(flat_out.valid.len(), legacy_out.len(), "{label}: valid len");
+    for (i, want) in legacy_out.iter().enumerate() {
+        match (want, flat_out.row(i)) {
+            (Some(w), Some(g)) => assert_eq!(
+                g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{label} row {i} differs"
+            ),
+            (None, None) => {}
+            (w, g) => panic!("{label} row {i} deferred mismatch: {w:?} vs {g:?}"),
+        }
+    }
+}
+
+/// Round-2 flat-F32 fast path (`ControllerBackend::evaluate_flat_f32`) on real
+/// Metal hardware must match `MetalBackend::evaluate` bit-for-bit across all 5
+/// interleaved catalog topologies, F32 and F16 weights, full-dispatch zero-copy
+/// path, partial-dispatch (non-finite) compaction+scatter, output buffer reuse
+/// (shrink/empty), and error cleanup.
+#[test]
+fn metal_backend_flat_f32_matches_evaluate_bit_for_bit_across_full_and_partial_batches()
+-> Result<(), CoreError> {
+    let Some(mut device_f32) = backend(32) else {
+        return Ok(());
+    };
+    let Some(mut device_f16) = backend(32) else {
+        return Ok(());
+    };
+    assert!(device_f32.supports_flat_f32());
+    assert!(device_f16.supports_flat_f32());
+
+    let catalog = topologies();
+    let batch_cases = cases(&catalog, 240);
+    let legacy_f32 = jobs(&catalog, &batch_cases, 0);
+    let f16_params: Vec<Vec<F16>> = batch_cases
+        .iter()
+        .map(|case| {
+            case.parameters
+                .iter()
+                .map(|&v| F16::from_f32_nearest(v))
+                .collect()
+        })
+        .collect();
+    let legacy_f16: Vec<ControllerJob<'_>> = legacy_f32
+        .iter()
+        .zip(&batch_cases)
+        .zip(&f16_params)
+        .map(|((job, case), weights)| ControllerJob {
+            genome: job.genome,
+            slot: job.slot,
+            controller: ReferenceController::new_f16(&catalog[case.topology], weights, BOUND)
+                .expect("admitted f16 controller"),
+            inputs: job.inputs,
+        })
+        .collect();
+
+    let inputs_f32: Vec<f32> = batch_cases
+        .iter()
+        .flat_map(|case| case.inputs.iter().map(|&v| v as f32))
+        .collect();
+    let inputs_finite = vec![1_u8; batch_cases.len()];
+
+    for (label, device, legacy) in [
+        ("F32", &mut device_f32, &legacy_f32),
+        ("F16", &mut device_f16, &legacy_f16),
+    ] {
+        let flat_jobs: Vec<FlatControllerJob<'_>> = legacy
+            .iter()
+            .map(|job| FlatControllerJob {
+                genome: job.genome,
+                slot: job.slot,
+                controller: job.controller,
+            })
+            .collect();
+
+        // 1. Cold zero-copy flat path (before any `evaluate` call, verifying
+        //    `staged_inputs` is never touched on the `all_dispatched` fast path).
+        let mut flat_out = FlatOutputs::default();
+        device.evaluate_flat_f32(
+            &flat_jobs,
+            SENSOR_WIDTH,
+            &inputs_f32,
+            &inputs_finite,
+            &mut flat_out,
+        )?;
+        let uploads_after_flat = device.uploads();
+        let mut legacy_out = Vec::new();
+        device.evaluate(legacy, &mut legacy_out)?;
+        assert_eq!(
+            device.uploads(),
+            uploads_after_flat,
+            "{label}: legacy evaluate must reuse shards uploaded by flat path"
+        );
+        assert_eq!(flat_out.output_width, 36);
+        assert_flat_matches_legacy(&format!("{label} full"), &legacy_out, &flat_out);
+
+        // 2. Partial-dispatch path: mark start/middle/end inputs non-finite.
+        let mut partial_finite = inputs_finite.clone();
+        let mut partial_legacy = legacy.clone();
+        let non_finite_inputs = [f64::INFINITY; SENSOR_WIDTH];
+        for idx in [0, 73, batch_cases.len() - 1] {
+            partial_finite[idx] = 0;
+            partial_legacy[idx].inputs = &non_finite_inputs;
+        }
+        let mut partial_legacy_out = Vec::new();
+        device.evaluate(&partial_legacy, &mut partial_legacy_out)?;
+        device.evaluate_flat_f32(
+            &flat_jobs,
+            SENSOR_WIDTH,
+            &inputs_f32,
+            &partial_finite,
+            &mut flat_out,
+        )?;
+        assert_flat_matches_legacy(&format!("{label} partial"), &partial_legacy_out, &flat_out);
+
+        // 3. Reuse across shrink, empty, and malformed-input error cleanup.
+        let half = flat_jobs.len() / 2;
+        device.evaluate_flat_f32(
+            &flat_jobs[..half],
+            SENSOR_WIDTH,
+            &inputs_f32[..half * SENSOR_WIDTH],
+            &inputs_finite[..half],
+            &mut flat_out,
+        )?;
+        assert_flat_matches_legacy(&format!("{label} shrink"), &legacy_out[..half], &flat_out);
+
+        device.evaluate_flat_f32(&[], SENSOR_WIDTH, &[], &[], &mut flat_out)?;
+        assert!(flat_out.valid.is_empty() && flat_out.values.is_empty());
+        assert_eq!(flat_out.output_width, 0);
+
+        device.evaluate_flat_f32(
+            &flat_jobs[..8],
+            SENSOR_WIDTH,
+            &inputs_f32[..8 * SENSOR_WIDTH],
+            &inputs_finite[..8],
+            &mut flat_out,
+        )?;
+        let err = device.evaluate_flat_f32(
+            &flat_jobs[..8],
+            SENSOR_WIDTH,
+            &inputs_f32[..4 * SENSOR_WIDTH],
+            &inputs_finite[..8],
+            &mut flat_out,
+        );
+        assert!(matches!(err, Err(CoreError::LayoutMismatch { .. })));
+        assert!(flat_out.valid.is_empty() && flat_out.values.is_empty());
+        assert_eq!(flat_out.output_width, 0);
     }
     Ok(())
 }

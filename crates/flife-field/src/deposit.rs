@@ -742,15 +742,22 @@ impl Deposits {
         }
         let entries = self.entries.len();
         let packets = self.packets.len();
-        self.packets
-            .extend(other.packets.iter().map(|packet| Packet {
-                entry: packet.entry + entries,
-                ..*packet
-            }));
-        self.entries.extend(other.entries.iter().map(|entry| Entry {
-            first: entry.first + packets,
-            ..*entry
-        }));
+        if !other.packets.is_empty() {
+            self.packets.extend_from_slice(&other.packets);
+            if entries > 0 {
+                for packet in &mut self.packets[packets..] {
+                    packet.entry += entries;
+                }
+            }
+        }
+        if !other.entries.is_empty() {
+            self.entries.extend_from_slice(&other.entries);
+            if packets > 0 {
+                for entry in &mut self.entries[entries..] {
+                    entry.first += packets;
+                }
+            }
+        }
         if other.grid.is_some() {
             self.grid = other.grid;
         }

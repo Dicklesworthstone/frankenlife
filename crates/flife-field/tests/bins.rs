@@ -1393,3 +1393,79 @@ fn round2_spatial_pyramid_256_batch_fused_streams_and_exp_neg_4_footprint_are_bi
         assert_eq!(scratch.allocated_bytes(), before_bytes, "scratch grew");
     }
 }
+
+#[test]
+fn deposits_append_interleaved_empty_and_nonempty_lanes_bit_exact() {
+    let grid = grid(16, 16);
+    let base = field(grid, 99);
+    let demands = clustered(&grid, 64, 37);
+    let mut next = lcg(73);
+    let deposits: Vec<Staged> = demands
+        .iter()
+        .map(|demand| {
+            let paid = 0.005 + next() * 0.02;
+            let mut direction = [0.0; CHANNELS];
+            direction[(next() * CHANNELS as f64) as usize % CHANNELS] = next() - 0.5;
+            (
+                demand.organism,
+                demand.position,
+                paid,
+                paid * 0.8,
+                direction,
+            )
+        })
+        .collect();
+    let limits = BufferLimits::host();
+
+    let mut direct =
+        Deposits::with_capacity(&grid, deposits.len() as u64, &limits).expect("direct");
+    for &(org, pos, paid, offered, dir) in &deposits {
+        direct
+            .push(&grid, org, pos, paid, offered, &dir)
+            .expect("push");
+    }
+    let mut direct_field = base.clone();
+    let expected = apply_deposits(&mut direct_field, &mut direct).expect("apply direct");
+
+    // Interleave empty lanes before, between, and after non-empty chunks so
+    // both the empty-dest fast path (entries == 0 / packets == 0) and the
+    // non-empty in-place offset shift path are exercised.
+    let mut merged =
+        Deposits::with_capacity(&grid, deposits.len() as u64, &limits).expect("merged");
+    let allocated = merged.allocated();
+    let mut lane = Deposits::new();
+    lane.fit_staging(deposits.len()).expect("lane");
+    // Leading empty lane into empty destination.
+    merged.append(&mut lane).expect("empty into empty");
+    assert!(merged.is_empty());
+    for chunk in deposits.chunks(13) {
+        for &(org, pos, paid, offered, dir) in chunk {
+            lane.push(&grid, org, pos, paid, offered, &dir)
+                .expect("lane push");
+        }
+        merged.append(&mut lane).expect("non-empty append");
+        assert!(lane.is_empty());
+        // Empty lane after non-empty destination.
+        merged.append(&mut lane).expect("empty after non-empty");
+    }
+    assert_eq!(merged.allocated(), allocated, "append allocated");
+    assert_eq!(merged.len(), deposits.len());
+    for i in 0..deposits.len() {
+        let direct_entry = direct.entry(i);
+        let merged_entry = merged.entry(i);
+        assert_eq!(merged_entry, direct_entry, "entry {i}");
+        let d_pkts: Vec<(usize, u64)> = direct
+            .entry_packets(i)
+            .map(|(c, e)| (c, e.to_bits()))
+            .collect();
+        let m_pkts: Vec<(usize, u64)> = merged
+            .entry_packets(i)
+            .map(|(c, e)| (c, e.to_bits()))
+            .collect();
+        assert_eq!(m_pkts, d_pkts, "entry_packets {i}");
+    }
+    let mut merged_field = base;
+    let got = apply_deposits(&mut merged_field, &mut merged).expect("apply merged");
+    assert_eq!(summary_bits(&got), summary_bits(&expected));
+    assert!(planes(&merged_field) == planes(&direct_field));
+}

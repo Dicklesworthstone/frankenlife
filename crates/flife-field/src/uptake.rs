@@ -568,7 +568,7 @@ fn resolve_into(
     workers: usize,
 ) -> Result<UptakeSummary, CoreError> {
     let grid = *field.grid();
-    stage(&grid, kernel, demands, grants)?;
+    stage_on(&grid, kernel, demands, grants, workers)?;
     group_packets(&grid, grants, workers)?;
 
     let energy = field.energy();
@@ -583,7 +583,16 @@ fn resolve_into(
     let items = packets.len();
     let buckets = bins.buckets();
     let offsets = bins.offsets();
-    let runs = workers.min(items / UPTAKE_PACKETS_PER_RUN).max(1);
+    let base_runs = workers.min(items / UPTAKE_PACKETS_PER_RUN).max(1);
+    let runs = if base_runs <= 1 {
+        1
+    } else {
+        workers
+            .saturating_mul(4)
+            .min(64)
+            .min(items / (UPTAKE_PACKETS_PER_RUN / 2).max(1))
+            .max(base_runs)
+    };
     let mut tally = Tally::default();
 
     if runs == 1 {
@@ -627,7 +636,7 @@ fn resolve_into(
             },
         );
         // Split `packets`, `occupied_buckets`, and `debits` into disjoint
-        // per-worker slices.
+        // per-tile slices for dynamic work-stealing.
         struct Slice<'a> {
             occupied: &'a [u32],
             pkt_base: usize,
@@ -678,12 +687,9 @@ fn resolve_into(
             }
             Ok(())
         };
-        flife_core::pool::try_parallel_for_each_mut(
-            workers,
-            "resolve uptake",
-            &mut slices,
-            |_, slice| work(slice),
-        )?;
+        flife_core::pool::try_parallel_tasks(workers, "resolve uptake", &mut slices, |_, slice| {
+            work(slice)
+        })?;
 
         for debit in debits.iter() {
             let len = (offsets[debit.cell + 1] - offsets[debit.cell]) as usize;
@@ -693,12 +699,15 @@ fn resolve_into(
     Ok(finish(grid, demands.len(), grants, tally))
 }
 
-/// Check `demands` and stage their packets in identity order.
-fn stage(
+/// Check `demands` and stage their packets in identity order, using up to
+/// `workers` threads on the ascending `grid-cic-v1` fast path with zero extra
+/// heap allocation (reusing `grants.staged`'s pre-reserved `4 * organisms` room).
+fn stage_on(
     grid: &FieldGrid,
     kernel: ExchangeKernel,
     demands: &[Demand],
     grants: &mut Grants,
+    workers: usize,
 ) -> Result<(), CoreError> {
     if demands.len() > grants.organisms {
         return Err(CoreError::BudgetExhausted {
@@ -711,6 +720,102 @@ fn stage(
         .windows(2)
         .all(|pair| pair[0].organism < pair[1].organism);
     if strictly_ascending {
+        if workers > 1 && demands.len() >= 4_096 && kernel.is_grid_cic() {
+            let max_packets = demands
+                .len()
+                .checked_mul(PACKETS_PER_DEMAND as usize)
+                .ok_or(CoreError::Overflow {
+                    quantity: UPTAKE_PACKETS,
+                })?;
+            grants.staged.resize(
+                max_packets,
+                GrantPacket {
+                    cell: 0,
+                    organism: OrganismId::new(0),
+                    demand: 0,
+                    requested: 0.0,
+                    granted: 0.0,
+                },
+            );
+            let tile_count = workers
+                .saturating_mul(4)
+                .min(64)
+                .min(demands.len().div_ceil(512))
+                .max(1);
+            let tile_demands = demands.len().div_ceil(tile_count);
+            struct StageTile<'a> {
+                base_demand: usize,
+                demands: &'a [Demand],
+                out: &'a mut [GrantPacket],
+                written: usize,
+            }
+            let mut tiles = Vec::with_capacity(tile_count);
+            let mut rem_out = grants.staged.as_mut_slice();
+            for (t_idx, d_chunk) in demands.chunks(tile_demands).enumerate() {
+                let cap = d_chunk.len() * PACKETS_PER_DEMAND as usize;
+                let (out_head, out_tail) = rem_out.split_at_mut(cap);
+                rem_out = out_tail;
+                tiles.push(StageTile {
+                    base_demand: t_idx * tile_demands,
+                    demands: d_chunk,
+                    out: out_head,
+                    written: 0,
+                });
+            }
+            flife_core::pool::try_parallel_tasks(
+                workers,
+                "stage uptake packets",
+                &mut tiles,
+                |_, tile| {
+                    let mut cursor = 0_usize;
+                    for (offset, demand) in tile.demands.iter().enumerate() {
+                        if !demand.amount.is_finite() || demand.amount < 0.0 {
+                            return Err(CoreError::NumericalInvalid {
+                                quantity: "uptake demand",
+                                detail: format!(
+                                    "organism {} requests {}",
+                                    demand.organism.get(),
+                                    demand.amount
+                                ),
+                            });
+                        }
+                        let stencil = ExchangeStencil::at(grid, demand.position)?;
+                        let index = tile.base_demand + offset;
+                        for (&cell, &weight) in stencil.cells().iter().zip(stencil.weights()) {
+                            let requested = demand.amount * weight;
+                            if requested > 0.0 {
+                                tile.out[cursor] = GrantPacket {
+                                    cell,
+                                    organism: demand.organism,
+                                    demand: index,
+                                    requested,
+                                    granted: 0.0,
+                                };
+                                cursor += 1;
+                            }
+                        }
+                    }
+                    tile.written = cursor;
+                    Ok(())
+                },
+            )?;
+            let spans: Vec<(usize, usize)> = tiles
+                .iter()
+                .map(|tile| (tile.base_demand * PACKETS_PER_DEMAND as usize, tile.written))
+                .collect();
+            drop(tiles);
+            let mut total_written = 0_usize;
+            for (src_start, count) in spans {
+                if count > 0 && src_start != total_written {
+                    grants
+                        .staged
+                        .copy_within(src_start..src_start + count, total_written);
+                }
+                total_written += count;
+            }
+            grants.staged.truncate(total_written);
+            return Ok(());
+        }
         for (index, demand) in demands.iter().enumerate() {
             stage_demand(
                 grid,
@@ -723,6 +828,25 @@ fn stage(
         }
         return Ok(());
     }
+    stage_unsorted(grid, kernel, demands, grants)
+}
+
+/// Check `demands` and stage their packets in identity order on one thread.
+fn stage(
+    grid: &FieldGrid,
+    kernel: ExchangeKernel,
+    demands: &[Demand],
+    grants: &mut Grants,
+) -> Result<(), CoreError> {
+    stage_on(grid, kernel, demands, grants, 1)
+}
+
+fn stage_unsorted(
+    grid: &FieldGrid,
+    kernel: ExchangeKernel,
+    demands: &[Demand],
+    grants: &mut Grants,
+) -> Result<(), CoreError> {
     grants.identities.extend(
         demands
             .iter()
@@ -782,7 +906,7 @@ fn group_packets(grid: &FieldGrid, grants: &mut Grants, workers: usize) -> Resul
     let cells = usize::try_from(grid.cell_count()).map_err(|_| CoreError::Overflow {
         quantity: UPTAKE_PACKETS,
     })?;
-    bins.group(cells, staged.len(), |at| {
+    bins.group_on(cells, staged.len(), workers, |at| {
         staged.get(at).map_or(usize::MAX, |packet| packet.cell)
     })?;
     let order = bins.order();
@@ -806,26 +930,20 @@ fn group_packets(grid: &FieldGrid, grants: &mut Grants, workers: usize) -> Resul
             },
         );
         let staged_ref: &[GrantPacket] = staged;
-        let chunk = items.div_ceil(runs);
-        let gather = |ord_chunk: &[u32], dst_chunk: &mut [GrantPacket]| {
-            for (&at, dst) in ord_chunk.iter().zip(dst_chunk) {
-                if let Some(&pkt) = staged_ref.get(at as usize) {
-                    *dst = pkt;
+        flife_core::pool::parallel_chunks_mut(
+            workers,
+            "group uptake packets",
+            packets.as_mut_slice(),
+            UPTAKE_PACKETS_PER_RUN,
+            |start, dst_chunk| {
+                let ord_chunk = &order[start..start + dst_chunk.len()];
+                for (&at, dst) in ord_chunk.iter().zip(dst_chunk) {
+                    if let Some(&pkt) = staged_ref.get(at as usize) {
+                        *dst = pkt;
+                    }
                 }
-            }
-        };
-        let gather = &gather;
-        let mut ord_iter = order.chunks(chunk);
-        let mut dst_iter = packets.chunks_mut(chunk);
-        let head = ord_iter.next().zip(dst_iter.next());
-        flife_core::pool::scope_workers(workers, "group uptake packets", |scope| {
-            for (o, d) in ord_iter.zip(dst_iter) {
-                scope.spawn(move || gather(o, d));
-            }
-            if let Some((o, d)) = head {
-                gather(o, d);
-            }
-        })?;
+            },
+        )?;
     }
     Ok(())
 }
@@ -1165,19 +1283,17 @@ pub fn apply_grants_on(
     };
     let active_moments = field.carrier0_moments_count();
     let used = workers.clamp(1, active_moments);
-    let per = active_moments.div_ceil(used);
-    let mut runs = field.moments_mut().chunks_mut(per * cells.max(1));
-    let head = runs.next().unwrap_or_default();
-    let scale = &scale;
     if used <= 1 {
-        scale(head);
+        scale(field.moments_mut());
     } else {
-        flife_core::pool::scope_workers(workers, "apply grants", |scope| {
-            for planes in runs {
-                scope.spawn(move || scale(planes));
-            }
-            scale(head);
-        })?;
+        let mut plane_tasks: Vec<&mut [f32]> =
+            field.moments_mut().chunks_exact_mut(cells.max(1)).collect();
+        flife_core::pool::parallel_tasks(
+            workers,
+            "apply grants",
+            &mut plane_tasks,
+            |_, plane| scale(plane),
+        )?;
     }
     grants.applied = true;
     Ok(grants.summary.granted)

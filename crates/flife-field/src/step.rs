@@ -1027,77 +1027,31 @@ pub fn advance_field_wave2_on(
     }
     let worker_budget = scratches.len();
     let used = worker_budget.clamp(1, channels.max(1));
-    let per = channels.div_ceil(used);
     if fused {
         if fused_accum.len() < used {
             fused_accum.resize_with(used, Vec::new);
         }
-        let mut runs = moments
-            .chunks_mut(per * cells)
-            .zip(fused_accum.iter_mut().take(used));
-        let head = runs.next();
-        let run =
-            |first: usize, planes: &mut [f32], accum: &mut Vec<f64>| -> Result<(), CoreError> {
-                for (offset, plane) in planes.chunks_exact_mut(cells).enumerate() {
-                    deposit_moments_fused(plane, sources, first + offset, supports, accum)?;
+        let mut plane_tasks: Vec<&mut [f32]> = moments.chunks_exact_mut(cells).collect();
+        flife_core::pool::try_parallel_tasks_with_lanes(
+            worker_budget,
+            "deposit",
+            &mut fused_accum[..used],
+            &mut plane_tasks,
+            |channel, plane, accum| deposit_moments_fused(plane, sources, channel, supports, accum),
+        )?;
+    } else {
+        let mut plane_tasks: Vec<&mut [f32]> = moments.chunks_exact_mut(cells).collect();
+        flife_core::pool::try_parallel_tasks(
+            worker_budget,
+            "deposit",
+            &mut plane_tasks,
+            |channel, plane| {
+                for (source, support) in sources.iter().zip(supports) {
+                    deposit_moment(plane, component(source, channel), support)?;
                 }
                 Ok(())
-            };
-        let run = &run;
-        if used <= 1 {
-            if let Some((planes, accum)) = head {
-                run(0, planes, accum)?;
-            }
-        } else {
-            let mut tail_results: [Result<(), CoreError>; 32] = std::array::from_fn(|_| Ok(()));
-            let mut head_result = Ok(());
-            flife_core::pool::scope_workers(worker_budget, "deposit", |scope| {
-                for (index, ((planes, accum), slot)) in
-                    runs.zip(tail_results.iter_mut()).enumerate()
-                {
-                    scope.spawn(move || {
-                        *slot = run((index + 1) * per, planes, accum);
-                    });
-                }
-                if let Some((planes, accum)) = head {
-                    head_result = run(0, planes, accum);
-                }
-            })?;
-            head_result?;
-            for res in tail_results {
-                res?;
-            }
-        }
-    } else {
-        let run = |first: usize, planes: &mut [f32]| -> Result<(), CoreError> {
-            for (offset, plane) in planes.chunks_exact_mut(cells).enumerate() {
-                for (source, support) in sources.iter().zip(supports) {
-                    deposit_moment(plane, component(source, first + offset), support)?;
-                }
-            }
-            Ok(())
-        };
-        let mut runs = moments.chunks_mut(per * cells);
-        let head = runs.next().unwrap_or(&mut []);
-        let run = &run;
-        if used <= 1 {
-            run(0, head)?;
-        } else {
-            let mut tail_results: [Result<(), CoreError>; 32] = std::array::from_fn(|_| Ok(()));
-            let mut head_result = Ok(());
-            flife_core::pool::scope_workers(worker_budget, "deposit", |scope| {
-                for (index, (planes, slot)) in runs.zip(tail_results.iter_mut()).enumerate() {
-                    scope.spawn(move || {
-                        *slot = run((index + 1) * per, planes);
-                    });
-                }
-                head_result = run(0, head);
-            })?;
-            head_result?;
-            for res in tail_results {
-                res?;
-            }
-        }
+            },
+        )?;
     }
     Ok(step_report(transported, deposits, next))
 }

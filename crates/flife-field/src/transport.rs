@@ -338,65 +338,53 @@ pub fn transport_on(
     }
 
     let energy_before = sum(current.energy());
-    let used = scratches.len().min(planes).min(64);
-    let per = planes.div_ceil(used.max(1));
-    let run = |first_plane: usize,
-               source: &[f32],
-               target: &mut [f32],
-               scratch: &mut TransportScratch|
-     -> Option<EnergyTerms> {
-        let mut energy = None;
-        for (offset, (source, target)) in source
-            .chunks_exact(cells)
-            .zip(target.chunks_exact_mut(cells))
-            .enumerate()
-        {
-            let is_energy = first_plane + offset == ENERGY_PLANE as usize;
-            if let Some(terms) =
-                transport_plane(&coefficients, plan, source, target, scratch, is_energy)
-            {
-                energy = Some(terms);
-            }
-        }
-        energy
-    };
     let worker_budget = scratches.len();
-    let Some((head_scratch, others)) = scratches.split_first_mut() else {
+    let used = worker_budget.min(planes).min(64);
+    if used == 0 {
         return Err(CoreError::StateConflict {
             operation: "transport",
             detail: "no transport scratch".to_owned(),
         });
-    };
-    let mut sources = source.chunks(per * cells);
-    let mut targets = target.chunks_mut(per * cells);
-    let (Some(head_source), Some(head_target)) = (sources.next(), targets.next()) else {
-        return Err(missing_plane());
-    };
-    let run = &run;
-    let energy = if used <= 1 {
-        run(0, head_source, head_target, head_scratch).ok_or_else(missing_plane)?
-    } else {
-        let mut tail_terms = [None; 64];
-        let mut head_energy = None;
-        flife_core::pool::scope_workers(worker_budget, "transport", |scope| {
-            for (index, (((source, target), scratch), slot)) in sources
-                .zip(targets)
-                .zip(others.iter_mut())
-                .zip(tail_terms.iter_mut())
-                .enumerate()
-            {
-                scope.spawn(move || {
-                    *slot = run((index + 1) * per, source, target, scratch);
-                });
-            }
-            head_energy = run(0, head_source, head_target, head_scratch);
-        })?;
-        let mut energy = head_energy;
-        for terms in tail_terms {
-            energy = energy.or(terms);
-        }
-        energy.ok_or_else(missing_plane)?
-    };
+    }
+    struct PlaneTask<'a> {
+        plane: usize,
+        source: &'a [f32],
+        target: &'a mut [f32],
+        terms: Option<EnergyTerms>,
+    }
+    let mut tasks: Vec<PlaneTask<'_>> = source
+        .chunks_exact(cells)
+        .zip(target.chunks_exact_mut(cells))
+        .enumerate()
+        .map(|(plane, (source, target))| PlaneTask {
+            plane,
+            source,
+            target,
+            terms: None,
+        })
+        .collect();
+    flife_core::pool::try_parallel_tasks_with_lanes(
+        worker_budget,
+        "transport",
+        &mut scratches[..used],
+        &mut tasks,
+        |_, task, scratch| {
+            let is_energy = task.plane == ENERGY_PLANE as usize;
+            task.terms = transport_plane(
+                &coefficients,
+                plan,
+                task.source,
+                task.target,
+                scratch,
+                is_energy,
+            );
+            Ok(())
+        },
+    )?;
+    let energy = tasks
+        .into_iter()
+        .find_map(|task| task.terms)
+        .ok_or_else(missing_plane)?;
     Ok(report(plan, energy_before, energy))
 }
 

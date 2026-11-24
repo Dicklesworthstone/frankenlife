@@ -875,6 +875,9 @@ struct Scratch {
     pyramid: SensorPyramid,
     /// The committed rows, in identity order, that phases 3 and 4 read.
     rows: Vec<Organism>,
+    /// Phases 3 and 4 decisions in identity order, shared across dynamic
+    /// work-stealing tiles so `lanes` only hold per-worker scratch.
+    decisions: Vec<Decision>,
     /// One per CPU worker (`[execution] cpu_workers`).
     lanes: Vec<DecisionLane>,
     sampled: Vec<Source>,
@@ -928,6 +931,15 @@ struct Decision {
     gradients: [[f64; 2]; RESPONSE_TERMS],
 }
 
+impl Decision {
+    const EMPTY: Self = Self {
+        held: HeldOutput::newborn(),
+        evaluated: false,
+        actions: DecodedActions::default(),
+        gradients: [[0.0; 2]; RESPONSE_TERMS],
+    };
+}
+
 /// Queries sampled per spatial pyramid batch on a decision lane. Sized to
 /// match [`PyramidView::sample_batch`]'s 256-query 8x8 tile-sorted L1D block.
 const SAMPLE_BATCH: usize = 256;
@@ -951,10 +963,9 @@ struct DecisionLane {
     /// exceeds baseline `SENSOR_WIDTH` (recurrent or v2 extra sensors); empty
     /// (0 bytes) on baseline 104-input worlds.
     controller_inputs: Vec<[f64; MAX_SENSOR_WIDTH]>,
-    /// Start index and count of this lane's due jobs inside a batched tick.
+    /// Start index and count of this lane's due jobs inside a legacy batched tick.
     due_offset: usize,
     due_count: usize,
-    decisions: Vec<Decision>,
     /// Phases 6 and 7 of this lane's run: one organism's packets at a
     /// time, the run's ledger flows and staged emissions in identity order,
     /// which the tick takes in lane order, and the watched organism's
@@ -2025,7 +2036,6 @@ impl World {
                 capacity_bytes(&lane.dual_raw_samples),
                 capacity_bytes(&lane.observed),
                 capacity_bytes(&lane.controller_inputs),
-                capacity_bytes(&lane.decisions),
                 capacity_bytes(&lane.packets),
                 lane.flows.allocated_bytes(),
                 lane.emissions.allocated_bytes(),
@@ -2040,6 +2050,7 @@ impl World {
         total(
             [
                 capacity_bytes(&scratch.rows),
+                capacity_bytes(&scratch.decisions),
                 capacity_bytes(&scratch.lanes),
                 capacity_bytes(&scratch.sampled),
                 capacity_bytes(&scratch.working),
@@ -2653,6 +2664,7 @@ impl World {
             field: field_work,
             pyramid,
             rows,
+            decisions,
             lanes,
             sampled,
             working,
@@ -2695,8 +2707,7 @@ impl World {
         // injections apply below, with phase 2's external sources.
         let opening = Holdings::new(field.current().energy_total(), organism_total(population))?;
         let mut tick_ledger = ledger.open(from, opening)?;
-        rows.clear();
-        rows.extend(population.iter());
+        population.copy_rows_into_on(rows, lanes.len())?;
         let mut applied = Vec::new();
         let mut removals = Vec::new();
         intervention::remove(
@@ -2838,6 +2849,7 @@ impl World {
             rows,
             crowding_counts,
             [from, to],
+            decisions,
             lanes,
             controllers,
         )?;
@@ -2861,11 +2873,10 @@ impl World {
             sensors.report.failure = Some(failure);
             sensors.backend = None;
         }
-        let total_decisions: usize = lanes.iter().map(|lane| lane.decisions.len()).sum();
-        if total_decisions != rows.len() {
+        if decisions.len() != rows.len() {
             return Err(CoreError::StateConflict {
                 operation: "gather decisions",
-                detail: format!("{total_decisions} decisions for {} organisms", rows.len()),
+                detail: format!("{} decisions for {} organisms", decisions.len(), rows.len()),
             });
         }
         let mut evaluated = 0_usize;
@@ -2890,84 +2901,83 @@ impl World {
                 intent: None,
             };
             set_len_reuse(working, rows.len(), placeholder);
-            let active_lanes: Vec<(usize, &[Decision])> = {
-                let mut v = Vec::with_capacity(lanes.len());
-                let mut offset = 0_usize;
-                for lane in lanes.iter() {
-                    let len = lane.decisions.len();
-                    if len > 0 {
-                        v.push((offset, lane.decisions.as_slice()));
-                        offset += len;
-                    }
-                }
-                v
-            };
-            let fill_working = |start: usize,
-                                row_c: &[Organism],
-                                dec_c: &[Decision],
-                                out_c: &mut [Working]|
-             -> Result<usize, CoreError> {
-                let mut local_eval = 0_usize;
-                for (i, ((&organism, decision), slot)) in
-                    row_c.iter().zip(dec_c).zip(out_c.iter_mut()).enumerate()
-                {
-                    local_eval += usize::from(decision.evaluated);
-                    let basal_multiplier =
-                        rules
-                            .v2
-                            .basal_multiplier(organism.birth_tick, from, rules.step)?;
-                    let local_crowding = crowding_counts.get(start + i).copied().unwrap_or(0);
-                    *slot = Working {
-                        committed: organism,
-                        budget: EnergyBudget::new(organism.energy)?,
-                        vitality: Vitality::new(),
-                        held: decision.held,
-                        evaluated: decision.evaluated,
-                        actions: decision.actions,
-                        gradients: decision.gradients,
-                        basal_multiplier,
-                        local_crowding,
-                        position: organism.position,
-                        velocity: organism.velocity,
-                        cooldown_deadline: organism.cooldown_deadline,
-                        secretory_readiness: organism.secretory_readiness,
-                        emission_cooldown_deadline: organism.emission_cooldown_deadline,
-                        emitted: false,
-                        lysed_residual: 0.0,
-                        intent: None,
-                    };
-                }
-                Ok(local_eval)
-            };
-            if let Some((&(head_start, head_decs), tail_decs)) = active_lanes.split_first() {
-                let (head_out, mut rest_out) = working.as_mut_slice().split_at_mut(head_decs.len());
-                let mut tail_results: Vec<Result<usize, CoreError>> =
-                    (0..tail_decs.len()).map(|_| Ok(0)).collect();
-                let mut head_result = Ok(0_usize);
-                let fill_working = &fill_working;
-                flife_core::pool::scope_workers(lanes.len(), "gather decisions", |scope| {
-                    for (&(start, decs), res_slot) in tail_decs.iter().zip(tail_results.iter_mut())
+            let tile_count = lanes
+                .len()
+                .saturating_mul(4)
+                .min(64)
+                .min(rows.len().div_ceil(512))
+                .max(1);
+            let tile_len = rows.len().div_ceil(tile_count);
+            struct GatherTile<'a> {
+                start: usize,
+                rows: &'a [Organism],
+                decisions: &'a [Decision],
+                out: &'a mut [Working],
+                evaluated: usize,
+            }
+            let mut tiles: Vec<GatherTile<'_>> = rows
+                .chunks(tile_len)
+                .zip(decisions.chunks(tile_len))
+                .zip(working.chunks_mut(tile_len))
+                .enumerate()
+                .map(|(idx, ((row_c, dec_c), out_c))| GatherTile {
+                    start: idx * tile_len,
+                    rows: row_c,
+                    decisions: dec_c,
+                    out: out_c,
+                    evaluated: 0,
+                })
+                .collect();
+            flife_core::pool::try_parallel_tasks(
+                lanes.len(),
+                "gather decisions",
+                &mut tiles,
+                |_, tile| {
+                    let mut local_eval = 0_usize;
+                    for (i, ((&organism, decision), slot)) in tile
+                        .rows
+                        .iter()
+                        .zip(tile.decisions)
+                        .zip(tile.out.iter_mut())
+                        .enumerate()
                     {
-                        let (out_c, next_out) =
-                            core::mem::take(&mut rest_out).split_at_mut(decs.len());
-                        rest_out = next_out;
-                        let row_c = &rows[start..start + decs.len()];
-                        scope.spawn(move || {
-                            *res_slot = fill_working(start, row_c, decs, out_c);
-                        });
+                        local_eval += usize::from(decision.evaluated);
+                        let basal_multiplier =
+                            rules
+                                .v2
+                                .basal_multiplier(organism.birth_tick, from, rules.step)?;
+                        let local_crowding =
+                            crowding_counts.get(tile.start + i).copied().unwrap_or(0);
+                        *slot = Working {
+                            committed: organism,
+                            budget: EnergyBudget::new(organism.energy)?,
+                            vitality: Vitality::new(),
+                            held: decision.held,
+                            evaluated: decision.evaluated,
+                            actions: decision.actions,
+                            gradients: decision.gradients,
+                            basal_multiplier,
+                            local_crowding,
+                            position: organism.position,
+                            velocity: organism.velocity,
+                            cooldown_deadline: organism.cooldown_deadline,
+                            secretory_readiness: organism.secretory_readiness,
+                            emission_cooldown_deadline: organism.emission_cooldown_deadline,
+                            emitted: false,
+                            lysed_residual: 0.0,
+                            intent: None,
+                        };
                     }
-                    let head_rows = &rows[head_start..head_start + head_decs.len()];
-                    head_result = fill_working(head_start, head_rows, head_decs, head_out);
-                })?;
-                evaluated += head_result?;
-                for res in tail_results {
-                    evaluated += res?;
-                }
+                    tile.evaluated = local_eval;
+                    Ok(())
+                },
+            )?;
+            for tile in &tiles {
+                evaluated += tile.evaluated;
             }
         } else {
             working.clear();
-            let decisions = lanes.iter().flat_map(|lane| lane.decisions.iter());
-            for (row_index, (&organism, decision)) in rows.iter().zip(decisions).enumerate() {
+            for (row_index, (&organism, decision)) in rows.iter().zip(decisions.iter()).enumerate() {
                 evaluated += usize::from(decision.evaluated);
                 let basal_multiplier =
                     rules
@@ -3010,7 +3020,7 @@ impl World {
         // The packets are in (cell, identity) order, so grouping them by
         // demand keeps each organism's in cell order.
         let granted = grants.packets();
-        by_demand.group(demands.len(), granted.len(), |at| {
+        by_demand.group_on(demands.len(), granted.len(), lanes.len(), |at| {
             granted.get(at).map_or(usize::MAX, |packet| packet.demand)
         })?;
 
@@ -3152,13 +3162,65 @@ impl World {
         // Phase 8: the last stages of organisms that do not reproduce, then
         // the births as one transaction, then the parents' last stages.
         let mut live = 0_u64;
-        for organism in working.iter_mut() {
-            if organism.intent.is_some() {
-                live += 1;
-            } else if organism.vitality.is_alive() {
-                organism
-                    .vitality
-                    .check(BudgetStage::Split, &organism.budget)?;
+        if working.len() >= 1_024 && lanes.len() > 1 {
+            let tiny_threshold = rules.tiny.threshold();
+            let tile_count = lanes
+                .len()
+                .saturating_mul(4)
+                .min(64)
+                .min(working.len().div_ceil(512))
+                .max(1);
+            let tile_len = working.len().div_ceil(tile_count);
+            struct SplitTile<'a> {
+                base: usize,
+                chunk: &'a mut [Working],
+                live_no_tiny: u64,
+                tiny_indices: Vec<usize>,
+            }
+            let mut tiles: Vec<SplitTile<'_>> = working
+                .chunks_mut(tile_len)
+                .enumerate()
+                .map(|(idx, chunk)| SplitTile {
+                    base: idx * tile_len,
+                    chunk,
+                    live_no_tiny: 0,
+                    tiny_indices: Vec::new(),
+                })
+                .collect();
+            flife_core::pool::try_parallel_tasks(
+                lanes.len(),
+                "phase 8 split check",
+                &mut tiles,
+                |_, tile| {
+                    let mut count = 0_u64;
+                    for (offset, organism) in tile.chunk.iter_mut().enumerate() {
+                        if organism.intent.is_some() {
+                            count += 1;
+                        } else if organism.vitality.is_alive() {
+                            organism
+                                .vitality
+                                .check(BudgetStage::Split, &organism.budget)?;
+                            if organism.vitality.is_alive() {
+                                let remaining = organism.budget.remaining();
+                                if remaining < tiny_threshold {
+                                    tile.tiny_indices.push(tile.base + offset);
+                                } else {
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                    tile.live_no_tiny = count;
+                    Ok(())
+                },
+            )?;
+            let mut tiny_indices = Vec::new();
+            for tile in tiles {
+                live += tile.live_no_tiny;
+                tiny_indices.extend(tile.tiny_indices);
+            }
+            for idx in tiny_indices {
+                let organism = &mut working[idx];
                 let cleared = clear_tiny(&rules.tiny, organism, &mut tick_ledger)?;
                 if let Some(record) = transactions
                     .as_mut()
@@ -3167,6 +3229,24 @@ impl World {
                     record.tiny = cleared;
                 }
                 live += u64::from(organism.vitality.is_alive());
+            }
+        } else {
+            for organism in working.iter_mut() {
+                if organism.intent.is_some() {
+                    live += 1;
+                } else if organism.vitality.is_alive() {
+                    organism
+                        .vitality
+                        .check(BudgetStage::Split, &organism.budget)?;
+                    let cleared = clear_tiny(&rules.tiny, organism, &mut tick_ledger)?;
+                    if let Some(record) = transactions
+                        .as_mut()
+                        .filter(|_| watch.organism == Some(organism.committed.id))
+                    {
+                        record.tiny = cleared;
+                    }
+                    live += u64::from(organism.vitality.is_alive());
+                }
             }
         }
         let mut requests = Vec::new();
@@ -3329,6 +3409,229 @@ impl World {
             &[]
         };
         let mut death_genomes = population.ascending();
+        if working.len() >= 1_024 && lanes.len() > 1 {
+            let tile_count = lanes
+                .len()
+                .saturating_mul(4)
+                .min(64)
+                .min(working.len().div_ceil(512))
+                .max(1);
+            let tile_len = working.len().div_ceil(tile_count);
+            struct FateTile<'a> {
+                base: usize,
+                chunk: &'a [Working],
+                emitted: usize,
+                survivors: usize,
+                dies: Vec<(usize, BudgetStage)>,
+            }
+            let mut fate_tiles: Vec<FateTile<'_>> = working
+                .chunks(tile_len)
+                .enumerate()
+                .map(|(idx, chunk)| FateTile {
+                    base: idx * tile_len,
+                    chunk,
+                    emitted: 0,
+                    survivors: 0,
+                    dies: Vec::new(),
+                })
+                .collect();
+            flife_core::pool::try_parallel_tasks(
+                lanes.len(),
+                "phase 8 fate scan",
+                &mut fate_tiles,
+                |_, tile| {
+                    let mut tile_emitted = 0_usize;
+                    let mut tile_survivors = 0_usize;
+                    for (offset, organism) in tile.chunk.iter().enumerate() {
+                        tile_emitted += usize::from(organism.emitted);
+                        match organism.vitality.fate()? {
+                            Fate::Survives => tile_survivors += 1,
+                            Fate::Dies(stage) => tile.dies.push((tile.base + offset, stage)),
+                        }
+                    }
+                    tile.emitted = tile_emitted;
+                    tile.survivors = tile_survivors;
+                    Ok(())
+                },
+            )?;
+            let mut total_survivors = 0_usize;
+            let mut die_list: Vec<(usize, BudgetStage)> = Vec::new();
+            let mut tile_specs: Vec<(usize, usize, usize)> = Vec::with_capacity(fate_tiles.len());
+            for tile in fate_tiles {
+                emitted += tile.emitted;
+                tile_specs.push((tile.base, tile.chunk.len(), tile.survivors));
+                total_survivors += tile.survivors;
+                die_list.extend(tile.dies);
+            }
+            if total_survivors > 0 {
+                set_len_reuse(survivors, total_survivors, working[0].committed);
+                struct BuildTile<'a> {
+                    base: usize,
+                    chunk: &'a [Working],
+                    out: &'a mut [Organism],
+                }
+                let mut build_tiles: Vec<BuildTile<'_>> = Vec::with_capacity(tile_specs.len());
+                let mut rem_out = survivors.as_mut_slice();
+                for (base, len, surv_count) in tile_specs {
+                    let (out_head, out_tail) = rem_out.split_at_mut(surv_count);
+                    rem_out = out_tail;
+                    if surv_count > 0 {
+                        build_tiles.push(BuildTile {
+                            base,
+                            chunk: &working[base..base + len],
+                            out: out_head,
+                        });
+                    }
+                }
+                flife_core::pool::try_parallel_tasks(
+                    lanes.len(),
+                    "phase 8 build survivors",
+                    &mut build_tiles,
+                    |_, tile| {
+                        let mut dst = 0_usize;
+                        for (offset, organism) in tile.chunk.iter().enumerate() {
+                            if !organism.vitality.is_alive() {
+                                continue;
+                            }
+                            let index = tile.base + offset;
+                            #[expect(
+                                clippy::cast_precision_loss,
+                                reason = "signed per-organism quantum delta is exact in f64 for |delta_k| <= 2^53"
+                            )]
+                            let trophallaxis_delta = trophallaxis_deltas
+                                .get(index)
+                                .copied()
+                                .map_or(0.0, |k| (k as f64) * TROPHALLAXIS_QUANTUM);
+                            let energy = if trophallaxis_delta != 0.0 {
+                                let updated = organism.budget.remaining() + trophallaxis_delta;
+                                if !updated.is_finite() || updated <= 0.0 {
+                                    return Err(CoreError::NumericalInvalid {
+                                        quantity: "trophallaxis survivor energy",
+                                        detail: format!(
+                                            "{} post-trophallaxis energy {updated:?} is not finite and positive",
+                                            organism.committed.id
+                                        ),
+                                    });
+                                }
+                                updated
+                            } else {
+                                organism.budget.remaining()
+                            };
+                            let position = match contacted.and_then(|moves| moves.get(index)) {
+                                Some(&[dx, dy]) if dx != 0.0 || dy != 0.0 => rules
+                                    .grid
+                                    .wrap_position([
+                                        organism.position[0] + dx,
+                                        organism.position[1] + dy,
+                                    ])?,
+                                _ => organism.position,
+                            };
+                            let base_velocity = next_velocities
+                                .get(index)
+                                .copied()
+                                .unwrap_or(organism.velocity);
+                            let velocity = match (pressed.get(index), &rules.contact) {
+                                (Some(&push), Some(bodies)) => {
+                                    inhibited(base_velocity, push, bodies.inhibition)
+                                }
+                                _ => base_velocity,
+                            };
+                            let polarity = next_polarities
+                                .get(index)
+                                .copied()
+                                .unwrap_or(organism.committed.polarity);
+                            let last_neighbor_h0 =
+                                next_neighbor_h0.get(index).copied().unwrap_or(0.0);
+                            tile.out[dst] = Organism {
+                                position,
+                                velocity,
+                                energy,
+                                energy_change_rate: (energy - organism.committed.energy) / seconds,
+                                held: organism.held,
+                                cooldown_deadline: organism.cooldown_deadline,
+                                secretory_readiness: organism.secretory_readiness,
+                                emission_cooldown_deadline: organism.emission_cooldown_deadline,
+                                polarity,
+                                last_neighbor_h0,
+                                ..organism.committed
+                            };
+                            dst += 1;
+                        }
+                        Ok(())
+                    },
+                )?;
+                for survivor in survivors.iter() {
+                    organisms.add(survivor.energy);
+                }
+                if !trophallaxis_deltas.is_empty()
+                    && let (Some(watched_id), Some(record)) =
+                        (watch.organism, transactions.as_mut())
+                    && let Ok(index) =
+                        working.binary_search_by_key(&watched_id, |o| o.committed.id)
+                    && working[index].vitality.is_alive()
+                {
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "signed per-organism quantum delta is exact in f64 for |delta_k| <= 2^53"
+                    )]
+                    let trophallaxis_delta = trophallaxis_deltas
+                        .get(index)
+                        .copied()
+                        .map_or(0.0, |k| (k as f64) * TROPHALLAXIS_QUANTUM);
+                    if trophallaxis_delta != 0.0 {
+                        record.trophallaxis_delta = trophallaxis_delta;
+                        record.closing = working[index].budget.remaining() + trophallaxis_delta;
+                    }
+                }
+            }
+            for (index, stage) in die_list {
+                let organism = &working[index];
+                let genome = death_genomes.next(organism.committed.id).0.ok_or_else(|| {
+                    CoreError::StateConflict {
+                        operation: "read genome",
+                        detail: format!("{} has no genome", organism.committed.id),
+                    }
+                })?;
+                let recurrent_h0 = organism.held.recurrent_state_array()[0];
+                let (death, corpse_dir) = if organism.lysed_residual > 0.0 {
+                    let death = Death::lysed(
+                        &organism.committed,
+                        to,
+                        organism.position,
+                        stage,
+                        organism.lysed_residual,
+                    )?;
+                    let direction = rules
+                        .v2
+                        .lysis()
+                        .map_or(CorpseDirection::GeneticAffinity, |lysis| {
+                            lysis.corpse_direction
+                        });
+                    let a_eff = effective_affinity(
+                        genome.traits(),
+                        recurrent_h0,
+                        &rules.v2,
+                        rules.chemistry.affinity_norm_limit(),
+                    )?;
+                    let corpse_dir = corpse_affinity_direction(
+                        &a_eff,
+                        direction,
+                        rules.v2.active_carrier0_channels(),
+                        rules.chemistry.affinity_norm_limit(),
+                    )?;
+                    (death, corpse_dir)
+                } else {
+                    let death =
+                        Death::exhausted(&organism.committed, to, organism.position, stage)?;
+                    (death, *genome.traits().affinity())
+                };
+                rules
+                    .recycling
+                    .settle_with(&rules.grid, rules.exchange, &death, &corpse_dir, recycling)?
+                    .record(&mut tick_ledger)?;
+                deaths.push(death);
+            }
+        } else {
         for (index, organism) in working.iter().enumerate() {
             emitted += usize::from(organism.emitted);
             match organism.vitality.fate()? {
@@ -3448,6 +3751,7 @@ impl World {
                     deaths.push(death);
                 }
             }
+        }
         }
         let attempted = requests.len();
         let (born, rejected, refused) = births.into_parts();
@@ -3674,8 +3978,14 @@ impl World {
         let closure = tick_ledger.close(closing)?;
         let mut next_ledger = ledger.clone();
         let cumulative = next_ledger.commit(&closure)?;
-        let checked =
-            population.check_tick_staged(to, survivors, deaths, &entrants, &next_quota)?;
+        let checked = population.check_tick_staged_on(
+            to,
+            survivors,
+            deaths,
+            &entrants,
+            &next_quota,
+            lanes.len(),
+        )?;
 
         let count =
             u64::try_from(deaths.len() + entrants.len()).map_err(|_| CoreError::Overflow {
@@ -3913,6 +4223,7 @@ impl Scratch {
             field,
             pyramid: SensorPyramid::from_config(config, &limits)?,
             rows: reserved(rows, "organism rows")?,
+            decisions: reserved(rows, "decisions")?,
             lanes: lanes(workers(workers_configured)?.get(), rules)?,
             sampled: Vec::with_capacity(sources),
             working: reserved(rows, "working organisms")?,
@@ -4189,11 +4500,7 @@ fn grown(rules: &Rules, founding: &Founding, seed: Seed) -> Result<Entrant, Core
 }
 
 fn organism_total(population: &Population) -> f64 {
-    let mut total = CompensatedSum::ZERO;
-    for organism in population.iter() {
-        total.add(organism.energy);
-    }
-    total.value()
+    population.energy_total()
 }
 
 /// `[execution] cpu_workers` as a thread count.
@@ -4303,7 +4610,6 @@ fn fit_lanes(
     let rows = lane_rows(organisms, lanes.len());
     let needs_expanded = rules.v2.sensors().input_width() > SENSOR_WIDTH;
     for lane in lanes {
-        fit(&mut lane.decisions, rows, "decisions")?;
         fit(
             &mut lane.packets,
             rules.max_exchange_cells,
@@ -4836,25 +5142,51 @@ fn demands_on_lanes(
     lanes: &mut [DecisionLane],
 ) -> Result<(), CoreError> {
     demands.clear();
+    if working.is_empty() {
+        return Ok(());
+    }
     reserve_for(demands, working.len(), "organism demands")?;
-    demands.extend(working.iter().map(|organism| Demand {
-        organism: organism.committed.id,
-        position: organism.position,
+    let placeholder = Demand {
+        organism: working[0].committed.id,
+        position: working[0].position,
         amount: 0.0,
-    }));
-    in_runs_mut(demands, lanes, "uptake demands", &|_, run, lane| {
-        for slot in run.iter_mut() {
-            *slot = demand_with_scratch(
-                field,
-                rule,
-                exchange,
-                slot.organism,
-                slot.position,
-                &mut lane.exchange,
-            )?;
-        }
-        Ok(())
-    })
+    };
+    set_len_reuse(demands, working.len(), placeholder);
+    let worker_budget = lanes.len().max(1);
+    let max_tiles = working.len().div_ceil(MINIMUM_ROWS_PER_LANE).max(1);
+    let tile_count = if worker_budget <= 1 || max_tiles <= 1 {
+        1
+    } else {
+        worker_budget
+            .saturating_mul(4)
+            .min(64)
+            .min(max_tiles)
+            .max(worker_budget.min(max_tiles))
+    };
+    let tile_len = working.len().div_ceil(tile_count);
+    let mut tiles: Vec<(&[Working], &mut [Demand])> = working
+        .chunks(tile_len)
+        .zip(demands.chunks_mut(tile_len))
+        .collect();
+    flife_core::pool::try_parallel_tasks_with_lanes(
+        worker_budget,
+        "uptake demands",
+        lanes,
+        &mut tiles,
+        |_, (work_chunk, dem_chunk), lane| {
+            for (organism, slot) in work_chunk.iter().zip(dem_chunk.iter_mut()) {
+                *slot = demand_with_scratch(
+                    field,
+                    rule,
+                    exchange,
+                    organism.committed.id,
+                    organism.position,
+                    &mut lane.exchange,
+                )?;
+            }
+            Ok(())
+        },
+    )
 }
 
 /// The watched organism's observation in the step from `from` to `to`,
@@ -5691,34 +6023,26 @@ fn compositions_into(
         }
         Ok(())
     };
-    let used = lanes
+    let base_used = lanes
         .min(granted.len().div_ceil(MINIMUM_PACKETS_PER_LANE))
         .max(1);
-    if used == 1 {
+    if base_used == 1 {
         return run(granted, out);
     }
-    let length = granted.len().div_ceil(used);
-    let mut runs = granted.chunks(length).zip(out.chunks_mut(length));
-    let Some((head, head_slots)) = runs.next() else {
-        return Ok(());
-    };
-    let run = &run;
-    let tail_count = used.saturating_sub(1);
-    let mut tail_results: Vec<Result<(), CoreError>> = (0..tail_count).map(|_| Ok(())).collect();
-    let mut head_result = Ok(());
-    flife_core::pool::scope_workers(lanes, "compose packets", |scope| {
-        for ((packets, slots), result_slot) in runs.zip(tail_results.iter_mut()) {
-            scope.spawn(move || {
-                *result_slot = run(packets, slots);
-            });
-        }
-        head_result = run(head, head_slots);
-    })?;
-    head_result?;
-    for result in tail_results {
-        result?;
-    }
-    Ok(())
+    let tile_count = lanes
+        .saturating_mul(4)
+        .min(64)
+        .min(granted.len().div_ceil(MINIMUM_PACKETS_PER_LANE))
+        .max(base_used);
+    let length = granted.len().div_ceil(tile_count);
+    let mut tiles: Vec<(&[GrantPacket], &mut [[f64; CHANNELS]])> =
+        granted.chunks(length).zip(out.chunks_mut(length)).collect();
+    flife_core::pool::try_parallel_tasks(
+        lanes,
+        "compose packets",
+        &mut tiles,
+        |_, (packets, slots)| run(packets, slots),
+    )
 }
 
 fn reserve_for<T>(

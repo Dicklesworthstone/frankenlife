@@ -1059,7 +1059,7 @@ pub fn apply_deposit_streams_to_carrier_on(
     let mut heaviest_stream = 0_usize;
     let mut heaviest_items = 0_usize;
     for (idx, stream) in streams.iter_mut().enumerate() {
-        let (summary, buckets) = stream.prepare_for_carrier(field, carrier)?;
+        let (summary, buckets) = stream.prepare_for_carrier(field, carrier, workers)?;
         let items = stream.bins.order().len();
         let occ = stream.bins.occupied_buckets().len();
         if items > 0 && occ > 0 {
@@ -1102,7 +1102,16 @@ pub fn apply_deposit_streams_to_carrier_on(
         (e_slice, m_slice)
     };
 
-    let runs = workers.min(total_items / PACKETS_PER_RUN).max(1);
+    let base_runs = workers.min(total_items / PACKETS_PER_RUN).max(1);
+    let runs = if base_runs <= 1 {
+        1
+    } else {
+        workers
+            .saturating_mul(4)
+            .min(64)
+            .min(total_items / (PACKETS_PER_RUN / 2).max(1))
+            .max(base_runs)
+    };
     if runs == 1 {
         let mut field_moments: [&mut [f32]; CHANNELS] =
             std::array::from_fn(|_| <&mut [f32]>::default());
@@ -1287,17 +1296,16 @@ pub fn apply_deposit_streams_to_carrier_on(
             );
         }
     };
-    let process_lane = &process_lane;
-    flife_core::pool::scope_workers(workers, "apply deposits", |scope| {
-        let mut pairs = field_lanes.iter_mut().zip(lane_streams.iter_mut());
-        let first = pairs.next();
-        for (f_lane, s_lanes) in pairs {
-            scope.spawn(move || process_lane(f_lane, s_lanes));
-        }
-        if let Some((f_lane, s_lanes)) = first {
-            process_lane(f_lane, s_lanes);
-        }
-    })?;
+    let mut work_tiles: Vec<(&mut FieldSlice<'_>, &mut Vec<StreamLane<'_>>)> = field_lanes
+        .iter_mut()
+        .zip(lane_streams.iter_mut())
+        .collect();
+    flife_core::pool::parallel_tasks(
+        workers,
+        "apply deposits",
+        &mut work_tiles,
+        |_, (f_lane, s_lanes)| process_lane(f_lane, s_lanes),
+    )?;
 
     for (s_idx, (mut summary, _)) in prepared.into_iter().enumerate() {
         let mut applied = CompensatedSum::ZERO;
@@ -1334,7 +1342,7 @@ pub fn apply_deposits_to_carrier_on(
     carrier: CarrierLayout,
     workers: usize,
 ) -> Result<DepositSummary, CoreError> {
-    let (mut summary, buckets) = deposits.prepare_for_carrier(field, carrier)?;
+    let (mut summary, buckets) = deposits.prepare_for_carrier(field, carrier, workers)?;
     let Deposits {
         entries,
         packets,
@@ -1375,7 +1383,16 @@ pub fn apply_deposits_to_carrier_on(
         (e_slice, m_slice)
     };
 
-    let runs = workers.min(items / PACKETS_PER_RUN).max(1);
+    let base_runs = workers.min(items / PACKETS_PER_RUN).max(1);
+    let runs = if base_runs <= 1 {
+        1
+    } else {
+        workers
+            .saturating_mul(4)
+            .min(64)
+            .min(items / (PACKETS_PER_RUN / 2).max(1))
+            .max(base_runs)
+    };
     received.resize(occupied_buckets.len(), 0.0);
     let seq = (!*identity_sequence).then_some(sequence.as_slice());
     let (packets, entries) = (&**packets, &**entries);
@@ -1461,20 +1478,17 @@ pub fn apply_deposits_to_carrier_on(
     }
 
     let reduce = |run: &mut Run<'_>| reduce_run(run, offsets, order, seq, packets, entries);
-    let reduce = &reduce;
     let mut occupied = vec![0_usize; lanes.len()];
-    flife_core::pool::scope_workers(workers, "apply deposits", |scope| {
-        let mut pairs = lanes.iter_mut().zip(occupied.iter_mut());
-        let first = pairs.next();
-        for (run, slot) in pairs {
-            scope.spawn(move || {
-                *slot = reduce(run);
-            });
-        }
-        if let Some((run, slot)) = first {
+    let mut work_tiles: Vec<(&mut Run<'_>, &mut usize)> =
+        lanes.iter_mut().zip(occupied.iter_mut()).collect();
+    flife_core::pool::parallel_tasks(
+        workers,
+        "apply deposits",
+        &mut work_tiles,
+        |_, (run, slot)| {
             *slot = reduce(run);
-        }
-    })?;
+        },
+    )?;
 
     let mut applied = CompensatedSum::ZERO;
     for (lane, &count) in lanes.iter().zip(&occupied) {
@@ -1495,6 +1509,7 @@ impl Deposits {
         &mut self,
         field: &FieldState,
         carrier: CarrierLayout,
+        workers: usize,
     ) -> Result<(DepositSummary, usize), CoreError> {
         let conflict = |detail: String| CoreError::StateConflict {
             operation: "apply deposits",
@@ -1603,7 +1618,7 @@ impl Deposits {
         sequence.clear();
         if contiguous {
             *identity_sequence = true;
-            bins.group(buckets, packets.len(), |at| packets[at].cell)?;
+            bins.group_on(buckets, packets.len(), workers, |at| packets[at].cell)?;
         } else {
             *identity_sequence = false;
             if strictly_ascending {
@@ -1618,10 +1633,12 @@ impl Deposits {
                     }
                 }
             }
-            bins.group(buckets, sequence.len(), |at| {
-                sequence
+            let seq_slice = sequence.as_slice();
+            let pkt_slice = packets.as_slice();
+            bins.group_on(buckets, seq_slice.len(), workers, |at| {
+                seq_slice
                     .get(at)
-                    .and_then(|&packet| packets.get(packet as usize))
+                    .and_then(|&packet| pkt_slice.get(packet as usize))
                     .map_or(usize::MAX, |packet| packet.cell)
             })?;
         }
@@ -1662,7 +1679,7 @@ impl Deposits {
         field: &FieldState,
         carrier: CarrierLayout,
     ) -> Result<DepositReduction<'_>, CoreError> {
-        let (summary, cells) = self.prepare_for_carrier(field, carrier)?;
+        let (summary, cells) = self.prepare_for_carrier(field, carrier, 1)?;
         Ok(DepositReduction {
             deposits: self,
             summary,

@@ -149,6 +149,291 @@ impl Bins {
         result
     }
 
+    /// Parallel, L1-cache-striped counterpart to [`Bins::group`] using up to
+    /// `workers` threads. Produces bit-identical `offsets`, `order`,
+    /// `occupied`, and `largest` to [`Bins::group`] (preserving ascending item
+    /// order within every bucket and exact lowest-index error reporting).
+    ///
+    /// Below `PARALLEL_ITEMS_MIN` (small worlds <= 4k organisms) or when
+    /// `workers <= 1`, delegates directly to [`Bins::group`] with zero
+    /// transient allocation.
+    ///
+    /// # Errors
+    /// As [`Bins::group`], plus [`CoreError::AllocationFailed`] or
+    /// [`CoreError::StateConflict`] if the parallel scratch or worker pool fails.
+    pub fn group_on(
+        &mut self,
+        buckets: usize,
+        items: usize,
+        workers: usize,
+        bucket_of: impl Fn(usize) -> usize + Sync,
+    ) -> Result<(), CoreError> {
+        const PARALLEL_ITEMS_MIN: usize = 24_576;
+        if workers <= 1 || items < PARALLEL_ITEMS_MIN || buckets < 256 {
+            return self.group(buckets, items, bucket_of);
+        }
+        self.clear();
+        let result = self.group_into_parallel(buckets, items, workers, &bucket_of);
+        if result.is_err() {
+            self.clear();
+        }
+        result
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "two-level 64-stripe L1-resident stable parallel counting sort preserving exact serial order"
+    )]
+    fn group_into_parallel(
+        &mut self,
+        buckets: usize,
+        items: usize,
+        workers: usize,
+        bucket_of: &(impl Fn(usize) -> usize + Sync),
+    ) -> Result<(), CoreError> {
+        const STRIPES: usize = 64;
+        const STACK_STRIPE_BUCKETS: usize = 4_096;
+
+        for (count, limit) in [(buckets, self.buckets_limit), (items, self.items_limit)] {
+            if count > limit {
+                return Err(CoreError::BudgetExhausted {
+                    budget: self.name,
+                    required: u64::try_from(count).unwrap_or(u64::MAX),
+                    available: u64::try_from(limit).unwrap_or(u64::MAX),
+                });
+            }
+        }
+        let outside = |item: usize, bucket: usize| CoreError::LayoutMismatch {
+            buffer: self.name,
+            detail: format!("item {item} names bucket {bucket} of {buckets}"),
+        };
+
+        self.offsets.resize(buckets + 1, 0);
+        if items == 0 {
+            self.largest = 0;
+            return Ok(());
+        }
+
+        let stripe_width = buckets.div_ceil(STRIPES).max(1);
+        let stripe_count = buckets.div_ceil(stripe_width);
+        let chunk_count = workers.min(items.div_ceil(4_096)).clamp(1, 32);
+        let chunk_len = items.div_ceil(chunk_count);
+
+        // Pass 1: per-chunk coarse stripe histograms + exact lowest-index bounds check.
+        struct ChunkCount {
+            start: usize,
+            end: usize,
+            counts: [usize; STRIPES],
+        }
+        let mut chunk_counts: Vec<ChunkCount> = (0..chunk_count)
+            .filter_map(|c| {
+                let start = c * chunk_len;
+                (start < items).then(|| ChunkCount {
+                    start,
+                    end: (start + chunk_len).min(items),
+                    counts: [0; STRIPES],
+                })
+            })
+            .collect();
+        let active_chunks = chunk_counts.len();
+
+        flife_core::pool::try_parallel_tasks(
+            workers,
+            "bins stripe count",
+            &mut chunk_counts,
+            |_, chunk| {
+                for item in chunk.start..chunk.end {
+                    let bucket = bucket_of(item);
+                    if bucket >= buckets {
+                        return Err(outside(item, bucket));
+                    }
+                    chunk.counts[bucket / stripe_width] += 1;
+                }
+                Ok(())
+            },
+        )?;
+
+        // Prefix-sum stripe totals; within each stripe, chunks stay in ascending
+        // item order so every stripe buffer is strictly ascending by `item`.
+        let mut stripe_bases = [0_usize; STRIPES + 1];
+        for s in 0..stripe_count {
+            let mut sum = 0_usize;
+            for c in &chunk_counts {
+                sum += c.counts[s];
+            }
+            stripe_bases[s + 1] = stripe_bases[s] + sum;
+        }
+
+        // Transient `(bucket, item)` buffer grouped into 64 contiguous L1-friendly stripes.
+        let mut staged: Vec<(u32, u32)> = Vec::new();
+        staged
+            .try_reserve_exact(items)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: self.name,
+                bytes: u64::try_from(items.saturating_mul(std::mem::size_of::<(u32, u32)>()))
+                    .unwrap_or(u64::MAX),
+            })?;
+        staged.resize(items, (0, 0));
+
+        // Pass 2: parallel scatter of `(bucket, item)` into disjoint per-(chunk, stripe) slices.
+        {
+            struct ScatterTask<'a> {
+                start: usize,
+                end: usize,
+                dsts: Vec<&'a mut [(u32, u32)]>,
+            }
+            let mut scatter_tasks: Vec<ScatterTask<'_>> = chunk_counts
+                .iter()
+                .map(|c| ScatterTask {
+                    start: c.start,
+                    end: c.end,
+                    dsts: Vec::with_capacity(stripe_count),
+                })
+                .collect();
+            let mut rem = staged.as_mut_slice();
+            for s in 0..stripe_count {
+                for c in 0..active_chunks {
+                    let count = chunk_counts[c].counts[s];
+                    let (slice, tail) = rem.split_at_mut(count);
+                    rem = tail;
+                    scatter_tasks[c].dsts.push(slice);
+                }
+            }
+            flife_core::pool::try_parallel_tasks(
+                workers,
+                "bins stripe scatter",
+                &mut scatter_tasks,
+                |_, task| {
+                    let mut cursors = [0_usize; STRIPES];
+                    for item in task.start..task.end {
+                        let bucket = bucket_of(item);
+                        if bucket >= buckets {
+                            return Err(outside(item, bucket));
+                        }
+                        let s = bucket / stripe_width;
+                        let pos = cursors[s];
+                        cursors[s] = pos + 1;
+                        let Some(slot) = task.dsts[s].get_mut(pos) else {
+                            return Err(outside(item, bucket));
+                        };
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "buckets and items are bounded by u32::MAX"
+                        )]
+                        {
+                            *slot = (bucket as u32, item as u32);
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+
+        // Pass 3: 64 independent L1-resident local counting sorts directly into
+        // disjoint slices of `self.offsets[1..=buckets]` and `self.order[..items]`.
+        self.offsets[0] = 0;
+        self.order.resize(items, 0);
+        struct StripeTask<'a> {
+            bucket_base: usize,
+            item_base: usize,
+            staged: &'a [(u32, u32)],
+            offsets_out: &'a mut [u32],
+            order_out: &'a mut [u32],
+            occupied: Vec<u32>,
+            largest: u32,
+        }
+        let mut stripe_tasks = Vec::with_capacity(stripe_count);
+        let mut rem_offsets = &mut self.offsets[1..=buckets];
+        let mut rem_order = self.order.as_mut_slice();
+        for s in 0..stripe_count {
+            let bucket_base = s * stripe_width;
+            let bucket_len = (buckets - bucket_base).min(stripe_width);
+            let item_base = stripe_bases[s];
+            let item_end = stripe_bases[s + 1];
+            let item_len = item_end - item_base;
+            let (off_slice, off_tail) = rem_offsets.split_at_mut(bucket_len);
+            rem_offsets = off_tail;
+            let (ord_slice, ord_tail) = rem_order.split_at_mut(item_len);
+            rem_order = ord_tail;
+            stripe_tasks.push(StripeTask {
+                bucket_base,
+                item_base,
+                staged: &staged[item_base..item_end],
+                offsets_out: off_slice,
+                order_out: ord_slice,
+                occupied: Vec::new(),
+                largest: 0,
+            });
+        }
+
+        flife_core::pool::parallel_tasks(
+            workers,
+            "bins stripe sort",
+            &mut stripe_tasks,
+            |_, task| {
+                let b_len = task.offsets_out.len();
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "items is bounded by u32::MAX"
+                )]
+                let base_u32 = task.item_base as u32;
+                if task.staged.is_empty() {
+                    task.offsets_out.fill(base_u32);
+                    return;
+                }
+                let mut stack_counts = [0_u32; STACK_STRIPE_BUCKETS];
+                let mut heap_counts = Vec::new();
+                let counts: &mut [u32] = if b_len <= STACK_STRIPE_BUCKETS {
+                    &mut stack_counts[..b_len]
+                } else {
+                    heap_counts.resize(b_len, 0);
+                    &mut heap_counts
+                };
+                for &(bucket_u32, _) in task.staged {
+                    counts[(bucket_u32 as usize) - task.bucket_base] += 1;
+                }
+                let mut local_run = 0_u32;
+                let mut largest = 0_u32;
+                let mut nonempty = 0_usize;
+                for &c in counts.iter() {
+                    nonempty += usize::from(c > 0);
+                }
+                task.occupied.reserve_exact(nonempty);
+                for (local_b, (count_slot, out_off)) in
+                    counts.iter_mut().zip(task.offsets_out.iter_mut()).enumerate()
+                {
+                    let c = *count_slot;
+                    *count_slot = local_run;
+                    if c > 0 {
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "buckets is bounded by u32::MAX"
+                        )]
+                        task.occupied.push((task.bucket_base + local_b) as u32);
+                        largest = largest.max(c);
+                        local_run += c;
+                    }
+                    *out_off = base_u32 + local_run;
+                }
+                for &(bucket_u32, item_u32) in task.staged {
+                    let local_b = (bucket_u32 as usize) - task.bucket_base;
+                    let dst = counts[local_b] as usize;
+                    counts[local_b] = (dst as u32) + 1;
+                    task.order_out[dst] = item_u32;
+                }
+                task.largest = largest;
+            },
+        )?;
+
+        let mut largest = 0_u32;
+        for task in &stripe_tasks {
+            self.occupied.extend_from_slice(&task.occupied);
+            largest = largest.max(task.largest);
+        }
+        self.largest = largest as usize;
+        Ok(())
+    }
+
     fn group_into(
         &mut self,
         buckets: usize,

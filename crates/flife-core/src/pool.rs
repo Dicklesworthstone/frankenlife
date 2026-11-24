@@ -263,10 +263,199 @@ where
     Ok(())
 }
 
-/// Split `slice` into up to `workers` contiguous chunks (each at least
-/// `min_chunk.max(1)` elements, except possibly the final chunk) and invoke
-/// `f(start_index, chunk)` with chunk `0` on the calling thread and remaining
-/// chunks on the cached private `workers` pool.
+/// Execute `f(index, task)` across every element of `tasks` using dynamic
+/// work-stealing across up to `workers` total threads (calling thread plus
+/// `workers - 1` cached private pool threads).
+///
+/// Unlike static one-chunk-per-worker partitioning, dynamic work-stealing lets
+/// faster cores (e.g., Apple Silicon P-cores or lightly loaded cells) pull more
+/// tiles than slower cores (E-cores or hotspot tiles), eliminating barrier tail
+/// stalls while keeping every output index deterministic.
+///
+/// # Errors
+/// [`CoreError::StateConflict`] if pool creation fails or any worker panics.
+pub fn parallel_tasks<T, F>(
+    workers: usize,
+    operation: &'static str,
+    tasks: &mut [T],
+    f: F,
+) -> Result<(), CoreError>
+where
+    T: Send,
+    F: Fn(usize, &mut T) + Sync,
+{
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    if workers <= 1 || tasks.len() == 1 || in_worker_dispatch() {
+        return catch_unwind(AssertUnwindSafe(|| {
+            for (index, task) in tasks.iter_mut().enumerate() {
+                f(index, task);
+            }
+        }))
+        .map_err(|_| worker_panicked(operation));
+    }
+    let active = workers.min(tasks.len());
+    let queue = Mutex::new(tasks.iter_mut().enumerate());
+    let queue_ref = &queue;
+    let f = &f;
+    let drain = || {
+        loop {
+            let next = {
+                let mut guard = lock_or_recover(queue_ref);
+                guard.next()
+            };
+            let Some((index, task)) = next else {
+                break;
+            };
+            f(index, task);
+        }
+    };
+    scope_workers(workers, operation, |scope| {
+        for _ in 1..active {
+            scope.spawn(drain);
+        }
+        drain();
+    })
+}
+
+/// Fallible counterpart to [`parallel_tasks`], returning the lowest-index error
+/// deterministically (identical to serial execution).
+///
+/// # Errors
+/// Returns the lowest-index error produced by `f`, or
+/// [`CoreError::StateConflict`] if pool creation fails or any worker panics.
+pub fn try_parallel_tasks<T, F>(
+    workers: usize,
+    operation: &'static str,
+    tasks: &mut [T],
+    f: F,
+) -> Result<(), CoreError>
+where
+    T: Send,
+    F: Fn(usize, &mut T) -> Result<(), CoreError> + Sync,
+{
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    if workers <= 1 || tasks.len() == 1 || in_worker_dispatch() {
+        return catch_unwind(AssertUnwindSafe(|| {
+            for (index, task) in tasks.iter_mut().enumerate() {
+                f(index, task)?;
+            }
+            Ok(())
+        }))
+        .map_err(|_| worker_panicked(operation))?;
+    }
+    let active = workers.min(tasks.len());
+    let mut results: Vec<Result<(), CoreError>> = (0..tasks.len()).map(|_| Ok(())).collect();
+    let queue = Mutex::new(tasks.iter_mut().zip(results.iter_mut()).enumerate());
+    let queue_ref = &queue;
+    let f = &f;
+    let drain = || {
+        loop {
+            let next = {
+                let mut guard = lock_or_recover(queue_ref);
+                guard.next()
+            };
+            let Some((index, (task, slot))) = next else {
+                break;
+            };
+            *slot = f(index, task);
+        }
+    };
+    scope_workers(workers, operation, |scope| {
+        for _ in 1..active {
+            scope.spawn(drain);
+        }
+        drain();
+    })?;
+    for result in results {
+        result?;
+    }
+    Ok(())
+}
+
+/// Fallible dynamic work-stealing over `tasks`, giving each active thread
+/// exclusive access to one reusable per-worker scratch lane from `lanes`.
+///
+/// Each active thread (`min(workers, lanes.len(), tasks.len())`) keeps its own
+/// `&mut L` across all tiles it steals, so scratch buffers stay hot in L1/L2
+/// with zero extra allocation while P-cores and E-cores balance dynamically.
+/// Returns the lowest-index error deterministically.
+///
+/// # Errors
+/// Returns the lowest-index error produced by `f`, or
+/// [`CoreError::StateConflict`] if `lanes` is empty when `tasks` is non-empty,
+/// pool creation fails, or any worker panics.
+pub fn try_parallel_tasks_with_lanes<L, T, F>(
+    workers: usize,
+    operation: &'static str,
+    lanes: &mut [L],
+    tasks: &mut [T],
+    f: F,
+) -> Result<(), CoreError>
+where
+    L: Send,
+    T: Send,
+    F: Fn(usize, &mut T, &mut L) -> Result<(), CoreError> + Sync,
+{
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let Some((first_lane, rest_lanes)) = lanes.split_first_mut() else {
+        return Err(CoreError::StateConflict {
+            operation,
+            detail: "no worker lane".to_owned(),
+        });
+    };
+    let active = workers.min(lanes.len()).min(tasks.len()).max(1);
+    if active == 1 || in_worker_dispatch() {
+        return catch_unwind(AssertUnwindSafe(|| {
+            for (index, task) in tasks.iter_mut().enumerate() {
+                f(index, task, first_lane)?;
+            }
+            Ok(())
+        }))
+        .map_err(|_| worker_panicked(operation))?;
+    }
+    let mut results: Vec<Result<(), CoreError>> = (0..tasks.len()).map(|_| Ok(())).collect();
+    let queue = Mutex::new(tasks.iter_mut().zip(results.iter_mut()).enumerate());
+    let queue_ref = &queue;
+    let f = &f;
+    let drain_with = |lane: &mut L| {
+        loop {
+            let next = {
+                let mut guard = lock_or_recover(queue_ref);
+                guard.next()
+            };
+            let Some((index, (task, slot))) = next else {
+                break;
+            };
+            *slot = f(index, task, lane);
+        }
+    };
+    let drain_with = &drain_with;
+    scope_workers(workers, operation, |scope| {
+        for lane in rest_lanes.iter_mut().take(active - 1) {
+            scope.spawn(move || drain_with(lane));
+        }
+        drain_with(first_lane);
+    })?;
+    for result in results {
+        result?;
+    }
+    Ok(())
+}
+
+/// Target work-stealing tiles per worker for chunked parallel loops.
+const TILES_PER_WORKER: usize = 4;
+/// Upper cap on work-stealing tiles so queue pops stay sub-microsecond.
+const MAX_WORK_TILES: usize = 64;
+
+/// Split `slice` into contiguous tiles (each at least `min_chunk.max(1)`
+/// elements, except possibly the final tile) and invoke `f(start_index, tile)`
+/// using dynamic work-stealing across up to `workers` total threads.
 ///
 /// # Errors
 /// [`CoreError::StateConflict`] if pool creation fails or any worker panics.
@@ -291,18 +480,19 @@ where
         return catch_unwind(AssertUnwindSafe(|| f(0, slice)))
             .map_err(|_| worker_panicked(operation));
     }
-    let chunk_len = len.div_ceil(used);
-    let mut chunks = slice.chunks_mut(chunk_len);
-    let Some(head) = chunks.next() else {
-        return Ok(());
-    };
-    let f = &f;
-    scope_workers(workers, operation, |scope| {
-        for (offset, chunk) in chunks.enumerate() {
-            let start = (offset + 1) * chunk_len;
-            scope.spawn(move || f(start, chunk));
-        }
-        f(0, head);
+    let target_tiles = used
+        .saturating_mul(TILES_PER_WORKER)
+        .min(MAX_WORK_TILES)
+        .min(max_chunks)
+        .max(used);
+    let tile_len = len.div_ceil(target_tiles);
+    let mut tiles: Vec<(usize, &mut [T])> = slice
+        .chunks_mut(tile_len)
+        .enumerate()
+        .map(|(idx, chunk)| (idx * tile_len, chunk))
+        .collect();
+    parallel_tasks(workers, operation, &mut tiles, |_, (start, chunk)| {
+        f(*start, chunk);
     })
 }
 
@@ -333,27 +523,20 @@ where
         return catch_unwind(AssertUnwindSafe(|| f(0, slice)))
             .map_err(|_| worker_panicked(operation))?;
     }
-    let chunk_len = len.div_ceil(used);
-    let mut chunks = slice.chunks_mut(chunk_len);
-    let Some(head) = chunks.next() else {
-        return Ok(());
-    };
-    let mut tail_results: Vec<Result<(), CoreError>> = (0..chunks.len()).map(|_| Ok(())).collect();
-    let f = &f;
-    let head_result = scope_workers(workers, operation, |scope| {
-        for (offset, (chunk, slot)) in chunks.zip(tail_results.iter_mut()).enumerate() {
-            let start = (offset + 1) * chunk_len;
-            scope.spawn(move || {
-                *slot = f(start, chunk);
-            });
-        }
-        f(0, head)
-    })?;
-    head_result?;
-    for result in tail_results {
-        result?;
-    }
-    Ok(())
+    let target_tiles = used
+        .saturating_mul(TILES_PER_WORKER)
+        .min(MAX_WORK_TILES)
+        .min(max_chunks)
+        .max(used);
+    let tile_len = len.div_ceil(target_tiles);
+    let mut tiles: Vec<(usize, &mut [T])> = slice
+        .chunks_mut(tile_len)
+        .enumerate()
+        .map(|(idx, chunk)| (idx * tile_len, chunk))
+        .collect();
+    try_parallel_tasks(workers, operation, &mut tiles, |_, (start, chunk)| {
+        f(*start, chunk)
+    })
 }
 
 /// Handle to a cached private Rayon pool (zero-refcount static borrow for

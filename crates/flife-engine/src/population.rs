@@ -346,13 +346,13 @@ impl Organism {
 
     /// INV-01: finite state and strictly positive energy.
     fn check(&self) -> Result<(), CoreError> {
-        let finite = self
-            .position
-            .iter()
-            .chain(&self.velocity)
-            .chain(&self.polarity)
-            .chain([&self.energy_change_rate])
-            .all(|value| value.is_finite());
+        let finite = self.position[0].is_finite()
+            && self.position[1].is_finite()
+            && self.velocity[0].is_finite()
+            && self.velocity[1].is_finite()
+            && self.polarity[0].is_finite()
+            && self.polarity[1].is_finite()
+            && self.energy_change_rate.is_finite();
         if !finite {
             return Err(CoreError::NumericalInvalid {
                 quantity: "organism state",
@@ -500,7 +500,22 @@ impl Population {
         births: &[Entrant],
         quota: &GenomeQuota,
     ) -> Result<CheckedTick, CoreError> {
-        let dying = self.check_whole_tick(tick, survivors, deaths, births, quota)?;
+        self.check_tick_staged_on(tick, survivors, deaths, births, quota, 1)
+    }
+
+    /// Parallel counterpart to [`Population::check_tick_staged`] using up to
+    /// `workers` threads; returns bit-identical validation results and exact
+    /// canonical first-error reporting.
+    pub(crate) fn check_tick_staged_on(
+        &self,
+        tick: Tick,
+        survivors: &[Organism],
+        deaths: &[Death],
+        births: &[Entrant],
+        quota: &GenomeQuota,
+        workers: usize,
+    ) -> Result<CheckedTick, CoreError> {
+        let dying = self.check_whole_tick_on(tick, survivors, deaths, births, quota, workers)?;
         Ok(CheckedTick { dying })
     }
 
@@ -515,16 +530,22 @@ impl Population {
         released: Option<&mut Vec<ArenaSlot>>,
     ) -> Result<(), CoreError> {
         self.reserve_arena(births)?;
-        let index = core::mem::take(&mut self.index);
-        let mut live = index.iter();
-        for organism in survivors {
-            if let Some(slot) = next_slot(&mut live, organism.id) {
+        if self.is_compact_dense() && checked.dying.is_empty() && survivors.len() == self.len() {
+            for (slot, organism) in survivors.iter().enumerate() {
                 self.write(slot, organism);
             }
-        }
-        self.index = index;
-        for collected in self.remove(checked.dying, released) {
-            quota.retire(collected.genome)?;
+        } else {
+            let index = core::mem::take(&mut self.index);
+            let mut live = index.iter();
+            for organism in survivors {
+                if let Some(slot) = next_slot(&mut live, organism.id) {
+                    self.write(slot, organism);
+                }
+            }
+            self.index = index;
+            for collected in self.remove(checked.dying, released) {
+                quota.retire(collected.genome)?;
+            }
         }
         for entrant in births.drain(..) {
             self.insert(entrant);
@@ -579,6 +600,17 @@ pub struct Population {
     latest: Option<OrganismId>,
 }
 
+/// Cursor strategy behind [`Ascending`]: direct array cursor under dense
+/// [`Arrangement::Compact`], falling back to the ordered identity `BTreeMap`
+/// under [`Arrangement::FreeList`].
+#[derive(Debug)]
+enum AscendingCursor<'a> {
+    Compact {
+        cursor: usize,
+    },
+    Tree(Peekable<btree_map::Range<'a, OrganismId, usize>>),
+}
+
 /// One ascending walk of a population's identity index (FL-034), for a
 /// caller visiting organisms in identity order: [`Ascending::next`] gives
 /// what [`Population::genome`] and [`Population::arena_slot`] give, read
@@ -586,7 +618,7 @@ pub struct Population {
 #[derive(Debug)]
 pub struct Ascending<'a> {
     population: &'a Population,
-    live: Peekable<btree_map::Range<'a, OrganismId, usize>>,
+    cursor: AscendingCursor<'a>,
 }
 
 impl<'a> Ascending<'a> {
@@ -596,16 +628,37 @@ impl<'a> Ascending<'a> {
     /// above the last identity found; the walk then keeps the entries at
     /// and after `id`.
     pub fn next(&mut self, id: OrganismId) -> (Option<&'a Genome>, Option<ArenaSlot>) {
-        while self.live.next_if(|&(&entry, _)| entry < id).is_some() {}
         let population = self.population;
-        self.live
-            .next_if(|&(&entry, _)| entry == id)
-            .map_or((None, None), |(_, &slot)| {
-                (
-                    population.genomes.get(slot).and_then(Option::as_ref),
-                    population.arena_slots.get(slot).copied().flatten(),
-                )
-            })
+        match &mut self.cursor {
+            AscendingCursor::Compact { cursor } => {
+                let occupants = &population.occupants;
+                while *cursor < occupants.len() {
+                    match occupants[*cursor] {
+                        Some(entry) if entry < id => *cursor += 1,
+                        Some(entry) if entry == id => {
+                            let slot = *cursor;
+                            *cursor += 1;
+                            return (
+                                population.genomes.get(slot).and_then(Option::as_ref),
+                                population.arena_slots.get(slot).copied().flatten(),
+                            );
+                        }
+                        _ => return (None, None),
+                    }
+                }
+                (None, None)
+            }
+            AscendingCursor::Tree(live) => {
+                while live.next_if(|&(&entry, _)| entry < id).is_some() {}
+                live.next_if(|&(&entry, _)| entry == id)
+                    .map_or((None, None), |(_, &slot)| {
+                        (
+                            population.genomes.get(slot).and_then(Option::as_ref),
+                            population.arena_slots.get(slot).copied().flatten(),
+                        )
+                    })
+            }
+        }
     }
 }
 
@@ -989,13 +1042,108 @@ impl Population {
             .and_then(|&slot| self.arena_slots.get(slot).copied().flatten())
     }
 
+    /// Whether physical slots `0..self.len()` are densely occupied in exact
+    /// ascending identity order (guaranteed invariant of [`Arrangement::Compact`]).
+    #[inline]
+    fn is_compact_dense(&self) -> bool {
+        self.arrangement == Arrangement::Compact && self.occupants.len() == self.index.len()
+    }
+
+    /// Direct column read of the six immutable lineage fields at `slot` without
+    /// materializing the full [`Organism`] row or copying [`HeldOutput`].
+    #[inline]
+    fn lineage_key_at(
+        &self,
+        slot: usize,
+    ) -> (
+        GenomeId,
+        Option<OrganismId>,
+        LineageId,
+        Generation,
+        Tick,
+        u32,
+    ) {
+        (
+            self.genome_ids[slot],
+            self.parents[slot],
+            self.lineages[slot],
+            self.generations[slot],
+            self.birth_ticks[slot],
+            self.phases[slot],
+        )
+    }
+
+    /// `Σ E` over every live organism in ascending identity order, compensated,
+    /// reading only the energy column without materializing [`Organism`] rows.
+    #[must_use]
+    pub fn energy_total(&self) -> f64 {
+        let mut total = flife_core::CompensatedSum::ZERO;
+        if self.is_compact_dense() {
+            for &energy in &self.energies {
+                total.add(energy);
+            }
+        } else {
+            for &slot in self.index.values() {
+                total.add(self.energies[slot]);
+            }
+        }
+        total.value()
+    }
+
+    /// Copy every live organism into `rows` in ascending identity order, using
+    /// up to `workers` threads on the dense [`Arrangement::Compact`] fast path.
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] if `rows` cannot hold `self.len()`, or
+    /// [`CoreError::StateConflict`] if the worker pool fails.
+    pub fn copy_rows_into_on(
+        &self,
+        rows: &mut Vec<Organism>,
+        workers: usize,
+    ) -> Result<(), CoreError> {
+        let len = self.len();
+        rows.clear();
+        if len == 0 {
+            return Ok(());
+        }
+        if self.is_compact_dense() && len >= 1_024 && workers > 1 {
+            rows.try_reserve(len)
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "organism rows",
+                    bytes: u64::try_from(len.saturating_mul(size_of::<Organism>()))
+                        .unwrap_or(u64::MAX),
+                })?;
+            let placeholder = self.read(0);
+            rows.resize(len, placeholder);
+            flife_core::pool::parallel_chunks_mut(
+                workers,
+                "copy organism rows",
+                rows.as_mut_slice(),
+                512,
+                |start, chunk| {
+                    for (offset, dst) in chunk.iter_mut().enumerate() {
+                        *dst = self.read(start + offset);
+                    }
+                },
+            )?;
+            return Ok(());
+        }
+        rows.extend(self.iter());
+        Ok(())
+    }
+
     /// A walk from the lowest identity that gives [`Population::genome`]
     /// and [`Population::arena_slot`] for ascending identities ([`Ascending`]).
     #[must_use]
     pub fn ascending(&self) -> Ascending<'_> {
+        let cursor = if self.is_compact_dense() {
+            AscendingCursor::Compact { cursor: 0 }
+        } else {
+            AscendingCursor::Tree(self.index.range(..).peekable())
+        };
         Ascending {
             population: self,
-            live: self.index.range(..).peekable(),
+            cursor,
         }
     }
 
@@ -1004,9 +1152,17 @@ impl Population {
     /// without per-organism tree searches.
     #[must_use]
     pub fn ascending_from(&self, first: OrganismId) -> Ascending<'_> {
+        let cursor = if self.is_compact_dense() {
+            let cursor = self
+                .occupants
+                .partition_point(|slot| slot.is_some_and(|id| id < first));
+            AscendingCursor::Compact { cursor }
+        } else {
+            AscendingCursor::Tree(self.index.range(first..).peekable())
+        };
         Ascending {
             population: self,
-            live: self.index.range(first..).peekable(),
+            cursor,
         }
     }
 
@@ -1071,7 +1227,7 @@ impl Population {
                 detail: format!("{} is not alive", organism.id),
             });
         };
-        if self.read(slot).lineage_key() != organism.lineage_key() {
+        if self.lineage_key_at(slot) != organism.lineage_key() {
             return Err(CoreError::StateConflict {
                 operation: "update organism",
                 detail: format!(
@@ -1177,38 +1333,140 @@ impl Population {
         births: &[Entrant],
         quota: &GenomeQuota,
     ) -> Result<BTreeMap<OrganismId, Death>, CoreError> {
+        self.check_whole_tick_on(tick, survivors, deaths, births, quota, 1)
+    }
+
+    fn check_whole_tick_on(
+        &self,
+        tick: Tick,
+        survivors: &[Organism],
+        deaths: &[Death],
+        births: &[Entrant],
+        quota: &GenomeQuota,
+        workers: usize,
+    ) -> Result<BTreeMap<OrganismId, Death>, CoreError> {
         let dying = self.check_deaths(tick, deaths)?;
         let conflict = |detail: String| CoreError::StateConflict {
             operation: "commit tick",
             detail,
         };
-        let mut previous: Option<OrganismId> = None;
-        let mut live = self.index.iter();
-        for organism in survivors {
-            if previous.is_some_and(|previous| organism.id <= previous) {
-                return Err(conflict(format!(
-                    "{} is not after the survivor before it; survivors are given once, in ascending identity order",
-                    organism.id
-                )));
+        let mut fast_validated = false;
+        if self.is_compact_dense() && survivors.len() >= 1_024 && workers > 1 {
+            if dying.is_empty() && survivors.len() == self.len() {
+                let tile_count = workers
+                    .saturating_mul(4)
+                    .min(64)
+                    .min(survivors.len().div_ceil(512))
+                    .max(1);
+                let tile_len = survivors.len().div_ceil(tile_count);
+                let mut tiles: Vec<(usize, &[Organism])> = survivors
+                    .chunks(tile_len)
+                    .enumerate()
+                    .map(|(idx, chunk)| (idx * tile_len, chunk))
+                    .collect();
+                let ok = flife_core::pool::try_parallel_tasks(
+                    workers,
+                    "check tick survivors",
+                    &mut tiles,
+                    |_, (start, chunk)| {
+                        for (offset, organism) in chunk.iter().enumerate() {
+                            let slot = *start + offset;
+                            if self.occupants[slot] != Some(organism.id) {
+                                return Err(conflict(format!("{} slot mismatch", organism.id)));
+                            }
+                            if self.lineage_key_at(slot) != organism.lineage_key() {
+                                return Err(conflict(format!(
+                                    "{} cannot change its genome, ancestry, birth tick or phase",
+                                    organism.id
+                                )));
+                            }
+                            organism.check()?;
+                        }
+                        Ok(())
+                    },
+                )
+                .is_ok();
+                if ok {
+                    fast_validated = true;
+                }
+            } else if survivors.len() + dying.len() == self.len() {
+                // Dense compact scan mapping survivors to slots without BTreeMap
+                // lookups, then parallel INV-01 check across workers.
+                let mut slot = 0_usize;
+                let mut all_matched = true;
+                let n = self.occupants.len();
+                for organism in survivors {
+                    while slot < n {
+                        match self.occupants[slot] {
+                            Some(entry) if entry < organism.id => slot += 1,
+                            _ => break,
+                        }
+                    }
+                    if slot >= n
+                        || self.occupants[slot] != Some(organism.id)
+                        || dying.contains_key(&organism.id)
+                        || self.lineage_key_at(slot) != organism.lineage_key()
+                    {
+                        all_matched = false;
+                        break;
+                    }
+                    slot += 1;
+                }
+                if all_matched {
+                    let tile_count = workers
+                        .saturating_mul(4)
+                        .min(64)
+                        .min(survivors.len().div_ceil(512))
+                        .max(1);
+                    let tile_len = survivors.len().div_ceil(tile_count);
+                    let mut tiles: Vec<&[Organism]> = survivors.chunks(tile_len).collect();
+                    let ok = flife_core::pool::try_parallel_tasks(
+                        workers,
+                        "check tick survivors",
+                        &mut tiles,
+                        |_, chunk| {
+                            for organism in *chunk {
+                                organism.check()?;
+                            }
+                            Ok(())
+                        },
+                    )
+                    .is_ok();
+                    if ok {
+                        fast_validated = true;
+                    }
+                }
             }
-            previous = Some(organism.id);
-            if dying.contains_key(&organism.id) {
-                return Err(conflict(format!("{} both survives and dies", organism.id)));
+        }
+        if !fast_validated {
+            let mut previous: Option<OrganismId> = None;
+            let mut live = self.index.iter();
+            for organism in survivors {
+                if previous.is_some_and(|previous| organism.id <= previous) {
+                    return Err(conflict(format!(
+                        "{} is not after the survivor before it; survivors are given once, in ascending identity order",
+                        organism.id
+                    )));
+                }
+                previous = Some(organism.id);
+                if dying.contains_key(&organism.id) {
+                    return Err(conflict(format!("{} both survives and dies", organism.id)));
+                }
+                // The survivors so far ascend and each matched its own entry,
+                // so the walk stands just past the last one's entry and this
+                // one's, if it is alive, lies ahead: one ordered walk of the
+                // index, not a search per survivor.
+                let Some(slot) = next_slot(&mut live, organism.id) else {
+                    return Err(conflict(format!("{} is not alive", organism.id)));
+                };
+                if self.lineage_key_at(slot) != organism.lineage_key() {
+                    return Err(conflict(format!(
+                        "{} cannot change its genome, ancestry, birth tick or phase",
+                        organism.id
+                    )));
+                }
+                organism.check()?;
             }
-            // The survivors so far ascend and each matched its own entry,
-            // so the walk stands just past the last one's entry and this
-            // one's, if it is alive, lies ahead: one ordered walk of the
-            // index, not a search per survivor.
-            let Some(slot) = next_slot(&mut live, organism.id) else {
-                return Err(conflict(format!("{} is not alive", organism.id)));
-            };
-            if self.read(slot).lineage_key() != organism.lineage_key() {
-                return Err(conflict(format!(
-                    "{} cannot change its genome, ancestry, birth tick or phase",
-                    organism.id
-                )));
-            }
-            organism.check()?;
         }
         if survivors.len() + dying.len() != self.len() {
             return Err(conflict(format!(

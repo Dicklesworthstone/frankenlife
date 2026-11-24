@@ -46,7 +46,7 @@ export function BundlePanels() {
                   height={shown.video.height}
                   loading="lazy"
                   decoding="async"
-                  alt={`The ${bundle.id} film's first frame: ${grouped(firstLive)} organisms of ${shown.world.name} at tick ${grouped(firstTick)}, seed ${shown.world.seed}, the whole torus.`}
+                  alt={`The ${bundle.id} film's first frame: ${grouped(firstLive)} organisms of ${shown.world.name} at tick ${grouped(firstTick)}, seed ${shown.world.seed}.`}
                   className="h-full w-full object-cover"
                 />
                 <Reticle inset={10} size={14} />
@@ -54,7 +54,9 @@ export function BundlePanels() {
                   {bundle.tag} · the film&apos;s world
                 </span>
                 <span className="absolute bottom-3 left-3 rounded-full border border-white/10 bg-black/60 px-2.5 py-1 font-mono text-[10px] tracking-[0.12em] text-green-200 uppercase backdrop-blur-md">
-                  tick {grouped(firstTick)} · {grouped(firstLive)} alive
+                  {/* On a phone the tick would run under the inset. */}
+                  <span className="hidden sm:inline">tick {grouped(firstTick)} · </span>
+                  {grouped(firstLive)} alive
                 </span>
                 <figure className="absolute right-3 bottom-3 w-[30%] overflow-hidden rounded-xl border border-white/20 bg-black shadow-2xl shadow-black/60">
                   {/* eslint-disable-next-line @next/next/no-img-element -- a static export; the manifest names the file */}
@@ -85,7 +87,10 @@ export function BundlePanels() {
                     </li>
                   ))}
                 </ul>
-                <dl className="mt-5 grid grid-cols-3 gap-3 border-t border-white/[0.06] pt-5">
+                <p className="mt-5 border-t border-white/[0.06] pt-5 font-mono text-[10px] tracking-[0.16em] text-slate-500 uppercase">
+                  Measured in Stage-2 runs of the committed preset
+                </p>
+                <dl className="mt-3 grid grid-cols-3 gap-3">
                   {bundle.measured.map((stat) => (
                     <div key={stat.label} className="min-w-0">
                       <dt className="text-[11px] leading-tight text-slate-500">{stat.label}</dt>

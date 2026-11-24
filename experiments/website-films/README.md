@@ -20,8 +20,8 @@ Each variant below is its base preset (seed 42)
 with the `[sources]` keys shown, rendered from tick 0 by `flife render CONFIG
 --every 256 --width 1080 --height 1080 --look sphere --color lineage-energy
 --no-field` on 2026-11-24, by flife built at 262f067 (the first runs) or at
-bbb5773. Their ticks agree: the 16 × 48,000, sigma 12 variant reached the same
-tick-1,536 digest, 7b72d200…149913, on both. "Alive" is the live count at the
+bbb5773. The two builds agree: the 16 × 48,000, sigma 12 variant reached the
+same tick-1,536 digest, 7b72d200…149913, on both. "Alive" is the live count at the
 last frame, "peak" the most at any frame.
 
 ## Tissue, round 1 (base `morphogenesis-tissue-v2`: 16 sources of power 4,000, sigma 4.2)
@@ -93,9 +93,11 @@ which caps the tissue near 7 cells per square world unit, about 47,000 on the
 | **gate 24, sources of 1,536,000** | 1,048,576 | **336,582 at 1,536** (stopped) | **chosen** |
 
 The chosen variant is `morphogenesis-tissue-v2-dense` with the ceiling at
-524,288, which it never approaches: its live counts equal the variant's
-(61,582 at tick 512, 258,101 at 1,024). It packs into lineage patches over
-most of the torus, the way the confluent world does.
+524,288, which it never reaches, so its live counts equal the variant's
+(61,582 at tick 512, 258,101 at 1,024). The committed presets' ceiling of
+262,144 would bind: in the film the tissue passes it at tick 1,044 and stays
+above it in 595 of 801 frames, at most 340,097. It packs into lineage patches
+over most of the torus, the way the confluent world does.
 
 ## Supercolony, round 2 (base `supercolony-v2-abundant`: 16 oases of 16,000)
 
@@ -117,10 +119,14 @@ food makes taller piles on the richest oases rather than a fuller torus.
 
 The chosen variant is `supercolony-v2-dense`, total power 1,228,800, 24 times
 the committed preset's 51,200. It reaches its ceiling of 524,288 soon after
-tick 512 and returns to it whenever its oases bloom: in the film's 3,200 ticks it
-falls to 321,553 between blooms and is at the ceiling in 123 of 801 frames. At the ceiling births are refused by
-refuse-excess-births-v1, which is externally imposed selection (AGENTS.md).
-Round 1 stopped
-the run that reached its ceiling; round 2 accepts it, as the confluent world
-does (`presets/confluent-world.toml`, fed to its ceiling of 262,144), and the
-site says so beside the films, as it does for the confluent film.
+tick 512 and returns to it whenever its oases bloom: in the film's 3,200 ticks
+it falls to 321,553 between blooms and is at the ceiling in 123 of 801 frames.
+At the ceiling births are refused by refuse-excess-births-v1, which is
+externally imposed selection (AGENTS.md). Round 1 stopped the run that reached
+its ceiling; round 2 accepts it, as the confluent world does
+(`presets/confluent-world.toml`, fed to its ceiling of 262,144), and the site
+says so beside the films, as it does for the confluent film.
+
+Both films start from a tick chosen by eye once the world fills the frame:
+1,024 for the tissue and 768 for the supercolony. The frames that chose the
+supercolony variant were its tick-512 frames, the fullest of the variants'.

@@ -83,10 +83,13 @@ film came to 338 MB, so it is CRF 26, which halves that with every sphere still 
 other two are CRF 20 (153 MB and 79 MB). `scripts/media.ts` encodes a finished `--work` again, without
 simulating, when only `--crf` changes.
 They show denser worlds built from the committed presets (`presets/morphogenesis-tissue-v2-dense.toml`,
-`presets/supercolony-v2-dense.toml`): more food, crowding arrest at 24 neighbours for the tissue, and 48
-oases with farther-landing children for the supercolony, whose population reaches its ceiling of 524,288
-whenever its oases bloom. `experiments/website-films/README.md` records how they were chosen, and each preset's header
-names every key it changes.
+`presets/supercolony-v2-dense.toml`): more food, crowding arrest at 24 neighbours for the tissue, 48
+oases with farther-landing children for the supercolony, and for both twice the presets' population ceiling,
+524,288, which the supercolony reaches whenever its oases bloom. `experiments/website-films/README.md`
+records how they were chosen, and each preset's header names every key it changes. The page says "every
+other parameter is the preset's", so `bun run build` runs `scripts/check-film-words.ts` after check-media:
+it refuses to build unless the words beside the films name every key the film presets change, with the
+presets' own numbers.
 
 ```bash
 # From the repository root: each world, seed 42, kept in a run directory. The supercolony run is
@@ -114,7 +117,7 @@ bun run media -- --film veins --flife ../target/release/flife --run-dir ../RUN-B
 
 A 3,200-tick film has room for three shots, one zoom each. Then list each new manifest in
 `lib/films/index.ts` and move the files of the films it replaces from `public/media` to
-`media-retired/`. Each film starts where its world first fills the frame, by eye: tick 1,024 for the
+`media-retired/`. Each film starts at a tick chosen by eye once its world fills the frame: tick 1,024 for the
 tissue (about 258,000 cells) and 768 for the supercolony (at its ceiling). The looks are the confluent
 film's, chosen by eye from 4K test frames. The page says so beside the films.
 

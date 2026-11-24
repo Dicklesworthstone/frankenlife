@@ -76,7 +76,7 @@ const SPECS: Spec[] = [
     bundle: "tissue",
     condition: "treatment",
     label: "Tissue, as committed",
-    caption: "Every Bundle A mechanism on: porous islands of tissue, several lineages side by side.",
+    caption: "All 14 of the preset's mechanisms on: porous islands of tissue, several lineages side by side.",
     draw: WHOLE,
   },
   {
@@ -103,7 +103,7 @@ const SPECS: Spec[] = [
     bundle: "supercolony",
     condition: "treatment",
     label: "Supercolony, as committed",
-    caption: "Every Bundle B mechanism on: compact colonies with well-fed, brightly lit rims, between blooming oases.",
+    caption: "All 11 of the preset's mechanisms on: compact colonies with well-fed, brightly lit rims, between blooming oases.",
     draw: WHOLE,
   },
   {
@@ -130,7 +130,7 @@ const SPECS: Spec[] = [
     bundle: "tissue",
     condition: "treatment",
     label: "Polarity",
-    caption: "--color polarity, sphere look: each cell's hue is the direction its polarity points, with a short tick on its apical side; grey cells have none. Patches of neighbouring cells point alike.",
+    caption: "Drawn with --color polarity and the sphere look: each cell's hue is the direction its polarity points, with a short tick on its apical side, and grey cells have none. Neighbouring cells point alike in patches.",
     draw: ["--look", "sphere", "--color", "polarity", "--no-field"],
     // The largest island on the whole-torus still (two lineages, cyan over lilac).
     camera: { center: [11, 41], zoom: 3 },
@@ -141,7 +141,7 @@ const SPECS: Spec[] = [
     bundle: "tissue",
     condition: "treatment",
     label: "Cell state",
-    caption: "--color cell-state: each cell keeps its lineage's hue; its lightness, and a small twist of hue, follow its first memory value h₀. At this tick h₀ varies little within a lineage, so the colours barely shift: no separate cell types yet (below).",
+    caption: "Drawn with --color cell-state: each cell keeps its lineage's hue, and its lightness and a small twist of hue follow its first memory value h₀. At this tick h₀ varies little within a lineage, so the colours barely shift: there are no separate cell types yet.",
     draw: ["--look", "glow", "--color", "cell-state", "--field-mapping", "energy"],
     // The cyan island east of centre and the mixed strands below it.
     camera: { center: [58.5, 35], zoom: 3 },
@@ -152,7 +152,7 @@ const SPECS: Spec[] = [
     bundle: "supercolony",
     condition: "treatment",
     label: "Trail carrier",
-    caption: "--field-mapping trail-carrier: the uneatable second carrier, plum through amber to gold as more lies on the field. It halves in 23 s, so it marks where colonies passed in the last minute.",
+    caption: "Drawn with --field-mapping trail-carrier: the uneatable second carrier, plum through amber to gold as more of it lies on the field. It halves in 23 s, so it marks where colonies passed in the last minute.",
     draw: ["--look", "glow", "--color", "lineage-energy", "--field-mapping", "trail-carrier"],
   },
   {
@@ -161,7 +161,7 @@ const SPECS: Spec[] = [
     bundle: "supercolony",
     condition: "treatment",
     label: "Vascular conductance",
-    caption: "--field-mapping vascular-conductance: the field's faces, bright where flux has widened them, dark seams where they have pruned back.",
+    caption: "Drawn with --field-mapping vascular-conductance: the field's faces, bright where flux has widened them and dark seams where they have pruned back.",
     draw: ["--look", "glow", "--color", "lineage-energy", "--field-mapping", "vascular-conductance"],
   },
 ];

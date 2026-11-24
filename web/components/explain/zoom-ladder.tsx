@@ -155,7 +155,8 @@ const STOPS: Stop[] = [
       <>
         Each sphere is one organism, drawn at its body&apos;s size: {BODY} units across, the width of one cell of the{" "}
         {FIELD_CELLS} × {FIELD_CELLS} field it feeds from and writes into. Overlapping bodies push apart, and near
-        neighbours pull together as alike as their chemistry is; food and signals pass only through the field.
+        neighbours pull together more strongly the more alike their chemistry is. Food and signals pass only through
+        the field.
       </>
     ),
     figures: [
@@ -179,7 +180,8 @@ const STOPS: Stop[] = [
         The founders&apos; controller: {SHAPE[0]} numbers in, from the field around it and from itself; hidden layers of{" "}
         {SHAPE[1]} and {SHAPE[2]} tanh units; {SHAPE[3]} numbers out: when to try to split, the child&apos;s share,
         whether to emit, which chemistry and how much. A birth moves a child to another of the catalog&apos;s five
-        shapes with probability 0.01 in this world, so this one&apos;s may differ; every shape is its own.
+        shapes with probability 0.01 in this world, so this one&apos;s may differ. In any shape, the weights are the
+        organism&apos;s own.
       </>
     ),
     figures: [

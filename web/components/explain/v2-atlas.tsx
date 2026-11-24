@@ -1,16 +1,19 @@
 "use client";
 
-// The v2 mechanism atlas: field-ecology-v2's 21 features by what they do, one
-// group at a time. Each card's chart is its rule computed in the page from
-// v2-atlas-math.ts at the committed presets' numbers; the words and numbers
-// are lib/v2-atlas.ts's, whose sources it names.
+// The v2 mechanisms, told as two step-throughs (the tissue's own, then the
+// supercolony's), a row of rules both worlds share and a row of opt-ins. Each
+// chart is its rule computed in the page from v2-atlas-math.ts at the
+// committed presets' numbers; the words and numbers are lib/v2-atlas.ts's,
+// whose sources it names, and each still is lib/stills.json's.
 
+import { ArrowLeft, ArrowRight } from "lucide-react";
 import { type KeyboardEvent, type ReactNode, useId, useRef, useState } from "react";
 
-import { MicroLabel } from "@/components/franken";
+import { MicroLabel, Reticle } from "@/components/franken";
+import { type V2Still, stills } from "@/lib/media";
 import { TONE } from "@/lib/palette";
-import { cn } from "@/lib/utils";
-import { type AtlasChart, type AtlasEntry, type AtlasGroup, atlas, atlasGroups } from "@/lib/v2-atlas";
+import { cn, grouped } from "@/lib/utils";
+import { type AtlasChart, type AtlasEntry, atlas, atlasEntry, storySteps } from "@/lib/v2-atlas";
 
 import {
   affinityTurn,
@@ -541,12 +544,23 @@ function Chart({ chart, slug }: { chart: AtlasChart; slug: AtlasEntry["slug"] })
   }
 }
 
-// ─── The atlas ───────────────────────────────────────────────────────────────
+// ─── The step-throughs ───────────────────────────────────────────────────────
+
+const ACCENT = {
+  tissue: { text: "text-violet-200", value: "text-violet-200", ring: "border-violet-400/50 bg-violet-400/10", dot: "bg-violet-300" },
+  supercolony: { text: "text-cyan-200", value: "text-cyan-200", ring: "border-cyan-400/50 bg-cyan-400/10", dot: "bg-cyan-300" },
+} as const;
+
+const stillById = (id: string): V2Still => {
+  const found = stills.stills.find((still) => still.id === id);
+  if (!found) throw new Error(`lib/stills.json has no still ${id}`);
+  return found;
+};
 
 function Presence({ entry }: { entry: AtlasEntry }) {
   const chip = "rounded-md border px-1.5 py-0.5 font-mono text-[10px] font-bold";
   if (!entry.on.tissue && !entry.on.supercolony) {
-    return <span className={cn(chip, "border-white/15 text-slate-400")}>opt-in</span>;
+    return <span className={cn(chip, "border-white/15 text-slate-400")}>off in both presets</span>;
   }
   return (
     <>
@@ -558,118 +572,278 @@ function Presence({ entry }: { entry: AtlasEntry }) {
   );
 }
 
-function Card({ entry }: { entry: AtlasEntry }) {
+/** The rule as numbers: its chart, its formula, the presets' values and where the energy goes. */
+function RulePanel({ entry }: { entry: AtlasEntry }) {
   return (
-    <article className="panel flex h-full flex-col rounded-[1.5rem] p-5 sm:p-6">
-      <div className="flex flex-wrap items-start justify-between gap-2">
-        <div className="min-w-0">
-          <h4 className="text-[17px] leading-snug font-bold text-white">{entry.name}</h4>
-          <p className="mt-0.5 font-mono text-[11px] text-green-300/80">{entry.slug}</p>
-        </div>
-        <div className="flex flex-wrap gap-1">
-          <Presence entry={entry} />
-        </div>
-      </div>
-      <p className="mt-3 text-[13px] text-slate-500 italic">From: {entry.borrowed}.</p>
-      <p className="mt-2 text-[14.5px] leading-relaxed text-slate-300">{entry.rule}</p>
+    <div className="flex flex-col gap-4 p-5 sm:p-7">
+      <span className="self-start rounded-full border border-cyan-300/25 bg-cyan-300/[0.06] px-2.5 py-1 font-mono text-[10px] font-bold tracking-[0.12em] text-cyan-100 uppercase">
+        The rule, computed here
+      </span>
       {entry.chart ? (
-        <div className="mt-4 rounded-xl border border-white/[0.06] bg-black/35 p-3">
+        <div className="rounded-xl border border-white/[0.06] bg-black/35 p-3 sm:p-4">
           <Chart chart={entry.chart} slug={entry.slug} />
         </div>
       ) : null}
-      <dl className="mt-4 space-y-2 text-[13px] leading-relaxed">
-        {entry.formula ? (
-          <div>
-            <dt className="sr-only">Rule</dt>
-            <dd className="rounded-lg bg-black/40 px-3 py-2 font-mono text-[12px] break-words whitespace-pre-wrap text-green-200">{entry.formula}</dd>
-          </div>
-        ) : null}
-        <div className="flex gap-2">
-          <dt className="w-[4.6rem] shrink-0 text-slate-500">Numbers</dt>
+      {entry.formula ? (
+        <p className="rounded-lg bg-black/40 px-3 py-2 font-mono text-[12px] break-words whitespace-pre-wrap text-green-200">{entry.formula}</p>
+      ) : null}
+      <dl className="space-y-2 text-[13px] leading-relaxed">
+        <div className="flex gap-3">
+          <dt className="w-[4.4rem] shrink-0 text-slate-500">Numbers</dt>
           <dd className="text-slate-300">{entry.numbers}</dd>
         </div>
-        <div className="flex gap-2">
-          <dt className="w-[4.6rem] shrink-0 text-slate-500">Energy</dt>
+        <div className="flex gap-3">
+          <dt className="w-[4.4rem] shrink-0 text-slate-500">Energy</dt>
           <dd className="text-slate-300">{entry.ledger}</dd>
         </div>
-        {entry.evidence ? (
-          <div className="flex gap-2">
-            <dt className="w-[4.6rem] shrink-0 text-slate-500">Measured</dt>
-            <dd className="text-slate-200">{entry.evidence}</dd>
-          </div>
-        ) : null}
-        {entry.caveat ? (
-          <div className="flex gap-2">
-            <dt className="w-[4.6rem] shrink-0 text-amber-200/70">Caveat</dt>
-            <dd className="text-amber-100/80">{entry.caveat}</dd>
-          </div>
-        ) : null}
       </dl>
-    </article>
+    </div>
   );
 }
 
-export function V2Atlas() {
-  const [group, setGroup] = useState<AtlasGroup>("world");
-  const tabs = useRef<(HTMLButtonElement | null)[]>([]);
-  const shown = atlas.filter((entry) => entry.group === group);
-  const current = atlasGroups.find((entry) => entry.id === group);
+/** One step's picture: the still drawn with the view that shows its state, or else its rule. */
+function Stage({ entry, view, setView }: { entry: AtlasEntry; view: "world" | "rule"; setView: (view: "world" | "rule") => void }) {
+  const still = entry.still ? stillById(entry.still) : null;
+  const showStill = still !== null && view === "world";
+  return (
+    <figure className="panel relative overflow-hidden rounded-[1.75rem]">
+      {still ? (
+        <div role="radiogroup" aria-label="Show" className="absolute top-3 right-3 z-10 inline-flex rounded-full border border-white/10 bg-black/70 p-0.5 backdrop-blur-md">
+          {(["world", "rule"] as const).map((option) => (
+            <button
+              key={option}
+              type="button"
+              role="radio"
+              aria-checked={view === option}
+              onClick={() => setView(option)}
+              className={cn(
+                "min-h-9 rounded-full px-3 text-[12px] font-bold transition-colors focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none",
+                view === option ? "bg-white/15 text-white" : "text-slate-400 hover:text-white",
+              )}
+            >
+              {option === "world" ? "In the world" : "The rule"}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {showStill ? (
+        <>
+          <a href={still.src} className="relative block aspect-square bg-black" aria-label={`${still.label}: open the ${still.width} × ${still.height} still`}>
+            {/* eslint-disable-next-line @next/next/no-img-element -- a static export; the manifest names the file */}
+            <img
+              src={still.src}
+              width={still.width}
+              height={still.height}
+              sizes="(min-width: 1024px) 52vw, 100vw"
+              loading="lazy"
+              decoding="async"
+              alt={`${still.label}: ${still.caption}`}
+              className="h-full w-full object-cover"
+            />
+            <Reticle inset={10} size={14} />
+            <span className="absolute bottom-3 left-3 rounded-full border border-white/10 bg-black/60 px-2.5 py-1 font-mono text-[10px] tracking-[0.12em] text-green-200 uppercase backdrop-blur-md">
+              flife render · tick {grouped(still.tick)} · seed {still.seed}
+              {still.view.zoom > 1.01 ? ` · ×${still.view.zoom}` : ""}
+            </span>
+          </a>
+          <figcaption className="px-5 py-4 text-[13px] leading-relaxed text-slate-400 sm:px-6">
+            <span className="font-semibold text-slate-200">{still.label}.</span> {still.caption}
+          </figcaption>
+        </>
+      ) : (
+        <RulePanel entry={entry} />
+      )}
+    </figure>
+  );
+}
 
-  const onKey = (event: KeyboardEvent<HTMLButtonElement>, at: number) => {
-    const n = atlasGroups.length;
-    const to =
-      event.key === "ArrowRight" ? (at + 1) % n : event.key === "ArrowLeft" ? (at - 1 + n) % n : event.key === "Home" ? 0 : event.key === "End" ? n - 1 : -1;
-    if (to < 0) return;
-    event.preventDefault();
-    const next = atlasGroups[to];
-    if (!next) return;
-    setGroup(next.id);
-    tabs.current[to]?.focus();
+/** What Stage-2 measured: a headline figure, the rest in words, and any caveat beside it. */
+function Measured({ entry, accent }: { entry: AtlasEntry; accent: string }) {
+  if (!entry.effect && !entry.evidence && !entry.caveat) return null;
+  return (
+    <div className="rounded-2xl border border-white/[0.08] bg-black/30 p-5">
+      {entry.effect || entry.evidence ? <MicroLabel className="text-slate-400">Measured · Stage-2, 4 seeds</MicroLabel> : null}
+      {entry.effect ? (
+        <div className="mt-3 flex items-baseline gap-4">
+          <span className={cn("shrink-0 text-4xl font-extrabold tracking-tight tabular-nums sm:text-5xl", accent)}>{entry.effect.value}</span>
+          <span className="text-[14px] leading-snug text-slate-200">{entry.effect.label}</span>
+        </div>
+      ) : null}
+      {entry.evidence ? <p className="mt-3 text-[13.5px] leading-relaxed text-slate-400">{entry.evidence}</p> : null}
+      {entry.caveat ? (
+        <p className="mt-3 border-t border-amber-300/15 pt-3 text-[13.5px] leading-relaxed text-amber-100/85">{entry.caveat}</p>
+      ) : null}
+    </div>
+  );
+}
+
+const nn = (n: number) => String(n).padStart(2, "0");
+
+/**
+ * One world's own mechanisms, one at a time: tabs to pick a step, the step's
+ * picture on the left and its rule and measurement on the right.
+ */
+export function MechanismStory({ story }: { story: "tissue" | "supercolony" }) {
+  const steps = storySteps(story);
+  const [at, setAt] = useState(0);
+  const [view, setView] = useState<"world" | "rule">("world");
+  const tabs = useRef<(HTMLButtonElement | null)[]>([]);
+  const id = useId().replace(/[^a-zA-Z0-9_-]/g, "");
+  const accent = ACCENT[story];
+  const entry = steps[at] ?? steps[0]!;
+  const also = entry.also ? atlasEntry(entry.also) : null;
+
+  const go = (to: number, focus = false) => {
+    const next = (to + steps.length) % steps.length;
+    setAt(next);
+    setView("world");
+    if (focus) tabs.current[next]?.focus();
   };
+
+  const onKey = (event: KeyboardEvent<HTMLButtonElement>) => {
+    const to =
+      event.key === "ArrowRight" ? at + 1 : event.key === "ArrowLeft" ? at - 1 : event.key === "Home" ? 0 : event.key === "End" ? steps.length - 1 : null;
+    if (to === null) return;
+    event.preventDefault();
+    go(to, true);
+  };
+
+  const arrow =
+    "inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-white/10 text-slate-300 transition-colors hover:border-white/25 hover:text-white focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none";
 
   return (
     <div>
-      <div role="tablist" aria-label="Mechanisms by what they do" className="flex flex-wrap gap-2">
-        {atlasGroups.map((entry, at) => {
-          const on = entry.id === group;
-          const count = atlas.filter((item) => item.group === entry.id).length;
-          return (
-            <button
-              key={entry.id}
-              ref={(element) => {
-                tabs.current[at] = element;
-              }}
-              id={`atlas-tab-${entry.id}`}
-              type="button"
-              role="tab"
-              aria-selected={on}
-              aria-controls="atlas-panel"
-              tabIndex={on ? 0 : -1}
-              onClick={() => setGroup(entry.id)}
-              onKeyDown={(event) => onKey(event, at)}
-              className={cn(
-                "flex min-h-11 items-center gap-2 rounded-xl border px-3.5 text-[13.5px] font-semibold transition-colors focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none",
-                on ? "border-green-400/50 bg-green-500/10 text-white" : "border-white/10 text-slate-400 hover:border-white/25 hover:text-white",
-              )}
-            >
-              {entry.title}
-              <span className={cn("font-mono text-[10px]", on ? "text-green-300" : "text-slate-500")}>{count}</span>
-            </button>
-          );
-        })}
-      </div>
-      <div id="atlas-panel" role="tabpanel" aria-labelledby={`atlas-tab-${group}`} className="mt-6">
-        {current ? (
-          <div className="mb-5 flex flex-wrap items-baseline gap-x-3 gap-y-1">
-            <MicroLabel>{current.title}</MicroLabel>
-            <p className="text-[15px] text-slate-400">{current.line}</p>
-          </div>
-        ) : null}
-        <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
-          {shown.map((entry) => (
-            <Card key={entry.slug} entry={entry} />
-          ))}
+      <div className="flex items-stretch gap-2">
+        <button type="button" className={cn(arrow, "hidden sm:inline-flex")} aria-label="Previous step" onClick={() => go(at - 1)}>
+          <ArrowLeft className="h-4 w-4" aria-hidden="true" />
+        </button>
+        <div role="tablist" aria-label={story === "tissue" ? "The tissue's mechanisms" : "The supercolony's mechanisms"} className="grid flex-1 grid-cols-3 gap-1 rounded-2xl border border-white/[0.08] bg-black/30 p-1 sm:grid-cols-6">
+          {steps.map((step, index) => {
+            const on = index === at;
+            return (
+              <button
+                key={step.slug}
+                ref={(element) => {
+                  tabs.current[index] = element;
+                }}
+                id={`${id}-tab-${index}`}
+                type="button"
+                role="tab"
+                aria-selected={on}
+                aria-controls={`${id}-panel`}
+                tabIndex={on ? 0 : -1}
+                onClick={() => go(index)}
+                onKeyDown={onKey}
+                className={cn(
+                  "flex min-h-12 flex-col items-center justify-center rounded-xl border px-1 text-center transition-colors focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none",
+                  on ? cn(accent.ring, "text-white") : "border-transparent text-slate-400 hover:bg-white/[0.04] hover:text-white",
+                )}
+              >
+                <span className={cn("font-mono text-[10px]", on ? accent.text : "text-slate-500")}>{nn(index + 1)}</span>
+                <span className="text-[13px] font-semibold">{step.short}</span>
+              </button>
+            );
+          })}
         </div>
+        <button type="button" className={cn(arrow, "hidden sm:inline-flex")} aria-label="Next step" onClick={() => go(at + 1)}>
+          <ArrowRight className="h-4 w-4" aria-hidden="true" />
+        </button>
+      </div>
+
+      <div
+        id={`${id}-panel`}
+        role="tabpanel"
+        aria-labelledby={`${id}-tab-${at}`}
+        className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1.08fr)_minmax(0,1fr)] lg:gap-10"
+      >
+        <Stage entry={entry} view={view} setView={setView} />
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-mono text-[11px] tracking-[0.16em] text-slate-400 uppercase">
+              Step {nn(at + 1)} of {nn(steps.length)}
+            </span>
+            <Presence entry={entry} />
+          </div>
+          <h3 className="mt-3 text-3xl leading-tight font-extrabold tracking-tight text-white sm:text-4xl">{entry.name}.</h3>
+          <p className="mt-2 font-mono text-[12px] text-green-300/80">{entry.slug}</p>
+          <p className="mt-4 text-[16px] leading-relaxed text-slate-300">{entry.rule}</p>
+          <p className="mt-3 text-[13px] text-slate-500">
+            <span className="font-semibold text-slate-400">Borrowed from</span> {entry.borrowed.charAt(0).toLowerCase() + entry.borrowed.slice(1)}.
+          </p>
+          <div className="mt-6">
+            <Measured entry={entry} accent={accent.value} />
+          </div>
+          {also ? (
+            <div className="mt-4 rounded-2xl border border-white/[0.06] p-5">
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <h4 className="text-[16px] font-bold text-white">With it: {also.name.charAt(0).toLowerCase() + also.name.slice(1)}</h4>
+                <code className="text-[11px] text-green-300/80">{also.slug}</code>
+              </div>
+              <p className="mt-2 text-[14px] leading-relaxed text-slate-300">{also.rule}</p>
+              {also.evidence ? <p className="mt-2 text-[13px] leading-relaxed text-slate-400">{also.evidence}</p> : null}
+            </div>
+          ) : null}
+          <div className="mt-6 flex items-center justify-between gap-3 border-t border-white/[0.06] pt-5">
+            <button type="button" onClick={() => go(at - 1)} className="inline-flex min-h-11 items-center gap-2 text-[13px] font-semibold text-slate-400 transition-colors hover:text-white">
+              <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
+              {steps[(at - 1 + steps.length) % steps.length]?.short}
+            </button>
+            <button type="button" onClick={() => go(at + 1)} className="inline-flex min-h-11 items-center gap-2 text-[13px] font-semibold text-slate-200 transition-colors hover:text-white">
+              {steps[(at + 1) % steps.length]?.short}
+              <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** The rules both presets switch on beyond the stories, and the three switched on by neither. */
+export function SharedRules() {
+  const shared = atlas.filter((entry) => entry.story === "shared");
+  const optIn = atlas.filter((entry) => entry.story === "opt-in");
+  return (
+    <div>
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        {shared.map((entry) => (
+          <article key={entry.slug} className="panel flex flex-col rounded-[1.5rem] p-5">
+            {entry.chart ? (
+              <div className="rounded-xl border border-white/[0.06] bg-black/35 p-2.5">
+                <Chart chart={entry.chart} slug={entry.slug} />
+              </div>
+            ) : null}
+            <h4 className="mt-4 text-[17px] leading-snug font-bold text-white">{entry.name}</h4>
+            <p className="mt-0.5 font-mono text-[11px] text-green-300/80">{entry.slug}</p>
+            <p className="mt-2 text-[14px] leading-relaxed text-slate-300">{entry.rule}</p>
+            <p className="mt-auto pt-3 font-mono text-[11px] leading-relaxed text-slate-500">{entry.numbers}</p>
+            {entry.evidence ? <p className="mt-2 text-[12.5px] leading-relaxed text-slate-400">{entry.evidence}</p> : null}
+          </article>
+        ))}
+      </div>
+      <div className="mt-8 flex flex-wrap items-baseline gap-x-3 gap-y-1">
+        <MicroLabel className="text-slate-400">Off in both presets</MicroLabel>
+        <p className="text-[14px] text-slate-400">Three switches no preset uses, for anyone to try.</p>
+      </div>
+      <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-3">
+        {optIn.map((entry) => (
+          <article key={entry.slug} className="flex flex-col rounded-[1.5rem] border border-white/[0.08] bg-black/20 p-5">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <h4 className="text-[16px] font-bold text-white">{entry.name}</h4>
+              <code className="text-[11px] text-green-300/80">{entry.slug}</code>
+            </div>
+            <p className="mt-2 text-[14px] leading-relaxed text-slate-300">{entry.rule}</p>
+            {entry.effect ? (
+              <div className="mt-auto flex items-baseline gap-3 pt-4">
+                <span className="shrink-0 text-2xl font-extrabold text-white tabular-nums">{entry.effect.value}</span>
+                <span className="text-[12.5px] leading-snug text-slate-400">{entry.effect.label}</span>
+              </div>
+            ) : (
+              <p className="mt-auto pt-4 text-[12.5px] text-slate-500">{entry.numbers}</p>
+            )}
+            {entry.evidence ? <p className="mt-2 text-[12.5px] leading-relaxed text-slate-500">{entry.evidence}</p> : null}
+          </article>
+        ))}
       </div>
     </div>
   );

@@ -263,8 +263,8 @@ export function ScaleCalculator() {
               </table>
             </div>
             <p className="mt-3 text-[11px] leading-snug text-slate-500">
-              At 400,000 × 9,988 these are the README&apos;s rows. A headline FLOP/s figure cannot justify a real-time
-              claim here; only sustained bandwidth with the real independent-weight layout can.
+              At 400,000 × 9,988 these are the README&apos;s rows. A real-time claim here needs sustained bandwidth,
+              measured with the real independent-weight layout; a headline FLOP/s figure cannot show it.
             </p>
           </div>
 

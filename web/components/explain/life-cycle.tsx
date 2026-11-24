@@ -101,7 +101,7 @@ export function LifeCycle() {
       eyebrow="FieldEcologyV1 · one organism, one tick at a time"
       title="Sense, decide, feed, move, emit, divide, die."
       basis="diagram"
-      source="README “How the world works” and “One tick”; plan §4–§8. Steps in the order the ordered tick runs them."
+      source="README “How the world works” and “One tick”; plan §4–§8. Steps in the order the tick runs them."
     >
       <div ref={frame} className="grid grid-cols-1 items-center gap-6 lg:grid-cols-[minmax(0,1.05fr)_minmax(0,1fr)]">
         <div ref={box} className="mx-auto w-full max-w-[520px]">
@@ -297,8 +297,8 @@ export function LifeCycle() {
 
           <p className="text-xs leading-relaxed text-slate-400">
             <span className="font-bold text-cyan-200">The ring is the field.</span> In the baseline model an organism
-            never touches another directly: no collisions, no attraction tables, no predation. Everything one does to
-            another, it does by eating from the field or writing into it.
+            never touches another directly; there are no collisions, attraction tables or predation. Whatever one does
+            to another, it does by eating from the field or writing into it.
           </p>
         </div>
       </div>

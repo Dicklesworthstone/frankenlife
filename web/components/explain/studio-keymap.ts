@@ -39,14 +39,14 @@ export const KEYS: Record<string, StudioKey> = {
     name: "8",
     v2: true,
     action:
-      "Colour by recurrent cell state (cell-state-v1): keeps the founder lineage's OKLab hue and modulates lightness, chroma and a slight hue twist from epigenetic state h₀. Active on field-ecology-v2 when v2-visual-mappings is enabled; no-op on v1.",
+      "Colour by recurrent cell state (cell-state-v1): each organism keeps its founder lineage's OKLab hue, and its epigenetic state h₀ shifts the lightness and chroma and twists the hue slightly. It works on field-ecology-v2 with v2-visual-mappings on, and does nothing on v1.",
   },
   "9": {
     group: "look",
     name: "9",
     v2: true,
     action:
-      "Colour by apical-basal polarity (polarity-v1): cyclic OKLab hue wheel for orientation angle, neutral grey when unpolarized, paired with bulk apical orientation ticks in sphere mode. Active on field-ecology-v2 when v2-visual-mappings is enabled; no-op on v1.",
+      "Colour by apical-basal polarity (polarity-v1): the orientation angle as a hue on a cyclic OKLab wheel, neutral grey where a cell has no polarity, and, in the sphere look, ticks marking the apical orientation. It works on field-ecology-v2 with v2-visual-mappings on, and does nothing on v1.",
   },
   R: { group: "look", name: "R", action: "The next look: glow, then raw (no halos, linear grey field), then sphere." },
   D: { group: "look", name: "D", action: "Density per screen bin instead of dots, and back." },

@@ -17,7 +17,7 @@ export const siteConfig = {
   name: "FrankenLife",
   // Where Cloudflare serves the site: wrangler.jsonc's custom domain (www. redirects here).
   url: "https://frankenlife.org",
-  title: "FrankenLife — artificial life you can watch, replay and check",
+  title: "FrankenLife: artificial life you can watch, replay and check",
   description:
     "A real-time artificial-life laboratory in memory-safe Rust. Organisms with their own heritable neural networks feed, signal, move, split and die through one shared energy field, and every committed tick is deterministic to the bit.",
   github: "https://github.com/Dicklesworthstone/frankenlife",
@@ -34,18 +34,18 @@ export const siteConfig = {
 // web/scripts/director.ts). AGENTS.md: a selection procedure is stated, never implied.
 export const filmChoice = {
   world: [
-    "The film's world is not the baseline model. It runs field-ecology-v1-contact, a registered variant with one added rule: every organism is a body, here 0.25 world units across, and after each tick overlapping bodies push apart while bodies within 1.5 diameters pull together by the square of how alike their inherited chemistry is. The rule moves organisms, never energy. It was added because the reference screenshots' organisms look like packed spheres, which organisms that are points cannot be. Measured, the bodies stack two or three deep rather than pack: the pull, summed over every neighbour, outweighs the push.",
+    "The confluent film's world runs field-ecology-v1-contact, a registered variant of the baseline model with one added rule: every organism is a body, here 0.25 world units across, and after each tick overlapping bodies push apart while bodies within 1.5 diameters pull together by the square of how alike their inherited chemistry is. The rule moves organisms, never energy. It was added because the organisms in the reference screenshots look like packed spheres, which points cannot. Measured, the bodies stack two or three deep instead of packing, because the pull, summed over every neighbour, outweighs the push.",
     "Its numbers were chosen by searches outside the simulation, in several stages, against 14 statistics of the reference screenshots that inspired the project. The last stage kept the rules and set the scale. The field is four times finer than in the stage before, so a field cell holds about 2.6 organisms rather than about ten, nearer the references' one. Food is plentiful, so the population sits at its ceiling of 262,144, as the references' counters show theirs do at a million. Children land up to 2.5 world units from their parent, so colonies fill the 80-unit torus instead of leaving most of it black. It scores 0.74 on the statistics' scale, against 1.93 for the same rules at the coarser scale and 1.03 for the same ecology without bodies, scored the same way; the nearest any world of the last stage came was 0.73. Every trial was scored coloured by chemical affinity; this world was chosen by eye, coloured by lineage. The film colours each organism by its lineage and lights it by its own energy: black with none, white with nearly twice what it needs to divide, so pale patches are well fed and dark ones starving. Coloured that way, the scored frame comes to 0.72, against 0.90 coloured by lineage alone. The film shows the chosen world itself, from the tick where it was scored.",
     "Nothing the search measured feeds back into a run. The organisms have no aesthetic fitness: they feed, emit, split and die by energy alone. The seed is the Desktop preset's 42, not a pick. On three seeds the search never saw, the world scores 0.81 to 1.57, against 1.92 to 2.68 for the coarser world on the same seeds.",
     "Emission, chosen by the neural networks, makes the structure, and contact shapes it at the scale of bodies. Organisms return about half of what they eat to the field, in a chemical composition their networks choose and kin choose alike, so each lineage paints its surroundings with its own chemistry. Adhesion then sorts lineages by that chemistry, as real tissues sort by adhesion, into domains of labyrinths, foam and packed spheres. With every controller's decisions zeroed, nothing is emitted and the bodies settle into a uniform mottled haze, with no domains, labyrinths or foam. With every newborn's genome drawn fresh instead of inherited, the population falls from its ceiling to about 1,200.",
   ],
   v2: [
-    "The v2 films show the two v2 presets exactly as committed, at their own seed, 42; no parameter was tuned for the camera. Each world was first run to tick 8,192 and drawn every 256 ticks; the starting tick was then chosen by eye from those frames, where colonies or tissue islands had formed: 2,048 for the supercolony and 3,072 for the tissue. The supercolony film's first digest is the one the Stage-2 campaign recorded for the same preset and seed at that tick.",
-    "The colouring was chosen by eye from single 4K test frames of five looks: founder lineage lit by each organism's energy, over the field's energy, for both. The tissue's cell-state colouring was nearly uniform at these ticks, so it appears only as a still. The veins film draws the same supercolony with the field coloured by vascular conductance, the whole torus, without a camera.",
-    "The camera is the director's described below, with its zooms given by hand: 1.3× to 1.7× for the supercolony, whose organisms are drawn at a fixed size that coarsens if the camera comes closer, and 2.6× to 3.4× for the tissue, whose bodies are 0.25 world units across.",
+    "The v2 films show each committed preset fed more, so that the frame fills. The tissue's food comes from 6 wide sources with 18 times the preset's total power, and the supercolony's 16 oases each give 5 times as much. Every v2 mechanism and every other parameter is the preset's. The amounts were chosen by eye from 17 variants, each rendered from tick 0, for the fullest frame; the supercolony's stays below the population ceiling, where births would be refused. experiments/website-films/README.md lists every variant with its counts. No Stage-2 claim covers these two worlds: every measured figure on this page is the committed presets'.",
+    "Each film runs 3,200 ticks at seed 42, from the ticks the first v2 films started at: 3,072 for the tissue, with 45,940 cells, and 2,048 for the supercolony, with 119,984 organisms. Both are drawn as the confluent film is, as spheres in their founder's colour, lighter the more energy they hold, with no field beneath them. The veins film draws the supercolony's world over its field coloured by vascular conductance, the whole torus, without a camera.",
+    "The camera is the director's, described below, with each shot's zoom given by hand: 1.6× to 3× for the tissue and 1.5× to 2.2× for the supercolony.",
   ],
   camera:
-    "Where the camera looks is chosen from the run, not by hand; each shot's zoom is given. The same ticks are first rendered small; each shot then eases into the region where the organisms changed most during it, and the film opens and closes on the whole torus. The camera changes no result: the preview and the film end on the same digest.",
+    "Where the camera looks comes from the run; only each shot's zoom is given by hand. The same ticks are first rendered small, each shot then eases into the region where the organisms changed most during it, and the film opens and closes on the whole torus. The camera changes no result: the preview and the film end on the same digest.",
 };
 
 /**
@@ -56,21 +56,21 @@ export const filmChoice = {
 export const filmNotes: Record<string, { tab: string; chip: string; title: string; line: string }> = {
   supercolony: {
     tab: "Supercolony",
-    chip: "v2 · Bundle B",
+    chip: "v2 · Bundle B, fed 5×",
     title: "Supercolony",
-    line: "The supercolony-v2 preset: 16,384 founders and 11 v2 mechanisms, with no forces between organisms. Colonies hold together only through the field they share: food sources bloom and fade, emitters fire in bursts, trails and veins form in the field. Colour is founder lineage, lit by each organism's energy, over the field's energy.",
+    line: "The supercolony-v2 preset with 5 times the food: 16,384 founders, 11 v2 mechanisms and no forces between organisms, with 64,000 to 181,000 alive during the film. Colonies hold together only through the field they share, where oases bloom and fade, emitters fire in bursts, and trails and veins form. Bright organisms are well fed, dark ones starving.",
   },
   tissue: {
     tab: "Tissue",
-    chip: "v2 · Bundle A",
+    chip: "v2 · Bundle A, fed 18×",
     title: "Tissue",
-    line: "The morphogenesis-tissue-v2 preset: 10,954 founders with bodies and 14 v2 mechanisms. Crowding stops division, polarity orients cells, inherited tags decide who sticks to whom, and kin pass food. The camera holds 2.6× to 3.4× closer than the whole torus; bright cells are well fed, dark ones starving.",
+    line: "The morphogenesis-tissue-v2 preset with 18 times the food, from 6 wide sources: 10,954 founders with bodies and 14 v2 mechanisms, with 33,000 to 50,000 cells during the film. Crowding stops division, polarity orients cells, inherited tags decide who sticks to whom, and kin pass food. Bright cells are well fed, dark ones starving.",
   },
   veins: {
     tab: "Veins",
     chip: "v2 · overlay",
     title: "Veins",
-    line: "The supercolony again, with the field drawn as vascular conductance instead of energy: bright where energy has kept flowing between cells and the faces have widened, dark seams where they have pruned back. The network is the field's own; no organism builds it on purpose. The whole torus, without a camera.",
+    line: "The supercolony film's world again, over its field drawn as vascular conductance: bright where energy has kept flowing between cells and the faces have widened, dark seams where they have pruned back. The network is the field's own; no organism builds it on purpose. The whole torus, without a camera.",
   },
   confluent: {
     tab: "Confluent",
@@ -102,7 +102,7 @@ export const chapters: Chapter[] = [
     number: "01",
     short: "World",
     label: "The world",
-    title: "Every speck is [someone].",
+    title: "Every speck is an [individual].",
     thesis:
       `The confluent world shows ${filmAlive} organisms at once, and each is an individual: a body, an energy budget, offspring and its own neural network. Zoom in until you reach one, watch what it does in a tick, then run a small world of your own.`,
     colour: 0,
@@ -117,9 +117,9 @@ export const chapters: Chapter[] = [
     number: "02",
     short: "Different",
     label: "Why it is different",
-    title: "Beautiful is easy. [Earned] is hard.",
+    title: "The structure is [earned].",
     thesis:
-      "Artificial-life imagery is easy to fake: one network copied into every body, energy from nowhere, a quiet cull, a renderer doing the work. FrankenLife forbids each shortcut, and its controls show the structure going when a cause is taken away.",
+      "Artificial-life imagery is easy to fake: one network copied into every body, energy from nowhere, a quiet cull, a renderer doing the work. FrankenLife forbids each shortcut, and its controls show the structure disappearing when a cause is taken away.",
     colour: 5,
     sections: [
       { id: "different", label: "Four forbidden shortcuts" },
@@ -150,15 +150,16 @@ export const chapters: Chapter[] = [
     label: "Version 2",
     title: "Tissue and [supercolonies].",
     thesis:
-      "Twenty-one new mechanisms, each a switch: food that blooms and fades, membranes, veins the field grows for itself, trails no one can eat, ageing, bodies that stop dividing in a crowd, sort by kind and feed their kin. Two presets combine them into a tissue and a supercolony, and 104 runs measured what each part does.",
+      "Version 2 adds 21 mechanisms, each a switch fixed when a world is founded. Two presets combine them, into a tissue whose cells touch and a supercolony held together only by the field, and 104 runs measured what each does by taking it away.",
     colour: 1,
     sections: [
       { id: "bundles", label: "Two worlds" },
-      { id: "atlas", label: "Twenty-one mechanisms" },
-      { id: "views", label: "Seeing the hidden state" },
+      { id: "tissue", label: "The tissue" },
+      { id: "supercolony", label: "The supercolony" },
+      { id: "shared", label: "The other switches" },
       { id: "ablations", label: "Take one away" },
       { id: "configure", label: "Compose your own" },
-      { id: "unshown", label: "What is not shown yet" },
+      { id: "unshown", label: "Not shown yet" },
     ],
   },
   {
@@ -185,7 +186,7 @@ export const chapters: Chapter[] = [
     label: "Use it",
     title: "Your [laboratory].",
     thesis:
-      "Ten worlds to open — eight v1 profiles and showcase worlds plus two authored v2 presets — a native Studio to watch and touch them, and a command line that records everything it does.",
+      "Ten worlds to open (eight v1 profiles and showcase worlds, and two authored v2 presets), a native Studio to watch and touch them, and a command line that records everything it does.",
     colour: 7,
     sections: [
       { id: "worlds", label: "Ten worlds" },
@@ -215,7 +216,7 @@ export const lifeCycle: LifeStep[] = [
     name: "Sources",
     actor: "field",
     phases: "phase 2",
-    body: "Seeded Gaussian patches drift across the torus on smooth paths. Each injects a fixed power per simulated second, with a fixed chemical direction. Apart from a researcher's brush, it is the only food that enters the world.",
+    body: "Seeded Gaussian patches drift across the torus on smooth paths. Each injects a fixed power per simulated second, with a fixed chemical direction. Apart from a researcher's brush, they are the only food that enters the world.",
   },
   {
     id: "field",
@@ -276,7 +277,7 @@ export const lifeCycle: LifeStep[] = [
     name: "Die",
     actor: "organism",
     phases: "phase 8, returned in 9",
-    body: "Zero energy after any stage is death, checked after every stage. Part of what it held returns to the field, as food and chemistry for whatever comes next.",
+    body: "An organism with zero energy dies; the check runs after every stage. Part of what it held returns to the field as food and chemistry.",
   },
 ];
 
@@ -287,7 +288,7 @@ export const shortcuts = [
   {
     shortcut: "One network, copied",
     temptation: "Hundreds of thousands of organisms that are really one shared policy: cheap, fast and smooth.",
-    rule: "Every organism carries its own weights. Organisms with the same topology are batched to share a kernel and a memory layout, never a parameter, and a rare topology gets a correct fallback, never a different controller.",
+    rule: "Every organism carries its own weights. Organisms with the same topology are batched to share a kernel and a memory layout but no parameters, and a rare topology gets a correct fallback that runs the same controller.",
     refs: ["INV-13", "plan §6.5"],
   },
   {
@@ -401,7 +402,7 @@ export const worldModel = [
   },
   {
     name: "Decisions",
-    body: "36 baseline outputs: a reproduction hazard, a child's energy share, an emission gate, a 32-dimensional emission direction and a spending rate, with no motor output on v1 (modular field-ecology-v2 appends optional SO(2) motor, budding, EMT and recurrent channels; §03.5).",
+    body: "36 baseline outputs: a reproduction hazard, a child's energy share, an emission gate, a 32-dimensional emission direction and a spending rate, with no motor output on v1 (modular field-ecology-v2 appends optional SO(2) motor, budding, EMT and recurrent channels; §04.6).",
   },
   {
     name: "Uptake",
@@ -425,7 +426,7 @@ export const worldModel = [
   },
   {
     name: "Death",
-    body: "Zero energy after any stage is death, checked after every stage. Part of the residue returns to the field.",
+    body: "An organism with zero energy dies; the check runs after every stage. Part of the residue returns to the field.",
   },
 ];
 
@@ -675,36 +676,36 @@ export const v2Bundles = [
   {
     id: "tissue",
     film: "tissue",
-    name: "Bundle A · tissue",
+    name: "Tissue",
+    tag: "Bundle A",
     preset: "presets/morphogenesis-tissue-v2.toml",
-    founders: 10954,
-    features: 14,
-    abi: "108 inputs → 40 decisions (44 raw outputs), 33 field planes",
-    bodies: "0.25 world units across; they push apart and adhere ([contact]).",
+    facts: ["10,954 founders", "14 switches on", "bodies 0.25 units across that push and stick", "108 inputs → 40 decisions"],
     picture:
-      "Porous islands of tissue, often several lineages side by side, brighter where cells are well fed. Cells stop dividing in a crowd, orient, stick to cells with matching tags and pass food to kin.",
+      "Porous islands of tissue, often several lineages side by side. Cells stop dividing in a crowd, orient, stick to cells with matching tags and pass food to kin.",
     measured: [
       { label: "Alive at tick 2,048", value: "15,446", note: "mean of 4 seeds" },
-      { label: "Close neighbours vs v2 off", value: "½ as many", note: "per cell, 2.0 against 3.6; 4/4" },
-      { label: "Food shared with kin", value: "79,910", note: "energy per run, every window" },
+      { label: "Close neighbours", value: "½", note: "as many as with v2 off: 2.0 against 3.6; 4/4" },
+      { label: "Energy passed to kin", value: "79,910", note: "units per run, in every window" },
     ],
+    filmWorld: "The film's world is this preset fed 18 times as much, from 6 wide sources instead of 16 narrow ones:",
+    filmPreset: "presets/morphogenesis-tissue-v2-abundant.toml",
   },
   {
     id: "supercolony",
     film: "supercolony",
-    name: "Bundle B · supercolony",
+    name: "Supercolony",
+    tag: "Bundle B",
     preset: "presets/supercolony-v2.toml",
-    founders: 16384,
-    features: 11,
-    abi: "108 inputs → 40 decisions (40 raw outputs), 34 field planes",
-    bodies: "Points: no organism pushes or pulls another (INV-08).",
+    facts: ["16,384 founders", "11 switches on", "points: nothing pushes or pulls (INV-08)", "108 inputs → 40 decisions"],
     picture:
-      "Compact, moving colonies with well-fed, brightly lit rims, between food sources that bloom and fade. Everything they share passes through the field: bursts of emission, slow trails and the veins that flow carves in it.",
+      "Compact, moving colonies with well-fed, brightly lit rims, between food sources that bloom and fade. All they share passes through the field: bursts of emission, slow trails and the veins that flow carves in it.",
     measured: [
       { label: "Alive at tick 2,048", value: "21,308", note: "mean of 4 seeds" },
-      { label: "Alignment from veins", value: "+50%", note: "0.378 vs 0.252 without, 4/4" },
-      { label: "From bursting", value: "+58%", note: "alive vs without the relay, 4/4" },
+      { label: "Alignment from veins", value: "+50%", note: "0.378 against 0.252 without; 4/4" },
+      { label: "Alive from bursts", value: "+58%", note: "against no relay; 4/4" },
     ],
+    filmWorld: "The film's world is this preset fed 5 times as much:",
+    filmPreset: "presets/supercolony-v2-abundant.toml",
   },
 ] as const;
 
@@ -739,7 +740,7 @@ export const v2Ablations: { bundle: string; preset: string; rows: AblationRow[] 
     preset: "supercolony-v2",
     rows: [
       { condition: "as committed", live: 21308, kind: "treatment" },
-      { condition: "every v2 feature off", live: 21075, kind: "control", note: "no fronts, no trails, no veins" },
+      { condition: "every v2 feature off", live: 21075, kind: "control", note: "colonies without lit rims, and neither trails nor veins" },
       { condition: "decisions removed", live: 20436, kind: "control", note: "no trails at all" },
       { condition: "networks cannot evolve", live: 19942, kind: "control", note: "evolving ones keep 10% more on held-out seeds" },
       { condition: "inheritance removed", live: 317, kind: "control", note: "67× fewer" },
@@ -759,7 +760,7 @@ export const v2Ablations: { bundle: string; preset: string; rows: AblationRow[] 
 export const v2Residuals = [
   {
     title: "No separate cell types yet",
-    body: "Clones do vary in their memory state, but at 2,048 ticks that state barely tracks how crowded a cell is (r = +0.069). Distinct core and sheath cells would need |r| above 0.3; longer runs may or may not get there.",
+    body: "Clones vary in their memory state, but at 2,048 ticks it barely tracks how crowded a cell is (r = +0.069). Distinct core and sheath cells would need |r| above 0.3, which longer runs may or may not reach.",
   },
   {
     title: "Sharing food does not raise the count",
@@ -767,11 +768,11 @@ export const v2Residuals = [
   },
   {
     title: "Organisms without decisions do well in the tissue",
-    body: "With every network output zeroed, 27,603 are alive against 15,446: they spend nothing on emission or on the networks' own steering, and kin feed them. They are less coherent on every alignment measure, on all 4 seeds, and a little more crowded (1.2× the close neighbours per cell).",
+    body: "With every network output zeroed, 27,603 are alive against 15,446: they spend nothing on emission or steering, and kin feed them. They are less coherent on every alignment measure, on all 4 seeds, and a little more crowded (1.2× the close neighbours per cell).",
   },
   {
     title: "Smoother gliders align more",
-    body: "In the supercolony, worlds without bursts or trails show higher short-range alignment than the committed preset (0.493 to 0.672 against 0.378). Within the committed dynamics, veins and oases raise it.",
+    body: "In the supercolony, worlds without bursts or trails align more at short range than the committed preset (0.493 to 0.672 against 0.378). Within the committed dynamics, veins and oases raise alignment.",
   },
   {
     title: "Trails cost a sixth of the colony",
@@ -901,7 +902,7 @@ export const hypotheses: {
     name: "Persistent heterogeneous colonies",
     verdict: "met",
     label: "Met · a low bar",
-    result: "Every run that reached tick 8,192 ended with clustered, spatially autocorrelated colonies: 32 of 32 in E2, 16 of 16 E1 controls, and 112 of 112 runs across every ablation. A low bar: it is clustering at one sample, not colonies persisting through time, and it holds without controllers, emission or inheritance.",
+    result: "Every run that reached tick 8,192 ended with clustered, spatially autocorrelated colonies: 32 of 32 in E2, 16 of 16 E1 controls, and 112 of 112 runs across every ablation. The bar is low: the criterion is clustering at one sample, not colonies persisting through time, and it is met without controllers, emission or inheritance.",
     strips: [{ measure: "E1 control meets the colony criterion", discovery: [8, 8], heldOut: [8, 8] }],
   },
   {
@@ -920,7 +921,7 @@ export const hypotheses: {
     name: "Paid emission supports niche construction",
     verdict: "narrow",
     label: "Met narrowly",
-    result: "Emission evens the field (Gini about 1.5% lower) but leaves how organisms cluster unchanged, and costs population: environment modification, not demonstrated niche construction.",
+    result: "Emission evens the field (Gini about 1.5% lower) but leaves how organisms cluster unchanged, and costs population. That is environment modification; niche construction is not demonstrated.",
     strips: [
       { measure: "Field Gini lower with emission", discovery: [6, 8], heldOut: [7, 8] },
       { measure: "Organism Morisita higher without emission", discovery: [4, 8], heldOut: [4, 8] },
@@ -1013,7 +1014,7 @@ export const presets: {
     dt: "1/128",
     kind: "profile",
     chosen: "Desktop profile · FL-034 E2",
-    body: "F16 weights. All 8 of E2's runs settled at 91,664 to 99,361 alive. About 10 ticks a second on 16 workers of an M5 Ultra: a world to study, not yet one to watch at frame rate.",
+    body: "F16 weights. All 8 of E2's runs settled at 91,664 to 99,361 alive. It runs at about 10 ticks a second on 16 workers of an M5 Ultra, too slow yet to watch at frame rate.",
   },
   {
     file: "showcase-world",

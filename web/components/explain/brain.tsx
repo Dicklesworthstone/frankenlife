@@ -475,8 +475,8 @@ export function BrainAnatomy() {
             <p className="text-sm leading-relaxed text-slate-300">
               Every input reaches every neuron of the first hidden layer, and every layer the next: a dense network
               with tanh hidden layers and a linear output. Point at a group, or tab to one, to see what it carries.
-              The colours pair what it reads with what it writes: chemistry in, chemistry out; energy in, energy
-              spent.
+              The colours pair what it reads with what it writes: the chemistry it senses and the chemistry it emits
+              are both cyan, and the energy it senses and the energy it spends are both gold.
             </p>
           )}
         </div>
@@ -502,7 +502,7 @@ export function BrainAnatomy() {
               decides when to split, what to give the child, and what to write into the field. Optional neural steering
               (<code className="text-amber-100">so2-motor</code>) and oriented budding (
               <code className="text-amber-100">so2-budding</code>) live in modular{" "}
-              <code className="text-amber-100">field-ecology-v2</code> (§03.5).
+              <code className="text-amber-100">field-ecology-v2</code> (§04.6).
             </p>
           </div>
         </div>

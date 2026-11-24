@@ -203,11 +203,11 @@ const MODES = [
 ] as const satisfies readonly { value: Mode; label: string; tone: "rule" | "wrong" }[];
 
 const EXPLAIN: Record<Mode, string> = {
-  own: "Every organism carries its own parameters, inherited from its parent with a few mutations and shared with no one. Kin look alike, never identical; unrelated organisms look unrelated. Selection acts on exactly those differences.",
+  own: "Every organism carries its own parameters, inherited from its parent with a few mutations and shared with no one. Kin look alike but are never identical, and unrelated organisms look different. Selection acts on exactly those differences.",
   shared:
     "What FrankenLife refuses: one network copied into every body. It is cheap, since the weights are read once and reused for everyone, and it turns hundreds of thousands of brains into a single policy with nothing for selection to choose between. Plan §6.5: replacing each organism's W with one common W would fundamentally change the project.",
   batched:
-    "How it actually runs. Organisms with the same topology share a kernel and a memory layout, so one dispatch evaluates a whole batch: Y_b = X_b W_b + b_b, where W_b changes with every organism b. The batch shares a code path, never a parameter (INV-13), and a rare topology gets a correct fallback, never a different controller.",
+    "How it actually runs. Organisms with the same topology share a kernel and a memory layout, so one dispatch evaluates a whole batch: Y_b = X_b W_b + b_b, where W_b changes with every organism b. The batch shares a code path but no parameters (INV-13), and a rare topology gets a correct fallback, never a different controller.",
 };
 
 /** Every organism has its own weights: the picture, with the one way it is not done and the way it is. */

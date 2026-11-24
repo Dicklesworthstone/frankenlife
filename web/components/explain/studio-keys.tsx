@@ -156,13 +156,13 @@ export function StudioKeys() {
           <Monitor className="mt-0.5 h-4 w-4 shrink-0 text-slate-500" aria-hidden="true" />
           <span>
             The Studio is macOS, drawn through Metal. Look, field, camera and selection keys change only the picture
-            (INV-09): nine styles of one 1,200-tick render all end at the same digest, and keys 8, 9 and C&apos;s V2
-            overlays remain read-only with zero cost on v1. Brushes are commands applied at the next open boundary.
-            Headless Cinema export (<code className="text-slate-300">flife-studio --export</code>) replays timelines at{" "}
-            <code className="text-slate-300">--export-size 1080p|4k|WxH</code>, constant{" "}
-            <code className="text-slate-300">--export-fps</code>, exact tick sampling (
-            <code className="text-slate-300">--export-every-ticks</code>) and JSON camera paths (
-            <code className="text-slate-300">--export-camera</code>); founding-only V2 flags (
+            (INV-09): nine styles of one 1,200-tick render all end at the same digest. The v2 views on keys 8, 9 and C
+            only read state too, and cost nothing on v1. Brushes are commands applied at the next open boundary.
+            Headless Cinema export (<code className="text-slate-300">flife-studio --export</code>) replays a timeline at
+            a chosen size (<code className="text-slate-300">--export-size 1080p|4k|WxH</code>) and a constant frame rate (
+            <code className="text-slate-300">--export-fps</code>), and can sample exact ticks (
+            <code className="text-slate-300">--export-every-ticks</code>) and follow a JSON camera path (
+            <code className="text-slate-300">--export-camera</code>). The founding-only v2 flags (
             <code className="text-slate-300">--disable</code>, <code className="text-slate-300">--enable</code>,{" "}
             <code className="text-slate-300">--v1-compat</code>) are refused with{" "}
             <code className="text-slate-300">--resume</code>.

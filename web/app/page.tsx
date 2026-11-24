@@ -24,11 +24,11 @@ import { Miniature } from "@/components/explain/miniature";
 import { ScaleCalculator } from "@/components/explain/scale";
 import { StudioKeys } from "@/components/explain/studio-keys";
 import { TickPipeline } from "@/components/explain/tick-pipeline";
-import { V2Atlas } from "@/components/explain/v2-atlas";
+import { MechanismStory, SharedRules } from "@/components/explain/v2-atlas";
 import { V2Explorer } from "@/components/explain/v2-explorer";
 import { IndependentWeights } from "@/components/explain/weights";
 import { ZoomLadder } from "@/components/explain/zoom-ladder";
-import { FilmProvenance } from "@/components/film-provenance";
+import { FilmRecords } from "@/components/film-records";
 import { FilmReel } from "@/components/film-reel";
 import { GreenTitle, MicroLabel, Reticle } from "@/components/franken";
 import { Reveal } from "@/components/reveal";
@@ -37,7 +37,7 @@ import { SEED_TONES, SeedStrips } from "@/components/seed-strip";
 import { ChapterBlock, Section } from "@/components/section";
 import { SiteHeader } from "@/components/site-header";
 import { SkipOffscreen } from "@/components/skip-offscreen";
-import { AblationBars, BundlePanels, ControlStills, Residuals, ViewStills } from "@/components/v2-sections";
+import { BundlePanels, Residuals, TakeOneAway } from "@/components/v2-sections";
 import {
   branchObservation,
   type Chapter,
@@ -64,7 +64,7 @@ import {
   type Verdict,
   worldModel,
 } from "@/lib/content";
-import { film, films, stills } from "@/lib/media";
+import { film } from "@/lib/media";
 import { cn, grouped } from "@/lib/utils";
 
 const { video } = film;
@@ -138,15 +138,15 @@ export default function Home() {
               <p className="lede mt-7 max-w-[36rem]">
                 A real-time artificial-life laboratory. Every organism in these films carries its own heritable neural
                 network; they feed, signal, move, split and die through one shared field of energy and chemistry,
-                and nothing is scripted or trained. Pause it, inspect it, branch it, replay it: the same world, to
-                the last bit, every time.
+                and nothing is scripted or trained. A run can be paused, inspected, branched and replayed, and every
+                replay reaches the same world, bit for bit.
               </p>
               <p className="mt-4 max-w-[36rem] text-[15px] leading-relaxed text-slate-400">
-                <span className="font-semibold text-slate-200">New in version 2:</span> twenty-one switchable
-                mechanisms. Tissue that stops dividing in a crowd, sorts by kind and feeds its kin; supercolonies that
-                pulse, lay trails and grow veins in the field they share.{" "}
+                <span className="font-semibold text-slate-200">New in version 2:</span> 21 mechanisms, each a switch.
+                With them a tissue stops dividing in a crowd, sorts by kind and feeds its kin, and a supercolony
+                pulses, lays trails and grows veins in the field it shares.{" "}
                 <a className={link} href="#ch-v2">
-                  What each one does
+                  Step through them
                 </a>
                 .
               </p>
@@ -215,8 +215,8 @@ export default function Home() {
             kicker={
               <>
                 Each organism is a small neural network with a body, a metabolism and offspring, living in one shared
-                field of energy and chemistry. Nothing is scripted and nothing is trained: whatever lineages survive,
-                they survive by these rules alone.
+                field of energy and chemistry. Nothing is scripted or trained; the lineages that survive do so under
+                these rules alone.
               </>
             }
           >
@@ -368,9 +368,9 @@ export default function Home() {
             title="Remove a cause, lose the [structure]."
             kicker={
               <>
-                The film&apos;s world, run again twice with one rule changed. Without emission nothing ever leaves an
-                organism, and the tissue becomes a haze; with fresh offspring instead of inherited ones, the world
-                dwindles to scatter. Same preset, seed, founders and food.
+                The confluent film&apos;s world, run again twice with one rule changed. Without emission nothing ever
+                leaves an organism, and the tissue becomes a haze; with fresh offspring instead of inherited ones, the
+                world dwindles to scatter. Same preset, seed, founders and food.
               </>
             }
           >
@@ -387,44 +387,44 @@ export default function Home() {
             title="What you are [watching]."
             kicker={
               <>
-                Not illustrations: <code className="text-green-300">flife render</code> drew each frame from the
-                committed world at its tick. Each world is deterministic: the same commands reach the same digests,
-                below, on any machine.
+                <code className="text-green-300">flife render</code> drew each frame from the committed world at its
+                tick. Each world is deterministic: the same commands reach the same digests, listed below, on any
+                machine.
               </>
             }
           >
-            <div className="grid grid-cols-1 gap-5">
-              {films.map((each) => (
-                <Reveal key={each.id}>
-                  <FilmProvenance film={each} />
-                </Reveal>
-              ))}
-            </div>
+            <Reveal>
+              <FilmRecords />
+            </Reveal>
             <Reveal className="mt-5">
               <div className="panel rounded-[1.75rem] p-6 sm:p-8">
                 <MicroLabel>How these worlds were chosen</MicroLabel>
-                <div className="mt-4 space-y-3 text-[15px] leading-relaxed text-slate-300">
-                  <p className="font-semibold text-white">The two v2 worlds.</p>
-                  {filmChoice.v2.map((paragraph) => (
-                    <p key={paragraph.slice(0, 24)}>{paragraph}</p>
-                  ))}
-                  <p className="pt-2 font-semibold text-white">The confluent world.</p>
-                  {filmChoice.world.map((paragraph) => (
-                    <p key={paragraph.slice(0, 24)}>{paragraph}</p>
-                  ))}
-                  <p className="pt-2 font-semibold text-white">The camera.</p>
-                  <p>{filmChoice.camera}</p>
-                  <p>
-                    <a className={link} href={siteConfig.showcase}>
-                      The confluent world&apos;s search, every sample&apos;s score and the held-out seeds
-                    </a>
-                    ;{" "}
-                    <a className={link} href={siteConfig.v2Report}>
-                      the v2 campaign&apos;s report
-                    </a>
-                    .
-                  </p>
+                <div className="mt-5 grid grid-cols-1 gap-x-10 gap-y-6 text-[14.5px] leading-relaxed text-slate-300 lg:grid-cols-2">
+                  <div className="space-y-3">
+                    <h3 className="text-[17px] font-bold text-white">The v2 worlds</h3>
+                    {filmChoice.v2.map((paragraph) => (
+                      <p key={paragraph.slice(0, 24)}>{paragraph}</p>
+                    ))}
+                    <h3 className="pt-3 text-[17px] font-bold text-white">The camera</h3>
+                    <p>{filmChoice.camera}</p>
+                  </div>
+                  <div className="space-y-3">
+                    <h3 className="text-[17px] font-bold text-white">The confluent world</h3>
+                    {filmChoice.world.map((paragraph) => (
+                      <p key={paragraph.slice(0, 24)}>{paragraph}</p>
+                    ))}
+                  </div>
                 </div>
+                <p className="mt-6 border-t border-white/[0.06] pt-4 text-[14px] text-slate-400">
+                  <a className={link} href={siteConfig.showcase}>
+                    The confluent world&apos;s search, every sample&apos;s score and the held-out seeds
+                  </a>
+                  ;{" "}
+                  <a className={link} href={siteConfig.v2Report}>
+                    the v2 campaign&apos;s report
+                  </a>
+                  .
+                </p>
               </div>
             </Reveal>
           </Section>
@@ -498,7 +498,7 @@ export default function Home() {
             layout="wide"
             eyebrow="Appendix C, playable"
             title="Check it [by hand]."
-            kicker="Each rule has a plausible-looking wrong version, and the plan pins each one with a known answer small enough to compute by hand. Change the numbers: the page recomputes the rule beside its wrong twin."
+            kicker="Each rule has a plausible-looking wrong version, and the plan pins each one with a known answer small enough to compute by hand. Change the numbers and the page recomputes the rule beside its wrong twin."
           >
             <Reveal>
               <FixtureBench />
@@ -529,10 +529,10 @@ export default function Home() {
             title="Two new [worlds]."
             kicker={
               <>
-                Version 2 is one model, <code className="text-green-300">field-ecology-v2</code>, with 21 mechanisms each
-                switched on or off when a world is founded. Two committed presets combine them: a tissue whose bodies
-                touch, and a supercolony where nothing touches and everything passes through the field. Every v1 world
-                is untouched: with every switch off, a v2 run is v1 bit for bit.
+                Version 2 is one model, <code className="text-green-300">field-ecology-v2</code>, with 21 mechanisms,
+                each switched on or off when a world is founded. Two committed presets combine them: a tissue whose
+                bodies touch, and a supercolony where nothing touches and everything passes through the field. With
+                every switch off, a v2 run is v1 bit for bit.
               </>
             }
           >
@@ -540,40 +540,59 @@ export default function Home() {
           </Section>
 
           <Section
-            id="atlas"
-            index={index("v2", "atlas")}
+            id="tissue"
+            index={index("v2", "tissue")}
             layout="wide"
-            eyebrow="The mechanism atlas"
-            title="Twenty-one [mechanisms]."
+            eyebrow="Bundle A · seven of its own"
+            title="How a tissue [forms]."
             kicker={
               <>
-                Each borrows an idea from biology and states it as a rule the ledger can check: what it does, its
-                numbers in the presets, where its energy goes, and what changed when Stage-2 took it away. The charts
-                are the rules themselves, computed in your browser from the presets&apos; numbers.
+                Seven of the tissue&apos;s 14 mechanisms are its own. Step through them: each shows its rule, computed
+                here from the preset&apos;s numbers, and what changed when Stage-2 ran the preset without it.
               </>
             }
           >
             <Reveal>
-              <V2Atlas />
+              <MechanismStory story="tissue" />
             </Reveal>
           </Section>
 
           <Section
-            id="views"
-            index={index("v2", "views")}
+            id="supercolony"
+            index={index("v2", "supercolony")}
             layout="wide"
-            eyebrow="Four read-only views"
-            title="Seeing the [hidden] state."
+            eyebrow="Bundle B · nothing touches"
+            title="Held together by the [field]."
             kicker={
               <>
-                The new mechanisms keep state the ordinary picture cannot show: a cell&apos;s polarity and memory, the
-                trail carrier, the field&apos;s conductances. Four mappings draw them. Drawing reads the committed tick
-                only, so no view changes a digest. Each still is the committed preset at tick{" "}
-                {grouped(stills.tick)}, seed {stills.stills[0]?.seed ?? 42}, at 4K.
+                The supercolony&apos;s organisms are points: none pushes or pulls another, so whatever holds a colony
+                together passes through the field. Four mechanisms are its own; the last two steps are on in both
+                presets and were measured here.
               </>
             }
           >
-            <ViewStills />
+            <Reveal>
+              <MechanismStory story="supercolony" />
+            </Reveal>
+          </Section>
+
+          <Section
+            id="shared"
+            index={index("v2", "shared")}
+            layout="wide"
+            eyebrow="Both presets, or neither"
+            title="The other [switches]."
+            kicker={
+              <>
+                Four more rules are on in both worlds: what a body costs to keep, what it may spend, and where its
+                deposits land. A twenty-first switch only adds the four views drawn in the steps above, and changes no
+                digest.
+              </>
+            }
+          >
+            <Reveal>
+              <SharedRules />
+            </Reveal>
           </Section>
 
           <Section
@@ -584,10 +603,9 @@ export default function Home() {
             title="Take one [away]."
             kicker={
               <>
-                Each preset was run as committed, beside controls and with each mechanism removed, on two discovery
-                seeds and two held-out seeds the presets were not tuned on: 13 conditions × 4 seeds × 2 presets, 2,048
-                ticks each. Below, each preset beside two controls at the same tick and seed, then the population in
-                every condition.{" "}
+                Each preset ran as committed, beside controls and with each mechanism removed, on two discovery seeds
+                and two held-out seeds the presets were not tuned on: 13 conditions × 4 seeds × 2 presets, 2,048 ticks
+                each.{" "}
                 <a className={link} href={siteConfig.v2Report}>
                   The full report
                 </a>{" "}
@@ -595,23 +613,14 @@ export default function Home() {
               </>
             }
           >
-            <ControlStills />
-            <p className="mt-5 text-xs leading-relaxed text-slate-500">
-              Each still is the world&apos;s last frame of <code className="text-slate-300">flife render</code> from tick
-              0.{" "}
-              {stills.stage2
-                ? "Each world's digest and live count at tick 2,048 equal those the Stage-2 campaign recorded for the same preset, condition and seed."
-                : null}{" "}
-              Rendered at revision <code className="text-slate-300">{stills.revision.slice(0, 12)}</code>.
-            </p>
-            <div className="mt-10">
-              <AblationBars />
-            </div>
+            <Reveal>
+              <TakeOneAway />
+            </Reveal>
             <p className="mt-5 text-sm leading-relaxed text-slate-400">
-              Population is one measure; the report scores each condition on a dozen, and the atlas above gives
-              each mechanism&apos;s. Some removals leave more organisms alive and less structure: without oases the
-              supercolony grows by half, but its trails fade and its veins stop being bimodal; without the trail
-              carrier it grows by a fifth and lays no trails at all.
+              Population is one measure; the report scores each condition on a dozen. Some removals leave more
+              organisms alive and less structure: without oases the supercolony grows by half, but its trails fade
+              and its veins stop being bimodal; without the trail carrier it grows by a fifth and lays no trails at
+              all.
             </p>
           </Section>
 
@@ -623,9 +632,9 @@ export default function Home() {
             title="Compose your [own]."
             kicker={
               <>
-                Any combination is a world: pick mechanisms and see the network&apos;s new inputs and outputs and the
-                command that founds it. Switches are fixed when a world is founded and enter its configuration hash
-                (INV-14), so a checkpoint always says which rules made it.
+                Any combination of switches is a world. Pick some to see what they add to each network&apos;s inputs
+                and outputs, and the command that founds the world. Switches enter the configuration hash (INV-14), so
+                a checkpoint always says which rules made it.
               </>
             }
           >
@@ -640,9 +649,11 @@ export default function Home() {
             layout="wide"
             eyebrow="Residuals"
             title="What is not [shown] yet."
-            kicker="The report lists what went against the hypotheses and what has not been run. So does this page."
+            kicker="What went against the hypotheses, and what has not been run, from the report's own list."
           >
-            <Residuals />
+            <Reveal>
+              <Residuals />
+            </Reveal>
           </Section>
         </ChapterBlock>
 
@@ -653,8 +664,8 @@ export default function Home() {
             index={index("evidence", "replay")}
             layout="wide"
             eyebrow="Checkpoints · resume · branches"
-            title="Rewind, [branch], compare."
-            kicker="A kept run checkpoints as it goes. Kill it and resume, and it reaches the uninterrupted world. Branch it, and a control reaches the parent's world exactly, while an intervention differs only from its brush onwards. That is what makes an experiment a comparison."
+            title="Rewind and [branch]."
+            kicker="A kept run checkpoints as it goes. Kill it and resume, and it reaches the uninterrupted world. Branch it, and a control reaches the parent's world exactly while an intervention differs only from its brush onwards, so any difference between the two is the brush's doing."
           >
             <div className="space-y-5">
               <Reveal>
@@ -844,7 +855,7 @@ export default function Home() {
             layout="wide"
             eyebrow="Why the scale is hard"
             title="Four billion [independent] parameters."
-            kicker="No two organisms share weights, so a full sweep cannot reuse them: it streams the whole bank from memory. At the target scale, bandwidth, not arithmetic, is the limit, and only a real measurement with the real layout can justify a real-time claim."
+            kicker="No two organisms share weights, so a full sweep cannot reuse them: it streams the whole bank from memory. At the target scale, memory bandwidth runs out before arithmetic does, and a real-time claim needs a measurement with the real weight layout."
           >
             <Reveal>
               <ScaleCalculator />
@@ -991,8 +1002,9 @@ export default function Home() {
                 <a className={link} href={siteConfig.showcase}>
                   the search states how
                 </a>
-                . Two are Stage-2 verified <code className="text-slate-200">field-ecology-v2</code> presets (Bundles A and B,
-                104 runs across discovery and held-out seeds with explicit residual tradeoffs).
+                . Two are the <code className="text-slate-200">field-ecology-v2</code> presets, Bundles A and B, verified in
+                Stage 2&apos;s 104 runs on discovery and held-out seeds; the campaign&apos;s report records what each one
+                trades away.
               </>
             }
           >
@@ -1030,8 +1042,8 @@ export default function Home() {
             index={index("lab", "studio")}
             layout="wide"
             eyebrow="Studio and laboratory"
-            title="Watch it, [touch] it, measure it."
-            kicker="The native Studio is the microscope: run, pause, step, zoom, select, inspect, brush and record, while the session commits every tick. The flife command line is the laboratory around it."
+            title="The Studio and the [command line]."
+            kicker="In the native Studio you can run, pause, step, zoom, select, inspect, brush and record while the session commits every tick. The flife command line does the rest: headless runs, branches, experiments and their analysis."
           >
             <div className="space-y-5">
               <Reveal>
@@ -1074,7 +1086,7 @@ export default function Home() {
             index={index("lab", "stack")}
             eyebrow="The FrankenSuite"
             title="Built on the [Franken] stack."
-            kicker="FrankenLife composes the suite rather than re-implementing it, and some of its work lands upstream."
+            kicker="FrankenLife builds on these five projects, and some of its work lands upstream in them."
           >
             <Reveal>
               <ul className="panel ruled overflow-hidden rounded-[1.75rem]">
@@ -1118,7 +1130,7 @@ export default function Home() {
           <div className="grid grid-cols-1 gap-12 lg:grid-cols-12">
             <div className="lg:col-span-7">
               <p className="display-2 font-extrabold text-white">
-                <GreenTitle text="The world is [alive]." />
+                <GreenTitle text="The code is [open]." />
               </p>
               <p className="mt-6 max-w-2xl text-sm leading-relaxed text-slate-400">
                 <span className="font-semibold text-slate-300">Inspiration, not a port.</span> {inspiration}

@@ -714,25 +714,25 @@ export function Miniature() {
       basis="toy"
       source={
         <>
-          A toy written in TypeScript for this page: not FrankenLife&apos;s code, and nothing it does is a FrankenLife
-          result. It borrows four rules in miniature: uptake in two passes, in whole quanta by largest remainder, ties
-          to the lower identity (plan §5.2, fixture C.1); a ledger that closes exactly on every tick (INV-03); birth as
+          A toy written in TypeScript for this page. It is not FrankenLife&apos;s code, and nothing it does is a
+          FrankenLife result. It borrows four rules in miniature: uptake in two passes, in whole quanta by largest
+          remainder, ties to the lower identity (plan §5.2, fixture C.1); a ledger that closes exactly on every tick (INV-03); birth as
           a transaction, cost paid and the rest split (C.5); and each organism its own weights, changed only by
           inherited mutation (INV-13). It leaves out chemistry and its 32 channels, emission, the sensing pyramid,
           the 9,988-parameter networks, the GPU kernels and the ordered ten-phase tick with its candidate world.
           Founders start from one forager&apos;s genome with every weight moved at random. Its step uses only +, −,
           ×, ÷, rounding down and 32-bit integer arithmetic, which every browser computes to the same bit (never exp, tanh or sin, whose last
-          bit can differ), so a seed reaches the same digest anywhere. The real rules:{" "}
+          bit can differ), so a seed reaches the same digest anywhere. The real model:{" "}
           <a className="text-green-300 underline-offset-4 hover:underline" href="#rules">
-            check them by hand
+            its rules, checked by hand
           </a>
           ,{" "}
           <a className="text-green-300 underline-offset-4 hover:underline" href="#brains">
-            the real networks
+            its networks
           </a>
           ,{" "}
           <a className="text-green-300 underline-offset-4 hover:underline" href="#tick">
-            one real tick
+            one of its ticks
           </a>
           .
         </>
@@ -977,7 +977,7 @@ export function Miniature() {
             </p>
             <p className="mt-2 text-[11px] leading-snug text-slate-500">
               Upkeep, motion, births and the field&apos;s slow loss are dissipated; a death returns the body&apos;s energy
-              to its cell. Nothing tops anything up.
+              to its cell. Only the sources and your brush add energy.
             </p>
           </div>
 

@@ -2,7 +2,7 @@
 
 The project's page: Next.js 16 as a static export, served by Cloudflare as an assets-only Worker
 (`wrangler.jsonc`). It shows films rendered by `flife render` from committed worlds (the two
-field-ecology-v2 presets, the supercolony's veins, and the v1 confluent world), with a readout of each
+field-ecology-v2 presets fed more, the supercolony's veins, and the v1 confluent world), with a readout of each
 frame's tick and live organisms taken from the render's own records. The Rust workspace does not
 build or read this directory (`.rchignore` keeps it out of remote builds too).
 
@@ -77,28 +77,37 @@ binary hash, and the ffmpeg arguments. `lib/films/index.ts` lists the films the 
 order; the first opens the page. The confluent film keeps the explainers cut from it (the zoom ladder, the
 controls); the share card is cut from the tissue film.
 
-The v2 films, all 801 frames at 60 fps, 2160 × 2160, CRF 20, split into segments of at most 22 MiB:
+The v2 films, all 801 frames at 60 fps, 2160 × 2160, CRF 20, split into segments of at most 22 MiB.
+They show the committed presets fed more (`presets/morphogenesis-tissue-v2-abundant.toml`,
+`presets/supercolony-v2-abundant.toml`); `experiments/website-films/README.md` records how the amounts
+were chosen.
 
 ```bash
-# From the repository root: each preset as committed, seed 42, kept in a run directory.
-target/release/flife run presets/supercolony-v2.toml --ticks 2048 --run-dir RUN-B
-target/release/flife run presets/morphogenesis-tissue-v2.toml --ticks 3072 --run-dir RUN-A
+# From the repository root: each world, seed 42, kept in a run directory. The supercolony run is
+# made twice so that its two films can render at once (a render locks its run directory); both
+# reach the same digest.
+target/release/flife run presets/morphogenesis-tissue-v2-abundant.toml --ticks 3072 --checkpoint-every 0 --run-dir RUN-A
+target/release/flife run presets/supercolony-v2-abundant.toml --ticks 2048 --checkpoint-every 0 --run-dir RUN-B
+target/release/flife run presets/supercolony-v2-abundant.toml --ticks 2048 --checkpoint-every 0 --run-dir RUN-B2
 
-# From web/: 3,200 ticks, a frame every 4, founder lineage lit by energy over the field's energy.
-bun run media -- --film supercolony --flife ../target/release/flife --run-dir ../RUN-B --work WORK-B \
-  --ticks 3200 --every 4 --size 2160 --fps 60 --crf 20 --look glow --color lineage-energy --field energy \
-  --zooms 1.3,1.7,1.4,1.8,1.5
+# From web/: 3,200 ticks, a frame every 4, founder lineage lit by energy, as spheres with no field.
 bun run media -- --film tissue --flife ../target/release/flife --run-dir ../RUN-A --work WORK-A \
-  --ticks 3200 --every 4 --size 2160 --fps 60 --crf 20 --look glow --color lineage-energy --field energy \
-  --zooms 2.6,3.4,2.8,3.6,3
-# The supercolony again, the whole torus, its field coloured by vascular conductance.
-bun run media -- --film veins --flife ../target/release/flife --run-dir ../RUN-B --work WORK-VEINS \
+  --ticks 3200 --every 4 --size 2160 --fps 60 --crf 20 --look sphere --color lineage-energy --field none \
+  --zooms 1.6,3,2.2,3.2,2.4
+bun run media -- --film supercolony --flife ../target/release/flife --run-dir ../RUN-B --work WORK-B \
+  --ticks 3200 --every 4 --size 2160 --fps 60 --crf 20 --look sphere --color lineage-energy --field none \
+  --zooms 1.5,2.2,1.8,2.4,1.9
+# The supercolony again, the whole torus, glowing over its field coloured by vascular conductance.
+bun run media -- --film veins --flife ../target/release/flife --run-dir ../RUN-B2 --work WORK-VEINS \
   --ticks 3200 --every 4 --size 2160 --fps 60 --crf 20 --look glow --color lineage-energy \
   --field vascular-conductance --camera none
 ```
 
-Then list each new manifest in `lib/films/index.ts`. The starting ticks and the looks were chosen by eye
-from a survey of each world to tick 8,192 and from 4K test frames; the page says so beside the films.
+A 3,200-tick film has room for three shots, so only the first three zooms are used. Then list each
+new manifest in `lib/films/index.ts` and move the files of the films it replaces from `public/media`
+to `media-retired/`. The starting ticks are those of the first v2 films, chosen by eye from a survey of
+each committed preset to tick 8,192; the looks were chosen by eye from 4K test frames. The page says so
+beside the films.
 
 The confluent film (`lib/films/confluent.json`) was made this way:
 

@@ -1,5 +1,5 @@
 // Pure configuration, ABI, validation and minimal CLI flag engine for the
-// interactive Modular V2 Feature & CLI Toggle Explorer (`v2-explorer.tsx`).
+// "Compose your own" switchboard (`v2-explorer.tsx`).
 //
 // Every rule mirrors `crates/flife-core/src/v2.rs` exactly (V2Feature::ALL,
 // BUNDLE_A_DEFAULTS, BUNDLE_B_DEFAULTS, V2Config::abi, validate_v2, and
@@ -333,8 +333,8 @@ export type V2PresetSpec = {
 export const V2_PRESETS: readonly V2PresetSpec[] = [
   {
     id: "bundle-a",
-    label: "Bundle A · Tissue",
-    shortLabel: "Bundle A",
+    label: "Tissue preset",
+    shortLabel: "Tissue",
     presetPath: "presets/morphogenesis-tissue-v2.toml",
     hasContact: true,
     baseEnabled: BUNDLE_A_DEFAULTS,
@@ -344,12 +344,12 @@ export const V2_PRESETS: readonly V2PresetSpec[] = [
     stateWidth: 2,
     notchNeighborMean: true,
     wakeNeuralPump: false,
-    note: "14 defaults on [contact] (inv08_pure_field = false), Metal F16 4-aligned (108→40, 44 raw, 33 planes).",
+    note: "The tissue preset as committed: 14 switches on, over bodies that touch ([contact]).",
   },
   {
     id: "bundle-b",
-    label: "Bundle B · Super-Colony",
-    shortLabel: "Bundle B",
+    label: "Supercolony preset",
+    shortLabel: "Supercolony",
     presetPath: "presets/supercolony-v2.toml",
     hasContact: false,
     baseEnabled: BUNDLE_B_PRESET_ACTIVE,
@@ -359,12 +359,12 @@ export const V2_PRESETS: readonly V2PresetSpec[] = [
     stateWidth: 2,
     notchNeighborMean: false,
     wakeNeuralPump: false,
-    note: "11 active pure-field features (strict INV-08, no [contact]), Metal F16 4-aligned (108→40, 34 planes).",
+    note: "The supercolony preset as committed: 11 switches on and no [contact] table, so organisms meet only through the field (INV-08).",
   },
   {
     id: "all-v2",
-    label: "All V2 · 21 slugs",
-    shortLabel: "All V2",
+    label: "All 21",
+    shortLabel: "All 21",
     presetPath: "presets/morphogenesis-tissue-v2.toml",
     hasContact: true,
     baseEnabled: BUNDLE_A_DEFAULTS,
@@ -374,12 +374,12 @@ export const V2_PRESETS: readonly V2PresetSpec[] = [
     stateWidth: 2,
     notchNeighborMean: true,
     wakeNeuralPump: false,
-    note: "Every registered V2 slug enabled over [contact] via --enable all-v2 (112→43, 47 raw, 34 planes).",
+    note: "Every switch on with --enable all-v2, over the tissue preset's bodies.",
   },
   {
     id: "v1-compat",
-    label: "V1 Compat · 0 slugs",
-    shortLabel: "V1 Compat",
+    label: "None (v1)",
+    shortLabel: "None",
     presetPath: "presets/morphogenesis-tissue-v2.toml",
     hasContact: true,
     baseEnabled: BUNDLE_A_DEFAULTS,
@@ -389,7 +389,7 @@ export const V2_PRESETS: readonly V2PresetSpec[] = [
     stateWidth: 2,
     notchNeighborMean: true,
     wakeNeuralPump: false,
-    note: "All V2 features disabled via --v1-compat: collapses cleanly to 104→36, 33 field planes.",
+    note: "Every switch off with --v1-compat: the v1 network and field.",
   },
 ];
 

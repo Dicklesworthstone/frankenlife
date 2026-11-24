@@ -122,7 +122,7 @@ export function ControlsTrio() {
         One preset, one seed, the same {grouped(film.world.founders)} founders and the same food, run{" "}
         {grouped(controls.tick)} ticks three times. Each control changes one rule and nothing else. flife drew all three
         the same way: the whole {controls.torus[0]}-unit torus, each organism a lit sphere in its founder&apos;s colour.
-        The tissue is not painted on: take away the networks&apos; decisions, or inheritance, and none forms.
+        Take away the networks&apos; decisions, or inheritance, and no tissue forms; the renderer does not add it.
       </p>
 
       <div className="mt-5 flex flex-wrap items-center gap-x-4 gap-y-3">

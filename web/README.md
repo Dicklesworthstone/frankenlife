@@ -77,37 +77,46 @@ binary hash, and the ffmpeg arguments. `lib/films/index.ts` lists the films the 
 order; the first opens the page. The confluent film keeps the explainers cut from it (the zoom ladder, the
 controls); the share card is cut from the tissue film.
 
-The v2 films, all 801 frames at 60 fps, 2160 × 2160, CRF 20, split into segments of at most 22 MiB.
-They show the committed presets fed more (`presets/morphogenesis-tissue-v2-abundant.toml`,
-`presets/supercolony-v2-abundant.toml`); `experiments/website-films/README.md` records how the amounts
-were chosen.
+The v2 films, all 801 frames at 60 fps, split into segments of at most 22 MiB: the tissue and supercolony
+films at 2160 × 2160, the veins film at 1440 × 1440. The tissue's packed frames barely compress: at CRF 20 its
+film came to 338 MB, so it is CRF 26, which halves that with every sphere still distinct at full size; the
+other two are CRF 20 (153 MB and 79 MB). `scripts/media.ts` encodes a finished `--work` again, without
+simulating, when only `--crf` changes.
+They show denser worlds built from the committed presets (`presets/morphogenesis-tissue-v2-dense.toml`,
+`presets/supercolony-v2-dense.toml`): more food, crowding arrest at 24 neighbours for the tissue, and 48
+oases with farther-landing children for the supercolony, whose population reaches its ceiling of 524,288
+whenever its oases bloom. `experiments/website-films/README.md` records how they were chosen, and each preset's header
+names every key it changes.
 
 ```bash
 # From the repository root: each world, seed 42, kept in a run directory. The supercolony run is
 # made twice so that its two films can render at once (a render locks its run directory); both
 # reach the same digest.
-target/release/flife run presets/morphogenesis-tissue-v2-abundant.toml --ticks 3072 --checkpoint-every 0 --run-dir RUN-A
-target/release/flife run presets/supercolony-v2-abundant.toml --ticks 2048 --checkpoint-every 0 --run-dir RUN-B
-target/release/flife run presets/supercolony-v2-abundant.toml --ticks 2048 --checkpoint-every 0 --run-dir RUN-B2
+target/release/flife run presets/morphogenesis-tissue-v2-dense.toml --ticks 1024 --checkpoint-every 0 --run-dir RUN-A
+target/release/flife run presets/supercolony-v2-dense.toml --ticks 768 --checkpoint-every 0 --run-dir RUN-B
+target/release/flife run presets/supercolony-v2-dense.toml --ticks 768 --checkpoint-every 0 --run-dir RUN-B2
 
 # From web/: 3,200 ticks, a frame every 4, founder lineage lit by energy, as spheres with no field.
+# Pass --cpu-workers: without it flife render uses the configuration's single worker.
 bun run media -- --film tissue --flife ../target/release/flife --run-dir ../RUN-A --work WORK-A \
-  --ticks 3200 --every 4 --size 2160 --fps 60 --crf 20 --look sphere --color lineage-energy --field none \
-  --zooms 1.6,3,2.2,3.2,2.4
+  --ticks 3200 --every 4 --size 2160 --fps 60 --crf 26 --look sphere --color lineage-energy --field none \
+  --zooms 1.6,3,2.2 --cpu-workers 12
 bun run media -- --film supercolony --flife ../target/release/flife --run-dir ../RUN-B --work WORK-B \
   --ticks 3200 --every 4 --size 2160 --fps 60 --crf 20 --look sphere --color lineage-energy --field none \
-  --zooms 1.5,2.2,1.8,2.4,1.9
-# The supercolony again, the whole torus, glowing over its field coloured by vascular conductance.
+  --zooms 1.5,2.2,1.8 --cpu-workers 12
+# The supercolony again, glowing over its field coloured by vascular conductance, at 1440 × 1440 and held
+# at zoom 1.03: at the ceiling of 524,288 the whole torus needs 2^20 + 1 draw rows (a halo and a dot per
+# organism, and the field), one more than flife-manim allows (bead flife-ovd); the zoom culls the rim.
 bun run media -- --film veins --flife ../target/release/flife --run-dir ../RUN-B2 --work WORK-VEINS \
-  --ticks 3200 --every 4 --size 2160 --fps 60 --crf 20 --look glow --color lineage-energy \
-  --field vascular-conductance --camera none
+  --ticks 3200 --every 4 --size 1440 --fps 60 --crf 20 --look glow --color lineage-energy \
+  --field vascular-conductance --camera fixed --zooms 1.03 --cpu-workers 12
 ```
 
-A 3,200-tick film has room for three shots, so only the first three zooms are used. Then list each
-new manifest in `lib/films/index.ts` and move the files of the films it replaces from `public/media`
-to `media-retired/`. The starting ticks are those of the first v2 films, chosen by eye from a survey of
-each committed preset to tick 8,192; the looks were chosen by eye from 4K test frames. The page says so
-beside the films.
+A 3,200-tick film has room for three shots, one zoom each. Then list each new manifest in
+`lib/films/index.ts` and move the files of the films it replaces from `public/media` to
+`media-retired/`. Each film starts where its world first fills the frame, by eye: tick 1,024 for the
+tissue (about 258,000 cells) and 768 for the supercolony (at its ceiling). The looks are the confluent
+film's, chosen by eye from 4K test frames. The page says so beside the films.
 
 The confluent film (`lib/films/confluent.json`) was made this way:
 
@@ -167,7 +176,8 @@ whole torus and, in between, eases into the most active region of each shot. Eac
 units on any torus of 128 units or more: the zooms are written for a 256-unit torus and scaled to the
 run's, never below 1.25. The rule is stated in
 `director.ts` and recorded in the manifest with every key. The camera is presentation only, and the script
-checks that the preview and the film end on the same world digest. `--camera none` films the whole torus.
+checks that the preview and the film end on the same world digest. `--camera none` films the whole torus, and
+`--camera fixed --zooms Z` holds the torus centre at zoom Z for the whole film, with no preview.
 `--field energy|composition|component-C|trail-carrier|vascular-conductance|none`, `--look glow|raw|sphere`
 and `--color lineage|lineage-energy|affinity|energy|generation|motion|topology|cell-state|polarity` choose
 how the frames are drawn; `--zooms` lists the shots' zooms on the run's torus instead. The film's shots, at 1.6, 3 and 2.2, show as many

@@ -294,9 +294,9 @@ export function BranchDiagram() {
             </tbody>
           </table>
           <p className="mt-3 text-xs leading-relaxed text-slate-400">
-            Killed part way, a run resumes from its newest checkpoint that restores and reaches exactly the
-            uninterrupted run&apos;s world and final checkpoint bytes, across controller phases, cooldowns, newborns and commands still
-            in the future. A control branch reaches the parent&apos;s world; its intervention sibling matches it until
+            Killed part way, a run resumes from its newest checkpoint and reaches exactly the uninterrupted run&apos;s
+            world and final checkpoint bytes, across controller phases, cooldowns, newborns and commands still in the
+            future. A control branch reaches the parent&apos;s world; its intervention sibling matches it until
             the brush applies at tick {grouped(lanes.brushAt)}&apos;s boundary, and differs from tick{" "}
             {grouped(lanes.brushAt + 1)} on. A branch links the parent&apos;s verified chunk files instead of copying
             them.

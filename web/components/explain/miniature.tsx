@@ -16,7 +16,6 @@ import { DemoButton, DemoFrame, Segmented, Slider } from "@/components/explain/d
 import {
   type Activity,
   type Brains,
-  CAPACITY,
   type Children,
   HIDDEN,
   INPUTS,

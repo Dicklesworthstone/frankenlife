@@ -12,7 +12,7 @@ import { Reticle } from "@/components/franken";
 import { Reveal } from "@/components/reveal";
 import { WatchFilm } from "@/components/watch-film";
 import { type AblationRow, v2Ablations, v2Bundles, v2Residuals } from "@/lib/content";
-import { type V2Still, stills } from "@/lib/media";
+import { type V2Still, filmById, stills } from "@/lib/media";
 import { cn, grouped } from "@/lib/utils";
 
 const byId = (id: string): V2Still => {
@@ -21,33 +21,56 @@ const byId = (id: string): V2Still => {
   return found;
 };
 
-/** The two presets, side by side, each with a button that plays its film in the hero. */
+/**
+ * The two presets, side by side. Each leads with its film's first frame, the
+ * denser world the hero plays, with the committed preset's own still inset
+ * beside it; the measured figures below are the committed preset's.
+ */
 export function BundlePanels() {
   return (
     <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
       {v2Bundles.map((bundle, at) => {
         const still = byId(`${bundle.id}-treatment`);
+        const shown = filmById(bundle.film);
+        // The poster is the film's opening frame (scripts/media.ts); its tick and count are that frame's.
+        const firstTick = shown.world.ticks[shown.poster.frame] ?? 0;
+        const firstLive = shown.world.live[shown.poster.frame] ?? 0;
         return (
           <Reveal key={bundle.id} delay={at * 0.08}>
             <article className="panel relative flex h-full flex-col overflow-hidden rounded-[1.75rem]">
-              <div className="relative aspect-[16/9] overflow-hidden bg-black">
+              <div className="relative aspect-[16/10] overflow-hidden bg-black">
                 {/* eslint-disable-next-line @next/next/no-img-element -- a static export; the manifest names the file */}
                 <img
-                  src={still.src}
-                  width={still.width}
-                  height={still.height}
+                  src={shown.poster.src}
+                  width={shown.video.width}
+                  height={shown.video.height}
                   loading="lazy"
                   decoding="async"
-                  alt={`The ${bundle.preset} preset at tick ${grouped(still.tick)}, seed ${still.seed}: ${grouped(still.live)} organisms, a wide band across the middle of the whole torus.`}
+                  alt={`The ${bundle.id} film's first frame: ${grouped(firstLive)} organisms of ${shown.world.name} at tick ${grouped(firstTick)}, seed ${shown.world.seed}, the whole torus.`}
                   className="h-full w-full object-cover"
                 />
                 <Reticle inset={10} size={14} />
                 <span className="absolute top-3 left-3 rounded-full border border-white/10 bg-black/60 px-2.5 py-1 font-mono text-[10px] font-bold tracking-[0.12em] text-white uppercase backdrop-blur-md">
-                  {bundle.tag}
+                  {bundle.tag} · the film&apos;s world
                 </span>
                 <span className="absolute bottom-3 left-3 rounded-full border border-white/10 bg-black/60 px-2.5 py-1 font-mono text-[10px] tracking-[0.12em] text-green-200 uppercase backdrop-blur-md">
-                  tick {grouped(still.tick)} · {grouped(still.live)} alive
+                  tick {grouped(firstTick)} · {grouped(firstLive)} alive
                 </span>
+                <figure className="absolute right-3 bottom-3 w-[30%] overflow-hidden rounded-xl border border-white/20 bg-black shadow-2xl shadow-black/60">
+                  {/* eslint-disable-next-line @next/next/no-img-element -- a static export; the manifest names the file */}
+                  <img
+                    src={still.src}
+                    width={still.width}
+                    height={still.height}
+                    loading="lazy"
+                    decoding="async"
+                    alt={`The committed ${bundle.preset} preset at tick ${grouped(still.tick)}, seed ${still.seed}: ${grouped(still.live)} organisms.`}
+                    className="aspect-square w-full object-cover"
+                  />
+                  <figcaption className="bg-black/80 px-2 py-1 font-mono text-[9px] leading-tight tracking-[0.08em] text-slate-300 uppercase">
+                    The preset · {grouped(still.live)} alive
+                  </figcaption>
+                </figure>
               </div>
               <div className="flex flex-1 flex-col p-6 sm:p-7">
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -74,7 +97,8 @@ export function BundlePanels() {
                 <div className="mt-auto flex flex-wrap items-center gap-x-4 gap-y-2 pt-6">
                   <WatchFilm id={bundle.film} label={`Watch the ${bundle.id} film`} />
                   <p className="min-w-0 flex-1 basis-56 text-[12px] leading-snug text-slate-500">
-                    {bundle.filmWorld} <code className="text-slate-400">{bundle.filmPreset}</code>
+                    {bundle.filmWorld}{" "}
+                    <code className="block [overflow-wrap:anywhere] text-slate-400">{bundle.filmPreset}</code>
                   </p>
                 </div>
               </div>
@@ -196,13 +220,12 @@ export function TakeOneAway() {
   const table = v2Ablations.find((each) => each.preset === shown.preset);
   return (
     <div>
-      <div role="radiogroup" aria-label="Preset" className="inline-flex rounded-xl border border-white/10 bg-black/40 p-1">
+      <div role="group" aria-label="Preset" className="inline-flex rounded-xl border border-white/10 bg-black/40 p-1">
         {WORLDS.map((each) => (
           <button
             key={each.id}
             type="button"
-            role="radio"
-            aria-checked={world === each.id}
+            aria-pressed={world === each.id}
             onClick={() => setWorld(each.id)}
             className={cn(
               "min-h-11 rounded-lg px-4 text-[13.5px] font-bold transition-colors focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none",

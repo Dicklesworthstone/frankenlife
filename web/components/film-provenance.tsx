@@ -47,7 +47,7 @@ export function FilmProvenance({ film }: { film: FilmManifest }) {
     <article className="panel relative rounded-[1.75rem] p-6 sm:p-8">
       <Reticle inset={9} size={12} />
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <h4 className="text-xl font-bold text-white">{note?.title ?? world.name}</h4>
+        <h3 className="text-xl font-bold text-white">{note?.title ?? world.name}</h3>
         <span className="font-mono text-[11px] text-green-300/80">{note?.chip ?? world.model}</span>
       </div>
       <div className="mt-4 grid grid-cols-1 gap-x-10 lg:grid-cols-2">
@@ -76,9 +76,11 @@ export function FilmProvenance({ film }: { film: FilmManifest }) {
             <Row label="Colour" value={render.meaning.split(":")[0]?.trim() ?? render.mapping} />
             <Row label="Field" value={`${render.field_mapping === "none" ? "not drawn" : render.field_mapping}, ${render.look} look`} />
             <Row label="Camera" value={
-                render.camera
-                  ? `${render.camera.keys.length} keys; centres from the run, zooms ${shotZooms(render.camera.keys)}`
-                  : "the whole torus, still"
+                !render.camera
+                  ? "the whole torus, still"
+                  : render.camera.keys.length === 1
+                    ? `held on the torus centre at zoom ${render.camera.keys[0]?.zoom}`
+                    : `${render.camera.keys.length} keys; centres from the run, zooms ${shotZooms(render.camera.keys)}`
               } />
             <Row label="Revision" value={render.revision.slice(0, 12)} mono />
           </dl>

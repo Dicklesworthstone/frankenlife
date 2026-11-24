@@ -40,6 +40,9 @@ export const DIRECTOR_RULE =
   "activity |blur(L[t+1] − L[t−1])| of a whole-world raw preview, blurred to each shot's view; " +
   "each shot looks where that activity was greatest over the shot, discounting regions already shown";
 
+/** The rule `scripts/media.ts --camera fixed` records: no director, one key held. */
+export const FIXED_RULE = "fixed: the torus centre held at one zoom for the whole film";
+
 const GRID = 128;
 
 /** A PNG's luminance as `GRID × GRID` cell means (the frame must be square, a multiple of GRID). */

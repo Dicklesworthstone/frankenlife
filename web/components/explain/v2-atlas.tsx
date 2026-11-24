@@ -608,13 +608,12 @@ function Stage({ entry, view, setView }: { entry: AtlasEntry; view: "world" | "r
   return (
     <figure className="panel relative overflow-hidden rounded-[1.75rem]">
       {still ? (
-        <div role="radiogroup" aria-label="Show" className="absolute top-3 right-3 z-10 inline-flex rounded-full border border-white/10 bg-black/70 p-0.5 backdrop-blur-md">
+        <div role="group" aria-label="Show" className="absolute top-3 right-3 z-10 inline-flex rounded-full border border-white/10 bg-black/70 p-0.5 backdrop-blur-md">
           {(["world", "rule"] as const).map((option) => (
             <button
               key={option}
               type="button"
-              role="radio"
-              aria-checked={view === option}
+              aria-pressed={view === option}
               onClick={() => setView(option)}
               className={cn(
                 "min-h-9 rounded-full px-3 text-[12px] font-bold transition-colors focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none",
@@ -784,11 +783,21 @@ export function MechanismStory({ story }: { story: "tissue" | "supercolony" }) {
             </div>
           ) : null}
           <div className="mt-6 flex items-center justify-between gap-3 border-t border-white/[0.06] pt-5">
-            <button type="button" onClick={() => go(at - 1)} className="inline-flex min-h-11 items-center gap-2 text-[13px] font-semibold text-slate-400 transition-colors hover:text-white">
+            <button
+              type="button"
+              onClick={() => go(at - 1)}
+              aria-label={`Previous step: ${steps[(at - 1 + steps.length) % steps.length]?.name}`}
+              className="inline-flex min-h-11 items-center gap-2 text-[13px] font-semibold text-slate-400 transition-colors hover:text-white focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none"
+            >
               <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
               {steps[(at - 1 + steps.length) % steps.length]?.short}
             </button>
-            <button type="button" onClick={() => go(at + 1)} className="inline-flex min-h-11 items-center gap-2 text-[13px] font-semibold text-slate-200 transition-colors hover:text-white">
+            <button
+              type="button"
+              onClick={() => go(at + 1)}
+              aria-label={`Next step: ${steps[(at + 1) % steps.length]?.name}`}
+              className="inline-flex min-h-11 items-center gap-2 text-[13px] font-semibold text-slate-200 transition-colors hover:text-white focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none"
+            >
               {steps[(at + 1) % steps.length]?.short}
               <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
             </button>
@@ -813,7 +822,7 @@ export function SharedRules() {
                 <Chart chart={entry.chart} slug={entry.slug} />
               </div>
             ) : null}
-            <h4 className="mt-4 text-[17px] leading-snug font-bold text-white">{entry.name}</h4>
+            <h3 className="mt-4 text-[17px] leading-snug font-bold text-white">{entry.name}</h3>
             <p className="mt-0.5 font-mono text-[11px] text-green-300/80">{entry.slug}</p>
             <p className="mt-2 text-[14px] leading-relaxed text-slate-300">{entry.rule}</p>
             <p className="mt-auto pt-3 font-mono text-[11px] leading-relaxed text-slate-500">{entry.numbers}</p>
@@ -829,7 +838,7 @@ export function SharedRules() {
         {optIn.map((entry) => (
           <article key={entry.slug} className="flex flex-col rounded-[1.5rem] border border-white/[0.08] bg-black/20 p-5">
             <div className="flex flex-wrap items-baseline justify-between gap-2">
-              <h4 className="text-[16px] font-bold text-white">{entry.name}</h4>
+              <h3 className="text-[16px] font-bold text-white">{entry.name}</h3>
               <code className="text-[11px] text-green-300/80">{entry.slug}</code>
             </div>
             <p className="mt-2 text-[14px] leading-relaxed text-slate-300">{entry.rule}</p>

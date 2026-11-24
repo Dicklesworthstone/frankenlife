@@ -250,7 +250,7 @@ export function V2Explorer() {
                             </span>
                             <code className="block font-mono text-[10.5px] text-slate-500">{feature.slug}</code>
                           </span>
-                          {feature.abiNote !== "none" && !feature.abiNote.startsWith("none") ? (
+                          {!feature.abiNote.startsWith("none") ? (
                             <span className={cn("max-w-[7.5rem] shrink-0 text-right font-mono text-[10px] leading-tight", active ? "text-cyan-200" : "text-slate-600")}>
                               {feature.abiNote}
                             </span>
@@ -310,7 +310,7 @@ export function V2Explorer() {
           <dd className="mt-1 text-[11px] leading-snug text-slate-500">
             inputs → decisions
             {abi.rawOutputWidth !== abi.actionWidth ? `, ${abi.rawOutputWidth} raw outputs` : ""}
-            {abi.metalF16Aligned ? "" : "; not 4-aligned, so the CPU fallback runs it"}
+            {abi.metalF16Aligned ? "" : "; not multiples of 4, so Metal cannot use 4-wide loads"}
           </dd>
           {abi.sensorDelta.length > 0 || abi.actionDelta.length > 0 ? (
             <dd className="mt-1 font-mono text-[10px] leading-snug break-words text-cyan-200/80">
@@ -325,7 +325,7 @@ export function V2Explorer() {
             <span className="ml-1.5 text-xs font-medium text-slate-400">planes</span>
           </dd>
           <dd className="mt-1 text-[11px] leading-snug text-slate-500">
-            {abi.fieldPlanes === 34 ? "25 metabolic and 9 for the trail carrier" : "energy and 32 chemical channels"}
+            {abi.fieldPlanes === 34 ? "25 for the food carrier and 9 for the trail carrier" : "energy and 32 chemical channels"}
           </dd>
         </div>
         <div className={tile}>

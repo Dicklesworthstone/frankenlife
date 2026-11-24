@@ -11,4 +11,4 @@ import tissue from "./tissue.json";
 import veins from "./veins.json";
 
 // A JSON import types each array as a list, not a pair; scripts/media.ts writes the FilmManifest shape.
-export const FILM_MANIFESTS = [supercolony, tissue, veins, confluent] as unknown as FilmManifest[];
+export const FILM_MANIFESTS = [tissue, supercolony, veins, confluent] as unknown as FilmManifest[];

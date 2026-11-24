@@ -5,7 +5,7 @@
 //     [--ticks 9600] [--every 32] [--size 1080 | --width 3840 --height 2160]
 //     [--fps 30|60] [--crf 24] [--segments auto|N] [--segment-max-mib 22]
 //     [--master-out PATH] [--master-crf 16]
-//     [--camera auto|none]
+//     [--camera auto|none|fixed]
 //     [--field energy|composition|component-C|trail-carrier|vascular-conductance|none]
 //     [--look glow|raw|sphere]
 //     [--color lineage|lineage-energy|affinity|energy|generation|motion|topology|cell-state|polarity]
@@ -60,6 +60,7 @@ import {
   type CameraKey,
   DIRECTOR_RULE,
   type DirectorOptions,
+  FIXED_RULE,
   activities,
   cardFrame,
   direct,
@@ -296,6 +297,13 @@ if (existsSync(made)) {
     camera = { rule: DIRECTOR_RULE, options: directorOptions, keys };
     writeFileSync(cameraFile, `${JSON.stringify({ keys }, null, 2)}\n`);
     console.error(`media: ${keys.length} camera keys`);
+  } else if (cameraMode === "fixed") {
+    // One key, which flife render holds before and after it: the torus centre at the one zoom given.
+    const zoom = zooms?.[0] ?? fail("--camera fixed needs one --zooms value");
+    const keys: CameraKey[] = [{ tick: 0, center: [torusExtent[0] / 2, torusExtent[1] / 2], zoom }];
+    camera = { rule: FIXED_RULE, options: { opening: 0, transition: 0, dwell: 0, closing: 0, zooms: [zoom] }, keys };
+    writeFileSync(cameraFile, `${JSON.stringify({ keys }, null, 2)}\n`);
+    console.error(`media: the torus centre held at zoom ${zoom}`);
   }
   console.error(`media: rendering ${ticks} ticks of ${runDir ?? config} at ${width}×${height}, a frame every ${every}`);
   run(

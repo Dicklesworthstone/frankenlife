@@ -37,8 +37,12 @@ export const MEDIA_FIELDS = ["energy", "composition", "trail-carrier", "vascular
 export const MEDIA_LOOKS = ["glow", "raw", "sphere"] as const;
 export type MediaLook = (typeof MEDIA_LOOKS)[number];
 
-/** Camera modes for scripts/media.ts. */
-export const CAMERA_MODES = ["auto", "none"] as const;
+/**
+ * Camera modes for scripts/media.ts: `auto`, the director's path from a
+ * preview; `none`, the whole torus; `fixed`, the torus centre held at the one
+ * zoom `--zooms` gives.
+ */
+export const CAMERA_MODES = ["auto", "none", "fixed"] as const;
 export type CameraMode = (typeof CAMERA_MODES)[number];
 
 /**
@@ -312,6 +316,9 @@ export function parseMediaArgs(argv: readonly string[], publicMediaDir?: string)
         return zoom;
       })
     : null;
+  if (cameraMode === "fixed" && zooms?.length !== 1) {
+    throw new Error("--camera fixed needs --zooms with exactly one zoom");
+  }
 
   return {
     film,

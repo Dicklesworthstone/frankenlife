@@ -547,8 +547,9 @@ export default function Home() {
             title="How a tissue [forms]."
             kicker={
               <>
-                Seven of the tissue&apos;s 14 mechanisms are its own. Step through them: each shows its rule, computed
-                here from the preset&apos;s numbers, and what changed when Stage-2 ran the preset without it.
+                Seven of the tissue&apos;s 14 mechanisms are its own, in six steps: lateral inhibition shares a step
+                with the memory it reads. Each shows its rule, computed here from the preset&apos;s numbers, and what
+                changed when Stage-2 ran the preset without it.
               </>
             }
           >
@@ -1161,15 +1162,6 @@ export default function Home() {
         </div>
       </footer>
     </>
-  );
-}
-
-function Row({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
-  return (
-    <div className="flex flex-col gap-0.5 py-2.5 sm:flex-row sm:items-baseline sm:justify-between sm:gap-6">
-      <dt className="shrink-0 text-xs text-slate-500">{label}</dt>
-      <dd className={cn("min-w-0 text-slate-200 sm:text-right", mono && "font-mono text-[13px] break-all")}>{value}</dd>
-    </div>
   );
 }
 

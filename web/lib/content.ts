@@ -6,12 +6,36 @@
 // (lib/films/*.json, lib/stills.json), or, in `branchObservation`, one
 // this page observed and dates; none is a target dressed as a result.
 
-import { filmById, films } from "@/lib/media";
+import { filmById } from "@/lib/media";
 
 // Chapter 1 zooms into the confluent film; its organisms on its first frame, from flife render's record of that frame.
 const filmAlive = (filmById("confluent").world.live[0] ?? 0).toLocaleString("en-US");
-// The films, counted for the words that name them.
-const filmCount = films.length;
+
+const n = (value: number) => value.toLocaleString("en-US");
+// A film's first frame: its tick and the organisms alive, from the manifest.
+const opening = (id: string) => ({ tick: n(filmById(id).world.ticks[0] ?? 0), live: n(filmById(id).world.live[0] ?? 0) });
+// presets/supercolony-v2-dense.toml [population] maximum_count.
+const SUPERCOLONY_CEILING = 524288;
+/**
+ * How many were alive during a film, from the counts its manifest records for
+ * every frame: the fewest and most, each rounded to the thousand toward the
+ * other so neither bound overstates, except a ceiling, which is exact; and how
+ * many frames sat at the ceiling, where births are refused.
+ */
+function alive(id: string, ceiling?: number): string {
+  const live = filmById(id).world.live;
+  const capped = ceiling === undefined ? 0 : live.filter((count) => count === ceiling).length;
+  if (ceiling !== undefined && capped === live.length && capped > 0) {
+    return `at its population ceiling of ${n(ceiling)} in every frame, where births are refused`;
+  }
+  const [fewest, most] = [Math.min(...live), Math.max(...live)];
+  const low = Math.ceil(fewest / 1000) * 1000;
+  const high = capped > 0 ? most : Math.floor(most / 1000) * 1000;
+  // Within one thousand of each other, rounding would cross: give them exactly.
+  const span = low <= high ? `${n(low)} to ${n(high)}` : `${n(fewest)} to ${n(most)}`;
+  const ceilingNote = capped > 0 ? `, at its population ceiling, where births are refused, in ${capped} of its ${live.length} frames` : "";
+  return `with ${span} alive during the film${ceilingNote}`;
+}
 
 export const siteConfig = {
   name: "FrankenLife",
@@ -40,8 +64,8 @@ export const filmChoice = {
     "Emission, chosen by the neural networks, makes the structure, and contact shapes it at the scale of bodies. Organisms return about half of what they eat to the field, in a chemical composition their networks choose and kin choose alike, so each lineage paints its surroundings with its own chemistry. Adhesion then sorts lineages by that chemistry, as real tissues sort by adhesion, into domains of labyrinths, foam and packed spheres. With every controller's decisions zeroed, nothing is emitted and the bodies settle into a uniform mottled haze, with no domains, labyrinths or foam. With every newborn's genome drawn fresh instead of inherited, the population falls from its ceiling to about 1,200.",
   ],
   v2: [
-    "The v2 films show each committed preset fed more, so that the frame fills. The tissue's food comes from 6 wide sources with 18 times the preset's total power, and the supercolony's 16 oases each give 5 times as much. Every v2 mechanism and every other parameter is the preset's. The amounts were chosen by eye from 17 variants, each rendered from tick 0, for the fullest frame; the supercolony's stays below the population ceiling, where births would be refused. experiments/website-films/README.md lists every variant with its counts. No Stage-2 claim covers these two worlds: every measured figure on this page is the committed presets'.",
-    "Each film runs 3,200 ticks at seed 42, from the ticks the first v2 films started at: 3,072 for the tissue, with 45,940 cells, and 2,048 for the supercolony, with 119,984 organisms. Both are drawn as the confluent film is, as spheres in their founder's colour, lighter the more energy they hold, with no field beneath them. The veins film draws the supercolony's world over its field coloured by vascular conductance, the whole torus, without a camera.",
+    "The v2 films show denser worlds built from the committed presets, so that the frame fills as the confluent film's does. The tissue's has 144 times the preset's food, from 6 wide sources, and crowding that stops division at 24 neighbours instead of 3.25. The supercolony's has 48 oases where the preset has 16, 24 times its food, and children landing up to 2.5 world units from their parent instead of 1. Every v2 mechanism and every other parameter is the preset's. The changes were chosen by eye from 31 variants in two rounds, each rendered from tick 0, for the fullest frame; experiments/website-films/README.md lists them with their counts, and each preset's header names every key it changes. No Stage-2 claim covers these worlds: every measured figure on this page is the committed presets'.",
+    `Each film runs 3,200 ticks at seed 42, from the tick where its world first fills the frame: ${opening("tissue").tick} for the tissue, with ${opening("tissue").live} cells, and ${opening("supercolony").tick} for the supercolony, with ${opening("supercolony").live} organisms. The supercolony runs ${alive("supercolony", SUPERCOLONY_CEILING)}; the confluent world stays at its own ceiling throughout. Both are drawn as the confluent film is, as spheres in their founder's colour, lighter the more energy they hold, with no field beneath them. The veins film draws the supercolony's world over its field coloured by vascular conductance, at 1440 × 1440, held still on nearly the whole torus (zoom 1.03): with every organism on screen at the ceiling, the glowing look needs one more draw row than the renderer allows.`,
     "The camera is the director's, described below, with each shot's zoom given by hand: 1.6× to 3× for the tissue and 1.5× to 2.2× for the supercolony.",
   ],
   camera:
@@ -56,21 +80,21 @@ export const filmChoice = {
 export const filmNotes: Record<string, { tab: string; chip: string; title: string; line: string }> = {
   supercolony: {
     tab: "Supercolony",
-    chip: "v2 · Bundle B, fed 5×",
+    chip: "v2 · Bundle B, dense",
     title: "Supercolony",
-    line: "The supercolony-v2 preset with 5 times the food: 16,384 founders, 11 v2 mechanisms and no forces between organisms, with 64,000 to 181,000 alive during the film. Colonies hold together only through the field they share, where oases bloom and fade, emitters fire in bursts, and trails and veins form. Bright organisms are well fed, dark ones starving.",
+    line: `A denser world built from the supercolony-v2 preset, with 48 oases where it has 16 and 24 times its food: 16,384 founders, the same 11 v2 mechanisms and no forces between organisms, ${alive("supercolony", SUPERCOLONY_CEILING)}. Colonies hold together only through the field they share, where oases bloom and fade, emitters fire in bursts, and trails and veins form. Bright organisms are well fed, dark ones starving.`,
   },
   tissue: {
     tab: "Tissue",
-    chip: "v2 · Bundle A, fed 18×",
+    chip: "v2 · Bundle A, dense",
     title: "Tissue",
-    line: "The morphogenesis-tissue-v2 preset with 18 times the food, from 6 wide sources: 10,954 founders with bodies and 14 v2 mechanisms, with 33,000 to 50,000 cells during the film. Crowding stops division, polarity orients cells, inherited tags decide who sticks to whom, and kin pass food. Bright cells are well fed, dark ones starving.",
+    line: `A denser world built from the morphogenesis-tissue-v2 preset, with 144 times its food from 6 wide sources, and crowding that stops division at 24 neighbours instead of 3.25: 10,954 founders with bodies and the same 14 v2 mechanisms, ${alive("tissue")}. Polarity orients cells, inherited tags decide who sticks to whom, and kin pass food. Bright cells are well fed, dark ones starving.`,
   },
   veins: {
     tab: "Veins",
     chip: "v2 · overlay",
     title: "Veins",
-    line: "The supercolony film's world again, over its field drawn as vascular conductance: bright where energy has kept flowing between cells and the faces have widened, dark seams where they have pruned back. The network is the field's own; no organism builds it on purpose. The whole torus, without a camera.",
+    line: "The supercolony film's world again, over its field drawn as vascular conductance: bright where energy has kept flowing between cells and the faces have widened, dark seams where they have pruned back. The network is the field's own; no organism builds it on purpose. Held still on nearly the whole torus (zoom 1.03).",
   },
   confluent: {
     tab: "Confluent",
@@ -150,7 +174,7 @@ export const chapters: Chapter[] = [
     label: "Version 2",
     title: "Tissue and [supercolonies].",
     thesis:
-      "Version 2 adds 21 mechanisms, each a switch fixed when a world is founded. Two presets combine them, into a tissue whose cells touch and a supercolony held together only by the field, and 104 runs measured what each does by taking it away.",
+      "Version 2 adds 21 mechanisms, each a switch fixed when a world is founded. Two presets combine them, into a tissue whose cells touch and a supercolony held together only by the field, and 104 Stage-2 runs measured what changes when one is taken away.",
     colour: 1,
     sections: [
       { id: "bundles", label: "Two worlds" },
@@ -679,16 +703,16 @@ export const v2Bundles = [
     name: "Tissue",
     tag: "Bundle A",
     preset: "presets/morphogenesis-tissue-v2.toml",
-    facts: ["10,954 founders", "14 switches on", "bodies 0.25 units across that push and stick", "108 inputs → 40 decisions"],
+    facts: ["10,954 founders", "14 switches on", "bodies 0.25 units across that push and stick", "108 inputs → 44 outputs"],
     picture:
-      "Porous islands of tissue, often several lineages side by side. Cells stop dividing in a crowd, orient, stick to cells with matching tags and pass food to kin.",
+      "Cells stop dividing in a crowd, orient, stick to cells with matching tags and pass food to kin. The preset itself, inset, grows porous islands, often several lineages side by side.",
     measured: [
       { label: "Alive at tick 2,048", value: "15,446", note: "mean of 4 seeds" },
       { label: "Close neighbours", value: "½", note: "as many as with v2 off: 2.0 against 3.6; 4/4" },
       { label: "Energy passed to kin", value: "79,910", note: "units per run, in every window" },
     ],
-    filmWorld: "The film's world is this preset fed 18 times as much, from 6 wide sources instead of 16 narrow ones:",
-    filmPreset: "presets/morphogenesis-tissue-v2-abundant.toml",
+    filmWorld: "The film's world, above, is denser: 144 times the food from 6 wide sources, and crowding arrest at 24 neighbours instead of 3.25.",
+    filmPreset: "presets/morphogenesis-tissue-v2-dense.toml",
   },
   {
     id: "supercolony",
@@ -696,16 +720,16 @@ export const v2Bundles = [
     name: "Supercolony",
     tag: "Bundle B",
     preset: "presets/supercolony-v2.toml",
-    facts: ["16,384 founders", "11 switches on", "points: nothing pushes or pulls (INV-08)", "108 inputs → 40 decisions"],
+    facts: ["16,384 founders", "11 switches on", "points: nothing pushes or pulls (INV-08)", "108 inputs → 40 outputs"],
     picture:
-      "Compact, moving colonies with well-fed, brightly lit rims, between food sources that bloom and fade. All they share passes through the field: bursts of emission, slow trails and the veins that flow carves in it.",
+      "Compact, moving colonies with well-fed, brightly lit rims, between food sources that bloom and fade. All they share passes through the field: bursts of emission, slow trails and the veins that flow carves in it. The inset is the preset itself.",
     measured: [
       { label: "Alive at tick 2,048", value: "21,308", note: "mean of 4 seeds" },
       { label: "Alignment from veins", value: "+50%", note: "0.378 against 0.252 without; 4/4" },
       { label: "Alive from bursts", value: "+58%", note: "against no relay; 4/4" },
     ],
-    filmWorld: "The film's world is this preset fed 5 times as much:",
-    filmPreset: "presets/supercolony-v2-abundant.toml",
+    filmWorld: "The film's world, above, is denser: 48 oases, 24 times the food, children landing farther out, and a ceiling of 524,288.",
+    filmPreset: "presets/supercolony-v2-dense.toml",
   },
 ] as const;
 
@@ -1086,7 +1110,7 @@ export const presets: {
     dt: "1/32",
     kind: "v2",
     chosen: "V2-17 verified · 52 Stage-2 runs",
-    body: "Bodies that touch, with 14 v2 mechanisms: crowding stops division, polarity orients, inherited tags decide who sticks to whom, kin share food. 108 inputs and 40 decisions per brain. Over 4 seeds at tick 2,048 each cell has about half as many close neighbours as with v2 off, and without inheritance 36 are alive against 15,446.",
+    body: "Bodies that touch, with 14 v2 mechanisms: crowding stops division, polarity orients, inherited tags decide who sticks to whom, kin share food. 108 inputs and 44 outputs per network. Over 4 seeds at tick 2,048 each cell has about half as many close neighbours as with v2 off, and without inheritance 36 are alive against 15,446.",
   },
   {
     file: "supercolony-v2",

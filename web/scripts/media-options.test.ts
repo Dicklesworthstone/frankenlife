@@ -29,6 +29,15 @@ import { validateSegmentsManifest, verifyMediaDirectory } from "./media-verify";
 const PUBLIC_MEDIA = resolve("/tmp/frankenlife-web/public/media");
 
 describe("parseMediaArgs", () => {
+  test("--camera fixed holds the one zoom --zooms gives, and refuses any other count", () => {
+    const base = ["--flife", "flife", "--run-dir", "../runs/veins", "--work", "/tmp/work-fixed", "--camera", "fixed"];
+    const opts = parseMediaArgs([...base, "--zooms", "1.03"], PUBLIC_MEDIA);
+    expect(opts.cameraMode).toBe("fixed");
+    expect(opts.zooms).toEqual([1.03]);
+    expect(() => parseMediaArgs(base, PUBLIC_MEDIA)).toThrow("exactly one zoom");
+    expect(() => parseMediaArgs([...base, "--zooms", "1.03,2"], PUBLIC_MEDIA)).toThrow("exactly one zoom");
+  });
+
   test("parses square 4K60 via --size 2160 --fps 60 and archival --master-out", () => {
     const opts = parseMediaArgs(
       [

@@ -21,6 +21,9 @@
 //! - [`numerics`]: host-independent `exp`, `exp(−x)`, `1 − exp(−x)`, `tanh`,
 //!   `sigmoid`, `log₂`, `ln` and turn-angle sine and cosine for the reference
 //!   numerical profile.
+//! - [`pool`]: cached private Rayon worker pools sized to the exact
+//!   `workers - 1` thread budget (caller plus pool = `workers`), with panic
+//!   isolation and zero interference with Rayon's global thread pool.
 //! - [`rng`]: `fnp-philox-semantic-v1`, semantically addressed Philox words
 //!   and the uniform, choice and Box–Muller conventions (FL-010).
 //! - [`binary16`]: the compact-F16 profile's weights, exact widening and
@@ -40,6 +43,7 @@ pub mod ledger;
 pub mod memory;
 pub mod model;
 pub mod numerics;
+pub mod pool;
 pub mod registry;
 pub mod rng;
 pub mod schema;

@@ -587,6 +587,7 @@ fn stage_introduction(
                 secretory_readiness: INITIAL_SECRETORY_READINESS,
                 emission_cooldown_deadline: Tick::new(0),
                 polarity,
+                last_neighbor_h0: 0.0,
             },
             genome,
         });

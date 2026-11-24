@@ -1129,3 +1129,59 @@ fn observe_dual_normalizes_carriers_independently_and_appends_4_trail_sensors() 
         Err(CoreError::NumericalInvalid { .. })
     ));
 }
+
+#[test]
+fn observe_and_observe_dual_refuse_denominator_overflow_instead_of_returning_zero() {
+    use flife_field::{CARRIER1_ENERGY_PLANE, DUAL_CARRIER_PLANES, DualRawSample};
+    use flife_neural::observe_dual;
+
+    let huge_scales = SensorScales::new(
+        [1.0e308, 1.0, 1.0e308, 1.0e308, 1.0e308, 1.0, 1.0],
+        0.25,
+        4.0,
+    )
+    .expect("large finite scales");
+    let raw = RawSample {
+        values: [0.0; PLANES],
+        dx: [0.0; PLANES],
+        dy: [0.0; PLANES],
+    };
+    let dual = DualRawSample {
+        values: [0.0; DUAL_CARRIER_PLANES as usize],
+        dx: [0.0; DUAL_CARRIER_PLANES as usize],
+        dy: [0.0; DUAL_CARRIER_PLANES as usize],
+    };
+
+    // Huge finite density where `density + R_scale == +inf` must fail instead of returning q = 0.
+    let mut big_density = raw;
+    big_density.values[0] = f64::MAX;
+    assert!(matches!(
+        observe(&big_density, &STILL, &huge_scales),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+
+    let mut big_energy = STILL;
+    big_energy.energy = f64::MAX;
+    assert!(matches!(
+        observe(&raw, &big_energy, &huge_scales),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+
+    let mut big_age = STILL;
+    big_age.age_seconds = f64::MAX;
+    assert!(matches!(
+        observe(&raw, &big_age, &huge_scales),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+
+    let mut big_dual = dual;
+    big_dual.values[CARRIER1_ENERGY_PLANE as usize] = f64::MAX;
+    assert!(matches!(
+        observe_dual(&big_dual, &STILL, &huge_scales, 1.0e308),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    assert!(matches!(
+        observe_dual(&dual, &big_energy, &huge_scales, 1.0),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+}

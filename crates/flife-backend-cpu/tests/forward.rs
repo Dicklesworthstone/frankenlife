@@ -12,8 +12,8 @@ use flife_core::CoreError;
 use flife_core::binary16::F16;
 use flife_core::ids::GenomeId;
 use flife_neural::{
-    ACTION_WIDTH, ArenaSlot, ControllerBackend, ControllerJob, ControllerScratch, DenseTopology,
-    RawOutputs, ReferenceController, SENSOR_WIDTH,
+    ACTION_WIDTH, ArenaSlot, BackendBudget, ControllerBackend, ControllerJob, ControllerScratch,
+    DenseTopology, RawOutputs, ReferenceController, SENSOR_WIDTH,
 };
 use rayon::prelude::*;
 
@@ -1086,5 +1086,97 @@ fn recurrent_reference_torch_f16_f32_bit_exact() -> Result<(), CoreError> {
             }
         }
     }
+    Ok(())
+}
+
+/// Regression for FL-043 budget adherence when widening hidden layers across
+/// topologies (`[64, 32]` -> `[96, 64]`): `Scratch::hold` must reserve exact
+/// activation capacity so `resident_bytes()` never overshoots `budget.bytes`
+/// via exponential `Vec` doubling, and `release_slots` reclaims empty shards.
+#[test]
+fn cpu_backend_budget_holds_strictly_when_widening_hidden_layers_and_across_release_slots()
+-> Result<(), CoreError> {
+    let narrow = DenseTopology::new(&[64, 32])?;
+    let wide = DenseTopology::new(&[96, 64])?;
+    let narrow_params = vec![0.0_f32; narrow.parameter_count()];
+    let wide_params = vec![0.0_f32; wide.parameter_count()];
+    let inputs = [0.0_f64; SENSOR_WIDTH];
+
+    let shard_slots = 4_u64;
+    let occupant_bytes = size_of::<Option<(u32, GenomeId)>>() as u64;
+    let shard_bytes_for =
+        |params: usize| (params as u64) * shard_slots * 4 + shard_slots * occupant_bytes;
+    let lane_count = 2_usize;
+    let exact_wide_activations = (lane_count as u64) * 2 * (96 * 4);
+    let tight_budget = BackendBudget {
+        bytes: shard_bytes_for(narrow.parameter_count())
+            + shard_bytes_for(wide.parameter_count())
+            + exact_wide_activations,
+        organisms: 256,
+    };
+
+    let mut backend = CpuBackend::with_budget(lanes(lane_count), shard_slots, tight_budget);
+    let mut out = Vec::new();
+
+    // Tick 1: populate `[64, 32]` across 2 lanes (widest = 64).
+    let narrow_slots: Vec<ArenaSlot> = (0..4).map(|s| ArenaSlot::new(0, s, 1)).collect();
+    let narrow_jobs: Vec<ControllerJob<'_>> = (0..200)
+        .map(|i| {
+            let slot = narrow_slots[i % 4];
+            ControllerJob {
+                genome: GenomeId::new(10 + (i % 4) as u64),
+                slot,
+                controller: ReferenceController::new(&narrow, &narrow_params, BOUND)
+                    .expect("narrow controller"),
+                inputs: &inputs,
+            }
+        })
+        .collect();
+    backend.evaluate(&narrow_jobs, &mut out)?;
+    assert!(out.iter().all(Option::is_some));
+    assert_eq!(backend.shards(), 1);
+    assert!(
+        backend.resident_bytes() <= tight_budget.bytes,
+        "after narrow tick: resident {} > budget {}",
+        backend.resident_bytes(),
+        tight_budget.bytes
+    );
+
+    // Tick 2: introduce `[96, 64]` (widest = 96). Previously `try_reserve`
+    // doubled capacity 64 -> 128 per activation buffer and exceeded `tight_budget.bytes`.
+    let wide_slots: Vec<ArenaSlot> = (0..4).map(|s| ArenaSlot::new(1, s, 1)).collect();
+    let wide_jobs: Vec<ControllerJob<'_>> = (0..200)
+        .map(|i| {
+            let slot = wide_slots[i % 4];
+            ControllerJob {
+                genome: GenomeId::new(100 + (i % 4) as u64),
+                slot,
+                controller: ReferenceController::new(&wide, &wide_params, BOUND)
+                    .expect("wide controller"),
+                inputs: &inputs,
+            }
+        })
+        .collect();
+    backend.evaluate(&wide_jobs, &mut out)?;
+    assert!(out.iter().all(Option::is_some));
+    assert_eq!(backend.shards(), 2);
+    assert!(
+        backend.resident_bytes() <= tight_budget.bytes,
+        "after widening 64 -> 96: resident {} > budget {}",
+        backend.resident_bytes(),
+        tight_budget.bytes
+    );
+
+    // Releasing all narrow slots reclaims the narrow shard and drops resident bytes.
+    let before_release = backend.resident_bytes();
+    backend.release_slots(&narrow_slots);
+    assert_eq!(backend.shards(), 1);
+    assert_eq!(
+        before_release - backend.resident_bytes(),
+        shard_bytes_for(narrow.parameter_count())
+    );
+    backend.release_slots(&wide_slots);
+    assert_eq!(backend.shards(), 0);
+    assert_eq!(backend.resident_bytes(), exact_wide_activations);
     Ok(())
 }

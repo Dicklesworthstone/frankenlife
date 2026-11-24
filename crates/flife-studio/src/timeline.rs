@@ -1020,9 +1020,26 @@ pub fn validate_timeline(
                     style: cur_style,
                 });
             }
+            TimelineRecord::View { center, zoom } => {
+                if !center.iter().all(|coord| coord.0.is_finite()) {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "timeline viewport center",
+                        detail: format!("center [{}, {}] must be finite", center[0].0, center[1].0),
+                    });
+                }
+                if !(1.0..=flife_manim::MAXIMUM_ZOOM).contains(&zoom.0) {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "timeline viewport zoom",
+                        detail: format!(
+                            "zoom {} is outside [1, {}]",
+                            zoom.0,
+                            flife_manim::MAXIMUM_ZOOM
+                        ),
+                    });
+                }
+            }
             TimelineRecord::Header { .. }
             | TimelineRecord::Overlay { .. }
-            | TimelineRecord::View { .. }
             | TimelineRecord::Select { .. }
             | TimelineRecord::Submitted { .. }
             | TimelineRecord::End { .. } => {}

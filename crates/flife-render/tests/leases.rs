@@ -346,3 +346,87 @@ fn dropped_lease_releases_slot_reference_before_returning_budget() {
     drop(tx);
     dropper.join().expect("dropper");
 }
+
+/// Peeking `Feed::latest`, calling `Viewer::latest_after` when nothing newer
+/// exists, and hitting `BudgetExhausted` in `Viewer::latest_after` never bump
+/// any slot's `Arc` strong count, so a 2-slot publisher with no leased slots
+/// (or a held lease on a separate viewer that never acquires a second slot)
+/// never observes a spurious `Publication::Busy` under concurrent peeking.
+#[test]
+fn peeking_feed_latest_and_refused_latest_after_never_block_a_2_slot_publisher() {
+    let config = ecology(&[("population", "initial_count", "8")]);
+    let mut world = found(&config, Arrangement::FreeList);
+    let mut publisher = Publisher::new(&world, 2, || {}).expect("publisher");
+    let feed = publisher.feed();
+    let done = Arc::new(AtomicBool::new(false));
+
+    // Thread 1: tight `feed.latest()` peek loop.
+    let peek_feed = feed.clone();
+    let peek_done = Arc::clone(&done);
+    let peeker = thread::spawn(move || {
+        let mut peeks = 0_u64;
+        while !peek_done.load(Ordering::Acquire) {
+            assert!(peek_feed.latest().is_some());
+            peeks += 1;
+        }
+        peeks
+    });
+
+    // Thread 2: tight `viewer.latest_after(RenderEpoch::new(u64::MAX))` loop (never newer).
+    let noop_viewer = feed.viewer(1).expect("noop viewer");
+    let noop_done = Arc::clone(&done);
+    let noop_reader = thread::spawn(move || {
+        let mut checks = 0_u64;
+        while !noop_done.load(Ordering::Acquire) {
+            assert!(
+                noop_viewer
+                    .latest_after(RenderEpoch::new(u64::MAX))
+                    .expect("no newer")
+                    .is_none()
+            );
+            checks += 1;
+        }
+        assert_eq!(noop_viewer.held(), 0);
+        checks
+    });
+
+    // Thread 3: viewer at limit on slot 1 repeatedly refusing `latest_after(0)` while
+    // we separately confirm `latest_after` at limit never clones a new slot.
+    let mut published = 0_u64;
+    for round in 0..256 {
+        step(&mut world);
+        let outcome = publisher.offer(&world).expect("offer");
+        assert!(
+            matches!(outcome, Publication::Published { .. }),
+            "round {round}: concurrent peeks must never cause spurious Busy, got {outcome:?}"
+        );
+        published += 1;
+    }
+
+    // Explicit refused `latest_after` at lease limit: 3-slot publisher, viewer
+    // holds 1 slot at limit=1; slot 2 is displayable, slot 3 is free; a refused
+    // `latest_after(0)` must never bump slot 2's refcount or leave `held != 1`.
+    done.store(true, Ordering::Release);
+    assert!(peeker.join().expect("peeker") > 0);
+    assert!(noop_reader.join().expect("noop_reader") > 0);
+    assert_eq!(published, 256);
+    assert_eq!(publisher.stats().busy, 0);
+
+    let mut pub3 = Publisher::new(&world, 3, || {}).expect("3-slot publisher");
+    let v1 = pub3.feed().viewer(1).expect("limit-1 viewer");
+    let held = v1.latest().expect("first lease");
+    step(&mut world);
+    assert!(matches!(
+        pub3.offer(&world).expect("offer 2"),
+        Publication::Published { .. }
+    ));
+    assert!(matches!(
+        v1.latest_after(RenderEpoch::new(0)),
+        Err(CoreError::BudgetExhausted { .. })
+    ));
+    assert_eq!(v1.held(), 1);
+    assert_eq!(pub3.free(), 1);
+    drop(held);
+    assert_eq!(v1.held(), 0);
+    assert_eq!(pub3.free(), 2);
+}

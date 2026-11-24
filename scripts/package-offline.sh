@@ -178,10 +178,22 @@ import json, sys
 rec = json.load(open(sys.argv[1], "r", encoding="utf-8"))
 assert rec.get("schema") == "frankenlife.capabilities.v1", f"bad schema: {rec.get('schema')}"
 world = rec.get("world", {})
-assert world.get("digest", "").startswith("82e0720d"), f"unexpected preset digest: {world.get('digest')}"
-routes = rec.get("routes", [])
-assert any(r.get("route") == "cpu" and r.get("status") == "verified" for r in routes), "cpu route not verified"
-print(f"capabilities OK: host={rec.get('host', {}).get('os')}/{rec.get('host', {}).get('arch')}, digest={world.get('digest', '')[:12]}...")
+pinned = world.get("pinned_digest", "")
+assert pinned.startswith("82e0720d"), f"unexpected preset pinned_digest: {pinned!r}"
+controllers = rec.get("controllers", [])
+cpu_ok = any(
+    r.get("route") == "cpu"
+    and r.get("status") == "verified"
+    and r.get("digest") == pinned
+    for r in controllers
+)
+assert cpu_ok, f"cpu route not verified against pinned_digest: {controllers}"
+verified_routes = [r.get("route") for r in controllers if r.get("status") == "verified"]
+build = rec.get("build", {})
+print(
+    f"capabilities OK: host={rec.get('host', {}).get('os')}/{build.get('arch')}, "
+    f"digest={pinned[:12]}..., verified={','.join(verified_routes)}"
+)
 PY
 
   log "Running offline fresh-install check #2: flife --list-features..."

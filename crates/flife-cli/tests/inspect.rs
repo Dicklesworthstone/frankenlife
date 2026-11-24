@@ -417,14 +417,14 @@ fn a_weight_dump_prints_an_organisms_whole_controller() {
     assert_eq!(err[0]["kind"], "state-conflict", "{err:?}");
 }
 
-/// FL-054 CLI end-to-end check: a recurrent world runs under default
-/// `--controllers auto` (selecting the CPU reference), explicitly refuses
-/// `--controllers torch` before creating a run directory, resumes across a
-/// `Held` v2 checkpoint, and `flife inspect --weights` exposes both the
-/// carried `recurrent_state` and the `(104 + S) -> hidden -> (36 + 2S)`
-/// weight dimensions.
+/// FL-054 + V2-12 CLI end-to-end check: a recurrent world runs bit-identically
+/// under `--controllers cpu`, `--controllers torch`, and `--controllers auto`,
+/// checkpoints (`Held` v2), `flife inspect --weights` exposes carried
+/// `recurrent_state` and `(104 + S) -> hidden -> (36 + 2S)` weight dimensions,
+/// and `flife capabilities --config` reports `torch` (and `metal` on Metal
+/// hosts) as available and matching the CPU reference.
 #[test]
-fn recurrent_run_inspects_carried_state_and_refuses_mlp_only_backends() {
+fn recurrent_run_inspects_carried_state_and_runs_batched_backends() {
     let mut cfg = ecology_text();
     cfg = cfg.replace(
         "family = \"independent-dense-mlp-v1\"",
@@ -438,25 +438,54 @@ fn recurrent_run_inspects_carried_state_and_refuses_mlp_only_backends() {
     let config = scratch().join("recurrent-ecology.toml");
     fs::write(&config, &cfg).expect("writes recurrent config");
 
-    // Explicit `--controllers torch` refuses honestly before creating run_dir.
-    let refused_dir = fresh("recurrent-refused");
-    let (status, out, err) = flife(&[
+    // Explicit `--controllers cpu` reference baseline.
+    let cpu_dir = fresh("recurrent-cpu");
+    let (status, cpu_out, err) = flife(&[
         "run",
         text(&config),
         "--ticks",
-        "4",
+        "6",
+        "--every",
+        "0",
+        "--controllers",
+        "cpu",
+        "--run-dir",
+        text(&cpu_dir),
+        "--checkpoint-every",
+        "6",
+        "--checkpoint-durability",
+        "process-crash",
+    ]);
+    assert_eq!(status, Some(0), "{err:?}");
+    assert_eq!(cpu_out[0]["controllers"], "cpu-reference");
+
+    // Explicit `--controllers torch` runs recurrent controllers natively and
+    // matches CPU reference bit-for-bit (`V2-12`).
+    let torch_dir = fresh("recurrent-torch");
+    let (status, torch_out, err) = flife(&[
+        "run",
+        text(&config),
+        "--ticks",
+        "6",
         "--every",
         "0",
         "--controllers",
         "torch",
         "--run-dir",
-        text(&refused_dir),
+        text(&torch_dir),
+        "--checkpoint-every",
+        "6",
+        "--checkpoint-durability",
+        "process-crash",
     ]);
-    assert_eq!(status, Some(2), "{out:?} {err:?}");
-    assert_eq!(err[0]["kind"], "missing-capability", "{err:?}");
-    assert!(!refused_dir.exists(), "refused run must not create run_dir");
+    assert_eq!(status, Some(0), "{torch_out:?} {err:?}");
+    assert_eq!(
+        torch_out.last().expect("torch end")["digest"],
+        cpu_out.last().expect("cpu end")["digest"],
+        "recurrent torch backend must match cpu-reference bit-for-bit"
+    );
 
-    // Default `--controllers auto` runs cleanly on CPU reference and checkpoints.
+    // Default `--controllers auto` runs cleanly, checkpoints, and matches CPU reference.
     let run_dir = fresh("recurrent-run");
     let (status, out, err) = flife(&[
         "run",
@@ -473,7 +502,11 @@ fn recurrent_run_inspects_carried_state_and_refuses_mlp_only_backends() {
         "process-crash",
     ]);
     assert_eq!(status, Some(0), "{err:?}");
-    assert_eq!(out[0]["controllers"], "cpu-reference");
+    assert_eq!(
+        out.last().expect("auto end")["digest"],
+        cpu_out.last().expect("cpu end")["digest"],
+        "recurrent auto backend must match cpu-reference bit-for-bit"
+    );
 
     // `flife inspect --weights 1` reports carried recurrent_state and recurrent layer widths.
     let (status, records, err) = flife(&["inspect", text(&run_dir), "--weights", "1"]);
@@ -500,12 +533,20 @@ fn recurrent_run_inspects_carried_state_and_refuses_mlp_only_backends() {
     assert_eq!(layers.first().expect("first")["inputs"], 108);
     assert_eq!(layers.last().expect("last")["outputs"], 44);
 
-    // `flife capabilities --config` reports torch/metal unavailable and auto -> cpu.
+    // `flife capabilities --config` verifies torch (and metal on Metal hosts) match reference.
     let (status, cap, err) = flife(&["capabilities", "--config", text(&config), "--ticks", "2"]);
     assert_eq!(status, Some(0), "{err:?}");
-    assert_eq!(cap[0]["auto"]["takes"], "cpu");
     let routes = cap[0]["controllers"].as_array().expect("routes");
     assert_eq!(routes[0]["status"], "reference");
-    assert_eq!(routes[1]["status"], "unavailable");
-    assert_eq!(routes[2]["status"], "unavailable");
+    assert_eq!(
+        routes[1]["status"], "verified",
+        "torch recurrent route: {routes:?}"
+    );
+    assert!(
+        matches!(
+            routes[2]["status"].as_str(),
+            Some("verified" | "unavailable")
+        ),
+        "metal recurrent route must be verified (on Metal) or unavailable: {routes:?}"
+    );
 }

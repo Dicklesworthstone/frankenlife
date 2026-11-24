@@ -55,7 +55,7 @@ use super::{
     Working, compositions_into, fit, genome_of, in_runs_mut, parameter_count, settle_all,
     settle_stages,
 };
-use crate::chemistry::UptakeSettlement;
+use crate::chemistry::{UptakeSettlement, effective_affinity};
 use crate::costs::{MaintenanceBill, MaintenanceSettlement};
 use crate::emission::EmissionSettlement;
 use crate::lifecycle::{BudgetStage, Vitality};
@@ -278,8 +278,15 @@ fn settle_on(
                 granted: packet.granted,
             });
         }
+        let post_phase4_h0 = organism.held.recurrent_state_array()[0];
+        let affinity = effective_affinity(
+            traits,
+            post_phase4_h0,
+            &rules.v2,
+            rules.chemistry.affinity_norm_limit(),
+        )?;
         chemistry.push(ChemistryOrganism {
-            affinity: *traits.affinity(),
+            affinity,
             remaining: organism.budget.remaining(),
             exhausted: organism.budget.is_exhausted(),
             first,
@@ -618,6 +625,7 @@ impl Stages for Device<'_> {
     fn uptake(
         &mut self,
         _rules: &Rules,
+        _organism: &Working,
         budget: &mut EnergyBudget,
     ) -> Result<UptakeSettlement, CoreError> {
         // settle_efficiencies' payments: the gain credited first, then the

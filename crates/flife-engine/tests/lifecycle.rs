@@ -187,6 +187,7 @@ fn founder_row(organism: u64, energy: f64) -> Organism {
         secretory_readiness: flife_engine::INITIAL_SECRETORY_READINESS,
         emission_cooldown_deadline: Tick::new(0),
         polarity: flife_engine::DEFAULT_POLARITY,
+        last_neighbor_h0: 0.0,
     }
 }
 
@@ -212,6 +213,7 @@ fn child_row(organism: u64, parent: &Organism, tick: u64, energy: f64) -> Organi
         secretory_readiness: flife_engine::INITIAL_SECRETORY_READINESS,
         emission_cooldown_deadline: Tick::new(0),
         polarity: flife_engine::DEFAULT_POLARITY,
+        last_neighbor_h0: 0.0,
     }
 }
 

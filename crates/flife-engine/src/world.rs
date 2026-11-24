@@ -159,8 +159,9 @@ pub use checkpoint::{
 pub use graft::Graft;
 use settle::{Settle, settle_with};
 pub use v2::{
-    BuddingRules, CarrierSpec, CorpseDirection, CrowdingMode, CrowdingRules, LysisRules,
-    PolarityRules, SenescenceRules, V2Rules, WasteRules,
+    BuddingRules, CarrierSpec, CorpseDirection, CrowdingMode, CrowdingRules, DifferentiationRules,
+    LysisRules, NotchDeltaMode, NotchDeltaRules, PolarityRules, SenescenceRules,
+    StateInheritanceMode, V2Rules, WasteRules,
 };
 
 /// The backend this module implements: the scalar CPU reference.
@@ -341,6 +342,8 @@ struct Staged {
     sensed_trail: Option<[f64; 4]>,
     /// Its optional Hippo-YAP crowding sensor `c_den` on this step, if active.
     sensed_crowding: Option<f64>,
+    /// Its optional Notch-Delta neighbor mean `h̄_0` on this step, if active.
+    sensed_notch_delta: Option<f32>,
     /// The watched organism's transactions in this step, if it settled.
     transactions: Option<Transactions>,
     report: TickReport,
@@ -420,6 +423,7 @@ impl Candidate<'_> {
                 world.watch.evaluated_state = staged.sensed_state;
                 world.watch.evaluated_trail = staged.sensed_trail;
                 world.watch.evaluated_crowding = staged.sensed_crowding;
+                world.watch.evaluated_notch_delta = staged.sensed_notch_delta;
             }
             world.watch.observed = Some(sensed);
         }
@@ -1147,6 +1151,9 @@ struct Watch {
     /// Its Hippo-YAP crowding sensor `c_den` on the newest published step it
     /// evaluated in (`V2-07`, when `expose_sensor` is active).
     evaluated_crowding: Option<f64>,
+    /// Its Notch-Delta neighbor mean `h̄_0` on the newest published step it
+    /// evaluated in (`V2-12`, when `notch-delta` is active).
+    evaluated_notch_delta: Option<f32>,
     /// Its transactions in its last [`RECENT_STEPS`] published steps,
     /// oldest first. Each step's preparation reserves the room, so
     /// publishing never allocates.
@@ -1708,6 +1715,57 @@ impl World {
         })
     }
 
+    /// Live primary recurrent cell states `h_0 ∈ [-1, 1]` in ascending
+    /// identity order when recurrent state (`epigenetic-recurrence` or
+    /// `independent-recurrent-mlp-v1`) is active (`recurrent_state_width > 0`);
+    /// `None` for stateless worlds (`INV-09` pure read-only seam for `V2-16` /
+    /// `Epoch::cell_states`).
+    #[must_use]
+    pub fn cell_states(&self) -> Option<Vec<f32>> {
+        (self.rules.recurrent_state_width > 0).then(|| {
+            self.population
+                .iter()
+                .map(|organism| {
+                    organism
+                        .held
+                        .recurrent_state()
+                        .first()
+                        .copied()
+                        .unwrap_or(0.0)
+                })
+                .collect()
+        })
+    }
+
+    /// Effective metabolic affinity `a_eff(h_0)` of live organism `id` at the
+    /// committed tick (`INV-09` pure read-only seam for `LocalChemistry`,
+    /// `flife inspect`, and `ColorMapping::Affinity`), or `None` when `id` is
+    /// not alive.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] if `id`'s genome is missing; otherwise as
+    /// [`effective_affinity`].
+    pub fn effective_affinity(&self, id: OrganismId) -> Result<Option<[f64; CHANNELS]>, CoreError> {
+        let Some(organism) = self.population.get(id) else {
+            return Ok(None);
+        };
+        let genome = self
+            .population
+            .genome(id)
+            .ok_or_else(|| CoreError::StateConflict {
+                operation: "effective affinity",
+                detail: format!("{id} has no genome"),
+            })?;
+        let h0 = organism.held.recurrent_state_array()[0];
+        effective_affinity(
+            genome.traits(),
+            h0,
+            &self.rules.v2,
+            self.rules.chemistry.affinity_norm_limit(),
+        )
+        .map(Some)
+    }
+
     /// How many controller topologies the run's catalog defines.
     #[must_use]
     pub fn topology_count(&self) -> usize {
@@ -2060,6 +2118,7 @@ impl World {
             self.field.current(),
             organism.position,
             genome.traits(),
+            organism.held.recurrent_state_array()[0],
         )?;
         let watched = self.watch.organism == Some(id);
         let sensed = self.watch.observed.clone().filter(|_| watched);
@@ -2087,6 +2146,11 @@ impl World {
                     (sensors.hippo_crowding(), self.watch.evaluated_crowding)
                 {
                     full_inputs[slot] = c_den;
+                }
+                if let (Some(slot), Some(h_bar)) =
+                    (sensors.notch_delta(), self.watch.evaluated_notch_delta)
+                {
+                    full_inputs[slot] = f64::from(h_bar);
                 }
                 let prev_state = self
                     .watch
@@ -2133,6 +2197,11 @@ impl World {
                         self.rules.v2.epigenetic_gate_bias(),
                         &mut next_state[..state_width],
                     )?;
+                    apply_notch_delta_inhibition(
+                        &self.rules.v2,
+                        self.watch.evaluated_notch_delta.unwrap_or(0.0),
+                        &mut next_state[..state_width],
+                    );
                     next_state[..state_width]
                         .iter()
                         .map(|value| value.to_bits())
@@ -2608,19 +2677,20 @@ impl World {
             lanes,
             controllers,
         )?;
-        let (sensed, sensed_state, sensed_trail, sensed_crowding) = match watch.organism {
-            Some(id) => watched(
-                rules,
-                population,
-                &view,
-                sampled,
-                rows,
-                crowding_counts,
-                id,
-                [from, to],
-            )?,
-            None => (None, None, None, None),
-        };
+        let (sensed, sensed_state, sensed_trail, sensed_crowding, sensed_notch_delta) =
+            match watch.organism {
+                Some(id) => watched(
+                    rules,
+                    population,
+                    &view,
+                    sampled,
+                    rows,
+                    crowding_counts,
+                    id,
+                    [from, to],
+                )?,
+                None => (None, None, None, None, None),
+            };
         // The reference sampled the tick without an error, so a backend that
         // met one failed where the reference does not.
         if let Some(failure) = sensor_failure {
@@ -2880,6 +2950,11 @@ impl World {
         } else {
             &[]
         };
+        let next_neighbor_h0 = if rules.v2.notch_delta().is_some() && rules.contact.is_some() {
+            contact.neighbor_h0.as_slice()
+        } else {
+            &[]
+        };
         for (index, organism) in working.iter().enumerate() {
             emitted += usize::from(organism.emitted);
             match organism.vitality.fate()? {
@@ -2903,6 +2978,7 @@ impl World {
                         .get(index)
                         .copied()
                         .unwrap_or(organism.committed.polarity);
+                    let last_neighbor_h0 = next_neighbor_h0.get(index).copied().unwrap_or(0.0);
                     survivors.push(Organism {
                         position,
                         velocity,
@@ -2913,12 +2989,13 @@ impl World {
                         secretory_readiness: organism.secretory_readiness,
                         emission_cooldown_deadline: organism.emission_cooldown_deadline,
                         polarity,
+                        last_neighbor_h0,
                         ..organism.committed
                     });
                 }
                 Fate::Dies(stage) => {
                     let genome = genome_of(population, organism.committed.id)?;
-                    let recurrent_h0 = organism.committed.held.recurrent_state_array()[0];
+                    let recurrent_h0 = organism.held.recurrent_state_array()[0];
                     let (death, corpse_dir) = if organism.lysed_residual > 0.0 {
                         let death = Death::lysed(
                             &organism.committed,
@@ -2933,7 +3010,12 @@ impl World {
                             .map_or(CorpseDirection::GeneticAffinity, |lysis| {
                                 lysis.corpse_direction
                             });
-                        let a_eff = effective_affinity(genome.traits(), recurrent_h0, &rules.v2);
+                        let a_eff = effective_affinity(
+                            genome.traits(),
+                            recurrent_h0,
+                            &rules.v2,
+                            rules.chemistry.affinity_norm_limit(),
+                        )?;
                         let corpse_dir = corpse_affinity_direction(
                             &a_eff,
                             direction,
@@ -3118,6 +3200,7 @@ impl World {
             sensed_state,
             sensed_trail,
             sensed_crowding,
+            sensed_notch_delta,
             transactions,
             report,
         })))
@@ -3362,7 +3445,8 @@ impl Scratch {
                     bodies,
                     rows,
                     rules.v2.polarity().is_some(),
-                    rules.v2.emt_gate(),
+                    rules.v2.emt_gate() || rules.v2.emt_h1_adhesion_enabled(),
+                    rules.v2.notch_delta().is_some(),
                 )?,
                 None => ContactWork::default(),
             },
@@ -3569,6 +3653,7 @@ fn grown(rules: &Rules, founding: &Founding, seed: Seed) -> Result<Entrant, Core
         secretory_readiness: INITIAL_SECRETORY_READINESS,
         emission_cooldown_deadline: Tick::new(0),
         polarity,
+        last_neighbor_h0: 0.0,
     };
     Ok(Entrant { organism, genome })
 }
@@ -4194,6 +4279,7 @@ type WatchedObservation = (
     Option<[f32; MAXIMUM_RECURRENT_STATE_WIDTH]>,
     Option<[f64; 4]>,
     Option<f64>,
+    Option<f32>,
 );
 
 #[expect(
@@ -4215,7 +4301,7 @@ fn watched(
         .ok()
         .and_then(|row| rows.get(row).map(|organism| (row, organism)))
     else {
-        return Ok((None, None, None, None));
+        return Ok((None, None, None, None, None));
     };
     let scale = genome_of(population, id)?.traits().sensing_scale();
     let prev_state =
@@ -4226,6 +4312,7 @@ fn watched(
         .hippo_crowding()
         .and_then(|_| crowding_counts.get(row).copied())
         .map(hippo_crowding_sensor);
+    let notch_h0 = rules.v2.notch_delta().map(|_| organism.last_neighbor_h0);
     if rules.v2.dual_carrier().is_some() {
         let dual_raw = match sampled {
             Some(Sampled::Dual(samples)) => match samples.get(row) {
@@ -4246,6 +4333,7 @@ fn watched(
             prev_state,
             Some(dual_obs.trail_inputs),
             c_den,
+            notch_h0,
         ));
     }
     let single = match sampled {
@@ -4266,6 +4354,7 @@ fn watched(
         prev_state,
         None,
         c_den,
+        notch_h0,
     ))
 }
 
@@ -4402,12 +4491,13 @@ fn finish(
 }
 
 /// Populate optional v2 non-recurrent sensor slots (`dual-carrier-trails`,
-/// `hippo-crowding` `c_den`, etc.) into `expanded` beyond the 104 baseline
-/// sensor entries.
+/// `hippo-crowding` `c_den`, `notch-delta` `h̄_0`) into `expanded` beyond the
+/// 104 baseline sensor entries.
 fn fill_v2_extra_sensors(
     sensors: SensorLayout,
     trail_inputs: Option<[f64; 4]>,
     local_crowding: Option<u32>,
+    notch_delta_h0: Option<f32>,
     expanded: &mut [f64; MAX_SENSOR_WIDTH],
 ) {
     if let (Some(start), Some(trail)) = (sensors.dual_carrier_trails(), trail_inputs) {
@@ -4415,6 +4505,22 @@ fn fill_v2_extra_sensors(
     }
     if let (Some(slot), Some(n_loc)) = (sensors.hippo_crowding(), local_crowding) {
         expanded[slot] = hippo_crowding_sensor(n_loc);
+    }
+    if let (Some(slot), Some(h_bar)) = (sensors.notch_delta(), notch_delta_h0) {
+        expanded[slot] = f64::from(h_bar);
+    }
+}
+
+/// Apply `V2-12` (`notch-delta`, `direct-lateral-inhibition-v1`) directly onto
+/// post-Phase-4 `next_state[0]` right after `update_recurrent_state`:
+/// `h''_0 = clamp(h'_0 - η_ND * last_neighbor_h0, -1, 1)`.
+fn apply_notch_delta_inhibition(v2: &V2Rules, last_neighbor_h0: f32, next_state: &mut [f32]) {
+    if let Some(nd) = v2.notch_delta()
+        && nd.mode == NotchDeltaMode::DirectLateralInhibition
+        && nd.inhibition_gain > 0.0
+        && let Some(h0) = next_state.first_mut()
+    {
+        *h0 = (*h0 - (nd.inhibition_gain as f32) * last_neighbor_h0).clamp(-1.0_f32, 1.0_f32);
     }
 }
 
@@ -4443,7 +4549,13 @@ fn evaluate_reference_held(
         &observation.inputs
     } else {
         expanded_obs[..SENSOR_WIDTH].copy_from_slice(&observation.inputs);
-        fill_v2_extra_sensors(sensors, trail_inputs, local_crowding, &mut expanded_obs);
+        fill_v2_extra_sensors(
+            sensors,
+            trail_inputs,
+            local_crowding,
+            Some(organism.last_neighbor_h0),
+            &mut expanded_obs,
+        );
         &expanded_obs[..obs_width]
     };
     if state_width > 0 {
@@ -4456,6 +4568,11 @@ fn evaluate_reference_held(
             controller,
             &mut next_state[..state_width],
         )?;
+        apply_notch_delta_inhibition(
+            &rules.v2,
+            organism.last_neighbor_h0,
+            &mut next_state[..state_width],
+        );
         HeldOutput::evaluated_recurrent_slice(to, raw.as_slice(), &next_state[..state_width])
     } else {
         let raw = eval.evaluate_raw(sensor_slice, controller)?;
@@ -4498,6 +4615,11 @@ fn held_from_raw(
             rules.v2.epigenetic_gate_bias(),
             &mut next_state[..state_width],
         )?;
+        apply_notch_delta_inhibition(
+            &rules.v2,
+            organism.last_neighbor_h0,
+            &mut next_state[..state_width],
+        );
         HeldOutput::evaluated_recurrent_slice(to, action_slice, &next_state[..state_width])
     } else {
         HeldOutput::evaluated_slice(to, action_slice)
@@ -5237,7 +5359,13 @@ fn decide_batched(
             if needs_expanded {
                 let mut full = [0.0_f64; MAX_SENSOR_WIDTH];
                 full[..SENSOR_WIDTH].copy_from_slice(&obs.inputs);
-                fill_v2_extra_sensors(sensors, trail_inputs, local_crowding, &mut full);
+                fill_v2_extra_sensors(
+                    sensors,
+                    trail_inputs,
+                    local_crowding,
+                    Some(organism.last_neighbor_h0),
+                    &mut full,
+                );
                 if state_width > 0 {
                     let prev = organism.held.recurrent_state_array();
                     for (slot, &h) in full[obs_width..input_width]
@@ -5600,8 +5728,15 @@ fn local_chemistry(
     field: &FieldState,
     position: [f64; 2],
     traits: &Traits,
+    recurrent_h0: f32,
 ) -> Result<LocalChemistry, CoreError> {
-    let affinity = Affinity::new(*traits.affinity(), &rules.chemistry)?;
+    let a_eff = effective_affinity(
+        traits,
+        recurrent_h0,
+        &rules.v2,
+        rules.chemistry.affinity_norm_limit(),
+    )?;
+    let affinity = Affinity::new(a_eff, &rules.chemistry)?;
     let mut scratch = ExchangeScratch::new();
     rules
         .exchange
@@ -5745,6 +5880,7 @@ trait Stages {
     fn uptake(
         &mut self,
         rules: &Rules,
+        organism: &Working,
         budget: &mut EnergyBudget,
     ) -> Result<UptakeSettlement, CoreError>;
 
@@ -5817,12 +5953,19 @@ impl Stages for Reference<'_> {
     fn uptake(
         &mut self,
         rules: &Rules,
+        organism: &Working,
         budget: &mut EnergyBudget,
     ) -> Result<UptakeSettlement, CoreError> {
+        let a_eff = effective_affinity(
+            self.traits,
+            organism.held.recurrent_state_array()[0],
+            &rules.v2,
+            rules.chemistry.affinity_norm_limit(),
+        )?;
         let affinity = if rules.limits.affinity_norm() <= rules.chemistry.affinity_norm_limit() {
-            Affinity::trusted(*self.traits.affinity())
+            Affinity::trusted(a_eff)
         } else {
-            Affinity::new(*self.traits.affinity(), &rules.chemistry)?
+            Affinity::new(a_eff, &rules.chemistry)?
         };
         rules.chemistry.settle(&affinity, self.packets, budget)
     }
@@ -6033,9 +6176,27 @@ fn inhibited(velocity: [f64; 2], push: [f64; 2], share: f64) -> [f64; 2] {
     }
 }
 
+/// Combined EMT adhesion multiplier for `organism` (`V2-08` `2 σ(o_adh)`
+/// composed multiplicatively with `V2-12` post-Phase-4
+/// `m(h_1) = clamp(1 + h_1, 0, 1)`).
+fn effective_emt_factor(rules: &Rules, organism: &Working) -> f64 {
+    let base = if rules.v2.emt_gate() {
+        2.0 * organism.actions.emt_gate.unwrap_or(0.5)
+    } else {
+        1.0
+    };
+    if rules.v2.emt_h1_adhesion_enabled() {
+        let h1 = organism.held.recurrent_state_array()[1];
+        base * (1.0 + f64::from(h1)).clamp(0.0, 1.0)
+    } else {
+        base
+    }
+}
+
 /// Every working organism's contact displacement into `work`, from the
-/// settled positions of those that survive the tick, with their affinity
-/// directions when bodies adhere.
+/// settled positions of those that survive the tick, with their genetic
+/// affinity directions when bodies adhere (or `pcp-polarity` / `notch-delta`
+/// is enabled).
 fn contact_displacements(
     rules: &Rules,
     bodies: &ContactRules,
@@ -6054,9 +6215,12 @@ fn contact_displacements(
     work.wedge_curvatures.clear();
     work.energy_gradients.clear();
     work.emt_factors.clear();
+    work.cell_states_h0.clear();
+    work.neighbor_h0.clear();
     let pcp = rules.v2.polarity();
-    let emt_gate = rules.v2.emt_gate();
-    let needs_affinities = bodies.adheres() || pcp.is_some();
+    let needs_emt_factors = rules.v2.emt_gate() || rules.v2.emt_h1_adhesion_enabled();
+    let notch_delta = rules.v2.notch_delta().is_some();
+    let needs_affinities = bodies.adheres() || pcp.is_some() || notch_delta;
     for organism in working {
         work.positions.push(organism.position);
         work.ids.push(organism.committed.id.get());
@@ -6068,6 +6232,9 @@ fn contact_displacements(
             None
         };
         if needs_affinities && let Some(genome) = genome {
+            // CRITICAL V2-12 clonal kin rule: contact kin weighting MUST use
+            // GENETIC `traits.affinity()`, NEVER rotated `a_eff(h_0)`, so
+            // differentiated clonal sisters retain kin adhesion & Notch-Delta.
             work.affinities
                 .push(unit_affinity(genome.traits().affinity()));
         }
@@ -6080,9 +6247,12 @@ fn contact_displacements(
                 .push(traits.and_then(Traits::wedge_curvature).unwrap_or(0.0));
             work.energy_gradients.push(organism.gradients[0]);
         }
-        if emt_gate {
-            let emt_eff = 2.0 * organism.actions.emt_gate.unwrap_or(0.5);
-            work.emt_factors.push(emt_eff);
+        if needs_emt_factors {
+            work.emt_factors.push(effective_emt_factor(rules, organism));
+        }
+        if notch_delta {
+            work.cell_states_h0
+                .push(organism.held.recurrent_state_array()[0]);
         }
     }
     let pcp_params = pcp.map(|pol| PcpSweepParams {
@@ -6090,7 +6260,14 @@ fn contact_displacements(
         torque_mobility: pol.torque_mobility,
         gradient_cue_strength: pol.gradient_cue_strength,
     });
-    work.relax_v2(&rules.grid, bodies, pcp_params, emt_gate, workers)
+    work.relax_v2(
+        &rules.grid,
+        bodies,
+        pcp_params,
+        needs_emt_factors,
+        notch_delta,
+        workers,
+    )
 }
 
 /// Phases 6 and 7 for one organism: chemistry, maintenance, motion,
@@ -6119,15 +6296,20 @@ fn settle_stages(
 ) -> Result<Settled, CoreError> {
     let mut settled = Settled::of(organism);
     let opening = settled.budget.remaining();
-    let uptake = stages.uptake(rules, &mut settled.budget)?;
+    let uptake = stages.uptake(rules, organism, &mut settled.budget)?;
     let mut byproduct_staged = 0.0;
     if let (Some(waste_rule), Some(byproducts)) = (rules.v2.waste(), byproducts) {
         let unconverted = sub_down(uptake.absorbed, uptake.gain).max(0.0);
         let candidate = (waste_rule.byproduct_recycle_fraction * unconverted).min(unconverted);
         let retained_uptake = uptake.absorbed - candidate;
         if candidate > 0.0 && retained_uptake >= uptake.gain {
-            let recurrent_h0 = organism.committed.held.recurrent_state_array()[0];
-            let a_eff = effective_affinity(traits, recurrent_h0, &rules.v2);
+            let recurrent_h0 = organism.held.recurrent_state_array()[0];
+            let a_eff = effective_affinity(
+                traits,
+                recurrent_h0,
+                &rules.v2,
+                rules.chemistry.affinity_norm_limit(),
+            )?;
             let waste_dir = symplectic_waste_direction(
                 &a_eff,
                 rules.v2.active_carrier0_channels(),
@@ -6244,6 +6426,16 @@ fn settle_stages(
         };
     }
     if let ReproductionProposal::Intent(mut intent) = proposal {
+        if let Some(diff) = rules.v2.differentiation() {
+            let parent_state = organism.held.recurrent_state_array();
+            intent.newborn_state = Reproduction::inherit_epigenetic_state(
+                &rules.rng,
+                intent.parent,
+                intent.tick,
+                &parent_state[..diff.state_width],
+                diff,
+            )?;
+        }
         if rules.v2.polarity().is_some() {
             intent.newborn_polarity = Some(Reproduction::inherit_polarity(
                 &rules.rng,
@@ -6261,11 +6453,7 @@ fn settle_stages(
         if local_radius.is_some() || lateral_diameter.is_some() {
             let (lambda_epi, lateral_offset) = if let Some(diameter) = lateral_diameter {
                 let alpha_pol = traits.polarity_strength().unwrap_or(0.0);
-                let emt_eff = if rules.v2.emt_gate() {
-                    2.0 * organism.actions.emt_gate.unwrap_or(0.5)
-                } else {
-                    1.0
-                };
+                let emt_eff = effective_emt_factor(rules, organism);
                 let lambda = (alpha_pol * emt_eff.min(1.0)).clamp(0.0, 1.0);
                 if lambda > 0.0 {
                     let offset = Reproduction::lateral_mitosis_offset(

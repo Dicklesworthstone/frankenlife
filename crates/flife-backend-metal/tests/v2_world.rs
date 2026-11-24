@@ -1,25 +1,27 @@
 //! Full-world `field-ecology-v2` Metal E2E bit-exact parity suite:
 //!
-//! 1. **All 11 closed V2 features enabled together** (`oases` + `senescence` +
-//!    `surplus-emission` + `excitable-relay` + `wake-offset` + `so2-motor` +
-//!    `so2-budding` + `hippo-crowding` (`cell-occupancy-v1`, `expose_sensor`) +
-//!    `tight-junctions` + `vascular-field` + `dual-carrier-trails`; 34 planes,
+//! 1. **All 13 closed pure-field V2 features enabled together** (`oases` +
+//!    `senescence` + `surplus-emission` + `excitable-relay` + `wake-offset` +
+//!    `so2-motor` + `so2-budding` + `hippo-crowding` (`cell-occupancy-v1`,
+//!    `expose_sensor`) + `tight-junctions` + `lysis-recycling` +
+//!    `symplectic-waste` + `vascular-field` + `dual-carrier-trails`; 34 planes,
 //!    `sensor_width = 109`, `action_width = 42`) with ALL 5 Metal backends
 //!    (`MetalField`, `MetalSensors`, `MetalUptake`, `MetalBackend`,
 //!    `MetalSettle`) sharing ONE [`DeviceOwner`], tested in BOTH `f32` and
 //!    `f16` over 64 ticks against pure CPU Reference:
-//!    - bit-exact `World::digest()`, `FieldSummary`, births, newborn genomes,
-//!      and watched-organism transactions at every tick;
+//!    - bit-exact `World::digest()`, `FieldSummary`, births, deaths, newborn
+//!      genomes, `Transfer::MetabolicByproduct`, and watched-organism
+//!      transactions at every tick;
 //!    - bit-exact `INV-03` ledger closure within `1e-6` per-tick relative
 //!      residual and cumulative profile bound;
 //!    - active GPU service on all 5 backends with 0 failures and 0 reference
 //!      fallback ticks;
 //!    - clean shared `DeviceOwner::usage()` (0 retiring, 0 leases, 0 running).
-//! 2. **Recurrent `S = 2` (`field-ecology-v2` `110/46` and `106/44`) and
-//!    FL-054 `S = 4` (`108/44`)** worlds comparing pure CPU Reference vs
-//!    FrankenTorch CPU (`CpuBackend`) vs Metal (`MetalBackend` + all 4 other
-//!    Metal backends on one shared `DeviceOwner`) in BOTH `f32` and `f16` over
-//!    64 ticks.
+//! 2. **Recurrent `S = 2` (`field-ecology-v2` `110/46` with full `supercolony`
+//!    including `V2-11`, and `106/44`) and FL-054 `S = 4` (`108/44`)** worlds
+//!    comparing pure CPU Reference vs FrankenTorch CPU (`CpuBackend`) vs Metal
+//!    (`MetalBackend` + all 4 other Metal backends on one shared `DeviceOwner`)
+//!    in BOTH `f32` and `f16` over 64 ticks.
 //! 3. **Explicit clean fallback (zero silent drift):** a V2 world using
 //!    `fixed-world-gaussian-v1` (which `UptakeBackend` and `SettleBackend`
 //!    explicitly refuse with `MissingCapability`) records both tick-1 refusals
@@ -27,6 +29,14 @@
 //!    `MetalSensors`, and `MetalBackend` serving every tick on the shared
 //!    owner, stays bit-identical to Reference at every tick, and leaves
 //!    `DeviceOwner` idle.
+//! 4. **All 15 closed V2 features with `[contact]` (`V2-08` `pcp-polarity` +
+//!    `emt-gate` + `V2-11` `lysis-recycling` + `symplectic-waste`):** full
+//!    contact-enabled V2 world (`34` planes, `109` sensors, odd `43` actions
+//!    exercising F16 padded slot stride) over 64 ticks + starved lysis-firing
+//!    sub-world over 16 ticks, asserting bit-exact `World::digest()`,
+//!    `World::polarities()`, `DeathCause::Lysed`, `Transfer::MetabolicByproduct`,
+//!    `Transfer::Recycling`, zero `Flow::TinyReservoir`, active GPU service on
+//!    all 5 backends, and clean `DeviceOwner::usage()` in BOTH `f32` and `f16`.
 
 #![allow(
     clippy::expect_used,
@@ -41,8 +51,8 @@ use flife_backend_metal::{
     BackendBudget, DeviceOwner, Limits, MetalBackend, MetalField, MetalSensors, MetalSettle,
     MetalUptake,
 };
-use flife_core::{CoreError, FeatureOverride, V2Feature, ValidatedConfig};
-use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
+use flife_core::{CoreError, Flow, Transfer, V2Feature, ValidatedConfig};
+use flife_engine::{Arrangement, DeathCause, NumericalProfile, Stepped, World};
 use flife_field::{DUAL_CARRIER_PLANES, FieldSummary, VASCULAR_INITIAL_CONDUCTANCE};
 use flife_genome::Genome;
 
@@ -205,10 +215,10 @@ fn full_v2_all_closed_features_on_single_metal_owner_matches_reference_f32_and_f
             ("architecture_mutation", "probability_per_birth", "0.25"),
             ("execution", "command_durability", "\"volatile-in-memory\""),
         ];
-        // Supercolony enables: oases, senescence, surplus-emission,
-        // excitable-relay, wake-offset, so2-motor, so2-budding, tight-junctions,
-        // vascular-field, dual-carrier-trails (+ lysis/waste disabled below to
-        // isolate the 11 closed V2 features), plus hippo-crowding enabled in
+        // Supercolony enables all 12 Bundle B features (oases, senescence,
+        // surplus-emission, excitable-relay, wake-offset, so2-motor,
+        // so2-budding, tight-junctions, lysis-recycling, symplectic-waste,
+        // vascular-field, dual-carrier-trails), plus hippo-crowding enabled in
         // pure-field cell-occupancy-v1 mode with expose_sensor = true.
         let tail = r#"
 [v2]
@@ -220,16 +230,10 @@ mode = "cell-occupancy-v1"
 expose_sensor = true
 "#;
         let toml = ecology_toml("field-ecology-v2", &overrides, tail);
-        let config = ValidatedConfig::from_toml_with_overrides(
-            &toml,
-            &[
-                FeatureOverride::Disable("lysis-recycling".to_owned()),
-                FeatureOverride::Disable("symplectic-waste".to_owned()),
-            ],
-        )
-        .expect("full closed V2 config validates");
+        let config =
+            ValidatedConfig::from_toml(&toml).expect("full closed pure-field V2 validates");
 
-        // Confirm every closed V2 feature is active and ABI dimensions match.
+        // Confirm every closed pure-field V2 feature is active and ABI dimensions match.
         for feature in [
             V2Feature::Oases,
             V2Feature::Senescence,
@@ -240,6 +244,8 @@ expose_sensor = true
             V2Feature::So2Budding,
             V2Feature::HippoCrowding,
             V2Feature::TightJunctions,
+            V2Feature::LysisRecycling,
+            V2Feature::SymplecticWaste,
             V2Feature::VascularField,
             V2Feature::DualCarrierTrails,
         ] {
@@ -267,6 +273,7 @@ expose_sensor = true
         let mut saw_vascular = false;
         let mut total_emissions = 0_usize;
         let mut total_births = 0_usize;
+        let mut total_byproducts = 0.0_f64;
         for step in 1..=ticks {
             let Stepped::Published(expected) = reference.step().expect("ref step") else {
                 panic!("dtype={dtype} tick={step}: reference paused");
@@ -289,17 +296,26 @@ expose_sensor = true
                     expected.closure.closing().field().to_bits(),
                     expected.closure.closing().organisms().to_bits(),
                     expected.closure.residual().to_bits(),
+                    expected
+                        .closure
+                        .credited(Transfer::MetabolicByproduct)
+                        .to_bits(),
                 ),
                 (
                     got.closure.closing().field().to_bits(),
                     got.closure.closing().organisms().to_bits(),
                     got.closure.residual().to_bits(),
+                    got.closure.credited(Transfer::MetabolicByproduct).to_bits(),
                 ),
-                "dtype={dtype} tick={step}: INV-03 closure diverged"
+                "dtype={dtype} tick={step}: INV-03 closure or MetabolicByproduct diverged"
             );
             assert_eq!(
                 expected.births, got.births,
                 "dtype={dtype} tick={step}: births diverged"
+            );
+            assert_eq!(
+                expected.deaths, got.deaths,
+                "dtype={dtype} tick={step}: deaths diverged"
             );
             for birth in &got.births {
                 let a = reference
@@ -324,6 +340,7 @@ expose_sensor = true
             max_rel = max_rel.max(rel);
             total_emissions += got.emitted;
             total_births += got.births.len();
+            total_byproducts += got.closure.credited(Transfer::MetabolicByproduct);
             let trail_sum: f64 = gpu
                 .field()
                 .trail_energy()
@@ -361,6 +378,10 @@ expose_sensor = true
         assert!(
             total_births > 0,
             "dtype={dtype}: expected live V2 births (so2-budding + hippo-crowding + metal birth mutation)"
+        );
+        assert!(
+            total_byproducts > 0.0,
+            "dtype={dtype}: expected positive V2-11 Transfer::MetabolicByproduct flux"
         );
 
         // Verify ALL FIVE Metal backends served every single tick with 0 failures!
@@ -495,18 +516,7 @@ profile = "supercolony"
                 ("execution", "command_durability", "\"volatile-in-memory\""),
             ];
             let toml = ecology_toml(case.model, &overrides, case.tail);
-            let config = if case.model == "field-ecology-v2" {
-                ValidatedConfig::from_toml_with_overrides(
-                    &toml,
-                    &[
-                        FeatureOverride::Disable("lysis-recycling".to_owned()),
-                        FeatureOverride::Disable("symplectic-waste".to_owned()),
-                    ],
-                )
-                .expect("v2 recurrent validates")
-            } else {
-                ValidatedConfig::from_toml(&toml).expect("v1 recurrent validates")
-            };
+            let config = ValidatedConfig::from_toml(&toml).expect("recurrent config validates");
             if case.model == "field-ecology-v2" {
                 let abi = config.v2_abi();
                 assert_eq!(abi.input_width, case.expected_in, "{}", case.label);
@@ -604,14 +614,7 @@ fn v2_explicit_clean_fallback_on_unsupported_exchange_kernel_preserves_bit_exact
 profile = "supercolony"
 "#;
     let toml = ecology_toml("field-ecology-v2", &overrides, tail);
-    let config = ValidatedConfig::from_toml_with_overrides(
-        &toml,
-        &[
-            FeatureOverride::Disable("lysis-recycling".to_owned()),
-            FeatureOverride::Disable("symplectic-waste".to_owned()),
-        ],
-    )
-    .expect("fixed-world-gaussian v2 validates");
+    let config = ValidatedConfig::from_toml(&toml).expect("fixed-world-gaussian v2 validates");
 
     let mut reference = found_world(&config);
     let mut gpu = found_world(&config);
@@ -668,4 +671,394 @@ profile = "supercolony"
     assert_eq!(gpu.controller_report().reference_ticks, 0);
     assert!(gpu.controller_report().batched > 0);
     assert_owner_idle(&owner, "fixed-world-gaussian fallback");
+}
+
+fn polarity_bits(world: &World) -> Vec<[u64; 2]> {
+    world
+        .polarities()
+        .expect("pcp-polarity world exposes live polarities")
+        .into_iter()
+        .map(|[x, y]| [x.to_bits(), y.to_bits()])
+        .collect()
+}
+
+/// Newly closed `V2-08` (`pcp-polarity` + `emt-gate`) and `V2-11`
+/// (`lysis-recycling` + `symplectic-waste`) on ONE shared Metal `DeviceOwner`
+/// (`MetalField` + `MetalSensors` + `MetalUptake` + `MetalBackend` +
+/// `MetalSettle`) vs pure CPU Reference in BOTH `f32` and `f16`:
+///
+/// - **Part A (64 ticks):** `[contact]` + all 15 closed V2 features enabled
+///   simultaneously (`34` planes, `109` sensors, odd `43` actions exercising
+///   Metal F16 4-element slot stride alignment), asserting bit-exact
+///   `World::digest()`, `World::polarities()`, `FieldSummary`, `INV-03`
+///   closure, births, deaths, newborn genomes, watched transactions, active
+///   polarity evolution, positive `Transfer::MetabolicByproduct`, `5/5` Metal
+///   backend service, and clean `DeviceOwner::usage()`.
+/// - **Part B (16 ticks):** starved `[contact]` + `pcp-polarity` + `emt-gate`
+///   with `lysis-recycling` (`viability_energy_floor = 0.25`, `initial_energy =
+///   0.20`) and `symplectic-waste`, guaranteeing `DeathCause::Lysed` fires on
+///   Metal GPU with `Transfer::Recycling > 0`, `Flow::TinyReservoir == 0`,
+///   bit-exact parity, active GPU service, and clean `DeviceOwner`.
+#[test]
+fn v2_contact_pcp_polarity_emt_gate_and_trophic_on_metal_matches_reference_f32_and_f16() {
+    if open_owner().is_none() {
+        return;
+    }
+    let profile = NumericalProfile::reference_f32().expect("profile");
+
+    for dtype in ["f32", "f16"] {
+        let dtype_toml = format!("\"{dtype}\"");
+
+        // Part A: all 15 closed V2 features simultaneously with `[contact]`.
+        let overrides = [
+            ("world", "width", "16.0"),
+            ("world", "height", "16.0"),
+            ("world", "grid_width", "32"),
+            ("world", "grid_height", "32"),
+            ("world", "tick_numerator", "1"),
+            ("world", "tick_denominator", "32"),
+            ("population", "initial_count", "96"),
+            ("population", "maximum_count", "384"),
+            ("population", "initial_energy", "3.5"),
+            ("sources", "count", "4"),
+            ("sources", "power_per_source", "220.0"),
+            ("sources", "sigma_world_units", "2.0"),
+            ("sources", "path_direction_interval_seconds", "2.0"),
+            ("controller", "hidden_widths", "[64, 32]"),
+            ("controller", "canonical_weight_dtype", dtype_toml.as_str()),
+            ("reproduction", "cooldown_seconds", "0.05"),
+            (
+                "reproduction",
+                "minimum_parent_energy_before_attempt",
+                "1.5",
+            ),
+            ("architecture_mutation", "probability_per_birth", "0.25"),
+            ("execution", "command_durability", "\"volatile-in-memory\""),
+        ];
+        let tail = r#"
+[contact]
+diameter = 0.5
+stiffness = 0.75
+adhesion = 0.35
+adhesion_range = 2.0
+sweeps = 3
+
+[v2]
+profile = "supercolony"
+
+[v2.crowding]
+enabled = true
+mode = "local-neighbors-v1"
+arrest_threshold = 6.0
+expose_sensor = true
+
+[v2.polarity]
+enabled = true
+torque_mobility = 2.0
+gradient_cue_strength = 0.25
+initial_polarity_strength_max = 0.8
+maximum_wedge_curvature = 0.25
+polarity_mutation_std = 0.05
+oriented_lateral_mitosis = true
+emt_gate_enabled = true
+"#;
+        let toml = ecology_toml("field-ecology-v2", &overrides, tail);
+        let config =
+            ValidatedConfig::from_toml(&toml).expect("15-feature contact V2 config validates");
+
+        for feature in [
+            V2Feature::Oases,
+            V2Feature::Senescence,
+            V2Feature::SurplusEmission,
+            V2Feature::ExcitableRelay,
+            V2Feature::WakeOffset,
+            V2Feature::So2Motor,
+            V2Feature::So2Budding,
+            V2Feature::HippoCrowding,
+            V2Feature::PcpPolarity,
+            V2Feature::EmtGate,
+            V2Feature::TightJunctions,
+            V2Feature::LysisRecycling,
+            V2Feature::SymplecticWaste,
+            V2Feature::VascularField,
+            V2Feature::DualCarrierTrails,
+        ] {
+            assert!(
+                config.is_v2_feature_enabled(feature),
+                "Part A dtype={dtype}: expected {feature:?} enabled"
+            );
+        }
+        let abi = config.v2_abi();
+        assert_eq!(abi.field_planes, DUAL_CARRIER_PLANES);
+        assert_eq!(abi.sensor_width, 109);
+        assert_eq!(
+            abi.action_width, 43,
+            "so2-motor(+4) + so2-budding(+2) + emt-gate(+1) = 43"
+        );
+
+        let mut reference = found_world(&config);
+        let mut gpu = found_world(&config);
+        assert!(reference.tracks_polarity() && gpu.tracks_polarity());
+        let owner = install_all_metal_on_one_owner(&mut gpu).expect("metal owner");
+
+        let watched = reference.population().ids().next();
+        reference.watch(watched);
+        gpu.watch(watched);
+
+        let initial_pols = polarity_bits(&gpu);
+        assert_eq!(initial_pols, polarity_bits(&reference));
+        let mut polarities_evolved = false;
+        let mut max_rel = 0.0_f64;
+        let mut saw_trail = false;
+        let mut saw_vascular = false;
+        let mut total_emissions = 0_usize;
+        let mut total_births = 0_usize;
+        let mut total_byproducts = 0.0_f64;
+
+        let ticks = 64_u64;
+        for step in 1..=ticks {
+            let Stepped::Published(expected) = reference.step().expect("ref step") else {
+                panic!("Part A dtype={dtype} tick={step}: reference paused");
+            };
+            let Stepped::Published(got) = gpu.step().expect("metal step") else {
+                panic!("Part A dtype={dtype} tick={step}: metal paused");
+            };
+            assert_eq!(
+                reference.digest(),
+                gpu.digest(),
+                "Part A dtype={dtype} tick={step}: World::digest diverged"
+            );
+            let ref_pols = polarity_bits(&reference);
+            let gpu_pols = polarity_bits(&gpu);
+            assert_eq!(
+                ref_pols, gpu_pols,
+                "Part A dtype={dtype} tick={step}: World::polarities diverged"
+            );
+            polarities_evolved |= gpu_pols != initial_pols;
+
+            assert_eq!(
+                summary_bits(&expected.field),
+                summary_bits(&got.field),
+                "Part A dtype={dtype} tick={step}: FieldSummary diverged"
+            );
+            assert_eq!(
+                (
+                    expected.closure.closing().field().to_bits(),
+                    expected.closure.closing().organisms().to_bits(),
+                    expected.closure.residual().to_bits(),
+                    expected
+                        .closure
+                        .credited(Transfer::MetabolicByproduct)
+                        .to_bits(),
+                ),
+                (
+                    got.closure.closing().field().to_bits(),
+                    got.closure.closing().organisms().to_bits(),
+                    got.closure.residual().to_bits(),
+                    got.closure.credited(Transfer::MetabolicByproduct).to_bits(),
+                ),
+                "Part A dtype={dtype} tick={step}: INV-03 closure or MetabolicByproduct diverged"
+            );
+            assert_eq!(expected.births, got.births);
+            assert_eq!(expected.deaths, got.deaths);
+            for birth in &got.births {
+                let a = reference
+                    .population()
+                    .genome(birth.child)
+                    .expect("ref child");
+                let b = gpu.population().genome(birth.child).expect("gpu child");
+                assert!(
+                    same_genome(a, b),
+                    "Part A dtype={dtype} tick={step}: newborn genome {:?} diverged",
+                    birth.child
+                );
+            }
+            assert!(
+                reference
+                    .watched_transactions()
+                    .eq(gpu.watched_transactions()),
+                "Part A dtype={dtype} tick={step}: watched transactions diverged"
+            );
+
+            let rel = got.closure.residual().abs() / got.closure.scale().max(1.0);
+            max_rel = max_rel.max(rel);
+            total_emissions += got.emitted;
+            total_births += got.births.len();
+            total_byproducts += got.closure.credited(Transfer::MetabolicByproduct);
+            let trail_sum: f64 = gpu
+                .field()
+                .trail_energy()
+                .expect("34-plane trail energy")
+                .iter()
+                .map(|&v| f64::from(v))
+                .sum();
+            saw_trail |= trail_sum > 0.0;
+            let (gx, gy) = gpu.field().vascular_edges().expect("vascular edges");
+            saw_vascular |= gx
+                .iter()
+                .chain(gy.iter())
+                .any(|&g| (g - VASCULAR_INITIAL_CONDUCTANCE).abs() > 1e-4);
+        }
+
+        assert!(
+            max_rel <= 1e-6,
+            "Part A dtype={dtype}: per-tick INV-03 residual {max_rel:e} > 1e-6"
+        );
+        let cum_norm = gpu.ledger().report().normalized.unwrap_or(0.0);
+        assert!(
+            cum_norm <= profile.residual.cumulative(),
+            "Part A dtype={dtype}: cumulative INV-03 residual {cum_norm:e} > {}",
+            profile.residual.cumulative()
+        );
+        assert!(
+            polarities_evolved,
+            "Part A dtype={dtype}: expected V2-08 PCP polarities to evolve"
+        );
+        assert!(
+            total_byproducts > 0.0,
+            "Part A dtype={dtype}: expected positive V2-11 Transfer::MetabolicByproduct flux"
+        );
+        assert!(
+            saw_vascular,
+            "Part A dtype={dtype}: expected vascular conductances to evolve"
+        );
+        assert!(
+            total_emissions > 0 && saw_trail,
+            "Part A dtype={dtype}: expected dual-carrier emissions & trail energy"
+        );
+        assert!(
+            total_births > 0,
+            "Part A dtype={dtype}: expected live V2 births under pcp-polarity + hippo-crowding"
+        );
+
+        let f_rep = gpu.field_report();
+        let s_rep = gpu.sensor_report();
+        let u_rep = gpu.uptake_report();
+        let c_rep = gpu.controller_report();
+        let t_rep = gpu.settle_report();
+        assert_eq!(f_rep.failure, None, "Part A {dtype} field: {f_rep:?}");
+        assert_eq!(s_rep.failure, None, "Part A {dtype} sensors: {s_rep:?}");
+        assert_eq!(u_rep.failure, None, "Part A {dtype} uptake: {u_rep:?}");
+        assert_eq!(c_rep.failure, None, "Part A {dtype} ctrl: {c_rep:?}");
+        assert_eq!(t_rep.failure, None, "Part A {dtype} settle: {t_rep:?}");
+        assert_eq!((f_rep.steps, f_rep.reference_steps), (ticks, 0));
+        assert_eq!((f_rep.reductions, f_rep.reference_reductions), (ticks, 0));
+        assert_eq!((f_rep.checks, f_rep.reference_checks), (ticks, 0));
+        assert_eq!((s_rep.ticks, s_rep.reference_ticks), (ticks, 0));
+        assert_eq!((u_rep.ticks, u_rep.reference_ticks), (ticks, 0));
+        assert_eq!((t_rep.ticks, t_rep.reference_ticks), (ticks, 0));
+        assert_eq!(c_rep.reference_ticks, 0);
+        assert!(c_rep.batched > 0);
+        assert_owner_idle(&owner, &format!("Part A contact+pcp+trophic {dtype}"));
+
+        // Part B: starved V2-11 lysis-recycling firing on Metal GPU alongside V2-08.
+        let starved_overrides = [
+            ("world", "width", "16.0"),
+            ("world", "height", "16.0"),
+            ("world", "grid_width", "32"),
+            ("world", "grid_height", "32"),
+            ("world", "tick_numerator", "1"),
+            ("world", "tick_denominator", "64"),
+            ("population", "initial_count", "16"),
+            ("population", "maximum_count", "64"),
+            ("population", "initial_energy", "0.20"),
+            ("sources", "count", "1"),
+            ("sources", "power_per_source", "1e-6"),
+            ("death", "residual_energy_recycle_fraction", "0.80"),
+            ("controller", "hidden_widths", "[32]"),
+            ("controller", "canonical_weight_dtype", dtype_toml.as_str()),
+            (
+                "reproduction",
+                "minimum_parent_energy_before_attempt",
+                "1.5",
+            ),
+            ("execution", "command_durability", "\"volatile-in-memory\""),
+        ];
+        let starved_tail = r#"
+[contact]
+diameter = 0.5
+stiffness = 0.75
+adhesion = 0.35
+adhesion_range = 2.0
+sweeps = 3
+
+[v2]
+profile = "minimal"
+
+[v2.emission.surplus_floor]
+enabled = true
+energy_floor = 0.50
+
+[v2.polarity]
+enabled = true
+emt_gate_enabled = true
+
+[v2.metabolism.lysis]
+enabled = true
+viability_energy_floor = 0.25
+corpse_direction = "symplectic-affinity"
+
+[v2.metabolism.waste]
+enabled = true
+"#;
+        let starved_toml = ecology_toml("field-ecology-v2", &starved_overrides, starved_tail);
+        let starved_cfg =
+            ValidatedConfig::from_toml(&starved_toml).expect("starved lysis+pcp config validates");
+        let mut s_ref = found_world(&starved_cfg);
+        let mut s_gpu = found_world(&starved_cfg);
+        let s_owner = install_all_metal_on_one_owner(&mut s_gpu).expect("metal owner");
+
+        let mut lysed_deaths = 0_usize;
+        let mut recycling_credited = 0.0_f64;
+        let starved_ticks = 16_u64;
+        for step in 1..=starved_ticks {
+            let Stepped::Published(expected) = s_ref.step().expect("starved ref") else {
+                panic!("Part B dtype={dtype} tick={step}: ref paused");
+            };
+            let Stepped::Published(got) = s_gpu.step().expect("starved gpu") else {
+                panic!("Part B dtype={dtype} tick={step}: gpu paused");
+            };
+            assert_eq!(
+                s_ref.digest(),
+                s_gpu.digest(),
+                "Part B dtype={dtype} tick={step}: starved lysis World::digest diverged"
+            );
+            assert_eq!(polarity_bits(&s_ref), polarity_bits(&s_gpu));
+            assert_eq!(expected.deaths, got.deaths);
+            assert_eq!(
+                got.closure.flow(Flow::TinyReservoir),
+                0.0,
+                "Part B dtype={dtype} tick={step}: lysis must not book Flow::TinyReservoir"
+            );
+            lysed_deaths += got
+                .deaths
+                .iter()
+                .filter(|d| matches!(d.cause, DeathCause::Lysed(_)))
+                .count();
+            recycling_credited += got.closure.credited(Transfer::Recycling);
+            let rel = got.closure.residual().abs() / got.closure.scale().max(1.0);
+            assert!(
+                rel <= 1e-6,
+                "Part B dtype={dtype} tick={step}: INV-03 residual {rel:e} > 1e-6"
+            );
+        }
+        assert_eq!(
+            lysed_deaths, 16,
+            "Part B dtype={dtype}: expected all 16 starved organisms to lyse via DeathCause::Lysed"
+        );
+        assert!(
+            recycling_credited > 0.0,
+            "Part B dtype={dtype}: expected positive Transfer::Recycling from corpse lysis"
+        );
+        assert_eq!(s_gpu.field_report().failure, None);
+        assert_eq!(s_gpu.field_report().steps, starved_ticks);
+        assert_eq!(s_gpu.sensor_report().failure, None);
+        assert_eq!(s_gpu.uptake_report().failure, None);
+        assert_eq!(s_gpu.controller_report().failure, None);
+        assert_eq!(s_gpu.controller_report().reference_ticks, 0);
+        assert!(s_gpu.controller_report().batched >= 16);
+        assert_eq!(s_gpu.settle_report().failure, None);
+        assert_eq!(s_gpu.settle_report().reference_ticks, 0);
+        assert_owner_idle(&s_owner, &format!("Part B starved lysis+pcp {dtype}"));
+    }
 }

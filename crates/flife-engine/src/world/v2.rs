@@ -115,6 +115,63 @@ pub struct PolarityRules {
     pub oriented_lateral_mitosis: bool,
 }
 
+/// Newborn epigenetic recurrent-state inheritance rule (`V2-12`,
+/// `epigenetic-recurrence`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StateInheritanceMode {
+    /// Newborns start with zero / empty recurrent state (`HeldOutput::INVALID`).
+    Zero,
+    /// Symmetric inheritance with retention and semantic-Philox Gaussian jitter:
+    /// `h_child[k] = clamp(α_epi * h_p[k] + σ_epi * ξ_k, -1, 1)`.
+    SymmetricEpigenetic,
+    /// Asymmetric stem-cell division on `k = 0`:
+    /// `c_stem = σ(3 * h_p[0])`,
+    /// `h_child[0] = clamp(α_epi * h_p[0] + c_stem * β_asym, -1, 1)`,
+    /// and symmetric inheritance on `k = 1..S`.
+    AsymmetricStem,
+}
+
+/// Juxtacrine Notch-Delta lateral inhibition coupling mode (`V2-12`,
+/// `notch-delta`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotchDeltaMode {
+    /// Feed kin-weighted mean neighbor `h̄_0` into `SensorLayout::notch_delta()`.
+    SensorNeighborMean,
+    /// Subtract `η_ND * h̄_0` directly from post-Phase-4 `h'_0` (0 extra sensors).
+    DirectLateralInhibition,
+}
+
+/// Resolved epigenetic recurrence & clonal differentiation rules (`V2-12`,
+/// `epigenetic-recurrence`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DifferentiationRules {
+    /// Recurrent state width `S ∈ 1..=16`.
+    pub state_width: usize,
+    /// Epigenetic slow-gate bias `b_epi ∈ [0.0, 4.0]`.
+    pub epigenetic_gate_bias: f64,
+    /// Newborn state inheritance mode.
+    pub state_inheritance: StateInheritanceMode,
+    /// Retention factor `α_epi ∈ [0.0, 1.0]`.
+    pub inheritance_retention: f64,
+    /// Jitter standard deviation `σ_epi >= 0.0`.
+    pub inheritance_jitter: f64,
+    /// Asymmetric stem push `β_asym ∈ [-2.0, 2.0]`.
+    pub stem_asymmetry: f64,
+    /// Whether `h_0` rotates effective metabolic affinity `a_eff(h_0)`.
+    pub affinity_rotation_enabled: bool,
+    /// Whether `h_1` modulates EMT adhesion multiplier `m(h_1) = clamp(1 + h_1, 0, 1)`.
+    pub emt_adhesion_enabled: bool,
+}
+
+/// Resolved juxtacrine Notch-Delta rules (`V2-12`, `notch-delta`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NotchDeltaRules {
+    /// Coupling mode (`sensor-neighbor-mean-v1` or `direct-lateral-inhibition-v1`).
+    pub mode: NotchDeltaMode,
+    /// Direct lateral inhibition gain `η_ND ∈ [0.0, 0.3]`.
+    pub inhibition_gain: f64,
+}
+
 /// Run-constant `field-ecology-v2` rules resolved from a [`ValidatedConfig`].
 ///
 /// For `field-ecology-v1*` worlds, `config` is `None`, `feature_bitmask` is
@@ -143,6 +200,8 @@ pub struct V2Rules {
     waste: Option<WasteRules>,
     polarity: Option<PolarityRules>,
     emt_gate: bool,
+    differentiation: Option<DifferentiationRules>,
+    notch_delta: Option<NotchDeltaRules>,
     config: Option<V2Config>,
 }
 
@@ -375,6 +434,103 @@ impl V2Rules {
         let emt_gate = v2_config
             .as_ref()
             .is_some_and(|v2| v2.is_enabled(V2Feature::EmtGate));
+        let differentiation = if let Some(v2) = v2_config
+            .as_ref()
+            .filter(|v2| v2.is_enabled(V2Feature::EpigeneticRecurrence))
+        {
+            let df = &v2.differentiation;
+            if state_width == 0 {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.differentiation.state_width",
+                    detail: "epigenetic-recurrence requires state_width >= 1".to_owned(),
+                });
+            }
+            if !df.epigenetic_gate_bias.is_finite()
+                || !(0.0..=4.0).contains(&df.epigenetic_gate_bias)
+            {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.differentiation.epigenetic_gate_bias",
+                    detail: format!("{} must lie in [0.0, 4.0]", df.epigenetic_gate_bias),
+                });
+            }
+            if !df.inheritance_retention.is_finite()
+                || !(0.0..=1.0).contains(&df.inheritance_retention)
+            {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.differentiation.inheritance_retention",
+                    detail: format!("{} must lie in [0.0, 1.0]", df.inheritance_retention),
+                });
+            }
+            if !df.inheritance_jitter.is_finite() || df.inheritance_jitter < 0.0 {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.differentiation.inheritance_jitter",
+                    detail: format!("{} must be finite and >= 0", df.inheritance_jitter),
+                });
+            }
+            if !df.stem_asymmetry.is_finite() || !(-2.0..=2.0).contains(&df.stem_asymmetry) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.differentiation.stem_asymmetry",
+                    detail: format!("{} must lie in [-2.0, 2.0]", df.stem_asymmetry),
+                });
+            }
+            let state_inheritance = match df.state_inheritance.as_str() {
+                "zero" => StateInheritanceMode::Zero,
+                "symmetric-epigenetic-v1" => StateInheritanceMode::SymmetricEpigenetic,
+                "asymmetric-stem-v1" => StateInheritanceMode::AsymmetricStem,
+                other => {
+                    return Err(CoreError::UnknownAlgorithm {
+                        role: "v2.differentiation.state_inheritance",
+                        name: other.to_owned(),
+                    });
+                }
+            };
+            Some(DifferentiationRules {
+                state_width,
+                epigenetic_gate_bias: df.epigenetic_gate_bias + 0.0,
+                state_inheritance,
+                inheritance_retention: df.inheritance_retention + 0.0,
+                inheritance_jitter: df.inheritance_jitter + 0.0,
+                stem_asymmetry: df.stem_asymmetry + 0.0,
+                affinity_rotation_enabled: df.affinity_rotation_enabled,
+                emt_adhesion_enabled: df.emt_adhesion_enabled,
+            })
+        } else {
+            None
+        };
+        let notch_delta = if let Some(v2) = v2_config
+            .as_ref()
+            .filter(|v2| v2.is_enabled(V2Feature::NotchDelta))
+        {
+            let nd = &v2.differentiation.notch_delta;
+            if differentiation.is_none() {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.differentiation.notch_delta.enabled",
+                    detail: "notch-delta requires epigenetic-recurrence enabled".to_owned(),
+                });
+            }
+            if !nd.inhibition_gain.is_finite() || !(0.0..=0.3).contains(&nd.inhibition_gain) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.differentiation.notch_delta.inhibition_gain",
+                    detail: format!("{} must lie in [0.0, 0.3]", nd.inhibition_gain),
+                });
+            }
+            let mode = match nd.mode.as_str() {
+                "sensor-neighbor-mean-v1" => NotchDeltaMode::SensorNeighborMean,
+                "direct-lateral-inhibition-v1" => NotchDeltaMode::DirectLateralInhibition,
+                other => {
+                    return Err(CoreError::UnknownAlgorithm {
+                        role: "v2.differentiation.notch_delta.mode",
+                        name: other.to_owned(),
+                    });
+                }
+            };
+            Some(NotchDeltaRules {
+                mode,
+                inhibition_gain: nd.inhibition_gain + 0.0,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             abi,
             sensors,
@@ -397,6 +553,8 @@ impl V2Rules {
             waste,
             polarity,
             emt_gate,
+            differentiation,
+            notch_delta,
             config: v2_config,
         })
     }
@@ -567,6 +725,39 @@ impl V2Rules {
     #[must_use]
     pub const fn emt_gate(&self) -> bool {
         self.emt_gate
+    }
+
+    /// Resolved epigenetic recurrence & clonal differentiation rules (`V2-12`),
+    /// if enabled.
+    #[must_use]
+    pub const fn differentiation(&self) -> Option<DifferentiationRules> {
+        self.differentiation
+    }
+
+    /// Resolved juxtacrine Notch-Delta lateral inhibition rules (`V2-12`), if
+    /// enabled.
+    #[must_use]
+    pub const fn notch_delta(&self) -> Option<NotchDeltaRules> {
+        self.notch_delta
+    }
+
+    /// Whether `h_0` rotates effective metabolic affinity `a_eff(h_0)` (`V2-12`).
+    #[must_use]
+    pub const fn affinity_rotation_enabled(&self) -> bool {
+        match self.differentiation {
+            Some(diff) => diff.affinity_rotation_enabled,
+            None => false,
+        }
+    }
+
+    /// Whether recurrent state `h_1` modulates adhesion via
+    /// `m(h_1) = clamp(1 + h_1, 0, 1)` (`V2-12`; requires `state_width >= 2`).
+    #[must_use]
+    pub const fn emt_h1_adhesion_enabled(&self) -> bool {
+        match self.differentiation {
+            Some(diff) => diff.emt_adhesion_enabled && diff.state_width >= 2,
+            None => false,
+        }
     }
 
     /// Number of active Carrier-0 chemical channels (`24` under `V2-15`

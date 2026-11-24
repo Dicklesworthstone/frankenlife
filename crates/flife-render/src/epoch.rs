@@ -1692,6 +1692,8 @@ impl Epoch {
             polarities.clear();
         }
         let affinity_limit = world.trait_limits().affinity_norm();
+        let v2_rules = world.v2_rules();
+        let affinity_rotation = v2_rules.affinity_rotation_enabled();
         let mut organism_energy = 0.0_f64;
         let mut max_generation = 0_u32;
         let mut parameters = 0_u64;
@@ -1718,17 +1720,33 @@ impl Epoch {
             self.lineages.push(organism.lineage.get());
             self.generations.push(organism.generation.get());
             self.topologies.push(topology);
-            self.affinities.push(affinity_projection(
-                genome.traits().affinity(),
-                affinity_limit,
-            ));
+            // Live primary recurrent cell state `h_0` (matches `World::cell_states()`
+            // without allocating a temporary Vec per published epoch).
+            let h0 = organism
+                .held
+                .recurrent_state()
+                .first()
+                .copied()
+                .unwrap_or(0.0);
+            // Project live V2-12 effective metabolic affinity `a_eff(h_0)` when
+            // epigenetic affinity rotation is active (matches
+            // `World::effective_affinity(id)` with zero heap allocation).
+            if affinity_rotation && h0 != 0.0 {
+                let effective = flife_engine::effective_affinity(
+                    genome.traits(),
+                    h0,
+                    v2_rules,
+                    affinity_limit,
+                )?;
+                self.affinities
+                    .push(affinity_projection(&effective, affinity_limit));
+            } else {
+                self.affinities.push(affinity_projection(
+                    genome.traits().affinity(),
+                    affinity_limit,
+                ));
+            }
             if let Some(states) = &mut self.cell_states {
-                let h0 = organism
-                    .held
-                    .recurrent_state()
-                    .first()
-                    .copied()
-                    .unwrap_or(0.0);
                 states.push(quantize_cell_state(h0));
             }
             if let Some(polarities) = &mut self.polarities {

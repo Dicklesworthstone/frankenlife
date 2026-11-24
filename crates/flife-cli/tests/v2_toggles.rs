@@ -524,4 +524,100 @@ enabled = true
     assert!(org_no_pcp.get("polarity").is_none());
     assert!(org_no_pcp.get("polarity_strength").is_none());
     assert!(org_no_pcp.get("wedge_curvature").is_none());
+    assert!(org_no_pcp.get("epigenetic_state").is_none());
+    assert!(org_no_pcp.get("effective_affinity").is_none());
+    assert!(org_no_pcp.get("last_neighbor_h0").is_none());
+
+    // 10. `V2-12` (`epigenetic-recurrence` + `notch-delta`) CLI run with batched
+    //     `--controllers torch` & `flife inspect` exposes `epigenetic_state`,
+    //     `effective_affinity`, and `last_neighbor_h0` when enabled, and omits
+    //     all three when disabled (`--disable epigenetic-recurrence,notch-delta`).
+    let diff_path = dir.join("v2_diff.toml");
+    fs::write(
+        &diff_path,
+        ecology_toml(
+            "field-ecology-v2",
+            r#"
+[contact]
+diameter = 0.5
+stiffness = 0.75
+adhesion = 0.35
+adhesion_range = 2.0
+sweeps = 2
+
+[v2]
+profile = "minimal"
+
+[v2.differentiation]
+enabled = true
+state_width = 2
+epigenetic_gate_bias = 2.5
+state_inheritance = "asymmetric-stem-v1"
+
+[v2.differentiation.notch_delta]
+enabled = true
+mode = "sensor-neighbor-mean-v1"
+"#,
+        ),
+    )
+    .expect("diff toml");
+    let diff_cpu_dir = dir.join("diff_cpu");
+    let (status, diff_cpu_out, err) = flife(&[
+        "run",
+        text(&diff_path),
+        "--ticks",
+        "8",
+        "--every",
+        "0",
+        "--controllers",
+        "cpu",
+        "--run-dir",
+        text(&diff_cpu_dir),
+        "--checkpoint-every",
+        "8",
+        "--checkpoint-durability",
+        "process-crash",
+    ]);
+    assert_eq!(status, Some(0), "{err:?}");
+    let diff_torch_dir = dir.join("diff_torch");
+    let (status, diff_torch_out, err) = flife(&[
+        "run",
+        text(&diff_path),
+        "--ticks",
+        "8",
+        "--every",
+        "0",
+        "--controllers",
+        "torch",
+        "--run-dir",
+        text(&diff_torch_dir),
+        "--checkpoint-every",
+        "8",
+        "--checkpoint-durability",
+        "process-crash",
+    ]);
+    assert_eq!(status, Some(0), "{err:?}");
+    assert_eq!(
+        diff_torch_out.last().expect("torch end")["digest"],
+        diff_cpu_out.last().expect("cpu end")["digest"],
+        "V2-12 torch batched recurrent run must match cpu-reference bit-for-bit"
+    );
+    let (status, inspected_diff, err) = flife(&["inspect", text(&diff_cpu_dir)]);
+    assert_eq!(status, Some(0), "{err:?}");
+    let org_diff = inspected_diff
+        .iter()
+        .find(|record| record["record"] == "organism")
+        .expect("differentiated organism");
+    let epi = org_diff["epigenetic_state"]
+        .as_array()
+        .expect("epigenetic_state exposed");
+    assert_eq!(epi.len(), 2);
+    let eff = org_diff["effective_affinity"]
+        .as_array()
+        .expect("effective_affinity exposed");
+    assert_eq!(eff.len(), 32);
+    let neighbor_h0 = org_diff["last_neighbor_h0"]
+        .as_f64()
+        .expect("last_neighbor_h0 exposed");
+    assert!((-1.0..=1.0).contains(&neighbor_h0));
 }

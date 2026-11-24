@@ -1975,7 +1975,13 @@ impl SessionOwner {
                     Control::Status { id, reply } => {
                         let _ = reply.send_blocking(book.status(id).cloned());
                     }
-                    Control::Pause(reply) => pause.push(reply),
+                    Control::Pause(reply) => {
+                        if deferred.is_empty() {
+                            pause.push(reply);
+                        } else {
+                            deferred.push_back(Control::Pause(reply));
+                        }
+                    }
                     Control::Close(reply) => {
                         *suspending = false;
                         closing.push(reply);

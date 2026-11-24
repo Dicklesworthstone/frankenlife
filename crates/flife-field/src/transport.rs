@@ -1885,7 +1885,7 @@ impl DualCarrierRules {
             .unwrap_or(0.05 * world.decay_per_second);
         let trail_scale = c
             .trail_energy_density_scale
-            .unwrap_or(config.config().sensors.energy_density_scale);
+            .unwrap_or_else(|| config.config().sensors.energy_density_scale);
         Self::new(
             trail_diffusion,
             trail_decay,

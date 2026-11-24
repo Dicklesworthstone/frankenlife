@@ -95,6 +95,25 @@ struct RangeSummary {
     empty_cells: u64,
 }
 
+/// Carrier-0 moment slices plus optional Carrier-1 `(energy, moments)` slices.
+type CarrierMoments<'a> = (&'a [&'a [f32]], Option<(&'a [f32], &'a [&'a [f32]])>);
+
+fn split_carrier_moments<'a>(dual: bool, moments: &'a [&'a [f32]]) -> CarrierMoments<'a> {
+    if dual {
+        let c0_end = CARRIER0_MOMENT_CHANNELS as usize;
+        let c1_e_idx = (CARRIER1_ENERGY_PLANE - 1) as usize;
+        let c1_m_start = (CARRIER1_FIRST_MOMENT_PLANE - 1) as usize;
+        (
+            moments.get(..c0_end).unwrap_or(&[]),
+            moments
+                .get(c1_e_idx)
+                .map(|&e1| (e1, moments.get(c1_m_start..).unwrap_or(&[]))),
+        )
+    } else {
+        (moments, None)
+    }
+}
+
 impl FieldState {
     /// Check INV-01 and INV-02 on this field.
     ///
@@ -135,20 +154,7 @@ impl FieldState {
                 empty_cells: 0,
             });
         };
-        let dual = self.is_dual_carrier();
-        let (c0_moments, c1): (&[&[f32]], Option<(&[f32], &[&[f32]])>) = if dual {
-            let c0_end = CARRIER0_MOMENT_CHANNELS as usize;
-            let c1_e_idx = (CARRIER1_ENERGY_PLANE - 1) as usize;
-            let c1_m_start = (CARRIER1_FIRST_MOMENT_PLANE - 1) as usize;
-            (
-                moments.get(..c0_end).unwrap_or(&[]),
-                moments
-                    .get(c1_e_idx)
-                    .map(|&e1| (e1, moments.get(c1_m_start..).unwrap_or(&[]))),
-            )
-        } else {
-            (moments, None)
-        };
+        let (c0_moments, c1) = split_carrier_moments(self.is_dual_carrier(), moments);
         let width = u64::from(grid.cells_x());
         let cells = energy.len();
         let ranges = workers.min(cells / CELLS_PER_RANGE).max(1);
@@ -231,20 +237,7 @@ impl FieldState {
         let Some((energy, moments)) = planes.split_first() else {
             return scan;
         };
-        let dual = self.is_dual_carrier();
-        let (c0_moments, c1): (&[&[f32]], Option<(&[f32], &[&[f32]])>) = if dual {
-            let c0_end = CARRIER0_MOMENT_CHANNELS as usize;
-            let c1_e_idx = (CARRIER1_ENERGY_PLANE - 1) as usize;
-            let c1_m_start = (CARRIER1_FIRST_MOMENT_PLANE - 1) as usize;
-            (
-                moments.get(..c0_end).unwrap_or(&[]),
-                moments
-                    .get(c1_e_idx)
-                    .map(|&e1| (e1, moments.get(c1_m_start..).unwrap_or(&[]))),
-            )
-        } else {
-            (moments, None)
-        };
+        let (c0_moments, c1) = split_carrier_moments(self.is_dual_carrier(), moments);
         let width = u64::from(self.grid().cells_x());
         for index in 0..energy.len() {
             let checked = match c1 {
@@ -302,20 +295,7 @@ impl FieldState {
         let Some((energy, moments)) = planes.split_first() else {
             return Ok(Some(summary));
         };
-        let dual = self.is_dual_carrier();
-        let (c0_moments, c1): (&[&[f32]], Option<(&[f32], &[&[f32]])>) = if dual {
-            let c0_end = CARRIER0_MOMENT_CHANNELS as usize;
-            let c1_e_idx = (CARRIER1_ENERGY_PLANE - 1) as usize;
-            let c1_m_start = (CARRIER1_FIRST_MOMENT_PLANE - 1) as usize;
-            (
-                moments.get(..c0_end).unwrap_or(&[]),
-                moments
-                    .get(c1_e_idx)
-                    .map(|&e1| (e1, moments.get(c1_m_start..).unwrap_or(&[]))),
-            )
-        } else {
-            (moments, None)
-        };
+        let (c0_moments, c1) = split_carrier_moments(self.is_dual_carrier(), moments);
         let width = u64::from(self.grid().cells_x());
         if let Some(index) = scan.offending {
             if index >= energy.len() {

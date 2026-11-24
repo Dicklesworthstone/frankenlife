@@ -160,6 +160,20 @@ pub struct InspectedOrganism {
     /// when `V2-08` `pcp-polarity` is enabled; omitted when disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wedge_curvature: Option<f64>,
+    /// Bounded epigenetic recurrent state `h ∈ [-1, 1]^S` (including unevaluated
+    /// newborns carrying inherited state) when `V2-12` `epigenetic-recurrence`
+    /// is enabled; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epigenetic_state: Option<Vec<f64>>,
+    /// Effective metabolic affinity `a_eff(h_0)` when `V2-12`
+    /// `epigenetic-recurrence` with `affinity_rotation_enabled` is active;
+    /// omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_affinity: Option<Vec<f64>>,
+    /// Persisted kin-weighted mean neighbor `h̄_0 ∈ [-1, 1]` when `V2-12`
+    /// `notch-delta` is enabled; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_neighbor_h0: Option<f64>,
 }
 
 /// An organism's held controller outputs.
@@ -373,6 +387,9 @@ fn of(
         .v2
         .as_ref()
         .is_some_and(|v2| v2.is_enabled(V2Feature::PcpPolarity));
+    let differentiation = world.v2_rules().differentiation();
+    let affinity_rotation_active = world.v2_rules().affinity_rotation_enabled();
+    let notch_delta_active = world.v2_rules().notch_delta().is_some();
     let population = world.population();
     let mut organisms = Vec::new();
     let mut organism_energy = 0.0;
@@ -381,6 +398,21 @@ fn of(
             .genome(organism.id)
             .ok_or_else(|| conflict(format!("{} has no genome", organism.id)))?;
         organism_energy += organism.energy;
+        let epigenetic_state = differentiation.map(|diff| {
+            let state = organism.held.recurrent_state();
+            if state.is_empty() {
+                vec![0.0_f64; diff.state_width]
+            } else {
+                state.iter().map(|&value| f64::from(value)).collect()
+            }
+        });
+        let effective_affinity = if affinity_rotation_active {
+            world
+                .effective_affinity(organism.id)?
+                .map(|direction| direction.to_vec())
+        } else {
+            None
+        };
         organisms.push(InspectedOrganism {
             record: "organism",
             id: organism.id.get(),
@@ -418,6 +450,9 @@ fn of(
             wedge_curvature: polarity_active
                 .then(|| genome.traits().wedge_curvature())
                 .flatten(),
+            epigenetic_state,
+            effective_affinity,
+            last_neighbor_h0: notch_delta_active.then(|| f64::from(organism.last_neighbor_h0)),
         });
     }
     let state = world.field();

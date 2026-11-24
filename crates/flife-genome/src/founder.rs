@@ -23,7 +23,7 @@ use crate::catalog::{TopologyCatalog, TopologyId};
 use crate::draws::normals;
 use crate::genome::{
     AFFINITY_TERMS, CADHERIN_TERMS, CadherinTraits, Genome, MOTION_RESPONSE_TERMS, PolarityTraits,
-    TraitLimits, Traits, Unsealed, rescale,
+    TraitLimits, Traits, Unsealed, check_maximum_wedge_curvature, rescale,
 };
 use crate::init::{WeightAddress, initialize};
 use crate::quota::{GenomeQuota, ParameterBuffer, WeightsMut};
@@ -207,6 +207,7 @@ pub fn founder_polarity_traits(
             detail: format!("{initial_strength_max} is outside [0, 1]"),
         });
     }
+    check_maximum_wedge_curvature(maximum_wedge_curvature)?;
     let strength_lane = Lane::new(0, LaneKind::Direction, POLARITY_STRENGTH_LANE)?;
     let u_strength = half_open_unit(rng.block(address(organism, strength_lane))[0]);
     let polarity_strength = (u_strength * initial_strength_max).clamp(0.0, initial_strength_max);

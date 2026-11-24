@@ -1108,7 +1108,7 @@ impl Deposits {
         let moment_end = carrier
             .first_moment_plane
             .checked_add(carrier.moment_count)
-            .ok_or_else(|| CoreError::Overflow {
+            .ok_or(CoreError::Overflow {
                 quantity: "carrier moment planes",
             })?;
         let moment_count = carrier.moment_count as usize;

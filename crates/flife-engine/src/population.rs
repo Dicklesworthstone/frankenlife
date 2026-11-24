@@ -310,11 +310,17 @@ pub struct Organism {
     /// (`pcp-polarity`). Holds [`DEFAULT_POLARITY`] (`0 B` storage in
     /// [`Population`]) when `pcp-polarity` is disabled.
     pub polarity: [f64; 2],
+    /// Kin-weighted mean neighbor primary recurrent state `h̄_0 ∈ [-1, 1]`
+    /// from the previous tick's contact Sweep 1 (`V2-12`, `notch-delta`).
+    /// Holds `0.0` (`0 B` storage in [`Population`]) when `notch-delta` is
+    /// disabled.
+    pub last_neighbor_h0: f32,
 }
 
 impl Organism {
     /// The row a staged newborn commits as: zero velocity and history, and
-    /// no held output.
+    /// an invalid held output (`evaluated_at == None`, carrying optional
+    /// inherited epigenetic state under `V2-12`).
     #[must_use]
     pub const fn newborn(newborn: &Newborn) -> Self {
         Self {
@@ -328,12 +334,13 @@ impl Organism {
             velocity: newborn.velocity,
             energy: newborn.energy,
             energy_change_rate: newborn.energy_change_rate,
-            held: HeldOutput::INVALID,
+            held: newborn.held,
             phase: newborn.phase,
             cooldown_deadline: newborn.cooldown_deadline,
             secretory_readiness: INITIAL_SECRETORY_READINESS,
             emission_cooldown_deadline: Tick::new(0),
             polarity: newborn.polarity,
+            last_neighbor_h0: 0.0,
         }
     }
 
@@ -382,6 +389,17 @@ impl Organism {
                 detail: format!(
                     "{}: {} is outside [0, 1]",
                     self.id, self.secretory_readiness
+                ),
+            });
+        }
+        if !self.last_neighbor_h0.is_finite()
+            || !(-1.0_f32..=1.0_f32).contains(&self.last_neighbor_h0)
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "organism notch-delta neighbor state",
+                detail: format!(
+                    "{}: last_neighbor_h0 {} is outside [-1, 1]",
+                    self.id, self.last_neighbor_h0
                 ),
             });
         }
@@ -544,6 +562,10 @@ pub struct Population {
     /// `polarities` stays empty (0 bytes) and reads return [`DEFAULT_POLARITY`].
     tracks_polarity: bool,
     polarities: Vec<[f64; 2]>,
+    /// Whether `V2-12` Notch-Delta neighbor state column is active and allocated.
+    /// When `false`, `last_neighbor_h0` stays empty (0 bytes) and reads return `0.0`.
+    tracks_notch_delta: bool,
+    last_neighbor_h0: Vec<f32>,
     genomes: Vec<Option<Genome>>,
     /// Each slot's genome's arena slot, beside `genomes`.
     arena_slots: Vec<Option<ArenaSlot>>,
@@ -671,12 +693,40 @@ impl Population {
         tracks_excitable: bool,
         tracks_polarity: bool,
     ) -> Result<Self, CoreError> {
+        Self::new_with_v2_columns(
+            arrangement,
+            capacity,
+            tracks_excitable,
+            tracks_polarity,
+            false,
+        )
+    }
+
+    /// An empty population of at most `capacity` organisms, conditionally
+    /// allocating `V2-04` excitable-relay, `V2-08` polarity, and/or `V2-12`
+    /// Notch-Delta SoA columns up front (`INV-15`; `0 B` for any disabled
+    /// column).
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] when the host refuses a column.
+    pub fn new_with_v2_columns(
+        arrangement: Arrangement,
+        capacity: usize,
+        tracks_excitable: bool,
+        tracks_polarity: bool,
+        tracks_notch_delta: bool,
+    ) -> Result<Self, CoreError> {
         let (secretory_readiness, emission_cooldown_deadlines) = if tracks_excitable {
             (reserve(capacity)?, reserve(capacity)?)
         } else {
             (Vec::new(), Vec::new())
         };
         let polarities = if tracks_polarity {
+            reserve(capacity)?
+        } else {
+            Vec::new()
+        };
+        let last_neighbor_h0 = if tracks_notch_delta {
             reserve(capacity)?
         } else {
             Vec::new()
@@ -702,6 +752,8 @@ impl Population {
             emission_cooldown_deadlines,
             tracks_polarity,
             polarities,
+            tracks_notch_delta,
+            last_neighbor_h0,
             genomes: reserve(capacity)?,
             arena_slots: reserve(capacity)?,
             arena: GenomeArena::new(),
@@ -733,13 +785,30 @@ impl Population {
             .v2
             .as_ref()
             .is_some_and(|v2| v2.is_enabled(V2Feature::PcpPolarity));
-        Self::new_with_v2(arrangement, capacity, tracks_excitable, tracks_polarity)
+        let tracks_notch_delta = config
+            .config()
+            .v2
+            .as_ref()
+            .is_some_and(|v2| v2.is_enabled(V2Feature::NotchDelta));
+        Self::new_with_v2_columns(
+            arrangement,
+            capacity,
+            tracks_excitable,
+            tracks_polarity,
+            tracks_notch_delta,
+        )
     }
 
     /// Whether this population stores live `V2-08` PCP polarity vectors.
     #[must_use]
     pub const fn tracks_polarity(&self) -> bool {
         self.tracks_polarity
+    }
+
+    /// Whether this population stores live `V2-12` Notch-Delta neighbor states.
+    #[must_use]
+    pub const fn tracks_notch_delta(&self) -> bool {
+        self.tracks_notch_delta
     }
 
     /// The arrangement.
@@ -773,6 +842,7 @@ impl Population {
             capacity_bytes(&self.secretory_readiness),
             capacity_bytes(&self.emission_cooldown_deadlines),
             capacity_bytes(&self.polarities),
+            capacity_bytes(&self.last_neighbor_h0),
             capacity_bytes(&self.genomes),
             capacity_bytes(&self.arena_slots),
         ])
@@ -1257,6 +1327,10 @@ impl Population {
                     bytes.push(0);
                 }
             }
+            if self.tracks_notch_delta {
+                bytes.push(6);
+                bytes.extend_from_slice(&organism.last_neighbor_h0.to_bits().to_le_bytes());
+            }
         }
         Sha256Digest::of(&bytes)
     }
@@ -1408,6 +1482,11 @@ impl Population {
         } else {
             DEFAULT_POLARITY
         };
+        let last_neighbor_h0 = if self.tracks_notch_delta {
+            self.last_neighbor_h0[slot]
+        } else {
+            0.0
+        };
         Organism {
             id: self.occupants[slot].unwrap_or(OrganismId::new(u64::MAX)),
             genome: self.genome_ids[slot],
@@ -1425,6 +1504,7 @@ impl Population {
             secretory_readiness,
             emission_cooldown_deadline,
             polarity,
+            last_neighbor_h0,
         }
     }
 
@@ -1450,6 +1530,9 @@ impl Population {
         if self.tracks_polarity {
             self.polarities[slot] = organism.polarity;
         }
+        if self.tracks_notch_delta {
+            self.last_neighbor_h0[slot] = organism.last_neighbor_h0;
+        }
     }
 
     /// Append a slot, within the reserved capacity.
@@ -1474,6 +1557,9 @@ impl Population {
         }
         if self.tracks_polarity {
             self.polarities.push(organism.polarity);
+        }
+        if self.tracks_notch_delta {
+            self.last_neighbor_h0.push(organism.last_neighbor_h0);
         }
     }
 
@@ -1524,6 +1610,9 @@ impl Population {
         }
         if self.tracks_polarity {
             self.polarities.truncate(length);
+        }
+        if self.tracks_notch_delta {
+            self.last_neighbor_h0.truncate(length);
         }
         self.genomes.truncate(length);
         self.arena_slots.truncate(length);

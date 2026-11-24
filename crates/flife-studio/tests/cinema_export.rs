@@ -469,8 +469,30 @@ fn g10_validate_timeline_catches_corruption_and_enforces_v2_visual_gate_before_w
     };
     let v1_header = TimelineRecord::header(&v1_cfg, [320, 200], Style::default());
 
-    // 1. Structural & monotonicity refusals.
-    let bad_cases: [(&str, Vec<TimelineRecord>); 8] = [
+    // 1. Structural, camera-view & monotonicity refusals.
+    let bad_cases: [(&str, Vec<TimelineRecord>); 10] = [
+        (
+            "non-finite viewport center",
+            vec![
+                v1_header.clone(),
+                TimelineRecord::View {
+                    center: [Exact(f64::NAN), Exact(16.0)],
+                    zoom: Exact(1.0),
+                },
+                end(0),
+            ],
+        ),
+        (
+            "zoom below 1",
+            vec![
+                v1_header.clone(),
+                TimelineRecord::View {
+                    center: [Exact(16.0), Exact(16.0)],
+                    zoom: Exact(0.5),
+                },
+                end(0),
+            ],
+        ),
         (
             "duplicate header",
             vec![v1_header.clone(), v1_header.clone(), end(0)],

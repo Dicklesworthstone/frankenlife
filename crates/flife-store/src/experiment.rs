@@ -120,31 +120,33 @@ impl ExperimentCatalog {
     /// experiment.
     pub fn open(path: &Path, experiment: &str, design: &str) -> Result<Self, CoreError> {
         let location = path.display().to_string();
-        let connection = block_on_inline(async {
-            let fail = |operation, error: &FrankenError| storage(operation, path, error);
-            let connection = Connection::open(location)
-                .await
-                .map_err(|error| fail("open experiment catalog", &error))?;
-            connection
-                .query("PRAGMA journal_mode = WAL")
-                .await
-                .map_err(|error| fail("set journal mode", &error))?;
-            connection
-                .execute("PRAGMA synchronous = FULL")
-                .await
-                .map_err(|error| fail("set synchronous mode", &error))?;
-            for statement in MARKER {
-                connection
-                    .execute(statement)
-                    .await
-                    .map_err(|error| fail("create experiment catalog schema", &error))?;
-            }
-            Ok::<_, CoreError>(connection)
-        })?;
+        let connection = block_on_inline(Connection::open(location))
+            .map_err(|error| storage("open experiment catalog", path, &error))?;
         let catalog = Self {
             connection,
             path: path.to_path_buf(),
         };
+        block_on_inline(async {
+            let fail = |operation, error: &FrankenError| storage(operation, &catalog.path, error);
+            catalog
+                .connection
+                .query("PRAGMA journal_mode = WAL")
+                .await
+                .map_err(|error| fail("set journal mode", &error))?;
+            catalog
+                .connection
+                .execute("PRAGMA synchronous = FULL")
+                .await
+                .map_err(|error| fail("set synchronous mode", &error))?;
+            for statement in MARKER {
+                catalog
+                    .connection
+                    .execute(statement)
+                    .await
+                    .map_err(|error| fail("create experiment catalog schema", &error))?;
+            }
+            Ok::<_, CoreError>(())
+        })?;
         let format = catalog.value("format")?;
         if format.as_deref() != Some(EXPERIMENT_CATALOG_FORMAT) {
             return Err(CoreError::SchemaMismatch {
@@ -350,10 +352,10 @@ impl ExperimentCatalog {
             .map_err(|error| storage(operation, &self.path, &error))?;
         match body(&self.connection).await {
             Ok(value) => {
-                self.connection
-                    .execute("COMMIT")
-                    .await
-                    .map_err(|error| storage(operation, &self.path, &error))?;
+                if let Err(error) = self.connection.execute("COMMIT").await {
+                    let _ = self.connection.execute("ROLLBACK").await;
+                    return Err(storage(operation, &self.path, &error));
+                }
                 Ok(value)
             }
             Err(error) => {

@@ -248,7 +248,7 @@ fn opening_admission_matches_frame_one_at_fractional_and_os_resized_surfaces() {
 }
 
 #[test]
-fn recurrent_studio_auto_admits_cpu_without_batched_budget_and_refuses_explicit_batched() {
+fn recurrent_studio_auto_admits_batched_within_budget_and_refuses_tight_budget() {
     let recurrent_toml = PRESET
         .replace(
             "family = \"independent-dense-mlp-v1\"",
@@ -265,8 +265,10 @@ fn recurrent_studio_auto_admits_cpu_without_batched_budget_and_refuses_explicit_
     let mut view = WorldView::for_epoch(&founding, [640, 400], [0, 0, 0]).expect("a view");
     view.enable_overlay();
 
-    // Auto routes recurrent worlds to the CPU reference (`backend == 0`) so
-    // Studio never starves observer headroom or installs an MLP-only backend.
+    // V2-12 unlocked batched Metal & FrankenTorch execution for recurrent
+    // worlds: admit all controller choices before installing a backend (since
+    // installing a batched backend reserves scratch inside `world.footprint()`),
+    // then verify each route installs and steps cleanly within FL-043 peak memory.
     let auto = admit_kept_at(
         &world,
         ControllerChoice::Auto,
@@ -277,20 +279,136 @@ fn recurrent_studio_auto_admits_cpu_without_batched_budget_and_refuses_explicit_
         0,
     )
     .expect("recurrent Auto admits");
-    assert_eq!(auto.backend, 0);
-    assert!(observer_limit(&auto) > auto.render);
+    let cpu = admit_kept_at(
+        &world,
+        ControllerChoice::Cpu,
+        &founding,
+        &view,
+        [1280, 800],
+        2.0,
+        0,
+    )
+    .expect("recurrent Cpu admits");
+    let torch = admit_kept_at(
+        &world,
+        ControllerChoice::Torch,
+        &founding,
+        &view,
+        [1280, 800],
+        2.0,
+        0,
+    )
+    .expect("recurrent Torch admits");
+    let metal = admit_kept_at(
+        &world,
+        ControllerChoice::Metal,
+        &founding,
+        &view,
+        [1280, 800],
+        2.0,
+        0,
+    )
+    .expect("recurrent Metal admits");
+
+    assert!(auto.backend > 0);
+    assert_eq!(auto.backend, auto.budget_bytes - auto.fixed_bytes());
+    assert_eq!(observer_limit(&auto), auto.render);
+    assert_eq!(torch.backend, auto.backend);
+    assert_eq!(metal.backend, auto.backend);
+    assert_eq!(cpu.backend, 0);
+    assert!(observer_limit(&cpu) > cpu.render);
+
     flife_cli::run::install(&mut world, ControllerChoice::Auto, auto.backend)
-        .expect("recurrent Auto installs CPU reference");
+        .expect("recurrent Auto installs batched backend");
+    assert!(
+        world.controller_report().backend.is_some(),
+        "V2-12 Auto on 1-worker recurrent world must install Metal or Torch"
+    );
+    world.step().expect("recurrent Auto tick");
+    assert!(world.controller_report().batched > 0);
+    assert_eq!(world.controller_report().deferred, 0);
+
+    // Explicit Cpu switches back to CPU reference cleanly.
+    flife_cli::run::install(&mut world, ControllerChoice::Cpu, cpu.backend)
+        .expect("recurrent Cpu installs reference");
     assert!(world.controller_report().backend.is_none());
 
-    // Explicit batched choices refuse cleanly before opening a session.
-    for explicit in [ControllerChoice::Torch, ControllerChoice::Metal] {
-        let err = flife_cli::run::install(&mut world, explicit, 64 << 20)
-            .expect_err("explicit batched choice on recurrent world must refuse");
-        assert!(
-            matches!(err, CoreError::MissingCapability { .. }),
-            "expected MissingCapability for {explicit:?}, got {err:?}"
-        );
+    // Explicit Torch and Metal execute recurrent batches cleanly (Metal may
+    // report MissingCapability on hosts without a Metal device).
+    flife_cli::run::install(&mut world, ControllerChoice::Torch, torch.backend)
+        .expect("recurrent Torch installs");
+    assert!(world.controller_report().backend.is_some());
+    let before_torch = world.controller_report().batched;
+    world.step().expect("recurrent Torch tick");
+    assert!(world.controller_report().batched > before_torch);
+    assert_eq!(world.controller_report().deferred, 0);
+
+    match flife_cli::run::install(&mut world, ControllerChoice::Metal, metal.backend) {
+        Ok(()) => {
+            assert!(world.controller_report().backend.is_some());
+            let before_metal = world.controller_report().batched;
+            world.step().expect("recurrent Metal tick");
+            assert!(world.controller_report().batched > before_metal);
+            assert_eq!(world.controller_report().deferred, 0);
+        }
+        Err(CoreError::MissingCapability { .. }) => {}
+        Err(other) => panic!("unexpected recurrent Metal install error: {other:?}"),
+    }
+
+    // Tight budget below the batched fixed footprint refuses Auto, Torch, and
+    // Metal honestly before opening a session, while Cpu still fits when its
+    // smaller unbatched footprint stays under the cap.
+    let tight_limit = auto.fixed_bytes().saturating_sub(1);
+    let tight_toml = recurrent_toml
+        .lines()
+        .map(|line| {
+            if line.split('=').next().map(str::trim) == Some("maximum_total_bytes") {
+                format!("maximum_total_bytes = {tight_limit}")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tight_config = ValidatedConfig::from_toml(&tight_toml).expect("valid tight recurrent toml");
+    let tight_world = found(&tight_config);
+    let tight_founding = Epoch::standalone(&tight_world).expect("tight epoch");
+    let mut tight_view =
+        WorldView::for_epoch(&tight_founding, [640, 400], [0, 0, 0]).expect("tight view");
+    tight_view.enable_overlay();
+
+    for batched in [
+        ControllerChoice::Auto,
+        ControllerChoice::Torch,
+        ControllerChoice::Metal,
+    ] {
+        match admit_kept_at(
+            &tight_world,
+            batched,
+            &tight_founding,
+            &tight_view,
+            [1280, 800],
+            2.0,
+            0,
+        ) {
+            Err(CoreError::BudgetExhausted { budget, .. }) => {
+                assert!(budget.starts_with("peak memory"), "{batched:?}: {budget}");
+            }
+            other => panic!("expected peak-memory refusal for {batched:?}, got {other:?}"),
+        }
+    }
+    if cpu.fixed_bytes() <= tight_limit {
+        let admitted_cpu = admit_kept_at(
+            &tight_world,
+            ControllerChoice::Cpu,
+            &tight_founding,
+            &tight_view,
+            [1280, 800],
+            2.0,
+            0,
+        )
+        .expect("unbatched Cpu still fits tight budget");
+        assert_eq!(admitted_cpu.backend, 0);
     }
 }
 

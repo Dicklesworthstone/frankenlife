@@ -503,26 +503,16 @@ pub fn capabilities(
     let ((), torch) = run_route(config, ControllerChoice::Torch, options, |_| ())?;
     let ((), metal) = run_route(config, ControllerChoice::Metal, options, |_| ())?;
 
-    let recurrent = config.config().controller.recurrent_state_width.is_some();
-    let metal_device = if recurrent {
-        None
-    } else {
-        match &metal {
-            Outcome::Ran { .. } | Outcome::Failed(_) => Some(true),
-            Outcome::Unavailable(_) => Some(false),
-            Outcome::Refused(_) => None,
-        }
+    let metal_device = match &metal {
+        Outcome::Ran { .. } | Outcome::Failed(_) => Some(true),
+        Outcome::Unavailable(_) => Some(false),
+        Outcome::Refused(_) => None,
     };
     let auto = Auto {
         cpu_workers,
         metal_device,
-        takes: if recurrent {
-            Some("cpu")
-        } else {
-            metal_device.map(|device| {
-                route_name(ControllerChoice::auto_for(cpu_workers, device, organisms))
-            })
-        },
+        takes: metal_device
+            .map(|device| route_name(ControllerChoice::auto_for(cpu_workers, device, organisms))),
     };
     let controllers = vec![
         reference_route(&reference, pinned),

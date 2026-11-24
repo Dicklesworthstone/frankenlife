@@ -78,6 +78,20 @@ impl Shared {
             .clone()
     }
 
+    /// The latest epoch's identity and tick without bumping its `Arc` strong
+    /// count, so peeking can never race `Publisher::offer`'s `Arc::get_mut` or
+    /// strand a pending boundary without a lease-release notification.
+    fn latest_prior(&self) -> Option<Prior> {
+        self.latest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|epoch| Prior {
+                id: epoch.id(),
+                tick: epoch.tick(),
+            })
+    }
+
     fn replace(&self, epoch: Arc<Epoch>) -> Option<Arc<Epoch>> {
         self.latest
             .lock()
@@ -402,13 +416,11 @@ impl Feed {
         self.shared.closed.load(Ordering::Acquire)
     }
 
-    /// The latest epoch's identity and tick, without leasing it.
+    /// The latest epoch's identity and tick, without leasing it or bumping its
+    /// slot reference count.
     #[must_use]
     pub fn latest(&self) -> Option<Prior> {
-        self.shared.latest().map(|epoch| Prior {
-            id: epoch.id(),
-            tick: epoch.tick(),
-        })
+        self.shared.latest_prior()
     }
 }
 
@@ -442,18 +454,26 @@ impl Viewer {
     }
 
     /// Lease the latest epoch if it is newer than `seen`; otherwise take
-    /// nothing from the budget.
+    /// nothing from the budget and never bump the slot's reference count.
     ///
     /// # Errors
     /// As [`Viewer::latest`].
     pub fn latest_after(&self, seen: RenderEpoch) -> Result<Option<Lease>, CoreError> {
-        match self.shared.latest() {
-            Some(epoch) if epoch.id() > seen => {
-                self.take()?;
-                Ok(Some(self.lease(epoch)))
+        let epoch = {
+            let guard = self
+                .shared
+                .latest
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match guard.as_ref() {
+                Some(epoch) if epoch.id() > seen => {
+                    self.take()?;
+                    Arc::clone(epoch)
+                }
+                _ => return Ok(None),
             }
-            _ => Ok(None),
-        }
+        };
+        Ok(Some(self.lease(epoch)))
     }
 
     /// Leases held now.

@@ -86,7 +86,13 @@ impl LayerShape {
     #[must_use]
     pub const fn weight(&self, output: usize, input: usize) -> Option<usize> {
         if output < self.outputs && input < self.inputs {
-            Some(self.weights + output * self.inputs + input)
+            match output.checked_mul(self.inputs) {
+                Some(row) => match row.checked_add(input) {
+                    Some(offset) => self.weights.checked_add(offset),
+                    None => None,
+                },
+                None => None,
+            }
         } else {
             None
         }
@@ -96,7 +102,7 @@ impl LayerShape {
     #[must_use]
     pub const fn bias(&self, output: usize) -> Option<usize> {
         if output < self.outputs {
-            Some(self.biases + output)
+            self.biases.checked_add(output)
         } else {
             None
         }
@@ -105,7 +111,7 @@ impl LayerShape {
     /// One past this layer's last parameter.
     #[must_use]
     pub const fn end(&self) -> usize {
-        self.biases + self.outputs
+        self.biases.saturating_add(self.outputs)
     }
 }
 
@@ -312,6 +318,7 @@ pub fn update_recurrent_state(
         }
     }
     let (raw_candidates, raw_gates) = raw_tail.split_at(width);
+    let mut computed = [0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
     for k in 0..width {
         let z_c = raw_candidates[k];
         if !z_c.is_finite() {
@@ -353,8 +360,9 @@ pub fn update_recurrent_state(
                 detail: format!("next_state[{k}] is {updated}"),
             });
         }
-        next_state[k] = updated;
+        computed[k] = updated;
     }
+    next_state.copy_from_slice(&computed[..width]);
     Ok(())
 }
 
@@ -1063,6 +1071,12 @@ impl<'a> ReferenceController<'a> {
                     state.len(),
                     next_state.len()
                 ),
+            });
+        }
+        if !gate_bias.is_finite() {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "recurrent gate bias",
+                detail: format!("gate bias {gate_bias} is not finite"),
             });
         }
         let mut rounded = [0.0_f32; MAX_SENSOR_WIDTH];

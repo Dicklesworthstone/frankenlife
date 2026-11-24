@@ -1535,6 +1535,12 @@ pub fn demands_on(
             rule.half_saturation_density,
             density,
         )?;
+        if !request.is_finite() || request < 0.0 {
+            return Err(backend_conflict(format!(
+                "organism {} request {request} is not finite and nonnegative",
+                demand.organism.get()
+            )));
+        }
         demand.amount = request;
     }
     Ok(())
@@ -1614,6 +1620,11 @@ fn resolve_on(
     for (((cell, range), occupied), &demand) in
         bins.occupied().zip(cells.iter()).zip(demanded.iter())
     {
+        if !demand.is_finite() || demand < 0.0 {
+            return Err(backend_conflict(format!(
+                "cell {cell} demand sum {demand} is not finite and nonnegative"
+            )));
+        }
         let at = cell_target(occupied.energy, demand);
         let (Some(shares), Some(group)) = (quanta.get(range.clone()), packets.get_mut(range))
         else {

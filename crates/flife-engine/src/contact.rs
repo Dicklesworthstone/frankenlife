@@ -90,10 +90,11 @@ pub struct PcpSweepParams {
 }
 
 /// Optional `field-ecology-v2` Sweep-1 context (`V2-08` PCP polarity + EMT
-/// adhesion gate, clean extension seam for `V2-12` and `V2-13`).
+/// adhesion gate, `V2-12` Notch-Delta neighbor averaging, clean extension seam
+/// for `V2-13`).
 ///
-/// When both `pcp` and `emt_factors` are `None`, Sweep 1 dispatches directly
-/// to the baseline isotropic [`relax`] kernel bit-for-bit.
+/// When `pcp`, `emt_factors`, and `cell_states_h0` are all `None`, Sweep 1
+/// dispatches directly to the baseline isotropic [`relax`] kernel bit-for-bit.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Sweep1Context<'a> {
     /// Active `V2-08` PCP polarity parameters, if `pcp-polarity` is enabled.
@@ -106,9 +107,12 @@ pub struct Sweep1Context<'a> {
     pub wedge_curvatures: Option<&'a [f64]>,
     /// Observed energy gradients `∇q_i` (`gradients[0]`, length `N`).
     pub energy_gradients: Option<&'a [[f64; 2]]>,
-    /// Neural EMT adhesion multipliers `emt_eff_i = 2 σ(o_adh)` (length `N`),
-    /// if `emt-gate` is enabled.
+    /// Combined EMT adhesion multipliers `emt_eff_i` (from `V2-08` `2 σ(o_adh)`
+    /// and/or `V2-12` `m(h_1) = clamp(1 + h_1, 0, 1)`, length `N`), if active.
     pub emt_factors: Option<&'a [f64]>,
+    /// Post-Phase-4 primary recurrent cell states `h_0 ∈ [-1, 1]` (length `N`),
+    /// if `V2-12` (`notch-delta`) is enabled.
+    pub cell_states_h0: Option<&'a [f32]>,
 }
 
 /// Mutable Sweep-1 outputs written by [`relax_sweep1_with_context`].
@@ -119,6 +123,9 @@ pub struct Sweep1Output<'a> {
     /// Updated unit polarity vectors `p'_i ∈ S^1` when `pcp-polarity` is active
     /// (length `N`); `None` when disabled.
     pub next_polarities: Option<&'a mut Vec<[f64; 2]>>,
+    /// Kin-weighted mean neighbor cell state `h̄_i ∈ [-1, 1]` when `V2-12`
+    /// (`notch-delta`) is active (length `N`); `None` when disabled.
+    pub neighbor_h0: Option<&'a mut Vec<f32>>,
 }
 
 /// Pure `V2-08` PCP lateral + wedge adhesion modulation factor
@@ -357,8 +364,14 @@ pub struct ContactWork {
     pub wedge_curvatures: Vec<f64>,
     /// Observed energy gradients `∇q_i` (`V2-08`; empty / `0 B` when off).
     pub energy_gradients: Vec<[f64; 2]>,
-    /// Neural EMT adhesion multipliers `2 σ(o_adh)` (`V2-08`; empty / `0 B` when off).
+    /// Combined EMT adhesion multipliers (`V2-08` / `V2-12`; empty / `0 B` when off).
     pub emt_factors: Vec<f64>,
+    /// Post-Phase-4 primary recurrent cell states `h_0` (`V2-12` `notch-delta`;
+    /// empty / `0 B` when off).
+    pub cell_states_h0: Vec<f32>,
+    /// Kin-weighted mean neighbor cell states `h̄_0` computed on Sweep 1 (`V2-12`
+    /// `notch-delta`; empty / `0 B` when off).
+    pub neighbor_h0: Vec<f32>,
     /// Each one's displacement, zero for those that die: the sum of its
     /// sweeps'.
     pub displacements: Vec<[f64; 2]>,
@@ -396,12 +409,13 @@ impl ContactWork {
         rules: &ContactRules,
         rows: usize,
     ) -> Result<Self, CoreError> {
-        Self::with_capacity_v2(grid, rules, rows, false, false)
+        Self::with_capacity_v2(grid, rules, rows, false, false, false)
     }
 
     /// Buffers for `rows` organisms on `grid` under `rules`, additionally
-    /// reserving `V2-08` PCP polarity and/or EMT adhesion gate scratch ONLY
-    /// when enabled (`0 B` when disabled, `INV-15`).
+    /// reserving `V2-08` PCP polarity, `V2-08`/`V2-12` EMT adhesion multipliers,
+    /// and/or `V2-12` Notch-Delta scratch ONLY when enabled (`0 B` when
+    /// disabled, `INV-15`).
     ///
     /// # Errors
     /// [`CoreError::AllocationFailed`] when a reservation fails.
@@ -411,11 +425,12 @@ impl ContactWork {
         rows: usize,
         pcp_polarity: bool,
         emt_gate: bool,
+        notch_delta: bool,
     ) -> Result<Self, CoreError> {
         // Later sweeps push only, binned at the diameter: never fewer bins.
         let reach = if rules.sweeps > 1 {
             rules.diameter
-        } else if pcp_polarity {
+        } else if pcp_polarity || notch_delta {
             rules.diameter * rules.range
         } else {
             rules.reach()
@@ -425,7 +440,7 @@ impl ContactWork {
         reserve(&mut work.positions, rows, "contact positions")?;
         reserve(&mut work.ids, rows, "contact identities")?;
         reserve(&mut work.alive, rows, "contact fates")?;
-        if rules.adheres() || pcp_polarity {
+        if rules.adheres() || pcp_polarity || notch_delta {
             reserve(&mut work.affinities, rows, "contact affinities")?;
         }
         if pcp_polarity {
@@ -441,6 +456,10 @@ impl ContactWork {
         }
         if emt_gate {
             reserve(&mut work.emt_factors, rows, "contact emt factors")?;
+        }
+        if notch_delta {
+            reserve(&mut work.cell_states_h0, rows, "contact cell states h0")?;
+            reserve(&mut work.neighbor_h0, rows, "contact neighbor h0")?;
         }
         reserve(&mut work.displacements, rows, "contact displacements")?;
         if rules.sweeps > 1 {
@@ -471,6 +490,8 @@ impl ContactWork {
             bytes(&self.wedge_curvatures),
             bytes(&self.energy_gradients),
             bytes(&self.emt_factors),
+            bytes(&self.cell_states_h0),
+            bytes(&self.neighbor_h0),
             bytes(&self.displacements),
             bytes(&self.pressed),
             bytes(&self.settled),
@@ -498,12 +519,13 @@ impl ContactWork {
         rules: &ContactRules,
         workers: usize,
     ) -> Result<(), CoreError> {
-        self.relax_v2(grid, rules, None, false, workers)
+        self.relax_v2(grid, rules, None, false, false, workers)
     }
 
-    /// [`Self::relax`] extended with optional `V2-08` PCP polarity (`pcp`) and
-    /// `emt-gate` (`emt_gate`) on Sweep 1. When both `pcp.is_none()` and
-    /// `!emt_gate`, runs the exact baseline isotropic [`relax`] path
+    /// [`Self::relax`] extended with optional `V2-08` PCP polarity (`pcp`),
+    /// `V2-08`/`V2-12` EMT adhesion multipliers (`emt_gate`), and `V2-12`
+    /// Notch-Delta neighbor averaging (`notch_delta`) on Sweep 1. When all
+    /// three are disabled, runs the exact baseline isotropic [`relax`] path
     /// bit-for-bit. Sweeps `2..S` remain strictly push-only (`d < D`).
     ///
     /// # Errors
@@ -514,6 +536,7 @@ impl ContactWork {
         rules: &ContactRules,
         pcp: Option<PcpSweepParams>,
         emt_gate: bool,
+        notch_delta: bool,
         workers: usize,
     ) -> Result<(), CoreError> {
         let Self {
@@ -527,14 +550,17 @@ impl ContactWork {
             wedge_curvatures,
             energy_gradients,
             emt_factors,
+            cell_states_h0,
+            neighbor_h0,
             displacements,
             pressed,
             settled,
             sweep,
             scratch,
         } = self;
-        let has_v2 = pcp.is_some() || emt_gate;
-        let sweep1_affinities = (rules.adheres() || pcp.is_some()).then_some(affinities.as_slice());
+        let has_v2 = pcp.is_some() || emt_gate || notch_delta;
+        let sweep1_affinities =
+            (rules.adheres() || pcp.is_some() || notch_delta).then_some(affinities.as_slice());
         let ctx = Sweep1Context {
             pcp,
             polarities: pcp.map(|_| polarities.as_slice()),
@@ -542,6 +568,7 @@ impl ContactWork {
             wedge_curvatures: pcp.map(|_| wedge_curvatures.as_slice()),
             energy_gradients: pcp.map(|_| energy_gradients.as_slice()),
             emt_factors: emt_gate.then_some(emt_factors.as_slice()),
+            cell_states_h0: notch_delta.then_some(cell_states_h0.as_slice()),
         };
         if rules.sweeps <= 1 {
             if has_v2 {
@@ -558,6 +585,7 @@ impl ContactWork {
                     Sweep1Output {
                         displacements,
                         next_polarities: pcp.map(|_| next_polarities),
+                        neighbor_h0: notch_delta.then_some(neighbor_h0),
                     },
                     scratch,
                     workers,
@@ -611,6 +639,7 @@ impl ContactWork {
                     Sweep1Output {
                         displacements: sweep,
                         next_polarities: pcp.map(|_| &mut *next_polarities),
+                        neighbor_h0: notch_delta.then_some(&mut *neighbor_h0),
                     },
                     scratch,
                     workers,
@@ -1013,7 +1042,7 @@ pub fn relax_sweep1_with_context(
     scratch: &mut ContactScratch,
     workers: usize,
 ) -> Result<(), CoreError> {
-    if context.pcp.is_none() && context.emt_factors.is_none() {
+    if context.pcp.is_none() && context.emt_factors.is_none() && context.cell_states_h0.is_none() {
         return relax(grid, rules, bodies, output.displacements, scratch, workers);
     }
     rules.check()?;
@@ -1034,13 +1063,14 @@ pub fn relax_sweep1_with_context(
             ),
         });
     }
-    let needs_affinities = rules.adheres() || context.pcp.is_some();
+    let needs_affinities =
+        rules.adheres() || context.pcp.is_some() || context.cell_states_h0.is_some();
     let affinities = match (needs_affinities, affinities) {
         (true, Some(affinities)) if affinities.len() == count => Some(affinities),
         (true, _) => {
             return Err(CoreError::StateConflict {
                 operation: "contact",
-                detail: format!("adhesion/pcp needs one affinity per body, of {count}"),
+                detail: format!("adhesion/pcp/notch-delta needs one affinity per body, of {count}"),
             });
         }
         (false, _) => None,
@@ -1116,6 +1146,32 @@ pub fn relax_sweep1_with_context(
         }
         None => None,
     };
+    let notch_h0 = match context.cell_states_h0 {
+        Some(states) if states.len() == count => {
+            for (index, &value) in states.iter().enumerate() {
+                if !value.is_finite() || !(-1.0_f32..=1.0_f32).contains(&value) {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "notch-delta cell state h0",
+                        detail: format!("body {index} has invalid h0 {value:?} outside [-1, 1]"),
+                    });
+                }
+            }
+            if output.neighbor_h0.is_none() {
+                return Err(CoreError::StateConflict {
+                    operation: "contact",
+                    detail: "notch-delta Sweep1Output requires neighbor_h0 buffer".to_owned(),
+                });
+            }
+            Some(states)
+        }
+        Some(states) => {
+            return Err(CoreError::StateConflict {
+                operation: "contact",
+                detail: format!("{} cell_states_h0 entries for {count} bodies", states.len()),
+            });
+        }
+        None => None,
+    };
 
     let ContactRules {
         diameter,
@@ -1127,7 +1183,7 @@ pub fn relax_sweep1_with_context(
         ..
     } = *rules;
     let adheres = rules.adheres();
-    let reach = if adheres || pcp_inputs.is_some() {
+    let reach = if adheres || pcp_inputs.is_some() || notch_h0.is_some() {
         diameter * range
     } else {
         diameter
@@ -1180,6 +1236,7 @@ pub fn relax_sweep1_with_context(
     let Sweep1Output {
         displacements,
         mut next_polarities,
+        mut neighbor_h0,
     } = output;
     displacements.clear();
     displacements.resize(count, [0.0, 0.0]);
@@ -1195,6 +1252,10 @@ pub fn relax_sweep1_with_context(
             pol_out.resize(count, [1.0, 0.0]);
         }
     }
+    if let Some(notch_out) = neighbor_h0.as_deref_mut() {
+        notch_out.clear();
+        notch_out.resize(count, 0.0_f32);
+    }
 
     let push_factor = 0.5 * stiffness;
     let pull_factor = if adheres {
@@ -1207,13 +1268,13 @@ pub fn relax_sweep1_with_context(
     let (half_width, half_height) = (0.5 * width, 0.5 * height);
     let (starts, members, bins) = (&*starts, &*members, &*bins);
 
-    type BodyEval = ([f64; 2], [f64; 2], [f64; 2]);
+    type BodyEval = ([f64; 2], [f64; 2], [f64; 2], f32);
     let eval_body = |index: usize| -> Result<BodyEval, CoreError> {
         let current_pol =
             pcp_inputs.map_or([1.0, 0.0], |(_, polarities, _, _, _)| polarities[index]);
         let bin = bins[index];
         if bin == usize::MAX {
-            return Ok(([0.0, 0.0], [0.0, 0.0], current_pol));
+            return Ok(([0.0, 0.0], [0.0, 0.0], current_pol, 0.0_f32));
         }
         let here = positions[index];
         let (bx, by) = (bin % bins_x, bin / bins_x);
@@ -1222,6 +1283,8 @@ pub fn relax_sweep1_with_context(
         let mut sum = [0.0_f64, 0.0_f64];
         let mut overlapping = [0.0_f64, 0.0_f64];
         let mut tau_neighbors = 0.0_f64;
+        let mut notch_num = 0.0_f64;
+        let mut notch_den = 0.0_f64;
         for &row in &rows[..row_count] {
             for &column in &columns[..column_count] {
                 let neighbour = row * bins_x + column;
@@ -1313,6 +1376,15 @@ pub fn relax_sweep1_with_context(
                             tau_neighbors += alpha_ij * w_torque * pair_term;
                         }
                     }
+                    if let Some(states_h0) = notch_h0
+                        && in_reach
+                    {
+                        let kin_pos = kin_weight.unwrap_or(0.0).max(0.0);
+                        if kin_pos > 0.0 {
+                            notch_num += kin_pos * f64::from(states_h0[other]);
+                            notch_den += kin_pos;
+                        }
+                    }
                 }
             }
         }
@@ -1333,22 +1405,32 @@ pub fn relax_sweep1_with_context(
         } else {
             current_pol
         };
-        Ok((sum, overlapping, next_pol))
+        let next_notch = if notch_h0.is_some() {
+            let value = ((notch_num / notch_den.max(1.0e-6)) as f32).clamp(-1.0_f32, 1.0_f32);
+            if value == 0.0 { 0.0 } else { value }
+        } else {
+            0.0_f32
+        };
+        Ok((sum, overlapping, next_pol, next_notch))
     };
 
     let fill = |first: usize,
                 out: &mut [[f64; 2]],
                 pushes: &mut [[f64; 2]],
-                pols: &mut [[f64; 2]]|
+                pols: &mut [[f64; 2]],
+                notches: &mut [f32]|
      -> Result<(), CoreError> {
         for (offset, slot) in out.iter_mut().enumerate() {
-            let (displacement, push, next_pol) = eval_body(first + offset)?;
+            let (displacement, push, next_pol, next_notch) = eval_body(first + offset)?;
             *slot = displacement;
             if let Some(push_slot) = pushes.get_mut(offset) {
                 *push_slot = push;
             }
             if let Some(pol_slot) = pols.get_mut(offset) {
                 *pol_slot = next_pol;
+            }
+            if let Some(notch_slot) = notches.get_mut(offset) {
+                *notch_slot = next_notch;
             }
         }
         Ok(())
@@ -1359,8 +1441,9 @@ pub fn relax_sweep1_with_context(
         .min(count.div_ceil(MINIMUM_BODIES_PER_WORKER))
         .max(1);
     let pol_slice: &mut [[f64; 2]] = next_polarities.map_or(&mut [], Vec::as_mut_slice);
+    let notch_slice: &mut [f32] = neighbor_h0.map_or(&mut [], Vec::as_mut_slice);
     if used == 1 {
-        return fill(0, displacements, pressed, pol_slice);
+        return fill(0, displacements, pressed, pol_slice, notch_slice);
     }
     let length = count.div_ceil(used);
     let mut chunks = displacements.chunks_mut(length);
@@ -1370,20 +1453,25 @@ pub fn relax_sweep1_with_context(
     let mut pol_chunks = pol_slice
         .chunks_mut(length)
         .chain(std::iter::repeat_with(|| -> &mut [[f64; 2]] { &mut [] }));
+    let mut notch_chunks = notch_slice
+        .chunks_mut(length)
+        .chain(std::iter::repeat_with(|| -> &mut [f32] { &mut [] }));
     let head = chunks.next().unwrap_or_default();
     let push_head = push_chunks.next().unwrap_or_default();
     let pol_head = pol_chunks.next().unwrap_or_default();
+    let notch_head = notch_chunks.next().unwrap_or_default();
     let fill = &fill;
     std::thread::scope(|scope| {
         let others: Vec<_> = chunks
             .zip(push_chunks)
             .zip(pol_chunks)
+            .zip(notch_chunks)
             .enumerate()
-            .map(|(index, ((chunk, pushes), pols))| {
-                scope.spawn(move || fill((index + 1) * length, chunk, pushes, pols))
+            .map(|(index, (((chunk, pushes), pols), notches))| {
+                scope.spawn(move || fill((index + 1) * length, chunk, pushes, pols, notches))
             })
             .collect();
-        let mut result = fill(0, head, push_head, pol_head);
+        let mut result = fill(0, head, push_head, pol_head, notch_head);
         for other in others {
             let joined = other.join().unwrap_or_else(|_| {
                 Err(CoreError::StateConflict {

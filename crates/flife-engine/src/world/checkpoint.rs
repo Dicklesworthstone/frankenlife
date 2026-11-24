@@ -407,6 +407,9 @@ impl World {
                     if is_v2 {
                         out.f32(organism.secretory_readiness);
                         out.u64(organism.emission_cooldown_deadline.get());
+                        if self.rules.v2.notch_delta().is_some() {
+                            out.f32(organism.last_neighbor_h0);
+                        }
                     }
                 }
                 Ok(())
@@ -985,7 +988,8 @@ impl World {
                     None => HeldOutput::INVALID,
                 }
             };
-            let (secretory_readiness, emission_cooldown_deadline) = if is_v2_chunk {
+            let (secretory_readiness, emission_cooldown_deadline, last_neighbor_h0) = if is_v2_chunk
+            {
                 let readiness = held.f32()?;
                 if !readiness.is_finite() || !(0.0_f32..=1.0_f32).contains(&readiness) {
                     return Err(refuse(format!(
@@ -993,9 +997,20 @@ impl World {
                     )));
                 }
                 let deadline = Tick::new(held.u64()?);
-                (readiness, deadline)
+                let neighbor_h0 = if rules.v2.notch_delta().is_some() {
+                    let value = held.f32()?;
+                    if !value.is_finite() || !(-1.0_f32..=1.0_f32).contains(&value) {
+                        return Err(refuse(format!(
+                            "{id} has last_neighbor_h0 {value}, outside [-1, 1]"
+                        )));
+                    }
+                    value
+                } else {
+                    0.0_f32
+                };
+                (readiness, deadline, neighbor_h0)
             } else {
-                (INITIAL_SECRETORY_READINESS, Tick::new(0))
+                (INITIAL_SECRETORY_READINESS, Tick::new(0), 0.0_f32)
             };
             entrants.push(Entrant {
                 organism: Organism {
@@ -1023,6 +1038,7 @@ impl World {
                     secretory_readiness,
                     emission_cooldown_deadline,
                     polarity,
+                    last_neighbor_h0,
                 },
                 genome,
             });

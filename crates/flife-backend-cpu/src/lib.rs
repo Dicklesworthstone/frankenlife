@@ -283,11 +283,20 @@ impl Scratch {
         capacity_bytes(&self.first).saturating_add(capacity_bytes(&self.second))
     }
 
-    /// Room for activations `width` wide.
+    /// Room for activations `width` wide, reserved to exact capacity so
+    /// widening across topologies never overshoots [`BackendBudget::bytes`]
+    /// through exponential `Vec` growth (FL-043).
     fn hold(&mut self, width: usize) -> Result<(), CoreError> {
         for buffer in [&mut self.first, &mut self.second] {
             if buffer.len() < width {
-                reserve(buffer, width - buffer.len(), "cpu controller activations")?;
+                let additional = width - buffer.len();
+                buffer
+                    .try_reserve_exact(additional)
+                    .map_err(|_| CoreError::AllocationFailed {
+                        buffer: "cpu controller activations",
+                        bytes: u64::try_from(additional.saturating_mul(size_of::<f32>()))
+                            .unwrap_or(u64::MAX),
+                    })?;
                 buffer.resize(width, 0.0);
             }
         }
@@ -351,11 +360,17 @@ impl Packing {
 
     /// Pack `job`'s parameters into its slot, in place of any earlier
     /// occupant's, unless they are resident, or their shard is not made yet
-    /// and would need more than `room` bytes (FL-043). Whether it packed
-    /// them, and the bytes of any shard it made.
-    fn place(&mut self, job: &ControllerJob<'_>, room: u64) -> Result<(bool, u64), CoreError> {
+    /// and would need more than `room` bytes (FL-043). Updates `held`
+    /// atomically on shard creation or error-path reclamation so a packing
+    /// failure never leaves a zombie shard or desyncs memory accounting.
+    fn place(
+        &mut self,
+        job: &ControllerJob<'_>,
+        room: u64,
+        held: &mut u64,
+    ) -> Result<bool, CoreError> {
         if self.resident(job).is_some() {
-            return Ok((false, 0));
+            return Ok(false);
         }
         let too_large = |quantity: &'static str| CoreError::Overflow { quantity };
         let at = self.geometry.locate(job.slot.slot());
@@ -369,13 +384,42 @@ impl Packing {
             .map_err(|_| too_large("arena shard elements"))?;
         let slots = usize::try_from(self.geometry.slots_per_shard())
             .map_err(|_| too_large("arena shard slots"))?;
-        let mut made = 0;
-        let shard = match self.shards.entry(at.shard) {
-            Entry::Occupied(entry) => entry.into_mut(),
+        let bytes = shard_bytes(&self.geometry);
+        match self.shards.entry(at.shard) {
+            Entry::Occupied(mut entry) => {
+                let shard = entry.get_mut();
+                if shard.values.len() < end {
+                    shard.values.resize(end, 0.0);
+                }
+                if shard.occupants.len() <= local {
+                    let more = local + 1 - shard.occupants.len();
+                    reserve(&mut shard.occupants, more, "cpu controller slots")?;
+                    shard.occupants.resize(local + 1, None);
+                }
+                // The old occupant is gone before anything of the new one is
+                // written, so a failure leaves the slot empty, never mixed.
+                if shard.occupants[local].take().is_some() {
+                    shard.live_count = shard.live_count.saturating_sub(1);
+                }
+                if let Err(error) = pack(
+                    job.controller.parameters(),
+                    job.controller.topology(),
+                    &self.layers,
+                    &mut shard.values[offset..end],
+                ) {
+                    if shard.live_count == 0 {
+                        entry.remove();
+                        *held = held.saturating_sub(bytes);
+                    }
+                    return Err(error);
+                }
+                shard.occupants[local] = Some((job.slot.generation(), job.genome));
+                shard.live_count += 1;
+                Ok(true)
+            }
             Entry::Vacant(entry) => {
-                let bytes = shard_bytes(&self.geometry);
                 if bytes > room {
-                    return Ok((false, 0));
+                    return Ok(false);
                 }
                 let mut shard = Shard::default();
                 shard
@@ -391,32 +435,21 @@ impl Packing {
                         bytes: bytes_for::<Option<(u32, GenomeId)>>(slots),
                     }
                 })?;
-                made = bytes;
-                entry.insert(shard)
+                shard.values.resize(end, 0.0);
+                shard.occupants.resize(local + 1, None);
+                pack(
+                    job.controller.parameters(),
+                    job.controller.topology(),
+                    &self.layers,
+                    &mut shard.values[offset..end],
+                )?;
+                shard.occupants[local] = Some((job.slot.generation(), job.genome));
+                shard.live_count = 1;
+                entry.insert(shard);
+                *held = held.saturating_add(bytes);
+                Ok(true)
             }
-        };
-        if shard.values.len() < end {
-            shard.values.resize(end, 0.0);
         }
-        if shard.occupants.len() <= local {
-            let more = local + 1 - shard.occupants.len();
-            reserve(&mut shard.occupants, more, "cpu controller slots")?;
-            shard.occupants.resize(local + 1, None);
-        }
-        // The old occupant is gone before anything of the new one is
-        // written, so a failure leaves the slot empty, never mixed.
-        if shard.occupants[local].take().is_some() {
-            shard.live_count = shard.live_count.saturating_sub(1);
-        }
-        pack(
-            job.controller.parameters(),
-            job.controller.topology(),
-            &self.layers,
-            &mut shard.values[offset..end],
-        )?;
-        shard.occupants[local] = Some((job.slot.generation(), job.genome));
-        shard.live_count += 1;
-        Ok((true, made))
     }
 }
 
@@ -548,9 +581,12 @@ impl CpuBackend {
                 continue;
             };
             if self.buckets.len() <= index {
-                let more = index + 1 - self.buckets.len();
+                let needed = index.checked_add(1).ok_or(CoreError::Overflow {
+                    quantity: "cpu controller buckets",
+                })?;
+                let more = needed - self.buckets.len();
                 reserve(&mut self.buckets, more, "cpu controller buckets")?;
-                self.buckets.resize_with(index + 1, || None);
+                self.buckets.resize_with(needed, || None);
             }
             let topology = job.controller.topology();
             let length = job.controller.parameters().len();
@@ -592,9 +628,7 @@ impl CpuBackend {
                 .budget
                 .bytes
                 .saturating_sub(self.held.saturating_add(activations));
-            let (packed, made) = packing.place(job, room)?;
-            self.held = self.held.saturating_add(made);
-            if packed {
+            if packing.place(job, room, &mut self.held)? {
                 self.packs += 1;
             }
             if packing.resident(job).is_some() {
@@ -731,16 +765,34 @@ impl ControllerBackend for CpuBackend {
         };
         if lanes == 1 {
             self.used = 1;
-            return run(buckets, head_jobs, head_outputs, head_scratch);
+            let result = run(buckets, head_jobs, head_outputs, head_scratch);
+            if result.is_err() {
+                outputs.clear();
+            }
+            return result;
         }
         let (result, used) = std::thread::scope(|scope| {
-            let workers: Vec<_> = runs
-                .map(|((jobs, outputs), scratch)| {
-                    scope.spawn(move || run(buckets, jobs, outputs, scratch))
-                })
-                .collect();
+            let mut workers = Vec::with_capacity(lanes - 1);
+            let mut spawn_error = None;
+            for ((chunk_jobs, chunk_outputs), chunk_scratch) in runs {
+                match std::thread::Builder::new().spawn_scoped(scope, move || {
+                    run(buckets, chunk_jobs, chunk_outputs, chunk_scratch)
+                }) {
+                    Ok(handle) => workers.push(handle),
+                    Err(error) => {
+                        spawn_error = Some(CoreError::StateConflict {
+                            operation: "cpu controller lanes",
+                            detail: format!("failed to spawn controller lane: {error}"),
+                        });
+                        break;
+                    }
+                }
+            }
             let used = 1 + workers.len();
-            let mut result = run(buckets, head_jobs, head_outputs, head_scratch);
+            let mut result = match spawn_error {
+                Some(error) => Err(error),
+                None => run(buckets, head_jobs, head_outputs, head_scratch),
+            };
             for worker in workers {
                 let joined = worker.join().unwrap_or_else(|_| {
                     Err(CoreError::StateConflict {
@@ -755,6 +807,9 @@ impl ControllerBackend for CpuBackend {
             (result, used)
         });
         self.used = used;
+        if result.is_err() {
+            outputs.clear();
+        }
         result
     }
 }

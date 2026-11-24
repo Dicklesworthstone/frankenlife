@@ -270,15 +270,14 @@ pub fn observer_bytes_at(
     observer_bytes_for_resize(feed_bytes, view, drawable, pixels_per_point)
 }
 
-/// Whether `controllers` reserves the batched controller path for `world`.
-/// Recurrent worlds (`FL-054`) run on the CPU reference under `Auto` until a
-/// batched recurrent backend exists; explicit `Torch` / `Metal` choices are
-/// still refused by `flife_cli::run::install`.
-const fn uses_batched_controllers(world: &World, controllers: ControllerChoice) -> bool {
+/// Whether `controllers` reserves the batched controller path (FL-043,
+/// V2-12): both dense and recurrent worlds use batched Torch/Metal under
+/// `Auto`, `Torch`, and `Metal`; only explicit `Cpu` runs on the reference
+/// path without a batched budget.
+const fn uses_batched_controllers(controllers: ControllerChoice) -> bool {
     match controllers {
         ControllerChoice::Cpu => false,
-        ControllerChoice::Auto => world.recurrent_state_width() == 0,
-        ControllerChoice::Torch | ControllerChoice::Metal => true,
+        ControllerChoice::Auto | ControllerChoice::Torch | ControllerChoice::Metal => true,
     }
 }
 
@@ -313,7 +312,7 @@ pub fn admit_kept(
     checkpoint: u64,
 ) -> Result<MemoryAdmission, CoreError> {
     world.admit_memory(
-        uses_batched_controllers(world, controllers),
+        uses_batched_controllers(controllers),
         checkpoint,
         observer_bytes(world, founding, view, drawable),
     )
@@ -336,9 +335,5 @@ pub fn admit_kept_at(
     checkpoint: u64,
 ) -> Result<MemoryAdmission, CoreError> {
     let observers = observer_bytes_at(world, founding, view, drawable, pixels_per_point)?;
-    world.admit_memory(
-        uses_batched_controllers(world, controllers),
-        checkpoint,
-        observers,
-    )
+    world.admit_memory(uses_batched_controllers(controllers), checkpoint, observers)
 }

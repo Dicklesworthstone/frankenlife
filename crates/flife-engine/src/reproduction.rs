@@ -94,7 +94,7 @@ use std::sync::{Barrier, mpsc};
 use flife_core::clock::{Tick, TickSpan, stable_phase};
 use flife_core::ids::{Generation, GenomeId, IdSequence, LineageId, OrganismId};
 use flife_core::ledger::{EnergyBudget, TickLedger, Transfer, sub_down};
-use flife_core::numerics::{normalize_turns, sin_cos_turns};
+use flife_core::numerics::{normalize_turns, sigmoid, sin_cos_turns};
 use flife_core::rng::{
     Address, Block, Lane, LaneKind, SemanticRng, Stream, bernoulli, box_muller, half_open_unit,
 };
@@ -104,9 +104,10 @@ use flife_genome::{
     BirthAttempt, CandidateRejection, DetachedProposal, Genome, GenomeQuota, LOGICAL_GENOME_BYTES,
     MutationRecord, Mutator, Prepared, Proposal, TopologyCatalog, TraitLimits, founder_v2,
 };
-use flife_neural::DecodedActions;
+use flife_neural::{DecodedActions, MAXIMUM_RECURRENT_STATE_WIDTH};
 
-use crate::population::DEFAULT_POLARITY;
+use crate::population::{DEFAULT_POLARITY, HeldOutput};
+use crate::world::{DifferentiationRules, StateInheritanceMode};
 
 /// Fewest admitted inherited births before spawning parallel proposal workers
 /// (`flife-s0t`). Below this, proposing on the main thread avoids sync cost.
@@ -496,6 +497,105 @@ impl Reproduction {
         crate::contact::rotate_unit_polarity(parent_polarity, jitter)
     }
 
+    /// `V2-12` (`epigenetic-recurrence`) newborn epigenetic recurrent state
+    /// inheritance from a parent's post-Phase-4 state `parent_state[0..S]`:
+    ///
+    /// - [`StateInheritanceMode::Zero`]: returns `Ok(None)` (`HeldOutput::INVALID`).
+    /// - [`StateInheritanceMode::SymmetricEpigenetic`]:
+    ///   `h_child[k] = clamp(α_epi * h_p[k] + σ_epi * ξ_k, -1, 1)` for `k ∈ 0..S`.
+    /// - [`StateInheritanceMode::AsymmetricStem`]:
+    ///   `c_stem = sigmoid(3.0 * h_p[0])`,
+    ///   `h_child[0] = clamp(α_epi * h_p[0] + c_stem * β_asym, -1, 1)`, and
+    ///   symmetric inheritance on `k ∈ 1..S`.
+    ///
+    /// Every jitter draw `ξ_k` is addressed semantically by
+    /// `(Stream::Birth, parent, tick, Lane(0, Direction, 0x0C01), draw = k)`.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] if `parent_state.len() != rules.state_width`
+    /// or `rules.state_width` lies outside `1..=MAXIMUM_RECURRENT_STATE_WIDTH`;
+    /// [`CoreError::NumericalInvalid`] for nonfinite or out-of-range state/rules;
+    /// [`CoreError::Overflow`] for lane construction.
+    pub fn inherit_epigenetic_state(
+        rng: &SemanticRng,
+        parent: OrganismId,
+        tick: Tick,
+        parent_state: &[f32],
+        rules: DifferentiationRules,
+    ) -> Result<Option<InheritedState>, CoreError> {
+        if rules.state_inheritance == StateInheritanceMode::Zero {
+            return Ok(None);
+        }
+        let width = rules.state_width;
+        if width == 0 || width > MAXIMUM_RECURRENT_STATE_WIDTH || parent_state.len() != width {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "parent recurrent state",
+                detail: format!(
+                    "expected parent_state len {width} (1..={MAXIMUM_RECURRENT_STATE_WIDTH}), got {}",
+                    parent_state.len()
+                ),
+            });
+        }
+        for (index, &value) in parent_state.iter().enumerate() {
+            if !value.is_finite() || !(-1.0_f32..=1.0_f32).contains(&value) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "parent recurrent state",
+                    detail: format!("parent_state[{index}] = {value} lies outside [-1, 1]"),
+                });
+            }
+        }
+        let alpha = rules.inheritance_retention;
+        let sigma = rules.inheritance_jitter;
+        let lane = Lane::new(0, LaneKind::Direction, 0x0C01)?;
+        let mut child = [0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
+        let start_sym = match rules.state_inheritance {
+            StateInheritanceMode::Zero => return Ok(None),
+            StateInheritanceMode::SymmetricEpigenetic => 0,
+            StateInheritanceMode::AsymmetricStem => {
+                let hp0 = f64::from(parent_state[0]);
+                let c_stem = sigmoid(3.0 * hp0).ok_or_else(|| CoreError::NumericalInvalid {
+                    quantity: "asymmetric stem sigmoid",
+                    detail: format!("sigmoid(3.0 * {hp0}) overflowed"),
+                })?;
+                let raw = alpha * hp0 + c_stem * rules.stem_asymmetry;
+                if !raw.is_finite() {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "inherited epigenetic state",
+                        detail: format!("asymmetric h_child[0] = {raw} is not finite"),
+                    });
+                }
+                let val = (raw.clamp(-1.0, 1.0) as f32).clamp(-1.0_f32, 1.0_f32);
+                child[0] = if val == 0.0 { 0.0 } else { val };
+                1
+            }
+        };
+        for k in start_sym..width {
+            let jitter = if sigma > 0.0 {
+                let [w1, w2, ..] = rng.block(Address {
+                    stream: Stream::Birth,
+                    entity: parent.get(),
+                    ordinal: tick.get(),
+                    lane,
+                    draw: u64::try_from(k).unwrap_or(u64::MAX),
+                });
+                let [z0, _] = box_muller(w1, w2)?;
+                sigma * z0
+            } else {
+                0.0
+            };
+            let raw = alpha * f64::from(parent_state[k]) + jitter;
+            if !raw.is_finite() {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "inherited epigenetic state",
+                    detail: format!("h_child[{k}] = {raw} is not finite"),
+                });
+            }
+            let val = (raw.clamp(-1.0, 1.0) as f32).clamp(-1.0_f32, 1.0_f32);
+            child[k] = if val == 0.0 { 0.0 } else { val };
+        }
+        InheritedState::from_slice(&child[..width]).map(Some)
+    }
+
     /// The split of `available`, the post-emission budget, at child share
     /// `β`, or why no viable birth fits it.
     ///
@@ -633,6 +733,7 @@ impl Reproduction {
                 split,
                 budding_offset: None,
                 newborn_polarity: None,
+                newborn_state: None,
             })),
         }
     }
@@ -829,6 +930,62 @@ pub enum ReproductionProposal {
     Intent(BirthIntent),
 }
 
+/// Compact bounded newborn epigenetic recurrent state `h_child ∈ [-1, 1]^S`
+/// carried from Phase 7 [`BirthIntent`] to Phase 8 [`Newborn`] (`V2-12`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InheritedState {
+    len: u8,
+    values: [f32; MAXIMUM_RECURRENT_STATE_WIDTH],
+}
+
+impl InheritedState {
+    /// Construct a validated inherited epigenetic state from `slice`.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] if `slice.len() > MAXIMUM_RECURRENT_STATE_WIDTH`;
+    /// [`CoreError::NumericalInvalid`] if any entry is nonfinite or outside `[-1, 1]`.
+    pub fn from_slice(slice: &[f32]) -> Result<Self, CoreError> {
+        if slice.len() > MAXIMUM_RECURRENT_STATE_WIDTH {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "inherited epigenetic state",
+                detail: format!(
+                    "expected at most {MAXIMUM_RECURRENT_STATE_WIDTH} entries, got {}",
+                    slice.len()
+                ),
+            });
+        }
+        let mut values = [0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
+        for (index, (dst, &value)) in values.iter_mut().zip(slice).enumerate() {
+            if !value.is_finite() || !(-1.0_f32..=1.0_f32).contains(&value) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "inherited epigenetic state",
+                    detail: format!("state[{index}] = {value} lies outside [-1, 1]"),
+                });
+            }
+            *dst = value;
+        }
+        let len = u8::try_from(slice.len()).map_err(|_| CoreError::Overflow {
+            quantity: "inherited epigenetic state width",
+        })?;
+        Ok(Self { len, values })
+    }
+
+    /// The inherited state lanes `0..S`.
+    #[must_use]
+    pub fn as_slice(&self) -> &[f32] {
+        &self.values[..usize::from(self.len)]
+    }
+
+    /// Convert into a newborn [`HeldOutput`] with `evaluated_at == None`
+    /// (preserving Appendix C.13 forced first evaluation).
+    ///
+    /// # Errors
+    /// As [`HeldOutput::newborn_with_state`].
+    pub fn into_held_output(self) -> Result<HeldOutput, CoreError> {
+        HeldOutput::newborn_with_state(self.as_slice())
+    }
+}
+
 /// A viable attempt: what phase 8 needs to construct the birth.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BirthIntent {
@@ -852,6 +1009,9 @@ pub struct BirthIntent {
     /// `V2-08` (`pcp-polarity`). `None` uses [`DEFAULT_POLARITY`] when
     /// `pcp-polarity` is disabled.
     pub newborn_polarity: Option<[f64; 2]>,
+    /// Optional inherited newborn epigenetic recurrent state `h_child ∈ [-1, 1]^S`
+    /// for `V2-12` (`epigenetic-recurrence`). `None` leaves newborn `HeldOutput::INVALID`.
+    pub newborn_state: Option<InheritedState>,
 }
 
 /// One birth for phase 8: an intent and its parent's genome.
@@ -1068,6 +1228,10 @@ pub struct Newborn {
     pub energy_change_rate: f64,
     /// False: its first advance forces a controller evaluation.
     pub held_output_valid: bool,
+    /// Its initial held controller state (`evaluated_at == None`, carrying
+    /// inherited epigenetic state under `V2-12` when configured; `HeldOutput::INVALID`
+    /// otherwise).
+    pub held: HeldOutput,
     /// Its stable controller phase, identity modulo the interval.
     pub phase: u32,
     /// `n + 1 + ⌈cooldown/Δt⌉`.
@@ -1862,6 +2026,10 @@ fn stage_detached(
             candidates,
         })),
         Proposal::Child { genome, record } => {
+            let held = match intent.newborn_state {
+                Some(state) => state.into_held_output()?,
+                None => HeldOutput::INVALID,
+            };
             *identities = issued;
             Ok(Staged::Born(Box::new(Birth {
                 parent: intent.parent,
@@ -1880,6 +2048,7 @@ fn stage_detached(
                     energy: intent.split.child,
                     energy_change_rate: 0.0,
                     held_output_valid: false,
+                    held,
                     phase,
                     cooldown_deadline: deadline,
                     polarity: intent.newborn_polarity.unwrap_or(DEFAULT_POLARITY),
@@ -2061,6 +2230,10 @@ fn stage(
             candidates,
         })),
         Proposal::Child { genome, record } => {
+            let held = match intent.newborn_state {
+                Some(state) => state.into_held_output()?,
+                None => HeldOutput::INVALID,
+            };
             *identities = issued;
             Ok(Staged::Born(Box::new(Birth {
                 parent: intent.parent,
@@ -2079,6 +2252,7 @@ fn stage(
                     energy: intent.split.child,
                     energy_change_rate: 0.0,
                     held_output_valid: false,
+                    held,
                     phase,
                     cooldown_deadline: deadline,
                     polarity: intent.newborn_polarity.unwrap_or(DEFAULT_POLARITY),
@@ -2163,6 +2337,7 @@ mod tests {
                 split,
                 budding_offset: None,
                 newborn_polarity: None,
+                newborn_state: None,
             })
             .collect();
         let requests: Vec<BirthRequest<'_>> = intents

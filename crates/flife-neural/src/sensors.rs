@@ -533,13 +533,25 @@ fn observe_with(
     let mut gradients = [[0.0; 2]; PLANES];
     // q = R/(R + R_scale) and ∂q = R_scale ∂R/(R + R_scale)².
     let shifted = density + scales.energy_density;
+    let regularized = density + scales.composition_floor;
+    let energy_denom = intrinsic.energy + scales.internal_energy;
+    let age_denom = intrinsic.age_seconds + scales.age_seconds;
+    if !shifted.is_finite()
+        || !regularized.is_finite()
+        || !energy_denom.is_finite()
+        || !age_denom.is_finite()
+    {
+        return Err(invalid(
+            "sensor normalization denominator",
+            "density, energy, or age scale sum overflowed".to_owned(),
+        ));
+    }
     let slope = scales.energy_density / (shifted * shifted);
     if let (Some(value), Some(gradient)) = (values.first_mut(), gradients.first_mut()) {
         *value = density / shifted;
         *gradient = [slope * density_x, slope * density_y];
     }
     // Z = M/(R + R_floor) and ∂Z = (∂M − Z ∂R)/(R + R_floor).
-    let regularized = density + scales.composition_floor;
     for ((value, gradient), ((moment, moment_x), moment_y)) in values
         .iter_mut()
         .zip(gradients.iter_mut())
@@ -568,8 +580,8 @@ fn observe_with(
         *y_slot = saturate(scales.gradient_length * gradient[1])?;
     }
     own.copy_from_slice(&[
-        intrinsic.energy / (intrinsic.energy + scales.internal_energy),
-        intrinsic.age_seconds / (intrinsic.age_seconds + scales.age_seconds),
+        intrinsic.energy / energy_denom,
+        intrinsic.age_seconds / age_denom,
         saturate(intrinsic.velocity[0] / scales.velocity)?,
         saturate(intrinsic.velocity[1] / scales.velocity)?,
         saturate(intrinsic.energy_change_per_second / scales.energy_change_per_second)?,
@@ -690,11 +702,27 @@ fn observe_dual_with(
     let mut values = [0.0; PLANES];
     let mut gradients = [[0.0; 2]; PLANES];
     let shifted0 = density0 + scales.energy_density;
+    let reg0 = density0 + scales.composition_floor;
+    let shifted1 = density1 + trail_energy_density_scale;
+    let reg1 = density1 + scales.composition_floor;
+    let energy_denom = intrinsic.energy + scales.internal_energy;
+    let age_denom = intrinsic.age_seconds + scales.age_seconds;
+    if !shifted0.is_finite()
+        || !reg0.is_finite()
+        || !shifted1.is_finite()
+        || !reg1.is_finite()
+        || !energy_denom.is_finite()
+        || !age_denom.is_finite()
+    {
+        return Err(invalid(
+            "sensor normalization denominator",
+            "density, energy, or age scale sum overflowed".to_owned(),
+        ));
+    }
     let slope0 = scales.energy_density / (shifted0 * shifted0);
     values[0] = density0 / shifted0;
     gradients[0] = [slope0 * density0_x, slope0 * density0_y];
 
-    let reg0 = density0 + scales.composition_floor;
     let c0_count = CARRIER0_MOMENT_CHANNELS as usize;
     for k in 0..c0_count {
         let p = 1 + k;
@@ -706,7 +734,6 @@ fn observe_dual_with(
         ];
     }
 
-    let reg1 = density1 + scales.composition_floor;
     let c1_first = CARRIER1_FIRST_MOMENT_PLANE as usize;
     let c1_count = CARRIER1_MOMENT_CHANNELS as usize;
     let mut z1_sq = 0.0_f64;
@@ -736,14 +763,13 @@ fn observe_dual_with(
         *y_slot = saturate(scales.gradient_length * gradient[1])?;
     }
     own.copy_from_slice(&[
-        intrinsic.energy / (intrinsic.energy + scales.internal_energy),
-        intrinsic.age_seconds / (intrinsic.age_seconds + scales.age_seconds),
+        intrinsic.energy / energy_denom,
+        intrinsic.age_seconds / age_denom,
         saturate(intrinsic.velocity[0] / scales.velocity)?,
         saturate(intrinsic.velocity[1] / scales.velocity)?,
         saturate(intrinsic.energy_change_per_second / scales.energy_change_per_second)?,
     ]);
 
-    let shifted1 = density1 + trail_energy_density_scale;
     let slope1 = trail_energy_density_scale / (shifted1 * shifted1);
     let q1 = density1 / shifted1;
     let dq1_x = slope1 * density1_x;

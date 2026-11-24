@@ -1398,6 +1398,8 @@ fn v2_optional_views_accounting_and_slot_order_invariance_c7() {
     assert_eq!(pub_compact.reserved_bytes(), 3 * expected_all_slot);
     assert_eq!(pub_freelist.reserved_bytes(), 3 * expected_all_slot);
 
+    let mut saw_nonzero_cell_state = false;
+    let mut saw_rotated_affinity = false;
     for _ in 0..32 {
         step(&mut compact);
         step(&mut freelist);
@@ -1425,22 +1427,49 @@ fn v2_optional_views_accounting_and_slot_order_invariance_c7() {
                 (View::FieldVascularConductance, Dtype::F32, 1, 32 * 32),
             ]
         );
-        // Verify cell_states match live recurrent state h_0 in identity order.
-        let expected_states: Vec<i8> = compact
-            .population()
-            .iter_with_genomes()
-            .map(|(org, _)| {
-                flife_render::quantize_cell_state(
-                    org.held.recurrent_state().first().copied().unwrap_or(0.0),
-                )
-            })
+        // Verify cell_states match live V2-12 `World::cell_states()` in identity order.
+        let world_cell_states = compact.cell_states().expect("V2-12 live cell states");
+        let expected_states: Vec<i8> = world_cell_states
+            .iter()
+            .copied()
+            .map(flife_render::quantize_cell_state)
             .collect();
         assert_eq!(a.cell_states(), Some(expected_states.as_slice()));
-        let expected_polarities: Vec<i16> = compact
-            .population()
-            .iter_with_genomes()
-            .map(|(org, _)| {
-                let [px, py] = org.polarity;
+        if expected_states.iter().any(|&q| q != 0) {
+            saw_nonzero_cell_state = true;
+        }
+        // Verify `Epoch::affinities` projects live V2-12 `World::effective_affinity(id)`.
+        let affinity_limit = compact.trait_limits().affinity_norm();
+        let mut expected_affinities = Vec::with_capacity(a.len());
+        for (org, genome) in compact.population().iter_with_genomes() {
+            let genome = genome.expect("genome");
+            let eff = compact
+                .effective_affinity(org.id)
+                .expect("effective affinity")
+                .expect("live");
+            let proj_eff = affinity_projection(&eff, affinity_limit);
+            let proj_gen = affinity_projection(genome.traits().affinity(), affinity_limit);
+            if proj_eff.map(f32::to_bits) != proj_gen.map(f32::to_bits) {
+                saw_rotated_affinity = true;
+            }
+            expected_affinities.push(proj_eff);
+        }
+        assert_eq!(
+            a.affinities()
+                .iter()
+                .map(|c| c.map(f32::to_bits))
+                .collect::<Vec<_>>(),
+            expected_affinities
+                .iter()
+                .map(|c| c.map(f32::to_bits))
+                .collect::<Vec<_>>(),
+            "Epoch::affinities must match V2-12 World::effective_affinity bit-for-bit"
+        );
+        let world_polarities = compact.polarities().expect("V2-08 live polarities");
+        let expected_polarities: Vec<i16> = world_polarities
+            .iter()
+            .copied()
+            .map(|[px, py]| {
                 if !(px.is_finite() && py.is_finite()) || (px == 0.0 && py == 0.0) {
                     flife_render::POLARITY_UNPOLARIZED
                 } else {
@@ -1494,6 +1523,14 @@ fn v2_optional_views_accounting_and_slot_order_invariance_c7() {
             "live vascular conductance must be strictly positive"
         );
     }
+    assert!(
+        saw_nonzero_cell_state,
+        "V2-12 all-v2 must evolve live non-zero quantized cell_states over 32 ticks"
+    );
+    assert!(
+        saw_rotated_affinity,
+        "V2-12 all-v2 must rotate Epoch::affinities via effective_affinity a_eff(h_0)"
+    );
     // 34-plane dual-carrier slice also projects cleanly via FieldTexture::from_planes_on
     // bit-identically across 1 and 4 workers.
     let grid = compact.field().grid();

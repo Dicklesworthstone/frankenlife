@@ -386,18 +386,37 @@ pub fn settle_efficiencies(
 
 /// Effective chemical affinity `a_eff` of an organism (`V2-11` / `V2-12` seam).
 ///
-/// Returns `*traits.affinity()` in baseline and `V2-11`; `V2-12` activates the
-/// epigenetic rotation `a_eff(h_0)` through this single entry point so uptake,
-/// corpse lysis (`-a_eff` / `J a_eff`), and obligate symplectic waste
-/// (`J a_eff`) always share the exact same effective affinity (2nd-Law rule:
-/// `a_eff · J a_eff == 0` for every cell type).
-#[must_use]
+/// Returns `*traits.affinity()` when `epigenetic-recurrence` or
+/// `affinity_rotation_enabled` is disabled, or when `recurrent_state_h0 == 0.0`.
+/// When active, rotates the active Carrier-0 channels (`0..active_carrier0_channels`,
+/// `32` single-carrier or `24` under `V2-15`) in the `(a, J a)` symplectic plane
+/// by `(π / 2) · h_0` via [`flife_neural::rotate_epigenetic_affinity`]
+/// (guarding negative `h_0` through `normalize_turns(0.25 * h_0)` and enforcing
+/// exact left-fold `‖a_eff‖₂² <= affinity_norm_limit²`).
+///
+/// Uptake (CPU Reference and `SettleBackend` `ChemistryOrganism`), corpse lysis
+/// (`-a_eff` / `J a_eff`), obligate symplectic waste (`J a_eff`), and
+/// [`LocalChemistry`](crate::LocalChemistry) all share this entry point so the
+/// 2nd-Law rule `a_eff · J a_eff == 0` holds for every cell type.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] if `recurrent_state_h0` is nonfinite or
+/// outside `[-1, 1]`, or as [`flife_neural::rotate_epigenetic_affinity`].
 pub fn effective_affinity(
     traits: &Traits,
-    _recurrent_state_h0: f32,
-    _rules: &V2Rules,
-) -> [f64; CHANNELS] {
-    *traits.affinity()
+    recurrent_state_h0: f32,
+    rules: &V2Rules,
+    affinity_norm_limit: f64,
+) -> Result<[f64; CHANNELS], CoreError> {
+    if !rules.affinity_rotation_enabled() || recurrent_state_h0 == 0.0 {
+        return Ok(*traits.affinity());
+    }
+    flife_neural::rotate_epigenetic_affinity(
+        traits.affinity(),
+        recurrent_state_h0,
+        rules.active_carrier0_channels(),
+        affinity_norm_limit,
+    )
 }
 
 /// Chemical direction deposited by a lysed corpse (`V2-11`, `lysis-recycling`)

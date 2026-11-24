@@ -1461,3 +1461,90 @@ fn control_arriving_during_step_cancellation_boundary_is_not_stranded_in_deferre
         assert_eq!(closed.boundary.tick, Tick::new(1), "seed {seed}");
     }
 }
+
+/// Regression: when `Resume` (`start`) and `Pause` arrive in that order on the
+/// control lane during `tick()`'s cancellation boundary, `Pause` must NOT
+/// overtake `Resume` by running ahead of `self.deferred`; otherwise `pause()`
+/// returns while `Resume` still sits in `deferred` and restarts the run.
+#[test]
+fn resume_then_pause_at_cancellation_boundary_leaves_session_paused() {
+    let config = ecology(&[
+        ("execution", "control_queue_capacity", "8"),
+        ("population", "initial_count", "8"),
+    ]);
+    for seed in 1..=8 {
+        let (results, closed) = lab(seed, &config, |handle| {
+            let controller = handle.clone();
+            vec![
+                Box::pin(async move {
+                    let cx = cx();
+                    let first = handle.start(&cx, None).await.expect("start");
+                    let _ = first.ended(&cx).await.expect("first run ends");
+                    None
+                }) as Client<Option<Boundary>>,
+                Box::pin(async move {
+                    let cx = cx();
+                    while !controller.inspect(&cx).await.expect("inspect").running {
+                        yield_now().await;
+                    }
+                    // Queue `start` (Control::Resume) followed immediately by
+                    // `pause` (Control::Pause) on the same FIFO control lane so
+                    // both are drained together at `tick()`'s cancellation
+                    // boundary.
+                    let mut restart = std::pin::pin!(controller.start(&cx, None));
+                    let mut pause = std::pin::pin!(controller.pause(&cx));
+                    let mut restarted = None;
+                    let mut paused = None;
+                    std::future::poll_fn(|context| {
+                        if restarted.is_none()
+                            && let Poll::Ready(v) = restart.as_mut().poll(context)
+                        {
+                            restarted = Some(v);
+                        }
+                        if paused.is_none()
+                            && let Poll::Ready(v) = pause.as_mut().poll(context)
+                        {
+                            paused = Some(v);
+                        }
+                        if restarted.is_some() && paused.is_some() {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                    let running = restarted.expect("restart").expect("started");
+                    let started = running.started();
+                    let paused_at = paused.expect("pause").expect("paused");
+                    // Yield several times so a wrongly restarted run would advance.
+                    for _ in 0..8 {
+                        yield_now().await;
+                    }
+                    let snapshot = controller.inspect(&cx).await.expect("inspect");
+                    assert!(
+                        !snapshot.running,
+                        "seed {seed}: session must stay paused after start then pause"
+                    );
+                    assert_eq!(
+                        snapshot.boundary, paused_at,
+                        "seed {seed}: tick must not advance after pause returned"
+                    );
+                    let end = running.ended(&cx).await.expect("restarted run ended");
+                    assert_eq!(
+                        end,
+                        RunEnd::Paused(paused_at),
+                        "seed {seed}: pause after start must end the restarted run"
+                    );
+                    assert_eq!(
+                        started, paused_at,
+                        "seed {seed}: pause queued behind start pauses at the same boundary"
+                    );
+                    controller.close(&cx).await.expect("close");
+                    Some(paused_at)
+                }),
+            ]
+        });
+        let paused_at = results[1].expect("paused boundary");
+        assert_eq!(closed.boundary, paused_at, "seed {seed}");
+    }
+}

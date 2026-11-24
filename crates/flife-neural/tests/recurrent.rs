@@ -797,3 +797,60 @@ fn a_eff_orthogonal_rotation_full_signed_range_left_fold_safe() {
         Err(CoreError::NumericalInvalid { .. })
     ));
 }
+
+#[test]
+fn update_recurrent_state_is_transactional_on_error_and_layer_shape_checks_overflow() {
+    use flife_neural::{LayerShape, update_recurrent_state};
+
+    // Transactional guarantee: if unit 1 fails validation, unit 0 must NOT be mutated.
+    let state = [0.25_f32, -0.5_f32, 0.75_f32];
+    let sentinel = [-0.9_f32, 0.8_f32, -0.7_f32];
+    let mut next_state = sentinel;
+    // Candidate 0 is valid, candidate 1 is NaN.
+    let bad_cand_tail = [0.5_f32, f32::NAN, 0.1_f32, 0.0_f32, 0.0_f32, 0.0_f32];
+    assert!(matches!(
+        update_recurrent_state(&state, &bad_cand_tail, 2.5, &mut next_state),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    assert_eq!(
+        next_state.map(f32::to_bits),
+        sentinel.map(f32::to_bits),
+        "failed update_recurrent_state must leave next_state untouched"
+    );
+
+    // Gate 2 is Inf after units 0 and 1 succeed.
+    let bad_gate_tail = [0.2_f32, -0.3_f32, 0.4_f32, 0.1_f32, -0.2_f32, f32::INFINITY];
+    assert!(matches!(
+        update_recurrent_state(&state, &bad_gate_tail, 0.0, &mut next_state),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    assert_eq!(
+        next_state.map(f32::to_bits),
+        sentinel.map(f32::to_bits),
+        "failed gate on late unit must not partially overwrite earlier next_state slots"
+    );
+
+    // Nonfinite gate_bias on evaluate_recurrent_slice fails fast and preserves next_state.
+    let topo = DenseTopology::new_recurrent(&[8], 3).expect("topo");
+    let params = vec![0.0_f32; topo.parameter_count()];
+    let ctrl = ReferenceController::new(&topo, &params, 1.0).expect("ctrl");
+    let mut scratch = ControllerScratch::new(&topo).expect("scratch");
+    let sensors = [0.0_f64; SENSOR_WIDTH];
+    assert!(matches!(
+        ctrl.evaluate_recurrent_slice(&sensors, &state, f64::NAN, &mut scratch, &mut next_state),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    assert_eq!(next_state.map(f32::to_bits), sentinel.map(f32::to_bits));
+
+    // LayerShape checked indexing returns None instead of panicking on overflow.
+    let huge = LayerShape {
+        inputs: usize::MAX,
+        outputs: usize::MAX,
+        weights: usize::MAX - 1,
+        biases: usize::MAX - 1,
+    };
+    assert_eq!(huge.weight(2, 1), None);
+    assert_eq!(huge.weight(0, 5), None);
+    assert_eq!(huge.bias(5), None);
+    assert_eq!(huge.end(), usize::MAX);
+}

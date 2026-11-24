@@ -2079,7 +2079,7 @@ fn dropping_command_journal_checkpoints_wal_cleanly() {
             })
             .expect("appends outcome");
         journal
-            .index_checkpoint(indexed.clone())
+            .index_checkpoint(indexed)
             .expect("indexes checkpoint");
     }
 
@@ -2091,4 +2091,112 @@ fn dropping_command_journal_checkpoints_wal_cleanly() {
     assert_eq!(contents.accepted, vec![(cmd, acceptance)]);
     assert_eq!(contents.outcomes, vec![(cmd.id, outcome)]);
     assert_eq!(reopened.checkpoints().expect("checkpoints"), vec![indexed]);
+}
+
+/// Regression: `CommandJournal` must refuse non-finite `applied` amounts both
+/// when appending an outcome and when reading back a corrupted SQLite
+/// `outcomes.applied_bits` row (matching `CommandBook::read_checkpoint`), and
+/// a `SchemaMismatch` during `CommandJournal::open` must still cleanly close
+/// its FrankenSQLite connection via `Drop`.
+#[test]
+fn command_journal_refuses_nonfinite_applied_outcome_and_closes_on_schema_mismatch() {
+    let dir = fresh("nonfinite-and-mismatch");
+    let path = dir.join("catalog.db");
+    let config = ecology();
+    let revision = config.config_hash();
+    let cmd = command(1, at(2), inject([4, 4], 3.0));
+    let acceptance = Accepted {
+        order: 0,
+        effective: Tick::new(2),
+        retargeted: false,
+        durability: flife_runtime::Durability::WriteAhead,
+    };
+    {
+        let mut journal = CommandJournal::open(&path).expect("creates");
+        let _ = journal.open_run(SESSION, revision).expect("opens run");
+        journal
+            .append(&JournalRecord::Accepted {
+                command: cmd,
+                accepted: acceptance,
+            })
+            .expect("appends acceptance");
+        for bad_applied in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = journal
+                .append(&JournalRecord::Ended {
+                    id: cmd.id,
+                    outcome: Outcome::Applied {
+                        tick: Tick::new(2),
+                        published: Tick::new(3),
+                        epoch: ResourceEpoch::new(3),
+                        applied: bad_applied,
+                        cursor: 0,
+                    },
+                })
+                .expect_err("non-finite applied must be refused");
+            assert!(
+                matches!(err, CoreError::NumericalInvalid { .. }),
+                "bad_applied={bad_applied:?}: expected NumericalInvalid, got {err:?}"
+            );
+        }
+        journal
+            .append(&JournalRecord::Ended {
+                id: cmd.id,
+                outcome: Outcome::Applied {
+                    tick: Tick::new(2),
+                    published: Tick::new(3),
+                    epoch: ResourceEpoch::new(3),
+                    applied: 3.0,
+                    cursor: 0,
+                },
+            })
+            .expect("appends finite outcome");
+    }
+
+    // Corrupt `outcomes.applied_bits` in SQLite to NaN and verify `open_run`
+    // refuses the row with `IncompatibleCheckpoint` instead of returning NaN.
+    block_on_inline(async {
+        let mut conn = fsqlite::Connection::open(path.display().to_string())
+            .await
+            .expect("raw open");
+        let nan_bits = i64::from_ne_bytes(f64::NAN.to_bits().to_ne_bytes());
+        conn.execute_with_params(
+            "UPDATE outcomes SET applied_bits = ?1 WHERE session = ?2 AND cursor = 0",
+            &[
+                fsqlite::SqliteValue::Integer(nan_bits),
+                fsqlite::SqliteValue::Integer(i64::from_ne_bytes(SESSION.get().to_ne_bytes())),
+            ],
+        )
+        .await
+        .expect("corrupts applied_bits");
+        let _ = conn.close_in_place().await;
+    });
+    let mut corrupted = CommandJournal::open(&path).expect("reopens corrupted db");
+    let err = corrupted
+        .open_run(SESSION, revision)
+        .expect_err("corrupted NaN applied_bits must be refused");
+    assert!(
+        matches!(err, CoreError::IncompatibleCheckpoint { .. }),
+        "expected IncompatibleCheckpoint, got {err:?}"
+    );
+    drop(corrupted);
+
+    // Opening a foreign `ExperimentCatalog` through `CommandJournal::open`
+    // returns `SchemaMismatch` and closes its connection cleanly via `Drop`.
+    let exp_path = dir.join("experiment.db");
+    {
+        let exp = ExperimentCatalog::open(&exp_path, "exp-mismatch", "design").expect("exp");
+        assert_eq!(exp.design().expect("design").as_deref(), Some("design"));
+    }
+    let mismatch = CommandJournal::open(&exp_path).expect_err("wrong catalog format");
+    assert!(
+        matches!(mismatch, CoreError::SchemaMismatch { .. }),
+        "expected SchemaMismatch, got {mismatch:?}"
+    );
+    let standalone = dir.join("experiment-standalone.db");
+    fs::copy(&exp_path, &standalone).expect("copies experiment db");
+    let read_back = ExperimentCatalog::read(&standalone).expect("reads standalone copy");
+    assert_eq!(
+        read_back.design().expect("design").as_deref(),
+        Some("design")
+    );
 }

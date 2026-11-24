@@ -249,13 +249,21 @@ fn read_outcome(row: &fsqlite::Row, first: usize, cursor: u64) -> Result<Outcome
             .ok_or_else(|| malformed(format!("outcome {cursor} has no tick")))
     };
     match kind {
-        "applied" => Ok(Outcome::Applied {
-            tick: tick()?,
-            published: Tick::new(integer(row, first + 2)?),
-            epoch: ResourceEpoch::new(integer(row, first + 3)?),
-            applied: f64::from_bits(integer(row, first + 4)?),
-            cursor,
-        }),
+        "applied" => {
+            let applied = f64::from_bits(integer(row, first + 4)?);
+            if !applied.is_finite() {
+                return Err(malformed(format!(
+                    "outcome {cursor} holds a non-finite applied amount {applied}"
+                )));
+            }
+            Ok(Outcome::Applied {
+                tick: tick()?,
+                published: Tick::new(integer(row, first + 2)?),
+                epoch: ResourceEpoch::new(integer(row, first + 3)?),
+                applied,
+                cursor,
+            })
+        }
         "cancelled" => Ok(Outcome::Cancelled {
             boundary: tick()?,
             reason: match string(row, first + 5)? {
@@ -283,26 +291,34 @@ impl CommandJournal {
     /// another catalog format.
     pub fn open(path: &Path) -> Result<Self, CoreError> {
         let location = path.display().to_string();
+        let connection = block_on_inline(Connection::open(location))
+            .map_err(|error| storage("open run catalog", path, &error))?;
+        let journal = Self {
+            connection,
+            path: path.to_path_buf(),
+            session: None,
+        };
         block_on_inline(async {
-            let fail = |operation, error: &FrankenError| storage(operation, path, error);
-            let connection = Connection::open(location.clone())
-                .await
-                .map_err(|error| fail("open run catalog", &error))?;
-            connection
+            let fail = |operation, error: &FrankenError| storage(operation, &journal.path, error);
+            journal
+                .connection
                 .query("PRAGMA journal_mode = WAL")
                 .await
                 .map_err(|error| fail("set journal mode", &error))?;
-            connection
+            journal
+                .connection
                 .execute("PRAGMA synchronous = FULL")
                 .await
                 .map_err(|error| fail("set synchronous mode", &error))?;
             for statement in MARKER {
-                connection
+                journal
+                    .connection
                     .execute(statement)
                     .await
                     .map_err(|error| fail("create run catalog schema", &error))?;
             }
-            let format = connection
+            let format = journal
+                .connection
                 .query("SELECT value FROM catalog WHERE key = 'format'")
                 .await
                 .map_err(|error| fail("read catalog format", &error))?;
@@ -318,17 +334,15 @@ impl CommandJournal {
                 });
             }
             for statement in SCHEMA {
-                connection
+                journal
+                    .connection
                     .execute(statement)
                     .await
                     .map_err(|error| fail("create run catalog schema", &error))?;
             }
-            Ok(Self {
-                connection,
-                path: path.to_path_buf(),
-                session: None,
-            })
-        })
+            Ok::<_, CoreError>(())
+        })?;
+        Ok(journal)
     }
 
     /// The database file.
@@ -395,10 +409,10 @@ impl CommandJournal {
             .map_err(|error| storage(operation, &self.path, &error))?;
         match body(&self.connection).await {
             Ok(value) => {
-                self.connection
-                    .execute("COMMIT")
-                    .await
-                    .map_err(|error| storage(operation, &self.path, &error))?;
+                if let Err(error) = self.connection.execute("COMMIT").await {
+                    let _ = self.connection.execute("ROLLBACK").await;
+                    return Err(storage(operation, &self.path, &error));
+                }
                 Ok(value)
             }
             Err(error) => {
@@ -516,6 +530,14 @@ impl CommandJournal {
         id: CommandId,
         outcome: &Outcome,
     ) -> Result<Watermarks, CoreError> {
+        if let Outcome::Applied { applied, .. } = outcome
+            && !applied.is_finite()
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "applied command energy",
+                detail: format!("{id} holds a non-finite applied amount {applied}"),
+            });
+        }
         let path = self.path.clone();
         let cursor = outcome.cursor();
         self.transaction("append outcome", async |connection| {
@@ -818,6 +840,17 @@ impl CommandJournal {
                 return Err(conflict(format!(
                     "inherited outcome {position} repeats {id}"
                 )));
+            }
+            if let Outcome::Applied { applied, .. } = outcome
+                && !applied.is_finite()
+            {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "applied command energy",
+                    detail: format!(
+                        "inherited outcome {position} ({id}) holds a non-finite applied amount \
+                         {applied}"
+                    ),
+                });
             }
         }
         let path = self.path.clone();

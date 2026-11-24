@@ -31,8 +31,7 @@ pub fn admit(
 ) -> Result<MemoryAdmission, CoreError> {
     let batched = match choice {
         ControllerChoice::Cpu => false,
-        ControllerChoice::Auto => world.recurrent_state_width() == 0,
-        ControllerChoice::Torch | ControllerChoice::Metal => true,
+        ControllerChoice::Auto | ControllerChoice::Torch | ControllerChoice::Metal => true,
     };
     world.admit_memory(
         batched,

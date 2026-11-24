@@ -749,3 +749,20 @@ fn traits_reseal_and_checkpoint_v3_round_trip_polarity_and_combined() {
         Err(CoreError::IncompatibleCheckpoint { .. })
     ));
 }
+
+/// Regression: `founder_polarity_traits` must validate `maximum_wedge_curvature`
+/// before calling `.clamp(-maximum_wedge_curvature, maximum_wedge_curvature)` so
+/// negative, NaN, infinite, or over-cap inputs return `NumericalInvalid` instead
+/// of panicking inside `f64::clamp`.
+#[test]
+fn founder_polarity_traits_refuses_invalid_wedge_bounds_without_panicking() {
+    let rng = SemanticRng::new(99);
+    for bad_wedge in [-0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.5] {
+        let err = founder_polarity_traits(&rng, OrganismId::new(1), 0.5, bad_wedge)
+            .expect_err("invalid maximum_wedge_curvature must be refused");
+        assert!(
+            matches!(err, CoreError::NumericalInvalid { .. }),
+            "bad_wedge={bad_wedge:?}: expected NumericalInvalid, got {err:?}"
+        );
+    }
+}

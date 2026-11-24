@@ -266,18 +266,51 @@ for start in range(nx * ny):
 components.sort(key=lambda item: (-item[0], min(item[1])))
 focal_cells = set(components[0][1])
 
-# Interior disk center: highest-density focal cell (tie: lowest y, then x).
-interior_idx = min(focal_cells, key=lambda idx: (-counts[idx], idx // nx, idx % nx))
-# Boundary cell: focal cell adjacent to a non-focal cell with highest count.
+# Boundary cells: focal cells 4-adjacent to at least one non-focal cell.
 boundary_candidates = []
 for idx in focal_cells:
     x, y = idx % nx, idx // nx
     if any((((y + oy) % ny) * nx + ((x + ox) % nx)) not in focal_cells for ox, oy in ((1, 0), (-1, 0), (0, 1), (0, -1))):
         boundary_candidates.append(idx)
-boundary_idx = min(boundary_candidates or list(focal_cells), key=lambda idx: (-counts[idx], idx // nx, idx % nx))
+
+# Multi-source BFS inward from boundary cells so `interior_idx` lands strictly
+# at maximum depth inside the focal colony (never colliding with `boundary_idx`
+# when the colony has >= 2 cells).
+depth = {}
+dq = deque()
+for b_idx in sorted(boundary_candidates):
+    depth[b_idx] = 1
+    dq.append(b_idx)
+while dq:
+    cur = dq.popleft()
+    cx, cy = cur % nx, cur // nx
+    next_d = depth[cur] + 1
+    for ox, oy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        nb = ((cy + oy) % ny) * nx + ((cx + ox) % nx)
+        if nb in focal_cells and nb not in depth:
+            depth[nb] = next_d
+            dq.append(nb)
+
+interior_idx = min(
+    focal_cells,
+    key=lambda idx: (-depth.get(idx, 0), -counts[idx], idx // nx, idx % nx),
+)
+ix, iy = (interior_idx % nx + 0.5) * hx, (interior_idx // nx + 0.5) * hy
+
+def cell_dist_to_interior(idx):
+    px = (idx % nx + 0.5) * hx
+    py = (idx // nx + 0.5) * hy
+    return math.hypot(min_img(px - ix, w), min_img(py - iy, h))
+
+distinct_boundary = [idx for idx in (boundary_candidates or list(focal_cells)) if idx != interior_idx]
+if not distinct_boundary:
+    boundary_idx = interior_idx
+else:
+    far_boundary = [idx for idx in distinct_boundary if cell_dist_to_interior(idx) >= 0.5 * radius]
+    pool = far_boundary or distinct_boundary
+    boundary_idx = min(pool, key=lambda idx: (-counts[idx], -cell_dist_to_interior(idx), idx // nx, idx % nx))
 
 # Distant control disk center: diametrically opposite interior peak on the torus.
-ix, iy = (interior_idx % nx + 0.5) * hx, (interior_idx // nx + 0.5) * hy
 bx, by = (boundary_idx % nx + 0.5) * hx, (boundary_idx // nx + 0.5) * hy
 dx_c, dy_c = (ix + 0.5 * w) % w, (iy + 0.5 * h) % h
 

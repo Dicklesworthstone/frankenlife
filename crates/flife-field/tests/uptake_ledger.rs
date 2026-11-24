@@ -17,7 +17,8 @@ use flife_field::state::CHANNELS;
 use flife_field::{
     BufferLimits, Cell, ConeTolerance, Demand, ExchangeStencil, FieldGrid, FieldPair, FieldState,
     Grants, RequestRule, Source, SourceKernel, SourceSupport, TransportPlan, TransportScratch,
-    advance_field, apply_grants, resolve_uptake, saturating_request,
+    UptakeBackend, UptakeCell, UptakeWork, advance_field, apply_grants, demands_on, resolve_uptake,
+    resolve_uptake_on, saturating_request,
 };
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -1097,4 +1098,122 @@ fn resolve_uptake_refuses_f64_overflowing_cell_demand_without_hanging() {
         matches!(err, CoreError::NumericalInvalid { .. }),
         "expected NumericalInvalid, got {err:?}"
     );
+}
+
+/// Regression: `resolve_uptake_on` and `demands_on` must refuse non-finite or
+/// negative values returned by an `UptakeBackend`, even when the returned
+/// `quanta` happen to match `cell_target`'s fallback target (e.g. `NaN.min(whole)`
+/// or `(-1.0) as u64 == 0`), so a faulty device backend triggers clean reference
+/// fallback instead of poisoning `Grants` / `UptakeSummary`.
+#[test]
+fn uptake_backend_nonfinite_and_negative_outputs_are_refused() {
+    #[derive(Debug)]
+    struct FaultyBackend {
+        request_value: f64,
+        demand_value: f64,
+        quanta_value: u32,
+    }
+
+    impl UptakeBackend for FaultyBackend {
+        fn describe(&self) -> String {
+            "faulty-test-backend".into()
+        }
+
+        fn request(
+            &mut self,
+            _field: &FieldState,
+            _rule: &RequestRule,
+            stencils: &[ExchangeStencil],
+            densities: &mut Vec<f64>,
+            requests: &mut Vec<f64>,
+        ) -> Result<(), CoreError> {
+            densities.clear();
+            densities.resize(stencils.len(), 1.0);
+            requests.clear();
+            requests.resize(stencils.len(), self.request_value);
+            Ok(())
+        }
+
+        fn resolve(
+            &mut self,
+            cells: &[UptakeCell],
+            requested: &[f64],
+            demanded: &mut Vec<f64>,
+            quanta: &mut Vec<u32>,
+        ) -> Result<(), CoreError> {
+            demanded.clear();
+            demanded.resize(cells.len(), self.demand_value);
+            quanta.clear();
+            quanta.resize(requested.len(), self.quanta_value);
+            Ok(())
+        }
+    }
+
+    let g = grid(4, 4, 4.0, 4.0);
+    let mut state = zeroed(g);
+    state
+        .set_cell(
+            0,
+            0,
+            &Cell {
+                energy: 1.0,
+                moments: [0.0; CHANNELS],
+            },
+        )
+        .expect("sets cell");
+    // For `energy = 1.0_f32`, `quanta_of(1.0) = (2^-23, 2^23 = 8_388_608)`.
+    let full_quanta = 1_u32 << 23;
+    let rule = RequestRule {
+        step: TimeStep::new(1, 60).expect("step"),
+        capacity_per_second: 1.0,
+        half_saturation_density: 1.0,
+    };
+    let mut work = UptakeWork::new();
+    let mut out_demands = Vec::new();
+    for bad_req in [f64::NAN, -0.5, f64::INFINITY] {
+        let mut backend = FaultyBackend {
+            request_value: bad_req,
+            demand_value: 0.0,
+            quanta_value: 0,
+        };
+        let err = demands_on(
+            &mut backend,
+            &state,
+            &rule,
+            [(OrganismId::new(1), [0.5, 0.5])],
+            &mut work,
+            &mut out_demands,
+        )
+        .expect_err("faulty backend request must be refused");
+        assert!(
+            matches!(err, CoreError::StateConflict { .. }),
+            "bad_req={bad_req:?}: expected StateConflict, got {err:?}"
+        );
+    }
+
+    let demands = [Demand {
+        organism: OrganismId::new(1),
+        position: [0.5, 0.5],
+        amount: 0.5,
+    }];
+    let mut grants = Grants::new();
+    for (bad_demand, matching_quanta) in [
+        (f64::NAN, full_quanta),
+        (-1.0, 0),
+        (f64::INFINITY, full_quanta),
+    ] {
+        let mut backend = FaultyBackend {
+            request_value: 0.5,
+            demand_value: bad_demand,
+            quanta_value: matching_quanta,
+        };
+        let err = resolve_uptake_on(&mut backend, &state, &demands, &mut work, &mut grants)
+            .expect_err("faulty backend demand sum must be refused");
+        assert!(
+            matches!(err, CoreError::StateConflict { .. }),
+            "bad_demand={bad_demand:?}: expected StateConflict, got {err:?}"
+        );
+        assert!(grants.packets().is_empty(), "grants reset on error");
+        assert!(grants.debits().is_empty(), "debits reset on error");
+    }
 }

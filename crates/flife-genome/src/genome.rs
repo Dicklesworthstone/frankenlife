@@ -1107,7 +1107,7 @@ fn check_cadherin_tag(tag: &[f64; CADHERIN_TERMS]) -> Result<(), CoreError> {
     Ok(())
 }
 
-fn check_maximum_wedge_curvature(maximum_wedge_curvature: f64) -> Result<(), CoreError> {
+pub(crate) fn check_maximum_wedge_curvature(maximum_wedge_curvature: f64) -> Result<(), CoreError> {
     if !maximum_wedge_curvature.is_finite()
         || !(0.0..=MAXIMUM_WEDGE_CURVATURE_CAP).contains(&maximum_wedge_curvature)
     {

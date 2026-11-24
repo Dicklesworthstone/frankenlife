@@ -278,19 +278,13 @@ impl World {
                 out.u32(grid.cells_y());
                 out.u32(planes);
                 for plane in 0..planes {
-                    for value in field.plane(plane).unwrap_or(&[]) {
-                        out.f32(*value);
-                    }
+                    out.f32_slice(field.plane(plane).unwrap_or(&[]));
                 }
                 if is_v2 {
                     if let Some((gx, gy)) = field.vascular_edges() {
                         out.u8(1);
-                        for &value in gx {
-                            out.f32(value);
-                        }
-                        for &value in gy {
-                            out.f32(value);
-                        }
+                        out.f32_slice(gx);
+                        out.f32_slice(gy);
                     } else {
                         out.u8(0);
                     }
@@ -327,10 +321,8 @@ impl World {
                     // Each value in the run's weight dtype: an F32's bits,
                     // or a binary16's.
                     match genome.parameters() {
-                        Weights::F32(values) => values.iter().for_each(|value| out.f32(*value)),
-                        Weights::F16(values) => {
-                            values.iter().for_each(|value| out.u16(value.to_bits()));
-                        }
+                        Weights::F32(values) => out.f32_slice(values),
+                        Weights::F16(values) => out.f16_slice(values),
                     }
                 }
                 Ok(())
@@ -389,9 +381,7 @@ impl World {
                         if is_v2 {
                             out.u8(u8::try_from(outputs.len()).unwrap_or(0));
                         }
-                        for value in outputs {
-                            out.f32(*value);
-                        }
+                        out.f32_slice(outputs);
                     }
                     out.u32(organism.phase);
                     out.u64(organism.cooldown_deadline.get());
@@ -400,9 +390,7 @@ impl World {
                     if is_v2 || state_width > 0 {
                         let state = organism.held.recurrent_state();
                         out.u8(u8::try_from(state.len()).unwrap_or(0));
-                        for value in state {
-                            out.f32(*value);
-                        }
+                        out.f32_slice(state);
                     }
                     if is_v2 {
                         out.f32(organism.secretory_readiness);

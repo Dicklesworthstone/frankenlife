@@ -29,6 +29,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::io::Read;
 
+use crate::binary16::F16;
 use crate::canonical::{Sha256Digest, Sha256Stream};
 use crate::error::CoreError;
 
@@ -1374,6 +1375,90 @@ impl ChunkWriter<'_> {
     }
 
     little_endian_writes!();
+
+    /// Encode a contiguous slice of `f32` values in little-endian order,
+    /// bit-identical to calling [`ChunkWriter::f32`] for each element while
+    /// filling `self.page` in page-sized bulk chunks.
+    pub fn f32_slice(&mut self, values: &[f32]) {
+        self.write_le_slice::<f32, 4>(values, |value| value.to_bits().to_le_bytes());
+    }
+
+    /// Encode a contiguous slice of `u16` values in little-endian order,
+    /// bit-identical to calling [`ChunkWriter::u16`] for each element while
+    /// filling `self.page` in page-sized bulk chunks.
+    pub fn u16_slice(&mut self, values: &[u16]) {
+        self.write_le_slice::<u16, 2>(values, u16::to_le_bytes);
+    }
+
+    /// Encode a contiguous slice of [`F16`] values in little-endian order,
+    /// bit-identical to calling `out.u16(value.to_bits())` for each element
+    /// while filling `self.page` in page-sized bulk chunks.
+    pub fn f16_slice(&mut self, values: &[F16]) {
+        self.write_le_slice::<F16, 2>(values, |value| value.to_bits().to_le_bytes());
+    }
+
+    #[inline]
+    fn write_le_slice<T: Copy, const W: usize>(
+        &mut self,
+        mut values: &[T],
+        to_le: impl Fn(T) -> [u8; W],
+    ) {
+        const BLOCK_BYTES: usize = 4096;
+        if values.is_empty()
+            || self
+                .spill
+                .as_ref()
+                .is_some_and(|spill| spill.failed.is_some())
+        {
+            return;
+        }
+        let block_elems = BLOCK_BYTES / W;
+        let mut buf = [0_u8; BLOCK_BYTES];
+        if self.spill.is_none() {
+            self.page.reserve(values.len().saturating_mul(W));
+            for chunk in values.chunks(block_elems) {
+                let byte_len = chunk.len() * W;
+                for (dst, &val) in buf[..byte_len].as_chunks_mut::<W>().0.iter_mut().zip(chunk) {
+                    *dst = to_le(val);
+                }
+                self.page.extend_from_slice(&buf[..byte_len]);
+            }
+            return;
+        }
+        while !values.is_empty() {
+            if self
+                .spill
+                .as_ref()
+                .is_some_and(|spill| spill.failed.is_some())
+            {
+                return;
+            }
+            let room = CHECKPOINT_PAGE_BYTES.saturating_sub(self.page.len());
+            if room < W {
+                // Single element straddling the page boundary: flush the tail
+                // of the current page cleanly through `put`.
+                let Some((&first, rest)) = values.split_first() else {
+                    break;
+                };
+                self.put(&to_le(first));
+                values = rest;
+                continue;
+            }
+            let fit = (room / W).min(values.len());
+            let (now, rest) = values.split_at(fit);
+            for chunk in now.chunks(block_elems) {
+                let byte_len = chunk.len() * W;
+                for (dst, &val) in buf[..byte_len].as_chunks_mut::<W>().0.iter_mut().zip(chunk) {
+                    *dst = to_le(val);
+                }
+                self.page.extend_from_slice(&buf[..byte_len]);
+            }
+            values = rest;
+            if self.page.len() >= CHECKPOINT_PAGE_BYTES {
+                self.spill_page();
+            }
+        }
+    }
 }
 
 /// Bounded little-endian decoding of one chunk or header.

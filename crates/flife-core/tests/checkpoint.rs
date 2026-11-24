@@ -12,9 +12,11 @@ use std::io::Read;
 
 use flife_core::CoreError;
 use flife_core::Sha256Digest;
+use flife_core::binary16::F16;
 use flife_core::checkpoint::{
     ByteReader, ByteWriter, CHECKPOINT_FORMAT, CHECKPOINT_PAGE_BYTES, CheckpointManifest,
-    CheckpointReader, CheckpointWriter, ChunkFamily, ChunkStream, MANIFEST_MAX_BYTES,
+    CheckpointReader, CheckpointWriter, ChunkFamily, ChunkSink, ChunkStream, ChunkWriter,
+    MANIFEST_MAX_BYTES,
 };
 
 const MODEL: &str = "field-ecology-v1";
@@ -594,4 +596,286 @@ fn byte_readers_bound_counts_before_allocation_and_refuse_leftovers() {
     let mut input = ByteReader::new(&bytes[9..], "test chunk");
     assert_eq!(input.u32().expect("four bytes"), 7);
     input.finish().expect("all read");
+}
+
+#[derive(Default)]
+struct RecordingSink {
+    pages: Vec<Vec<u8>>,
+    length: u64,
+    digest: Option<Sha256Digest>,
+    fail_on_page: Option<usize>,
+}
+
+impl ChunkSink for RecordingSink {
+    fn begin(&mut self, _index: usize, _family: ChunkFamily) -> Result<(), CoreError> {
+        self.pages.clear();
+        self.length = 0;
+        self.digest = None;
+        Ok(())
+    }
+
+    fn page(&mut self, bytes: &[u8]) -> Result<(), CoreError> {
+        if self.fail_on_page == Some(self.pages.len()) {
+            return Err(CoreError::StorageFailed {
+                operation: "write page",
+                path: "recording-sink".into(),
+                reason: "injected page fault".into(),
+            });
+        }
+        assert!(
+            bytes.len() <= CHECKPOINT_PAGE_BYTES,
+            "page length {} exceeded CHECKPOINT_PAGE_BYTES ({CHECKPOINT_PAGE_BYTES})",
+            bytes.len()
+        );
+        self.pages.push(bytes.to_vec());
+        Ok(())
+    }
+
+    fn end(&mut self, length: u64, digest: Sha256Digest) -> Result<(), CoreError> {
+        self.length = length;
+        self.digest = Some(digest);
+        Ok(())
+    }
+}
+
+fn stream_chunk(
+    encode: impl FnOnce(&mut ChunkWriter<'_>) -> Result<(), CoreError>,
+) -> (Vec<u8>, Vec<usize>, Sha256Digest) {
+    let mut sink = RecordingSink::default();
+    let mut writer = CheckpointWriter::streaming(MODEL, &mut sink);
+    writer
+        .chunk_with(ChunkFamily::Genomes, 1, 1, &[], encode)
+        .expect("streams chunk");
+    let _sealed = writer.seal().expect("seals streamed chunk");
+    let page_sizes: Vec<usize> = sink.pages.iter().map(Vec::len).collect();
+    if let Some((_, intermediate)) = page_sizes.split_last() {
+        for &size in intermediate {
+            assert_eq!(
+                size, CHECKPOINT_PAGE_BYTES,
+                "every intermediate spilled page must be exactly CHECKPOINT_PAGE_BYTES"
+            );
+        }
+    }
+    let bytes: Vec<u8> = sink.pages.into_iter().flatten().collect();
+    assert_eq!(
+        u64::try_from(bytes.len()).expect("fits u64"),
+        sink.length,
+        "streamed length matches concatenated pages"
+    );
+    let digest = sink.digest.expect("sink recorded digest");
+    assert_eq!(digest, Sha256Digest::of(&bytes));
+    (bytes, page_sizes, digest)
+}
+
+fn memory_chunk(
+    encode: impl FnOnce(&mut ChunkWriter<'_>) -> Result<(), CoreError>,
+) -> (Vec<u8>, Sha256Digest) {
+    let mut writer = CheckpointWriter::new(MODEL);
+    writer
+        .chunk_with(ChunkFamily::Genomes, 1, 1, &[], encode)
+        .expect("encodes in-memory chunk");
+    let container = writer.finish().expect("finishes in-memory container");
+    let reader = CheckpointReader::parse(&container, &[ChunkFamily::Genomes]).expect("parses");
+    let chunk = reader.chunk(ChunkFamily::Genomes).expect("chunk");
+    let bytes = chunk.bytes.to_vec();
+    let digest = Sha256Digest::of(&bytes);
+    (bytes, digest)
+}
+
+fn make_f32_values(count: usize) -> Vec<f32> {
+    (0..count)
+        .map(|i| match i % 7 {
+            0 => 0.0_f32,
+            1 => -0.0_f32,
+            2 => f32::from_bits(1_u32.wrapping_add((i as u32) & 0x3f)),
+            3 => f32::from_bits(0x3f80_0000 ^ ((i as u32).wrapping_mul(0x9e37_79b9) & 0x007f_ffff)),
+            4 => -((i as f32) * 0.125 + 1.0),
+            5 => f32::from_bits(0x7fc0_0001),
+            _ => (i as f32) * 0.0625,
+        })
+        .collect()
+}
+
+fn make_u16_values(count: usize) -> Vec<u16> {
+    (0..count)
+        .map(|i| (i as u16).wrapping_mul(251).wrapping_add(17))
+        .collect()
+}
+
+fn make_f16_values(count: usize) -> Vec<F16> {
+    make_u16_values(count)
+        .into_iter()
+        .map(F16::from_bits)
+        .collect()
+}
+
+#[test]
+fn bulk_slice_writers_match_element_wise_across_page_straddles() {
+    let page = CHECKPOINT_PAGE_BYTES;
+    let f32_per_page = page / 4;
+    let u16_per_page = page / 2;
+
+    // 1. Exact element counts hitting empty, tiny, page-1, page, page+1, and 3*page+13 byte sizes.
+    let f32_counts = [
+        0,
+        1,
+        7,
+        f32_per_page - 1,
+        f32_per_page,
+        f32_per_page + 1,
+        3 * f32_per_page + 13,
+    ];
+    let f32_max = make_f32_values(*f32_counts.iter().max().expect("nonempty"));
+    for count in f32_counts {
+        let slice = &f32_max[..count];
+        let (want_bytes, want_pages, want_digest) = stream_chunk(|out| {
+            for &v in slice {
+                out.f32(v);
+            }
+            Ok(())
+        });
+        let (got_bytes, got_pages, got_digest) = stream_chunk(|out| {
+            out.f32_slice(slice);
+            Ok(())
+        });
+        assert_eq!(got_digest, want_digest, "f32_slice digest count={count}");
+        assert_eq!(got_pages, want_pages, "f32_slice pages count={count}");
+        assert_eq!(got_bytes, want_bytes, "f32_slice bytes count={count}");
+        let (mem_bytes, mem_digest) = memory_chunk(|out| {
+            out.f32_slice(slice);
+            Ok(())
+        });
+        assert_eq!(
+            mem_digest, want_digest,
+            "f32_slice mem digest count={count}"
+        );
+        assert_eq!(mem_bytes, want_bytes, "f32_slice mem bytes count={count}");
+    }
+
+    let u16_counts = [
+        0,
+        1,
+        7,
+        u16_per_page - 1,
+        u16_per_page,
+        u16_per_page + 1,
+        3 * u16_per_page + 13,
+    ];
+    let u16_max = make_u16_values(*u16_counts.iter().max().expect("nonempty"));
+    let f16_max = make_f16_values(*u16_counts.iter().max().expect("nonempty"));
+    for count in u16_counts {
+        let u_slice = &u16_max[..count];
+        let (want_bytes, want_pages, want_digest) = stream_chunk(|out| {
+            for &v in u_slice {
+                out.u16(v);
+            }
+            Ok(())
+        });
+        let (got_bytes, got_pages, got_digest) = stream_chunk(|out| {
+            out.u16_slice(u_slice);
+            Ok(())
+        });
+        assert_eq!(got_digest, want_digest, "u16_slice digest count={count}");
+        assert_eq!(got_pages, want_pages, "u16_slice pages count={count}");
+        assert_eq!(got_bytes, want_bytes, "u16_slice bytes count={count}");
+
+        let f_slice = &f16_max[..count];
+        let (got_f16_bytes, got_f16_pages, got_f16_digest) = stream_chunk(|out| {
+            out.f16_slice(f_slice);
+            Ok(())
+        });
+        assert_eq!(
+            got_f16_digest, want_digest,
+            "f16_slice digest count={count}"
+        );
+        assert_eq!(got_f16_pages, want_pages, "f16_slice pages count={count}");
+        assert_eq!(got_f16_bytes, want_bytes, "f16_slice bytes count={count}");
+
+        let (mem_f16_bytes, mem_f16_digest) = memory_chunk(|out| {
+            out.f16_slice(f_slice);
+            Ok(())
+        });
+        assert_eq!(
+            mem_f16_digest, want_digest,
+            "f16_slice mem digest count={count}"
+        );
+        assert_eq!(
+            mem_f16_bytes, want_bytes,
+            "f16_slice mem bytes count={count}"
+        );
+    }
+
+    // 2. Unaligned prefix lengths straddling page boundaries (0, 1, 7, page-3, page-2, page-1, page, page+1).
+    let straddle_prefixes = [0, 1, 7, page - 3, page - 2, page - 1, page, page + 1];
+    let f32_span = &f32_max[..f32_per_page + 13];
+    let f16_span = &f16_max[..u16_per_page + 13];
+    for prefix_len in straddle_prefixes {
+        let prefix = vec![0x5a_u8; prefix_len];
+        let (want_f32, want_f32_pages, want_f32_digest) = stream_chunk(|out| {
+            out.bytes(&prefix);
+            for &v in f32_span {
+                out.f32(v);
+            }
+            Ok(())
+        });
+        let (got_f32, got_f32_pages, got_f32_digest) = stream_chunk(|out| {
+            out.bytes(&prefix);
+            out.f32_slice(f32_span);
+            Ok(())
+        });
+        assert_eq!(
+            got_f32_digest, want_f32_digest,
+            "f32 straddle prefix={prefix_len}"
+        );
+        assert_eq!(
+            got_f32_pages, want_f32_pages,
+            "f32 straddle pages prefix={prefix_len}"
+        );
+        assert_eq!(got_f32, want_f32, "f32 straddle bytes prefix={prefix_len}");
+
+        let (want_f16, want_f16_pages, want_f16_digest) = stream_chunk(|out| {
+            out.bytes(&prefix);
+            for &v in f16_span {
+                out.u16(v.to_bits());
+            }
+            Ok(())
+        });
+        let (got_f16, got_f16_pages, got_f16_digest) = stream_chunk(|out| {
+            out.bytes(&prefix);
+            out.f16_slice(f16_span);
+            Ok(())
+        });
+        assert_eq!(
+            got_f16_digest, want_f16_digest,
+            "f16 straddle prefix={prefix_len}"
+        );
+        assert_eq!(
+            got_f16_pages, want_f16_pages,
+            "f16 straddle pages prefix={prefix_len}"
+        );
+        assert_eq!(got_f16, want_f16, "f16 straddle bytes prefix={prefix_len}");
+    }
+
+    // 3. Sink failure mid-slice stops cleanly and returns the sink's error.
+    let mut failing = RecordingSink {
+        fail_on_page: Some(1),
+        ..RecordingSink::default()
+    };
+    let mut writer = CheckpointWriter::streaming(MODEL, &mut failing);
+    let err = writer
+        .chunk_with(ChunkFamily::Genomes, 1, 1, &[], |out| {
+            out.f16_slice(&f16_max[..3 * u16_per_page + 13]);
+            Ok(())
+        })
+        .expect_err("mid-slice page fault must propagate");
+    assert!(
+        matches!(
+            err,
+            CoreError::StorageFailed {
+                operation: "write page",
+                ..
+            }
+        ),
+        "unexpected error: {err:?}"
+    );
 }

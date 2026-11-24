@@ -1053,14 +1053,12 @@ impl Filing {
         })
     }
 
-    /// Index `committed`, then keep the newest `keep` checkpoints the store
-    /// verifies.
+    /// Index `committed`, then prune intact checkpoints beyond `keep` without
+    /// re-reading `committed.publication.sequence` (which was just verified).
     fn file(&self, store: &mut ChunkStore, committed: Committed) -> Result<Filed, CoreError> {
         self.index(&committed)?;
-        Ok(Filed {
-            committed,
-            retired: store.retain_intact(self.keep)?.removed,
-        })
+        let retired = store.prune_excess_intact(self.keep, Some(committed.publication.sequence))?;
+        Ok(Filed { committed, retired })
     }
 
     /// Look up the indexed container digest for `sequence` in `catalog.db`, if
@@ -1439,10 +1437,10 @@ impl Checkpoints {
             })
             .await??;
         let keep = self.filing.keep;
-        let filed = Filed {
-            retired: self.store()?.retain_intact(keep)?.removed,
-            committed,
-        };
+        let retired = self
+            .store()?
+            .prune_excess_intact(keep, Some(committed.publication.sequence))?;
+        let filed = Filed { retired, committed };
         let taken = Taken {
             boundary: filed.committed.boundary,
             mode: CheckpointMode::BoundedBackground,

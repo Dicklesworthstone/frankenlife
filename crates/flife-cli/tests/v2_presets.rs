@@ -17,11 +17,13 @@ use std::process::Command;
 
 use flife_backend_metal::MetalControllers;
 use flife_cli::{
-    DISCOVERY_SCHEMA, ERROR_SCHEMA, INSPECT_SCHEMA, METRICS_SCHEMA, RENDER_SCHEMA, RUN_SCHEMA,
-    VALIDATE_SCHEMA,
+    DISCOVERY_SCHEMA, ERROR_SCHEMA, EXPERIMENT_CATALOG_FILE, EXPERIMENT_SCHEMA, Experiment,
+    INSPECT_SCHEMA, MANIFEST_SCHEMA, METRICS_SCHEMA, RENDER_SCHEMA, REPORT_FILE, REPORT_SCHEMA,
+    RUN_SCHEMA, VALIDATE_SCHEMA,
 };
 use flife_core::schema::Scope;
 use flife_core::{CoreError, FeatureOverride, ModelDescriptor, V2Abi, V2Feature, ValidatedConfig};
+use flife_store::ExperimentCatalog;
 use serde_json::Value;
 
 const BUNDLE_A_RAW: &str = include_str!("../../../presets/morphogenesis-tissue-v2.toml");
@@ -1551,5 +1553,298 @@ fn e2e_leave_one_out_disable_all_21_v2_features() {
         checked,
         V2Feature::ALL.len(),
         "leave-one-out sweep must cover all 21 V2Feature::ALL entries"
+    );
+}
+
+const ABLATION_EXPECTED_MODELS: [(&str, &str); 4] = [
+    ("control", "field-ecology-v2"),
+    ("chemistry-only", "field-ecology-v2-chemistry-only"),
+    ("fixed-controller", "field-ecology-v2-fixed-controller"),
+    ("fresh-offspring", "field-ecology-v2-fresh-offspring"),
+];
+
+fn verify_ablation_experiment(
+    spec_path: &Path,
+    out_dir: &Path,
+    overrides: &[FeatureOverride],
+    extra_cli: &[&str],
+    label: &str,
+) -> (Value, String, String) {
+    let mut args = vec![
+        "experiment",
+        text(spec_path),
+        "--out",
+        text(out_dir),
+        "--cpu-workers",
+        "1",
+        "--controllers",
+        "cpu",
+    ];
+    args.extend_from_slice(extra_cli);
+    let (status, out, err) = flife(&args);
+    assert_eq!(status, Some(0), "{label}: flife experiment failed: {err:?}");
+
+    let start = find_record(&out, "experiment-start");
+    assert_eq!(start["schema"], EXPERIMENT_SCHEMA, "{label}: start schema");
+    assert_eq!(start["name"], "v2-ablation-controls");
+    assert_eq!(
+        json_strings(&start["conditions"]),
+        [
+            "control",
+            "chemistry-only",
+            "fixed-controller",
+            "fresh-offspring",
+        ]
+    );
+    assert_eq!(start["cataloged"], 0);
+
+    let run_records: Vec<&Value> = out
+        .iter()
+        .filter(|record| record["record"] == "experiment-run")
+        .collect();
+    assert_eq!(
+        run_records.len(),
+        12,
+        "{label}: 4 conditions × (2 discovery + 1 held-out) runs"
+    );
+    for rec in &run_records {
+        assert_eq!(rec["schema"], EXPERIMENT_SCHEMA, "{label}: run schema");
+        let res = &rec["result"];
+        assert_eq!(res["status"], "reached", "{label}: run reached: {rec:?}");
+        assert_eq!(res["tick"], 16, "{label}: run tick");
+        assert_hex_sha256(
+            res["digest"].as_str().expect("experiment run digest"),
+            label,
+        );
+        let measures = &res["measures"];
+        assert!(
+            measures["final_live"].as_u64().expect("final_live") > 0,
+            "{label}: live population at tick 16: {rec:?}"
+        );
+        assert_eq!(
+            measures["last"]["tick"], 16,
+            "{label}: last metrics tick recorded"
+        );
+        assert!(
+            measures["last"]["occupied_fraction"]
+                .as_f64()
+                .is_some_and(|val| val.is_finite() && (0.0..=1.0).contains(&val)),
+            "{label}: finite sampled occupied_fraction"
+        );
+    }
+
+    let end = find_record(&out, "experiment-end");
+    assert_eq!(end["schema"], EXPERIMENT_SCHEMA, "{label}: end schema");
+    assert_eq!(end["runs"], 12);
+    assert_eq!(end["complete"], 12);
+    assert_eq!(end["extinct"], 0);
+    assert_hex_sha256(
+        end["report_sha256"].as_str().expect("report_sha256"),
+        &format!("{label} report_sha256"),
+    );
+
+    let report_path = out_dir.join(REPORT_FILE);
+    assert!(report_path.is_file(), "{label}: report.json must exist");
+    let report: Value = serde_json::from_str(
+        &fs::read_to_string(&report_path).expect("reads experiment report.json"),
+    )
+    .expect("parses report.json");
+    assert_eq!(report["schema"], REPORT_SCHEMA, "{label}: report schema");
+    assert_eq!(report["name"], "v2-ablation-controls");
+    assert_eq!(report["ticks"], 16);
+    assert_eq!(report["control"], "control");
+
+    let reported_runs = report["runs"].as_array().expect("report runs array");
+    assert_eq!(reported_runs.len(), 12);
+    for (cond, _) in ABLATION_EXPECTED_MODELS {
+        for (split, seed) in [("discovery", 1_u64), ("discovery", 2), ("held-out", 101)] {
+            let entry = reported_runs
+                .iter()
+                .find(|row| {
+                    row["condition"] == cond && row["split"] == split && row["seed"] == seed
+                })
+                .unwrap_or_else(|| {
+                    panic!("{label}: missing ({cond}, {split}, {seed}) in report.json")
+                });
+            assert_eq!(entry["result"]["status"], "reached");
+            assert_eq!(entry["result"]["tick"], 16);
+            assert!(
+                entry["result"]["measures"]["final_live"]
+                    .as_u64()
+                    .expect("reported final_live")
+                    > 0
+            );
+            assert_eq!(entry["result"]["measures"]["last"]["tick"], 16);
+        }
+    }
+
+    let comparisons = report["comparisons"]
+        .as_array()
+        .expect("report comparisons array");
+    assert_eq!(
+        comparisons.len(),
+        6,
+        "{label}: 3 non-control conditions × 2 splits"
+    );
+    for comp in comparisons {
+        let split = comp["split"].as_str().expect("comparison split");
+        let expected_seeds = if split == "discovery" {
+            &[1_u64, 2][..]
+        } else {
+            &[101_u64][..]
+        };
+        let got_seeds: Vec<u64> = comp["seeds"]
+            .as_array()
+            .expect("comparison seeds")
+            .iter()
+            .map(|value| value.as_u64().expect("seed u64"))
+            .collect();
+        assert_eq!(got_seeds, expected_seeds, "{label}: paired seeds");
+        assert!(
+            comp["unpaired_seeds"]
+                .as_array()
+                .expect("unpaired_seeds")
+                .is_empty(),
+            "{label}: zero unpaired seeds"
+        );
+        let effects = comp["effects"].as_object().expect("comparison effects");
+        assert!(
+            !effects.is_empty(),
+            "{label}: comparison must populate structured effects"
+        );
+    }
+
+    // Verify cataloged manifests and resolved v2 control model names.
+    let loaded =
+        Experiment::load_with_overrides(spec_path, overrides).expect("reloads experiment spec");
+    for (idx, &(_, expected_model)) in ABLATION_EXPECTED_MODELS.iter().enumerate() {
+        let resolved = loaded
+            .configuration(idx, 1)
+            .unwrap_or_else(|err| panic!("{label}: resolves condition {idx}: {err}"));
+        assert_eq!(
+            resolved.config().model,
+            expected_model,
+            "{label}: Experiment::configuration model"
+        );
+    }
+
+    let catalog = ExperimentCatalog::open(
+        &out_dir.join(EXPERIMENT_CATALOG_FILE),
+        &loaded.identity().to_hex(),
+        loaded.design(),
+    )
+    .expect("opens experiment catalog");
+    let cataloged = catalog.runs().expect("reads cataloged runs");
+    assert_eq!(cataloged.len(), 12, "{label}: 12 cataloged runs in sqlite");
+    for row in &cataloged {
+        let manifest: Value =
+            serde_json::from_str(&row.manifest).expect("parses cataloged manifest JSON");
+        assert_eq!(manifest["schema"], MANIFEST_SCHEMA);
+        let expected_model = ABLATION_EXPECTED_MODELS
+            .iter()
+            .find_map(|&(name, model)| (name == row.condition).then_some(model))
+            .unwrap_or_else(|| panic!("{label}: unknown condition `{}`", row.condition));
+        assert_eq!(
+            manifest["model"]["model"], expected_model,
+            "{label}: cataloged manifest model for `{}` seed {}",
+            row.condition, row.seed
+        );
+        let artifact = manifest["artifacts"][0]["path"]
+            .as_str()
+            .expect("artifact path");
+        assert!(
+            out_dir.join(artifact).is_file(),
+            "{label}: run NDJSON artifact `{artifact}` exists"
+        );
+    }
+
+    let find_digest = |cond: &str| -> String {
+        reported_runs
+            .iter()
+            .find(|row| row["condition"] == cond && row["split"] == "discovery" && row["seed"] == 1)
+            .expect("seed-1 discovery run")["result"]["digest"]
+            .as_str()
+            .expect("seed-1 digest")
+            .to_owned()
+    };
+    let ctrl_digest = find_digest("control");
+    let chem_digest = find_digest("chemistry-only");
+    (report, ctrl_digest, chem_digest)
+}
+
+/// Runs real `flife experiment` CLI across all four `field-ecology-v2` control
+/// conditions (`control`, `chemistry-only`, `fixed-controller`,
+/// `fresh-offspring`) on discovery (`[1, 2]`) and held-out (`[101]`) seeds,
+/// verifying cataloged manifests, resolved `field-ecology-v2*` model names,
+/// structured NDJSON/report metrics, and a second `--v1-compat` run with
+/// distinct structured outcomes.
+#[test]
+fn v2_ablation_controls_execute_and_report_structured_metrics() {
+    let dir = scratch("v2_ablation_controls");
+    let base_path = dir.join("base.toml");
+    fs::write(&base_path, scale_preset_32(BUNDLE_A_RAW, 24, &[]))
+        .expect("writes 32x32 Bundle A base config");
+
+    let spec_path = dir.join("experiment.toml");
+    fs::write(
+        &spec_path,
+        r#"schema = "frankenlife.experiment.v1"
+name = "v2-ablation-controls"
+hypothesis = "V2-17 control ablations execute and report structured metrics across discovery and held-out seeds"
+base = "base.toml"
+ticks = 16
+metrics_every = 8
+control = "control"
+selection = "Every run of every condition is reported across discovery and held-out splits."
+
+[seeds]
+discovery = [1, 2]
+held_out = [101]
+
+[[conditions]]
+name = "control"
+
+[[conditions]]
+name = "chemistry-only"
+ablation = "chemistry-only"
+
+[[conditions]]
+name = "fixed-controller"
+ablation = "fixed-controller"
+
+[[conditions]]
+name = "fresh-offspring"
+ablation = "fresh-offspring"
+"#,
+    )
+    .expect("writes experiment.toml");
+
+    let v2_out = dir.join("out_v2");
+    let (v2_report, v2_ctrl_digest, v2_chem_digest) =
+        verify_ablation_experiment(&spec_path, &v2_out, &[], &[], "v2-default");
+    assert_ne!(
+        v2_ctrl_digest, v2_chem_digest,
+        "v2 control neural decisions must diverge from chemistry-only control"
+    );
+
+    let compat_out = dir.join("out_v1_compat");
+    let (compat_report, compat_ctrl_digest, _) = verify_ablation_experiment(
+        &spec_path,
+        &compat_out,
+        &[FeatureOverride::V1Compat],
+        &["--v1-compat"],
+        "v1-compat",
+    );
+    assert_ne!(
+        v2_report["base_config_hash"], compat_report["base_config_hash"],
+        "--v1-compat must materialize a distinct base_config_hash"
+    );
+    assert_ne!(
+        v2_report["experiment"], compat_report["experiment"],
+        "--v1-compat must produce a distinct experiment identity"
+    );
+    assert_ne!(
+        v2_ctrl_digest, compat_ctrl_digest,
+        "all-v2-disabled --v1-compat must diverge from v2-default trajectory"
     );
 }

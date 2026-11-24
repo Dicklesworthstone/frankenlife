@@ -156,20 +156,7 @@ that produced the output it holds, recomputed on the reference and checked again
 and introduction brushes: a click becomes a world-space command the session applies at its next open boundary, reported with
 the tick it applied at and the energy it moved; the host's brush path has not been run in a window here.**
 
-**Modular `field-ecology-v2` (M6 extension) & Cinema export:** `V2-01` adds a 21-slug feature registry
-(`flife --list-features`), default-on per bundle (Bundle A `tissue`: 14 defaults with `[contact]`; Bundle B
-`supercolony`: 13 defaults, strictly `INV-08` pure-field) and founding-only CLI overrides (`--disable`,
-`--enable`, `--v1-compat`, refused on `resume`, `step` and `render --run-dir` per `INV-14`); every
-`field-ecology-v1*` configuration leaves `[v2]` absent so v1 hashes and checkpoints remain byte-identical.
-**Observed:** `V2-02` (`oases`), `V2-06` (`so2-budding`) and `V2-09` (`tight-junctions`) are verified and closed
-alongside `flife-field` (86/86 tests) and `flife-neural` (35/35 tests) at commit `d6352a0`; `V2-16` adds pure
-read-only (`INV-09`) visual mappings (`cell-state-v1`, `polarity-v1`, `trail-carrier`, `vascular-conductance`)
-and Studio keys `8`, `9` and `C` with zero overhead on v1; `FL-050` wires 1080p/4K Cinema export options
-(`--export-size`, `--export-every-ticks`, `--export-camera`) into `flife-studio`; `V2-10` preregistered quickie
-configs (`experiments/v2-quickies/`) and `V2-17` presets (`presets/morphogenesis-tissue-v2.toml`,
-`presets/supercolony-v2.toml`) are authored. Remaining Wave-1b/Wave-2 engine modules (`V2-08`, `V2-11`,
-`V2-12..15`) are in flight, and Stage-2 `V2-10`/`V2-17` multi-seed campaigns have not run yet — **no visual
-(`G5`) or ecological (`G9`) claims are made for `field-ecology-v2` yet.**
+**Modular `field-ecology-v2` (M6 extension) & Cinema export:** `V2-01`–`V2-17` are implemented and verified end-to-end: a 21-slug modular feature registry (`flife --list-features`), two default-on `320×320` F16 showcase presets (`presets/morphogenesis-tissue-v2.toml` Bundle A, `inv08_pure_field = false`, `108/40/44/33`; `presets/supercolony-v2.toml` Bundle B, `inv08_pure_field = true`, `108/40/40/34`) with founding-only CLI overrides (`--disable`, `--enable`, `--v1-compat`, refused on `resume`, `step`, and `render --run-dir` per `INV-14`), four pure read-only (`INV-09`) `V2-16` visual mappings (`cell-state-v1`, `polarity-v1`, `trail-carrier`, `vascular-conductance`; Studio keys `8`, `9`, `C`), and 1080p/4K Cinema export options (`FL-050`: `--export-size`, `--export-every-ticks`, `--export-camera`). Every `field-ecology-v1*` configuration leaves `[v2]` absent so v1 hashes and checkpoints remain byte-identical. **Observed (`V2-17`, 2026-11-24):** All 4 E2E suites in `crates/flife-cli/tests/v2_presets.rs` pass (including all 21 features composed simultaneously at `112/44/48/34`, Reference/Torch/Apple M5 Ultra Metal F16 bit-exact with `0` alignment deferrals, and leave-one-out toggles across all 21 slugs), and `104 / 104` full `320×320` 2,048-tick Stage-2 runs (Discovery `[42, 43]` + Held-Out `[101, 102]`) completed with `0` faults, `0` extinctions, `0` refused births, and max `|INV-03| = 7.17e-9`. Full Four-Claims findings (wins and honest residuals) are published in [`experiments/v2-emergence/README.md`](experiments/v2-emergence/README.md) alongside Stage-1 quickies in [`experiments/v2-quickies/README.md`](experiments/v2-quickies/README.md).
 
 | Question | Answer |
 |---|---|
@@ -300,8 +287,18 @@ refuse them.
 `v2-visual-mappings` (`V2-16`) exposes four pure read-only (`INV-09`) projections with zero overhead on v1:
 `cell-state-v1` (`--color cell-state`, key `8`), `polarity-v1` (`--color polarity`, key `9`, plus bulk apical
 orientation ticks in sphere mode), `trail-carrier` (`--field-mapping trail-carrier`, key `C`) and
-`vascular-conductance` (`--field-mapping vascular-conductance`, key `C`). Stage-2 empirical verification
-(`V2-10` quickies, `V2-17` presets) has not yet run.
+`vascular-conductance` (`--field-mapping vascular-conductance`, key `C`).
+
+Two default-on modular showcase presets ship under `presets/` and can be customized at founding time via CLI or
+TOML toggles (`--disable vascular-field`, `--disable pcp-polarity`, `--disable epigenetic-recurrence,notch-delta`,
+`--enable velocity-alignment`, `--v1-compat`):
+
+- `presets/morphogenesis-tissue-v2.toml` (**Bundle A**, `inv08_pure_field = false`, `320×320×33`, `108/40/44` ABI)
+- `presets/supercolony-v2.toml` (**Bundle B**, `inv08_pure_field = true`, `320×320×34`, `108/40/40` ABI)
+
+Stage-1 (`V2-10`) and Stage-2 (`V2-17`, `104 / 104` multi-seed `320×320` runs) empirical results and honest
+Four-Claims evaluations live in [`experiments/v2-quickies/README.md`](experiments/v2-quickies/README.md) and
+[`experiments/v2-emergence/README.md`](experiments/v2-emergence/README.md).
 
 ---
 

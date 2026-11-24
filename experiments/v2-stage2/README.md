@@ -1,6 +1,6 @@
 # V2-17 Stage-2 Verification & Ablation Harness
 
-**Status:** **Pre-run / Target** (harness, CLI toggle matrices, `V2-16` render hooks, and independent known-answer diagnostic unit tests are implemented; **no Stage-2 empirical outcomes are claimed until real `flife` runs execute and are logged outside git**).
+**Status:** **Observed (`76f47f9`, 2026-11-24 UTC)** — full `104 / 104` Stage-2 multi-seed campaign (`44` Bundle A + `44` Bundle B + `16` `chemistry-only`/`fresh-offspring` controls on unmodified `320×320` presets across Discovery `[42, 43]` & Held-Out `[101, 102]`, `2,048` ticks + `1280×1280` Gate G5 & `V2-16` renders) completed with `0` faults and `0` extinctions. Full Four-Claims analysis and tables are published in [`experiments/v2-emergence/README.md`](../v2-emergence/README.md).
 
 This directory implements the reproducible Stage-2 campaign for `V2-17`, exercising the two authored `field-ecology-v2` showcase presets alongside modular single-mechanism CLI ablations, `v1-compat` baselines, and `fixed-controller` controls:
 
@@ -99,7 +99,7 @@ experiments/v2-stage2/run_stage2.sh --full --flife target/release/flife --render
 
 | Claim | Status | Notes |
 |---|---|---|
-| **Rules** (`INV-01..15`, ledger closure) | *Not yet measured* | Verified at runtime on every tick committed by `run_stage2.sh`; failed or paused runs are kept verbatim. |
-| **Implementation** (`diagnostics.py` oracles) | **Target / Unit-tested** | 16 analytical oracle cases in `test_diagnostics.py` verify formulas independently of simulation runs. |
-| **Visual** (Gate G5 raw + sphere + `V2-16`) | *Not yet measured* | Requires human review of `--render` outputs from full 320×320 runs. |
-| **Ecological** (paired multi-seed ablations) | *Not yet measured* | Requires full `--full` multi-seed ensemble runs with all outcomes (including extinctions) retained. |
+| **Rules** (`INV-01..15`, ledger closure) | **Observed (PASS)** | `104 / 104` full `320×320` 2,048-tick runs reached (`0` extinct, `0` paused, `0` failed, `0` refused births, max `\|INV-03\| = 7.17e-9`). See [`experiments/v2-emergence/README.md`](../v2-emergence/README.md). |
+| **Implementation** (`diagnostics.py` oracles + E2E) | **Observed (PASS)** | 16 analytical oracle cases in `test_diagnostics.py` + 4/4 E2E suites in `crates/flife-cli/tests/v2_presets.rs` (all 21 features, leave-one-out, Metal F16 bit-exact `0` deferrals, `flife experiment` controls). |
+| **Visual** (Gate G5 raw + sphere + `V2-16`) | **Observed (2026-11-24)** | `1280×1280` `raw`, `sphere`/`glow`, and all four `V2-16` overlays reviewed on Discovery (`42`) and Held-Out (`101`) for both Bundle A and Bundle B (`experiments/v2-emergence/README.md` §3). |
+| **Ecological** (paired multi-seed ablations) | **Observed (Positive + Residuals)** | Full 4-seed (`[42, 43]` discovery + `[101, 102]` held-out) tables, paired win counts, and honest residual tradeoffs reported in [`experiments/v2-emergence/README.md`](../v2-emergence/README.md) §4. |

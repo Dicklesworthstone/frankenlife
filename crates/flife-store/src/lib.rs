@@ -69,10 +69,11 @@ pub use experiment::{CatalogedRun, EXPERIMENT_CATALOG_FORMAT, ExperimentCatalog}
 pub use journal::{BranchOrigin, CATALOG_FORMAT, CommandJournal, IndexedCheckpoint};
 pub use stream::{Observer, Stream};
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use flife_core::checkpoint::{
     CheckpointManifest, CheckpointReader, ChunkFamily, MANIFEST_MAX_BYTES, MODEL_MAX_BYTES,
@@ -320,44 +321,439 @@ fn chunk_path_in(root: &Path, digest: &Sha256Digest) -> PathBuf {
     root.join(CHUNKS).join(&hex[..2]).join(hex)
 }
 
-/// The bytes a streamed read holds at once.
+/// The bytes a streamed read holds at once (shared ceiling across concurrent
+/// chunk verifiers so `CHECKPOINT_FIXED_BYTES` is never exceeded).
 const READ_BUFFER_BYTES: usize = 1 << 20;
 
-/// Feed `length` bytes of the file at `path` to `chunk` and `container`,
-/// a buffer at a time. False when the file ends early.
-fn hash_file(
+/// Half of [`READ_BUFFER_BYTES`]: two buffers for a single pipelined reader
+/// (`read` overlapped with `SHA-256`) stay strictly within [`READ_BUFFER_BYTES`].
+const PIPELINE_HALF_BYTES: usize = READ_BUFFER_BYTES / 2;
+
+/// Quarter of [`READ_BUFFER_BYTES`]: four buffers (either four concurrent
+/// chunk verifiers or two double-buffered pipelined lanes) stay strictly
+/// within [`READ_BUFFER_BYTES`].
+const LANE_BUFFER_BYTES: usize = READ_BUFFER_BYTES / 4;
+
+/// Chunks at or below this byte length hash inline without worker-pool
+/// dispatch overhead.
+const PARALLEL_HASH_MIN_BYTES: u64 = 64 << 10;
+
+/// Total held payload below which [`ChunkStore::assemble`] reads chunks
+/// serially without worker-pool dispatch overhead.
+const PARALLEL_LOAD_MIN_BYTES: u64 = 256 << 10;
+
+/// Fixed upper bound on worker threads for store I/O and hashing. Using one
+/// consistent worker count across store operations keeps `flife_core::pool`
+/// to at most one small cached private pool.
+const MAX_STORE_WORKERS: usize = 4;
+
+fn store_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .clamp(1, MAX_STORE_WORKERS)
+}
+
+fn alloc_read_buffer(bytes: usize) -> Result<Vec<u8>, CoreError> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(bytes)
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer: "chunk read buffer",
+            bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+        })?;
+    buffer.resize(bytes, 0);
+    Ok(buffer)
+}
+
+/// Reusable double buffer whose combined length never exceeds
+/// [`READ_BUFFER_BYTES`].
+struct ReadBuffers {
+    cur: Vec<u8>,
+    next: Vec<u8>,
+}
+
+impl ReadBuffers {
+    const fn new() -> Self {
+        Self {
+            cur: Vec::new(),
+            next: Vec::new(),
+        }
+    }
+
+    fn ensure_len(buf: &mut Vec<u8>, want: usize) -> Result<(), CoreError> {
+        if buf.len() < want {
+            let extra = want - buf.len();
+            buf.try_reserve_exact(extra)
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "chunk read buffer",
+                    bytes: u64::try_from(want).unwrap_or(u64::MAX),
+                })?;
+            buf.resize(want, 0);
+        }
+        Ok(())
+    }
+
+    /// Pre-size the reusable pair for a sequence of chunks whose largest chunk
+    /// is `max_len` bytes, staying strictly within [`READ_BUFFER_BYTES`].
+    fn prepare_for(&mut self, max_len: u64, workers: usize) -> Result<(), CoreError> {
+        if max_len == 0 {
+            return Ok(());
+        }
+        let cur_cap =
+            usize::try_from(max_len.min(PIPELINE_HALF_BYTES as u64)).unwrap_or(PIPELINE_HALF_BYTES);
+        Self::ensure_len(&mut self.cur, cur_cap)?;
+        if workers >= 2 && max_len > PIPELINE_HALF_BYTES as u64 {
+            Self::ensure_len(&mut self.next, PIPELINE_HALF_BYTES)?;
+        }
+        Ok(())
+    }
+}
+
+/// Fill `buf` from `file`, looping past short reads and `EINTR` until either
+/// `buf` is full or EOF is reached. Returns `< buf.len()` on early EOF.
+fn read_full(file: &mut File, path: &Path, buf: &mut [u8]) -> Result<usize, CoreError> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let Some(dst) = buf.get_mut(filled..) else {
+            break;
+        };
+        match file.read(dst) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(storage("read chunk", path, &error)),
+        }
+    }
+    Ok(filled)
+}
+
+/// Feed `length` bytes of the file at `path` to `chunk` and optional
+/// `container`, reusing `buffers` (whose combined length never exceeds
+/// [`READ_BUFFER_BYTES`]).
+///
+/// For chunks larger than [`PARALLEL_HASH_MIN_BYTES`] on multi-core hosts,
+/// overlaps the next block read with SHA-256 compression (and hashes `chunk`
+/// and `container` in parallel when both are present). Returns `Ok(false)`
+/// when the file ends before `length` bytes.
+fn hash_file_with_buffers(
     path: &Path,
     length: u64,
     chunk: &mut Sha256Stream,
     mut container: Option<&mut Sha256Stream>,
+    buffers: &mut ReadBuffers,
 ) -> Result<bool, CoreError> {
     let mut file = File::open(path).map_err(|error| storage("read chunk", path, &error))?;
-    let mut buffer = Vec::new();
-    buffer
-        .try_reserve_exact(READ_BUFFER_BYTES)
-        .map_err(|_| CoreError::AllocationFailed {
-            buffer: "chunk read buffer",
-            bytes: READ_BUFFER_BYTES as u64,
-        })?;
-    buffer.resize(READ_BUFFER_BYTES, 0);
+    if length == 0 {
+        return Ok(true);
+    }
+    let workers = store_workers();
+    if workers <= 1 || length <= PARALLEL_HASH_MIN_BYTES {
+        let cap =
+            usize::try_from(length.min(PIPELINE_HALF_BYTES as u64)).unwrap_or(PIPELINE_HALF_BYTES);
+        ReadBuffers::ensure_len(&mut buffers.cur, cap)?;
+        let mut remaining = length;
+        while remaining > 0 {
+            let want = usize::try_from(remaining.min(PIPELINE_HALF_BYTES as u64))
+                .unwrap_or(PIPELINE_HALF_BYTES);
+            let Some(slice) = buffers.cur.get_mut(..want) else {
+                return Ok(false);
+            };
+            let read = read_full(&mut file, path, slice)?;
+            if read < want {
+                return Ok(false);
+            }
+            chunk.update(slice);
+            if let Some(container_stream) = container.as_deref_mut() {
+                container_stream.update(slice);
+            }
+            remaining -= u64::try_from(want).unwrap_or(remaining);
+        }
+        return Ok(true);
+    }
+
+    buffers.prepare_for(length, workers)?;
     let mut remaining = length;
-    while remaining > 0 {
-        let want =
-            usize::try_from(remaining.min(READ_BUFFER_BYTES as u64)).unwrap_or(READ_BUFFER_BYTES);
-        let read = file
-            .read(&mut buffer[..want])
-            .map_err(|error| storage("read chunk", path, &error))?;
-        if read == 0 {
-            return Ok(false);
+    let first_want =
+        usize::try_from(remaining.min(PIPELINE_HALF_BYTES as u64)).unwrap_or(PIPELINE_HALF_BYTES);
+    let Some(first_dst) = buffers.cur.get_mut(..first_want) else {
+        return Ok(false);
+    };
+    let first_read = read_full(&mut file, path, first_dst)?;
+    if first_read < first_want {
+        return Ok(false);
+    }
+    remaining -= u64::try_from(first_want).unwrap_or(remaining);
+    let mut cur_len = first_want;
+
+    loop {
+        let next_want = usize::try_from(remaining.min(PIPELINE_HALF_BYTES as u64))
+            .unwrap_or(PIPELINE_HALF_BYTES);
+        if next_want > 0 {
+            let mut next_outcome: Result<usize, CoreError> = Ok(0);
+            {
+                let ready = buffers.cur.get(..cur_len).unwrap_or_default();
+                let next_dst = buffers.next.get_mut(..next_want).unwrap_or_default();
+                let next_outcome_ref = &mut next_outcome;
+                let container_opt = container.as_deref_mut();
+                let file_ref = &mut file;
+                flife_core::pool::scope_workers(workers, "verify checkpoint", |scope| {
+                    if let Some(container_stream) = container_opt {
+                        scope.spawn(move || container_stream.update(ready));
+                    }
+                    scope.spawn(move || {
+                        *next_outcome_ref = read_full(file_ref, path, next_dst);
+                    });
+                    chunk.update(ready);
+                })?;
+            }
+            let read = next_outcome?;
+            if read < next_want {
+                return Ok(false);
+            }
+            remaining -= u64::try_from(next_want).unwrap_or(remaining);
+            std::mem::swap(&mut buffers.cur, &mut buffers.next);
+            cur_len = next_want;
+        } else {
+            let ready = buffers.cur.get(..cur_len).unwrap_or_default();
+            if let Some(container_stream) = container.as_deref_mut() {
+                flife_core::pool::scope_workers(workers, "verify checkpoint", |scope| {
+                    scope.spawn(move || container_stream.update(ready));
+                    chunk.update(ready);
+                })?;
+            } else {
+                chunk.update(ready);
+            }
+            break;
         }
-        let bytes = &buffer[..read];
-        chunk.update(bytes);
-        if let Some(container) = container.as_deref_mut() {
-            container.update(bytes);
-        }
-        remaining -= u64::try_from(read).unwrap_or(remaining);
     }
     Ok(true)
+}
+
+/// Verify a single chunk file matches `length` bytes and `digest`, reading
+/// into caller-supplied `buf`. Returns `false` on any I/O error, early EOF,
+/// or digest mismatch.
+fn verify_single_chunk_with_buf(
+    path: &Path,
+    length: u64,
+    digest: &Sha256Digest,
+    buf: &mut [u8],
+) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    if length == 0 {
+        return Sha256Digest::of(&[]) == *digest;
+    }
+    if buf.is_empty() {
+        return false;
+    }
+    let mut hasher = Sha256Stream::new();
+    let mut remaining = length;
+    let cap = buf.len();
+    while remaining > 0 {
+        let want = usize::try_from(remaining.min(cap as u64)).unwrap_or(cap);
+        let Some(slice) = buf.get_mut(..want) else {
+            return false;
+        };
+        match read_full(&mut file, path, slice) {
+            Ok(read) if read == want => {
+                hasher.update(slice);
+                remaining -= u64::try_from(want).unwrap_or(remaining);
+            }
+            _ => return false,
+        }
+    }
+    hasher.finish() == *digest
+}
+
+struct ActiveChunk {
+    work_index: usize,
+    path: PathBuf,
+    file: File,
+    digest: Sha256Digest,
+    remaining: u64,
+    cur_len: usize,
+    hasher: Sha256Stream,
+}
+
+struct PipelinedSlot {
+    cur: Vec<u8>,
+    next: Vec<u8>,
+    active: Option<ActiveChunk>,
+}
+
+struct LaneRead<'a> {
+    file: &'a mut File,
+    path: &'a Path,
+    dst: &'a mut [u8],
+    out: &'a mut Result<usize, CoreError>,
+}
+
+struct LaneTask<'a> {
+    hasher: &'a mut Sha256Stream,
+    ready: &'a [u8],
+    read: Option<LaneRead<'a>>,
+}
+
+impl PipelinedSlot {
+    fn new(block_bytes: usize) -> Result<Self, CoreError> {
+        Ok(Self {
+            cur: alloc_read_buffer(block_bytes)?,
+            next: alloc_read_buffer(block_bytes)?,
+            active: None,
+        })
+    }
+
+    fn next_want(&self) -> usize {
+        self.active.as_ref().map_or(0, |active| {
+            let cap = self.next.len();
+            usize::try_from(active.remaining.min(cap as u64)).unwrap_or(cap)
+        })
+    }
+
+    fn prepare_task<'a>(
+        &'a mut self,
+        want: usize,
+        out: &'a mut Result<usize, CoreError>,
+    ) -> Option<LaneTask<'a>> {
+        let active = self.active.as_mut()?;
+        let ready = self.cur.get(..active.cur_len).unwrap_or_default();
+        let read = if want > 0 {
+            Some(LaneRead {
+                file: &mut active.file,
+                path: active.path.as_path(),
+                dst: self.next.get_mut(..want).unwrap_or_default(),
+                out,
+            })
+        } else {
+            None
+        };
+        Some(LaneTask {
+            hasher: &mut active.hasher,
+            ready,
+            read,
+        })
+    }
+}
+
+struct PipelinedBatch<'a> {
+    root: &'a Path,
+    pending: &'a [(Sha256Digest, u64)],
+    next_job: usize,
+    results: Vec<bool>,
+}
+
+impl<'a> PipelinedBatch<'a> {
+    fn new(root: &'a Path, pending: &'a [(Sha256Digest, u64)]) -> Self {
+        Self {
+            root,
+            pending,
+            next_job: 0,
+            results: vec![false; pending.len()],
+        }
+    }
+
+    fn set_result(&mut self, index: usize, ok: bool) {
+        if let Some(slot) = self.results.get_mut(index) {
+            *slot = ok;
+        }
+    }
+
+    /// Assign the next multi-block chunk to `slot`, resolving any zero-byte or
+    /// single-block (`<= slot.cur.len()`) chunks inline without a scope barrier.
+    fn refill(&mut self, slot: &mut PipelinedSlot) {
+        let block_cap = slot.cur.len();
+        while slot.active.is_none() {
+            let Some(&(digest, length)) = self.pending.get(self.next_job) else {
+                return;
+            };
+            let work_index = self.next_job;
+            self.next_job += 1;
+            let path = chunk_path_in(self.root, &digest);
+            let Ok(mut file) = File::open(&path) else {
+                self.set_result(work_index, false);
+                continue;
+            };
+            if length == 0 {
+                self.set_result(work_index, Sha256Digest::of(&[]) == digest);
+                continue;
+            }
+            let first_want = usize::try_from(length.min(block_cap as u64)).unwrap_or(block_cap);
+            let Some(first_dst) = slot.cur.get_mut(..first_want) else {
+                self.set_result(work_index, false);
+                continue;
+            };
+            match read_full(&mut file, &path, first_dst) {
+                Ok(read) if read == first_want => {}
+                _ => {
+                    self.set_result(work_index, false);
+                    continue;
+                }
+            }
+            let remaining = length.saturating_sub(u64::try_from(first_want).unwrap_or(length));
+            if remaining == 0 {
+                let intact = Sha256Digest::of(first_dst) == digest;
+                self.set_result(work_index, intact);
+                continue;
+            }
+            slot.active = Some(ActiveChunk {
+                work_index,
+                path,
+                file,
+                digest,
+                remaining,
+                cur_len: first_want,
+                hasher: Sha256Stream::new(),
+            });
+        }
+    }
+
+    fn advance(
+        &mut self,
+        slot: &mut PipelinedSlot,
+        want: usize,
+        read_res: Result<usize, CoreError>,
+    ) {
+        if slot.active.is_none() {
+            return;
+        }
+        if want == 0 {
+            if let Some(done) = slot.active.take() {
+                let intact = done.hasher.finish() == done.digest;
+                self.set_result(done.work_index, intact);
+            }
+            return;
+        }
+        match read_res {
+            Ok(read) if read == want => {
+                if let Some(active) = slot.active.as_mut() {
+                    active.remaining -= u64::try_from(want).unwrap_or(active.remaining);
+                    active.cur_len = want;
+                    std::mem::swap(&mut slot.cur, &mut slot.next);
+                }
+            }
+            _ => {
+                if let Some(failed) = slot.active.take() {
+                    self.set_result(failed.work_index, false);
+                }
+            }
+        }
+    }
+}
+
+enum LoadTask<'a> {
+    Streamed {
+        path: PathBuf,
+        length: u64,
+        output: Option<io::Take<File>>,
+    },
+    Held {
+        path: PathBuf,
+        family: ChunkFamily,
+        digest: Sha256Digest,
+        buf: &'a mut [u8],
+    },
 }
 
 fn remove_all(temporaries: &[PathBuf]) {
@@ -1103,6 +1499,93 @@ impl ChunkStore {
                 bytes: u64::try_from(total).unwrap_or(u64::MAX),
             })?;
         bytes.extend_from_slice(&prefix);
+
+        let held_count = manifest
+            .entries()
+            .iter()
+            .filter(|entry| Some(entry.family) != streamed)
+            .count();
+        let workers = store_workers();
+        if workers >= 2 && held_count >= 2 && held_payload >= PARALLEL_LOAD_MIN_BYTES {
+            bytes.resize(total, 0);
+            let mut source = None;
+            {
+                let mut rest = bytes.get_mut(prefix.len()..).unwrap_or_default();
+                let mut tasks = Vec::with_capacity(manifest.entries().len());
+                for entry in manifest.entries() {
+                    let path = self.chunk_path(&entry.digest);
+                    if Some(entry.family) == streamed {
+                        tasks.push(LoadTask::Streamed {
+                            path,
+                            length: entry.length,
+                            output: None,
+                        });
+                        continue;
+                    }
+                    let len = usize::try_from(entry.length).map_err(|_| {
+                        refuse(format!("checkpoint {sequence} is too large for this host"))
+                    })?;
+                    let (buf, tail) = rest.split_at_mut_checked(len).ok_or_else(|| {
+                        refuse(format!("checkpoint {sequence} is too large for this host"))
+                    })?;
+                    rest = tail;
+                    tasks.push(LoadTask::Held {
+                        path,
+                        family: entry.family,
+                        digest: entry.digest,
+                        buf,
+                    });
+                }
+                flife_core::pool::try_parallel_for_each_mut(
+                    workers,
+                    "load checkpoint",
+                    &mut tasks,
+                    |_index, task| match task {
+                        LoadTask::Streamed {
+                            path,
+                            length,
+                            output,
+                        } => {
+                            let path = path.as_path();
+                            let file = File::open(path)
+                                .map_err(|error| storage("open chunk", path, &error))?
+                                .take(*length);
+                            *output = Some(file);
+                            Ok(())
+                        }
+                        LoadTask::Held {
+                            path,
+                            family,
+                            digest,
+                            buf,
+                        } => {
+                            let path = path.as_path();
+                            let mut file = File::open(path)
+                                .map_err(|error| storage("read chunk", path, &error))?;
+                            let read = read_full(&mut file, path, buf)?;
+                            if read != buf.len() || Sha256Digest::of(buf) != *digest {
+                                return Err(refuse(format!(
+                                    "chunk {} ({}) hash mismatch",
+                                    family.name(),
+                                    digest
+                                )));
+                            }
+                            Ok(())
+                        }
+                    },
+                )?;
+                for task in tasks {
+                    if let LoadTask::Streamed {
+                        output: Some(file), ..
+                    } = task
+                    {
+                        source = Some(file);
+                    }
+                }
+            }
+            return Ok((bytes, source));
+        }
+
         let mut source = None;
         for entry in manifest.entries() {
             let chunk = self.chunk_path(&entry.digest);
@@ -1142,12 +1625,26 @@ impl ChunkStore {
     pub fn verify(&self, sequence: u64) -> Result<Sha256Digest, CoreError> {
         let prefix = self.sealed_prefix(sequence)?;
         let manifest = CheckpointManifest::parse(&prefix)?;
+        let max_len = manifest
+            .entries()
+            .iter()
+            .map(|entry| entry.length)
+            .max()
+            .unwrap_or(0);
+        let mut buffers = ReadBuffers::new();
+        buffers.prepare_for(max_len, store_workers())?;
         let mut container = Sha256Stream::new();
         container.update(&prefix);
         for entry in manifest.entries() {
             let path = self.chunk_path(&entry.digest);
             let mut chunk = Sha256Stream::new();
-            let whole = hash_file(&path, entry.length, &mut chunk, Some(&mut container))?;
+            let whole = hash_file_with_buffers(
+                &path,
+                entry.length,
+                &mut chunk,
+                Some(&mut container),
+                &mut buffers,
+            )?;
             if !whole || chunk.finish() != entry.digest {
                 return Err(refuse(format!(
                     "chunk {} ({}) hash mismatch",
@@ -1287,46 +1784,263 @@ impl ChunkStore {
         keep: usize,
         mut accept: impl FnMut(u64, &[u8]) -> Result<(), CoreError>,
     ) -> Result<Retention, CoreError> {
-        self.retain_by(keep, |store, sequence| {
-            store
+        let sequences = self.prepare_retain(keep)?;
+        let mut valid = Vec::new();
+        for &sequence in sequences.iter().rev() {
+            if valid.len() == keep {
+                break;
+            }
+            if self
                 .load(sequence)
                 .and_then(|bytes| accept(sequence, &bytes))
                 .is_ok()
-        })
+            {
+                valid.push(sequence);
+            }
+        }
+        self.finish_retention(keep, &sequences, valid)
     }
 
     /// [`ChunkStore::retain`], counting a checkpoint valid when it
     /// [verifies](ChunkStore::verify): its seal, and every chunk's length
     /// and hash, read a buffer at a time. It does not decode a checkpoint,
-    /// and holds at most one read buffer (FL-038).
+    /// does not compute the unused container digest, deduplicates chunks
+    /// shared across candidate manifests, and stays strictly within the
+    /// 1 MiB read-buffer budget (FL-038).
     ///
     /// # Errors
     /// As [`ChunkStore::retain`].
     pub fn retain_intact(&mut self, keep: usize) -> Result<Retention, CoreError> {
-        self.retain_by(keep, |store, sequence| store.verify(sequence).is_ok())
+        let sequences = self.prepare_retain(keep)?;
+        let mut valid = Vec::new();
+        let mut chunk_status: BTreeMap<(Sha256Digest, u64), bool> = BTreeMap::new();
+        let mut cursor = sequences.len();
+
+        while valid.len() < keep && cursor > 0 {
+            let batch_len = (keep - valid.len()).min(cursor);
+            let batch_start = cursor - batch_len;
+            let candidates = sequences.get(batch_start..cursor).unwrap_or_default();
+            cursor = batch_start;
+
+            let mut parsed: Vec<(u64, Option<Vec<(Sha256Digest, u64)>>)> =
+                Vec::with_capacity(candidates.len());
+            let mut seen = BTreeSet::new();
+            let mut pending = Vec::new();
+
+            for &sequence in candidates.iter().rev() {
+                let entries = self.sealed_prefix(sequence).ok().and_then(|prefix| {
+                    let manifest = CheckpointManifest::parse(&prefix).ok()?;
+                    Some(
+                        manifest
+                            .entries()
+                            .iter()
+                            .map(|entry| (entry.digest, entry.length))
+                            .collect::<Vec<_>>(),
+                    )
+                });
+                if let Some(entries_ref) = &entries {
+                    for &key in entries_ref {
+                        if !chunk_status.contains_key(&key) && seen.insert(key) {
+                            pending.push(key);
+                        }
+                    }
+                }
+                parsed.push((sequence, entries));
+            }
+
+            // Schedule largest chunks first (LPT) so dominant genome chunks
+            // start immediately across concurrent workers/lanes.
+            pending.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            self.verify_chunk_batch(&pending, &mut chunk_status)?;
+
+            for (sequence, entries) in parsed {
+                if let Some(entries) = entries
+                    && entries
+                        .iter()
+                        .all(|key| chunk_status.get(key).copied().unwrap_or(false))
+                {
+                    valid.push(sequence);
+                }
+            }
+        }
+
+        self.finish_retention(keep, &sequences, valid)
     }
 
-    fn retain_by(
-        &mut self,
-        keep: usize,
-        mut valid_checkpoint: impl FnMut(&Self, u64) -> bool,
-    ) -> Result<Retention, CoreError> {
+    fn prepare_retain(&self, keep: usize) -> Result<Vec<u64>, CoreError> {
         if keep == 0 {
             return Err(CoreError::StateConflict {
                 operation: "retain checkpoints",
                 detail: "keeping none would discard the last valid checkpoint".into(),
             });
         }
-        let sequences = self.sequences()?;
-        let mut valid = Vec::new();
-        for &sequence in sequences.iter().rev() {
-            if valid.len() == keep {
-                break;
+        self.sequences()
+    }
+
+    /// Verify every `(digest, length)` chunk in `pending` (sorted descending
+    /// by `length`) against its stored file, recording results in
+    /// `chunk_status`. Total simultaneous read-buffer heap stays strictly
+    /// within [`READ_BUFFER_BYTES`].
+    fn verify_chunk_batch(
+        &self,
+        pending: &[(Sha256Digest, u64)],
+        chunk_status: &mut BTreeMap<(Sha256Digest, u64), bool>,
+    ) -> Result<(), CoreError> {
+        let Some(&(_, max_len)) = pending.first() else {
+            return Ok(());
+        };
+        let workers = store_workers();
+
+        // Small batches or single-core hosts run inline with an exact-sized
+        // buffer and zero worker-pool overhead.
+        if workers <= 1 || max_len <= PARALLEL_HASH_MIN_BYTES {
+            let cap = usize::try_from(max_len.min(PIPELINE_HALF_BYTES as u64))
+                .unwrap_or(PIPELINE_HALF_BYTES)
+                .max(1);
+            let mut buf = alloc_read_buffer(cap)?;
+            for &(digest, length) in pending {
+                let path = chunk_path_in(&self.root, &digest);
+                let intact = verify_single_chunk_with_buf(&path, length, &digest, &mut buf);
+                chunk_status.insert((digest, length), intact);
             }
-            if valid_checkpoint(self, sequence) {
-                valid.push(sequence);
-            }
+            return Ok(());
         }
+
+        // Single chunk larger than the inline threshold: pipeline disk reads
+        // against SHA-256 on 2 threads inside 2 × 512 KiB = 1 MiB.
+        if let &[(digest, length)] = pending {
+            let path = chunk_path_in(&self.root, &digest);
+            let mut buffers = ReadBuffers::new();
+            let mut chunk = Sha256Stream::new();
+            let intact = matches!(
+                hash_file_with_buffers(&path, length, &mut chunk, None, &mut buffers),
+                Ok(true)
+            ) && chunk.finish() == digest;
+            chunk_status.insert((digest, length), intact);
+            return Ok(());
+        }
+
+        let dominant_floor = (max_len / 4).max(PARALLEL_HASH_MIN_BYTES + 1);
+        let dominant = pending
+            .iter()
+            .take_while(|&&(_, length)| length >= dominant_floor)
+            .count();
+
+        // When 1 or 2 huge chunks dominate (e.g. two multi-GB genome chunks),
+        // run two lockstep double-buffered lanes on 4 threads (`hash0 || read0
+        // || hash1 || read1`) inside 4 × 256 KiB = 1 MiB total heap.
+        if workers >= 4 && dominant <= 2 {
+            let mut slot0 = PipelinedSlot::new(LANE_BUFFER_BYTES)?;
+            let mut slot1 = PipelinedSlot::new(LANE_BUFFER_BYTES)?;
+            let mut batch = PipelinedBatch::new(&self.root, pending);
+            batch.refill(&mut slot0);
+            batch.refill(&mut slot1);
+
+            while slot0.active.is_some() || slot1.active.is_some() {
+                let w0 = slot0.next_want();
+                let w1 = slot1.next_want();
+                let mut r0: Result<usize, CoreError> = Ok(0);
+                let mut r1: Result<usize, CoreError> = Ok(0);
+                {
+                    let task1 = slot1.prepare_task(w1, &mut r1);
+                    let task0 = slot0.prepare_task(w0, &mut r0);
+                    flife_core::pool::scope_workers(workers, "retain checkpoints", |scope| {
+                        if let Some(LaneTask {
+                            hasher,
+                            ready,
+                            read,
+                        }) = task1
+                        {
+                            scope.spawn(move || hasher.update(ready));
+                            if let Some(LaneRead {
+                                file,
+                                path,
+                                dst,
+                                out,
+                            }) = read
+                            {
+                                scope.spawn(move || {
+                                    *out = read_full(file, path, dst);
+                                });
+                            }
+                        }
+                        if let Some(LaneTask {
+                            hasher,
+                            ready,
+                            read,
+                        }) = task0
+                        {
+                            if let Some(LaneRead {
+                                file,
+                                path,
+                                dst,
+                                out,
+                            }) = read
+                            {
+                                scope.spawn(move || {
+                                    *out = read_full(file, path, dst);
+                                });
+                            }
+                            hasher.update(ready);
+                        }
+                    })?;
+                }
+                batch.advance(&mut slot0, w0, r0);
+                batch.advance(&mut slot1, w1, r1);
+                batch.refill(&mut slot0);
+                batch.refill(&mut slot1);
+            }
+
+            for (&key, intact) in pending.iter().zip(batch.results) {
+                chunk_status.insert(key, intact);
+            }
+            return Ok(());
+        }
+
+        // Three or more dominant chunks (or 2–3 core hosts): verify distinct
+        // chunks concurrently across `worker_count` workers, dividing the
+        // `READ_BUFFER_BYTES` ceiling evenly so total heap never exceeds 1 MiB.
+        let worker_count = workers.min(pending.len());
+        let buf_bytes = (READ_BUFFER_BYTES / worker_count)
+            .min(usize::try_from(max_len).unwrap_or(READ_BUFFER_BYTES))
+            .max(1);
+        let mut worker_bufs = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            worker_bufs.push(alloc_read_buffer(buf_bytes)?);
+        }
+        let next_idx = AtomicUsize::new(0);
+        let results: Vec<AtomicBool> = (0..pending.len()).map(|_| AtomicBool::new(false)).collect();
+        let root = self.root.as_path();
+        flife_core::pool::parallel_for_each_mut(
+            workers,
+            "retain checkpoints",
+            &mut worker_bufs,
+            |_worker_id, buf| {
+                loop {
+                    let index = next_idx.fetch_add(1, Ordering::Relaxed);
+                    let Some(&(digest, length)) = pending.get(index) else {
+                        break;
+                    };
+                    let path = chunk_path_in(root, &digest);
+                    let intact = verify_single_chunk_with_buf(&path, length, &digest, buf);
+                    if let Some(slot) = results.get(index) {
+                        slot.store(intact, Ordering::Relaxed);
+                    }
+                }
+            },
+        )?;
+        for (&key, result) in pending.iter().zip(&results) {
+            chunk_status.insert(key, result.load(Ordering::Relaxed));
+        }
+        Ok(())
+    }
+
+    fn finish_retention(
+        &self,
+        keep: usize,
+        sequences: &[u64],
+        valid: Vec<u64>,
+    ) -> Result<Retention, CoreError> {
         let oldest = if valid.len() == keep {
             valid.last().copied()
         } else {
@@ -1430,7 +2144,8 @@ fn stored_as(path: &Path, length: u64, digest: &Sha256Digest) -> Result<Stored, 
         Ok(metadata) if !metadata.is_file() || metadata.len() != length => Ok(Stored::Damaged),
         Ok(_) => {
             let mut hash = Sha256Stream::new();
-            let whole = hash_file(path, length, &mut hash, None)?;
+            let mut buffers = ReadBuffers::new();
+            let whole = hash_file_with_buffers(path, length, &mut hash, None, &mut buffers)?;
             Ok(if whole && hash.finish() == *digest {
                 Stored::Intact
             } else {
@@ -1497,5 +2212,250 @@ mod tests {
             .expect("reopens immediately after drop despite duplicated descriptor");
         drop(reopened);
         drop(duplicated);
+    }
+
+    fn fresh_dir(label: &str) -> TempDir {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        TempDir(std::env::temp_dir().join(format!(
+            "flife-store-{label}-{}-{nanos}-{n}",
+            std::process::id()
+        )))
+    }
+
+    fn pattern_bytes(seed: u8, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut state = u64::from(seed).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x517c_c1b7_2722_0a95;
+        for index in 0..len {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407 ^ (index as u64));
+            out.push((state >> 56) as u8);
+        }
+        out
+    }
+
+    fn build_checkpoint(seed: u8, sizes: &[(ChunkFamily, usize)]) -> Vec<u8> {
+        let mut writer = flife_core::checkpoint::CheckpointWriter::new("field-ecology-v2");
+        for &(family, len) in sizes {
+            let bytes = pattern_bytes(seed.wrapping_add(family.code()), len);
+            writer
+                .chunk(family, 1, u64::try_from(len).expect("len"), bytes, &[])
+                .expect("adds chunk");
+        }
+        writer.finish().expect("seals container")
+    }
+
+    /// Pipelined `verify`, parallel `load`/`load_streaming`, and `stored_as`
+    /// must match naive whole-container SHA-256 and bytes bit-for-bit across
+    /// every block-size boundary (0, 1, 64 KiB, 64 KiB+1, 256 KiB, 256 KiB+1,
+    /// 512 KiB, 512 KiB+1, 1 MiB+137) and reject single-bit flips and
+    /// single-byte truncations in both small and multi-block chunks.
+    #[test]
+    fn pipelined_verify_and_parallel_load_match_naive_across_boundaries() {
+        let sizes = [
+            (ChunkFamily::Configuration, 0),
+            (ChunkFamily::Random, 1),
+            (ChunkFamily::Topology, 137),
+            (
+                ChunkFamily::Environment,
+                usize::try_from(PARALLEL_HASH_MIN_BYTES).expect("fits"),
+            ),
+            (
+                ChunkFamily::Lifecycle,
+                usize::try_from(PARALLEL_HASH_MIN_BYTES).expect("fits") + 1,
+            ),
+            (ChunkFamily::Field, LANE_BUFFER_BYTES),
+            (ChunkFamily::Particles, LANE_BUFFER_BYTES + 1),
+            (ChunkFamily::Held, PIPELINE_HALF_BYTES),
+            (ChunkFamily::Ledger, PIPELINE_HALF_BYTES + 1),
+            (ChunkFamily::Commands, LANE_BUFFER_BYTES * 3 + 19),
+            (ChunkFamily::Genomes, READ_BUFFER_BYTES + 137),
+        ];
+        let whole = build_checkpoint(1, &sizes);
+        let expected_digest = Sha256Digest::of(&whole);
+
+        let dir = fresh_dir("verify-boundaries");
+        let mut store = ChunkStore::open(&dir.0, Durability::ProcessCrash).expect("opens");
+        let pub1 = store.publish(&whole).expect("publishes");
+        assert_eq!(
+            store.verify(pub1.sequence).expect("verifies"),
+            expected_digest
+        );
+        assert_eq!(store.load(pub1.sequence).expect("loads"), whole);
+
+        // Republishing shares every chunk (exercises `stored_as` across all sizes).
+        let pub2 = store.publish(&whole).expect("republishes");
+        assert_eq!(pub2.shared, sizes.len());
+        assert_eq!(
+            store.verify(pub2.sequence).expect("verifies"),
+            expected_digest
+        );
+
+        // Parallel `load_streaming` matches `load` chunk-for-chunk.
+        let (held, streamed) = store
+            .load_streaming(pub1.sequence, ChunkFamily::Genomes)
+            .expect("loads streaming");
+        let mut streamed_bytes = Vec::new();
+        streamed
+            .expect("genomes handle")
+            .read_to_end(&mut streamed_bytes)
+            .expect("reads genomes");
+        let manifest = CheckpointManifest::parse(&whole).expect("manifest");
+        let genome_entry = manifest
+            .entries()
+            .iter()
+            .find(|entry| entry.family == ChunkFamily::Genomes)
+            .expect("genome entry");
+        let g_start =
+            manifest.sealed_length() + usize::try_from(genome_entry.offset).expect("fits");
+        let g_end = g_start + usize::try_from(genome_entry.length).expect("fits");
+        assert_eq!(streamed_bytes, &whole[g_start..g_end]);
+        assert_eq!(held.len() + streamed_bytes.len(), whole.len());
+
+        // Flip 1 bit in the tail of the multi-block `Genomes` chunk and check
+        // rejection in `verify`, `load`, and `retain_intact`.
+        let genome_path = store.chunk_path(&genome_entry.digest);
+        let original = fs::read(&genome_path).expect("reads original");
+        let mut flipped = original.clone();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0x80;
+        fs::write(&genome_path, &flipped).expect("writes flipped");
+        assert!(matches!(
+            store.verify(pub1.sequence),
+            Err(CoreError::IncompatibleCheckpoint { .. })
+        ));
+        assert!(matches!(
+            store.load(pub1.sequence),
+            Err(CoreError::IncompatibleCheckpoint { .. })
+        ));
+        let retained_damaged = store.retain_intact(1).expect("retains damaged");
+        assert!(retained_damaged.valid.is_empty());
+
+        // Truncate by 1 byte -> refused cleanly before restoring original.
+        fs::write(&genome_path, &original[..original.len() - 1]).expect("writes truncated");
+        assert!(matches!(
+            store.verify(pub1.sequence),
+            Err(CoreError::IncompatibleCheckpoint { .. })
+        ));
+        assert!(matches!(
+            store.load(pub1.sequence),
+            Err(CoreError::IncompatibleCheckpoint { .. })
+        ));
+        fs::write(&genome_path, &original).expect("restores");
+        assert_eq!(
+            store.verify(pub1.sequence).expect("restored"),
+            expected_digest
+        );
+    }
+
+    /// `retain_intact` must produce identical `Retention` results to serial
+    /// `retain` across all parallel verification regimes (1-dominant, 2-lane
+    /// lockstep pipelined, 3+/4-worker atomic pool, shared chunks, and damaged
+    /// newest or middle checkpoints).
+    #[test]
+    fn retain_intact_matches_serial_across_all_parallel_regimes() {
+        let shared_config = pattern_bytes(77, 1024);
+        let shared_field = pattern_bytes(88, LANE_BUFFER_BYTES + 333);
+        let make_ckpt = |seed: u8, genome_len: usize| -> Vec<u8> {
+            let mut writer = flife_core::checkpoint::CheckpointWriter::new("field-ecology-v2");
+            writer
+                .chunk(
+                    ChunkFamily::Configuration,
+                    1,
+                    u64::try_from(shared_config.len()).expect("len"),
+                    shared_config.clone(),
+                    &[],
+                )
+                .expect("config");
+            writer
+                .chunk(
+                    ChunkFamily::Field,
+                    1,
+                    u64::try_from(shared_field.len()).expect("len"),
+                    shared_field.clone(),
+                    &[],
+                )
+                .expect("field");
+            let particles = pattern_bytes(seed.wrapping_add(10), 100_000);
+            writer
+                .chunk(
+                    ChunkFamily::Particles,
+                    1,
+                    u64::try_from(particles.len()).expect("len"),
+                    particles,
+                    &[],
+                )
+                .expect("particles");
+            let genomes = pattern_bytes(seed.wrapping_add(20), genome_len);
+            writer
+                .chunk(
+                    ChunkFamily::Genomes,
+                    1,
+                    u64::try_from(genomes.len()).expect("len"),
+                    genomes,
+                    &[],
+                )
+                .expect("genomes");
+            writer.finish().expect("seals")
+        };
+
+        // 5 checkpoints with multi-block genomes so keep=1 (1-dominant),
+        // keep=2 (2-lane lockstep pipelined), and keep=4 (4-worker atomic pool)
+        // are all exercised against an identical serial `retain` twin.
+        let checkpoints = [
+            make_ckpt(1, 300_000),
+            make_ckpt(2, READ_BUFFER_BYTES + 511),
+            make_ckpt(3, READ_BUFFER_BYTES + 1023),
+            make_ckpt(4, READ_BUFFER_BYTES + 2047),
+            make_ckpt(5, READ_BUFFER_BYTES + 4093),
+        ];
+
+        for (case, damage_idx, keep) in [
+            ("intact-keep-1", None, 1),
+            ("intact-keep-2", None, 2),
+            ("intact-keep-4", None, 4),
+            ("damaged-newest-keep-2", Some(4_usize), 2),
+            ("damaged-middle-keep-3", Some(2_usize), 3),
+        ] {
+            let intact_dir = fresh_dir(&format!("retain-intact-{case}"));
+            let serial_dir = fresh_dir(&format!("retain-serial-{case}"));
+            let mut by_intact =
+                ChunkStore::open(&intact_dir.0, Durability::ProcessCrash).expect("opens");
+            let mut by_serial =
+                ChunkStore::open(&serial_dir.0, Durability::ProcessCrash).expect("opens");
+            for bytes in &checkpoints {
+                by_intact.publish(bytes).expect("publishes");
+                by_serial.publish(bytes).expect("publishes");
+            }
+            if let Some(idx) = damage_idx {
+                let manifest = CheckpointManifest::parse(&checkpoints[idx]).expect("manifest");
+                let digest = manifest
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.family == ChunkFamily::Genomes)
+                    .expect("genomes")
+                    .digest;
+                for store in [&by_intact, &by_serial] {
+                    let path = store.chunk_path(&digest);
+                    let mut raw = fs::read(&path).expect("reads");
+                    let mid = raw.len() / 2;
+                    raw[mid] ^= 0x01;
+                    fs::write(&path, raw).expect("corrupts");
+                }
+            }
+            let got = by_intact.retain_intact(keep).expect("retain_intact");
+            let expected = by_serial.retain(keep, |_, _| Ok(())).expect("retain");
+            assert_eq!(got, expected, "case {case} must match serial retain");
+            assert_eq!(
+                by_intact.sequences().expect("seqs"),
+                by_serial.sequences().expect("seqs"),
+                "case {case} kept sequences must match"
+            );
+        }
     }
 }

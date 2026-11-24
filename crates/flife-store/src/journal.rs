@@ -310,6 +310,65 @@ impl CommandJournal {
                 .execute("PRAGMA synchronous = FULL")
                 .await
                 .map_err(|error| fail("set synchronous mode", &error))?;
+
+            // Fast path for an already-initialized catalog: inspect existing
+            // tables read-only so reopening on every checkpoint avoids ten
+            // redundant DDL/write-transaction fsyncs while still refusing
+            // foreign catalogs without mutating them.
+            const REQUIRED_TABLES: [&str; 6] = [
+                "runs",
+                "commands",
+                "outcomes",
+                "checkpoints",
+                "lineage",
+                "branches",
+            ];
+            let existing_tables: BTreeSet<String> = journal
+                .connection
+                .query("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .await
+                .map_err(|error| fail("read catalog schema", &error))?
+                .into_iter()
+                .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
+                .collect();
+            if existing_tables.contains("catalog") {
+                let format = journal
+                    .connection
+                    .query("SELECT value FROM catalog WHERE key = 'format'")
+                    .await
+                    .map_err(|error| fail("read catalog format", &error))?;
+                let found = format
+                    .first()
+                    .and_then(|row| row.get(0))
+                    .and_then(SqliteValue::as_text)
+                    .map(str::to_owned);
+                match found.as_deref() {
+                    Some(CATALOG_FORMAT) => {
+                        if REQUIRED_TABLES
+                            .iter()
+                            .all(|table| existing_tables.contains(*table))
+                        {
+                            return Ok::<_, CoreError>(());
+                        }
+                        for statement in SCHEMA {
+                            journal
+                                .connection
+                                .execute(statement)
+                                .await
+                                .map_err(|error| fail("create run catalog schema", &error))?;
+                        }
+                        return Ok::<_, CoreError>(());
+                    }
+                    Some(other) => {
+                        return Err(CoreError::SchemaMismatch {
+                            expected: CATALOG_FORMAT.into(),
+                            found: other.to_owned(),
+                        });
+                    }
+                    None => {}
+                }
+            }
+
             for statement in MARKER {
                 journal
                     .connection

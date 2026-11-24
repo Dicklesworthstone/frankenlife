@@ -75,6 +75,153 @@ pub fn exp_neg(x: f64) -> Option<f64> {
     Some(scaled * power_of_two(-first) * power_of_two(first - n))
 }
 
+/// Four-lane batch [`exp_neg`], bit-identical to
+/// `[exp_neg(xs[0])?, exp_neg(xs[1])?, exp_neg(xs[2])?, exp_neg(xs[3])?]`.
+///
+/// Uses the exact same IEEE-754 operations and parenthesization per lane in
+/// lockstep fixed-size arrays so LLVM auto-vectorizes across lanes (`fdiv.2d` /
+/// `fmul.2d` / `fsub.2d`) without FMA contraction or numerical drift. Returns
+/// `None` if any lane is negative or nonfinite.
+#[must_use]
+pub fn exp_neg_4(xs: [f64; 4]) -> Option<[f64; 4]> {
+    if !xs[0].is_finite()
+        || xs[0] < 0.0
+        || !xs[1].is_finite()
+        || xs[1] < 0.0
+        || !xs[2].is_finite()
+        || xs[2] < 0.0
+        || !xs[3].is_finite()
+        || xs[3] < 0.0
+    {
+        return None;
+    }
+    if xs[0] > REDUCED
+        && xs[0] < EXP_UNDERFLOWS
+        && xs[1] > REDUCED
+        && xs[1] < EXP_UNDERFLOWS
+        && xs[2] > REDUCED
+        && xs[2] < EXP_UNDERFLOWS
+        && xs[3] > REDUCED
+        && xs[3] < EXP_UNDERFLOWS
+    {
+        let n = [
+            (xs[0] / core::f64::consts::LN_2).round(),
+            (xs[1] / core::f64::consts::LN_2).round(),
+            (xs[2] / core::f64::consts::LN_2).round(),
+            (xs[3] / core::f64::consts::LN_2).round(),
+        ];
+        let r = [
+            (xs[0] - n[0] * LN2_HI) - n[0] * LN2_LO,
+            (xs[1] - n[1] * LN2_HI) - n[1] * LN2_LO,
+            (xs[2] - n[2] * LN2_HI) - n[2] * LN2_LO,
+            (xs[3] - n[3] * LN2_HI) - n[3] * LN2_LO,
+        ];
+        let scaled = exp_series_15_4(r);
+        let scale_lane = |s: f64, nf: f64| {
+            let ni = nf as i32;
+            let first = ni.min(1000);
+            s * power_of_two(-first) * power_of_two(first - ni)
+        };
+        return Some([
+            scale_lane(scaled[0], n[0]),
+            scale_lane(scaled[1], n[1]),
+            scale_lane(scaled[2], n[2]),
+            scale_lane(scaled[3], n[3]),
+        ]);
+    }
+    if xs[0] > 0.0
+        && xs[0] <= REDUCED
+        && xs[1] > 0.0
+        && xs[1] <= REDUCED
+        && xs[2] > 0.0
+        && xs[2] <= REDUCED
+        && xs[3] > 0.0
+        && xs[3] <= REDUCED
+    {
+        return Some(exp_series_12_4(xs));
+    }
+    Some([
+        exp_neg(xs[0])?,
+        exp_neg(xs[1])?,
+        exp_neg(xs[2])?,
+        exp_neg(xs[3])?,
+    ])
+}
+
+/// Four-lane lockstep [`exp_series_12`], bit-identical per lane.
+#[inline]
+fn exp_series_12_4(y: [f64; 4]) -> [f64; 4] {
+    let mut s = [
+        1.0 - y[0] / 12.0,
+        1.0 - y[1] / 12.0,
+        1.0 - y[2] / 12.0,
+        1.0 - y[3] / 12.0,
+    ];
+    for div in [11.0, 10.0, 9.0] {
+        for (si, &yi) in s.iter_mut().zip(&y) {
+            *si = 1.0 - (yi / div) * *si;
+        }
+    }
+    for (si, &yi) in s.iter_mut().zip(&y) {
+        *si = 1.0 - (yi * 0.125) * *si;
+    }
+    for div in [7.0, 6.0, 5.0] {
+        for (si, &yi) in s.iter_mut().zip(&y) {
+            *si = 1.0 - (yi / div) * *si;
+        }
+    }
+    for (si, &yi) in s.iter_mut().zip(&y) {
+        *si = 1.0 - (yi * 0.25) * *si;
+    }
+    for (si, &yi) in s.iter_mut().zip(&y) {
+        *si = 1.0 - (yi / 3.0) * *si;
+    }
+    for (si, &yi) in s.iter_mut().zip(&y) {
+        *si = 1.0 - (yi * 0.5) * *si;
+    }
+    for (si, &yi) in s.iter_mut().zip(&y) {
+        *si = 1.0 - yi * *si;
+    }
+    s
+}
+
+/// Four-lane lockstep [`exp_series_15`], bit-identical per lane.
+#[inline]
+fn exp_series_15_4(y: [f64; 4]) -> [f64; 4] {
+    let mut s = [
+        1.0 - y[0] / 15.0,
+        1.0 - y[1] / 15.0,
+        1.0 - y[2] / 15.0,
+        1.0 - y[3] / 15.0,
+    ];
+    for div in [14.0, 13.0, 12.0, 11.0, 10.0, 9.0] {
+        for (si, &yi) in s.iter_mut().zip(&y) {
+            *si = 1.0 - (yi / div) * *si;
+        }
+    }
+    for (si, &yi) in s.iter_mut().zip(&y) {
+        *si = 1.0 - (yi * 0.125) * *si;
+    }
+    for div in [7.0, 6.0, 5.0] {
+        for (si, &yi) in s.iter_mut().zip(&y) {
+            *si = 1.0 - (yi / div) * *si;
+        }
+    }
+    for (si, &yi) in s.iter_mut().zip(&y) {
+        *si = 1.0 - (yi * 0.25) * *si;
+    }
+    for (si, &yi) in s.iter_mut().zip(&y) {
+        *si = 1.0 - (yi / 3.0) * *si;
+    }
+    for (si, &yi) in s.iter_mut().zip(&y) {
+        *si = 1.0 - (yi * 0.5) * *si;
+    }
+    for (si, &yi) in s.iter_mut().zip(&y) {
+        *si = 1.0 - yi * *si;
+    }
+    s
+}
+
 /// `Σ_{i ≤ 12} (−y)^i / i!` by Horner's rule from the highest term.
 /// Independent quotients `y / k` are evaluated up front (with exact
 /// power-of-two multiplies for `2, 4, 8` and `y / 1 = y`) so out-of-order
@@ -311,6 +458,161 @@ pub fn tanh_f64_as_f32(x: f64) -> Option<f32> {
         }
     }
     tanh(x).map(|value| value as f32)
+}
+
+/// Four-lane batch [`tanh_f64_as_f32`], bit-identical to
+/// `[tanh_f64_as_f32(xs[0])?, tanh_f64_as_f32(xs[1])?, tanh_f64_as_f32(xs[2])?, tanh_f64_as_f32(xs[3])?]`.
+///
+/// Runs Estrin polynomial evaluation and Cody–Waite range reduction in
+/// lockstep across all four lanes (with exact double-rounding tie guards and
+/// scalar [`tanh`] fallback on tie/subnormal lanes) so LLVM auto-vectorizes
+/// across lanes (`fmul.2d` / `fadd.2d` / `fdiv.2d`) while preserving every
+/// F32 bit. Returns `None` if any lane is nonfinite.
+#[must_use]
+pub fn tanh_f64_as_f32_4(xs: [f64; 4]) -> Option<[f32; 4]> {
+    if !xs[0].is_finite() || !xs[1].is_finite() || !xs[2].is_finite() || !xs[3].is_finite() {
+        return None;
+    }
+    let mags = [xs[0].abs(), xs[1].abs(), xs[2].abs(), xs[3].abs()];
+    let s = [2.0 * mags[0], 2.0 * mags[1], 2.0 * mags[2], 2.0 * mags[3]];
+
+    let mut any_small_nz = false;
+    let mut any_mid = false;
+    for (&x, (&mag, &si)) in xs.iter().zip(mags.iter().zip(&s)) {
+        if x != 0.0 && mag < TANH_SATURATES {
+            if si < TANH_SERIES_BELOW {
+                any_small_nz = true;
+            } else {
+                any_mid = true;
+            }
+        }
+    }
+
+    if !any_small_nz {
+        // Every active lane lies in `[TANH_SERIES_BELOW, 2 * TANH_SATURATES)`;
+        // zero and saturated lanes pass `0.0` safely through the lockstep path
+        // and receive their exact outputs in `finalize_tanh_f64_as_f32_4`.
+        let s_safe = [
+            if mags[0] >= TANH_SATURATES { 0.0 } else { s[0] },
+            if mags[1] >= TANH_SATURATES { 0.0 } else { s[1] },
+            if mags[2] >= TANH_SATURATES { 0.0 } else { s[2] },
+            if mags[3] >= TANH_SATURATES { 0.0 } else { s[3] },
+        ];
+        let n = [
+            (s_safe[0] * core::f64::consts::LOG2_E).round(),
+            (s_safe[1] * core::f64::consts::LOG2_E).round(),
+            (s_safe[2] * core::f64::consts::LOG2_E).round(),
+            (s_safe[3] * core::f64::consts::LOG2_E).round(),
+        ];
+        let neg_r = [
+            -((s_safe[0] - n[0] * LN2_HI) - n[0] * LN2_LO),
+            -((s_safe[1] - n[1] * LN2_HI) - n[1] * LN2_LO),
+            -((s_safe[2] - n[2] * LN2_HI) - n[2] * LN2_LO),
+            -((s_safe[3] - n[3] * LN2_HI) - n[3] * LN2_LO),
+        ];
+        let poly = estrin12_4(neg_r, &EXP_COEFFICIENTS);
+        let d = [
+            poly[0] * power_of_two(-(n[0] as i32)),
+            poly[1] * power_of_two(-(n[1] as i32)),
+            poly[2] * power_of_two(-(n[2] as i32)),
+            poly[3] * power_of_two(-(n[3] as i32)),
+        ];
+        let approx = [
+            (1.0 - d[0]) / (1.0 + d[0]),
+            (1.0 - d[1]) / (1.0 + d[1]),
+            (1.0 - d[2]) / (1.0 + d[2]),
+            (1.0 - d[3]) / (1.0 + d[3]),
+        ];
+        return finalize_tanh_f64_as_f32_4(xs, mags, approx);
+    }
+
+    if !any_mid {
+        // Every active lane lies in `(0, TANH_SERIES_BELOW)`.
+        let s_safe = [
+            if mags[0] >= TANH_SATURATES { 0.0 } else { s[0] },
+            if mags[1] >= TANH_SATURATES { 0.0 } else { s[1] },
+            if mags[2] >= TANH_SATURATES { 0.0 } else { s[2] },
+            if mags[3] >= TANH_SATURATES { 0.0 } else { s[3] },
+        ];
+        let poly = estrin8_4(
+            [-s_safe[0], -s_safe[1], -s_safe[2], -s_safe[3]],
+            &EXPM1_COEFFICIENTS,
+        );
+        let m = [
+            s_safe[0] * poly[0],
+            s_safe[1] * poly[1],
+            s_safe[2] * poly[2],
+            s_safe[3] * poly[3],
+        ];
+        let approx = [
+            m[0] / (2.0 - m[0]),
+            m[1] / (2.0 - m[1]),
+            m[2] / (2.0 - m[2]),
+            m[3] / (2.0 - m[3]),
+        ];
+        return finalize_tanh_f64_as_f32_4(xs, mags, approx);
+    }
+
+    Some([
+        tanh_f64_as_f32(xs[0])?,
+        tanh_f64_as_f32(xs[1])?,
+        tanh_f64_as_f32(xs[2])?,
+        tanh_f64_as_f32(xs[3])?,
+    ])
+}
+
+#[inline]
+fn finalize_tanh_f64_as_f32_4(xs: [f64; 4], mags: [f64; 4], approx: [f64; 4]) -> Option<[f32; 4]> {
+    const TIE: u64 = 1 << 28;
+    const LOW_MASK: u64 = (1 << 29) - 1;
+    const MARGIN: u64 = 65_536;
+    let min_normal = 2.0 * f64::from(f32::MIN_POSITIVE);
+    let mut out = [0.0_f32; 4];
+    for ((dst, &x), (&mag, &ap)) in out.iter_mut().zip(&xs).zip(mags.iter().zip(&approx)) {
+        *dst = if x == 0.0 {
+            x as f32
+        } else if mag >= TANH_SATURATES {
+            if x.is_sign_negative() { -1.0 } else { 1.0 }
+        } else if ap >= min_normal && (ap.to_bits() & LOW_MASK).abs_diff(TIE) > MARGIN {
+            let value = ap as f32;
+            if x.is_sign_negative() { -value } else { value }
+        } else {
+            tanh(x)? as f32
+        };
+    }
+    Some(out)
+}
+
+/// Four-lane lockstep [`estrin8`], bit-identical per lane.
+#[inline]
+fn estrin8_4(u: [f64; 4], c: &[f64; 8]) -> [f64; 4] {
+    let [c0, c1, c2, c3, c4, c5, c6, c7] = *c;
+    let mut out = [0.0; 4];
+    for (dst, &ui) in out.iter_mut().zip(&u) {
+        let u2 = ui * ui;
+        let u4 = u2 * u2;
+        let low = (c0 + c1 * ui) + (c2 + c3 * ui) * u2;
+        let high = (c4 + c5 * ui) + (c6 + c7 * ui) * u2;
+        *dst = low + high * u4;
+    }
+    out
+}
+
+/// Four-lane lockstep [`estrin12`], bit-identical per lane.
+#[inline]
+fn estrin12_4(u: [f64; 4], c: &[f64; 12]) -> [f64; 4] {
+    let [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11] = *c;
+    let mut out = [0.0; 4];
+    for (dst, &ui) in out.iter_mut().zip(&u) {
+        let u2 = ui * ui;
+        let u4 = u2 * u2;
+        let u8 = u4 * u4;
+        let low = (c0 + c1 * ui) + (c2 + c3 * ui) * u2;
+        let middle = (c4 + c5 * ui) + (c6 + c7 * ui) * u2;
+        let high = (c8 + c9 * ui) + (c10 + c11 * ui) * u2;
+        *dst = (low + middle * u4) + high * u8;
+    }
+    out
 }
 
 /// Below this `2|x|`, [`tanh_estrin`] takes `1 − e^(−2|x|)` from its own
@@ -711,4 +1013,169 @@ pub fn symplectic_rotate_channels(
     }
     shrink_to_left_fold_norm_limit(&mut rotated, limit)?;
     Ok(rotated)
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    #[test]
+    fn exp_neg_4_matches_scalar_exp_neg_bit_for_bit() {
+        let mut samples = vec![
+            0.0,
+            -0.0,
+            f64::MIN_POSITIVE,
+            1e-12,
+            7.8125e-5,
+            1.0 / 32.0,
+            REDUCED.next_down(),
+            REDUCED,
+            REDUCED.next_up(),
+            0.1,
+            core::f64::consts::LN_2,
+            1.0,
+            2.5,
+            8.0,
+            20.0,
+            100.0,
+            693.1471805599453,
+            709.78,
+            745.0,
+            EXP_UNDERFLOWS.next_down(),
+            EXP_UNDERFLOWS,
+            EXP_UNDERFLOWS.next_up(),
+            1000.0,
+            f64::MAX,
+        ];
+        // Dense log/linear sweeps across small (<= REDUCED) and Cody-Waite ranges.
+        for k in 1..=2000_u32 {
+            samples.push(f64::from(k) * (REDUCED / 2000.0));
+            samples.push(REDUCED + f64::from(k) * (20.0 / 2000.0));
+            samples.push(20.0 + f64::from(k) * (730.0 / 2000.0));
+        }
+        // Homogeneous 4-tuples (same regime) and strided mixed 4-tuples.
+        for &xs in samples.as_chunks::<4>().0 {
+            let got = exp_neg_4(xs).expect("valid exp_neg_4");
+            for (lane, &x) in xs.iter().enumerate() {
+                let expected = exp_neg(x).expect("valid scalar exp_neg");
+                assert_eq!(
+                    got[lane].to_bits(),
+                    expected.to_bits(),
+                    "exp_neg_4 mismatch at lane {lane} for x={x:e}"
+                );
+            }
+        }
+        // Explicitly test homogeneous small, homogeneous Cody-Waite, and mixed tuples.
+        let special = [
+            [1e-6, 1e-4, 0.01, REDUCED],
+            [0.07, 0.5, 5.0, 740.0],
+            [0.0, 1e-5, 1.5, 800.0],
+            [-0.0, REDUCED, REDUCED.next_up(), EXP_UNDERFLOWS],
+        ];
+        for xs in special {
+            let got = exp_neg_4(xs).expect("special exp_neg_4");
+            for (lane, &x) in xs.iter().enumerate() {
+                assert_eq!(
+                    got[lane].to_bits(),
+                    exp_neg(x).expect("scalar").to_bits(),
+                    "special exp_neg_4 mismatch for {xs:?} lane {lane}"
+                );
+            }
+        }
+        // Refusals: negative or nonfinite in any lane.
+        assert_eq!(exp_neg_4([-1e-12, 0.5, 1.0, 2.0]), None);
+        assert_eq!(exp_neg_4([0.5, f64::NAN, 1.0, 2.0]), None);
+        assert_eq!(exp_neg_4([0.5, 1.0, f64::INFINITY, 2.0]), None);
+        assert_eq!(exp_neg_4([0.5, 1.0, 2.0, f64::NEG_INFINITY]), None);
+    }
+
+    #[test]
+    fn tanh_f64_as_f32_4_matches_scalar_bit_for_bit() {
+        let cutoff = 0.5 * TANH_SERIES_BELOW;
+        let mut samples = vec![
+            0.0,
+            -0.0,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            f64::from(f32::MIN_POSITIVE),
+            -f64::from(f32::MIN_POSITIVE),
+            1e-9,
+            -1e-9,
+            cutoff.next_down(),
+            cutoff,
+            cutoff.next_up(),
+            -cutoff.next_down(),
+            -cutoff,
+            -cutoff.next_up(),
+            0.5,
+            -0.5,
+            1.0,
+            -1.0,
+            TANH_SATURATES.next_down(),
+            TANH_SATURATES,
+            TANH_SATURATES.next_up(),
+            -TANH_SATURATES.next_down(),
+            -TANH_SATURATES,
+            -TANH_SATURATES.next_up(),
+            1e6,
+            -1e6,
+            f64::MAX,
+            f64::MIN,
+        ];
+        for k in 1..=2500_u32 {
+            let small = f64::from(k) * (cutoff / 2500.0);
+            let mid = cutoff + f64::from(k) * ((TANH_SATURATES - cutoff) / 2500.0);
+            samples.push(small);
+            samples.push(-small);
+            samples.push(mid);
+            samples.push(-mid);
+        }
+        // Deterministic pseudo-random F64 values to hit near-tie rounding margins too.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..4000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let u = (state as f64) / (u64::MAX as f64);
+            samples.push((u * 2.0 - 1.0) * 22.0);
+        }
+
+        for &xs in samples.as_chunks::<4>().0 {
+            let got = tanh_f64_as_f32_4(xs).expect("valid tanh_f64_as_f32_4");
+            for (lane, &x) in xs.iter().enumerate() {
+                let expected = tanh_f64_as_f32(x).expect("valid scalar tanh_f64_as_f32");
+                assert_eq!(
+                    got[lane].to_bits(),
+                    expected.to_bits(),
+                    "tanh_f64_as_f32_4 mismatch at lane {lane} for x={x:e}"
+                );
+            }
+        }
+
+        // Explicit regime combos: all-small, all-mid + zero + saturated, mixed small+mid.
+        let special = [
+            [0.0, -0.0, 1e-4, -0.02],
+            [0.0, -0.5, 25.0, -0.0],
+            [0.2, -3.5, 19.999, -100.0],
+            [1e-4, 0.5, -1e-4, -0.5],
+            [1e-40, -1e-40, 1e-38, -1e-38],
+        ];
+        for xs in special {
+            let got = tanh_f64_as_f32_4(xs).expect("special tanh_f64_as_f32_4");
+            for (lane, &x) in xs.iter().enumerate() {
+                let expected = tanh_f64_as_f32(x).expect("scalar");
+                assert_eq!(
+                    got[lane].to_bits(),
+                    expected.to_bits(),
+                    "special tanh_f64_as_f32_4 mismatch for {xs:?} lane {lane}"
+                );
+            }
+        }
+
+        // Nonfinite refusal in any lane.
+        assert_eq!(tanh_f64_as_f32_4([f64::NAN, 0.0, 1.0, -1.0]), None);
+        assert_eq!(tanh_f64_as_f32_4([0.0, f64::INFINITY, 1.0, -1.0]), None);
+        assert_eq!(tanh_f64_as_f32_4([0.0, 1.0, f64::NEG_INFINITY, -1.0]), None);
+        assert_eq!(tanh_f64_as_f32_4([0.0, 1.0, -1.0, f64::NAN]), None);
+    }
 }

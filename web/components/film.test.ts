@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 
 import { film } from "@/lib/media";
 
-import { frameAt, scaleBarWidthCqw } from "./film";
+import { frameAt, scaleBarWidthCqw, zoomView } from "./film";
 import {
   type DualSlotState,
   globalFrameFromSegmentTime,
@@ -249,5 +249,14 @@ describe("multi-segment film timeline mapping", () => {
       state = tr.nextState;
     }
     expect(visited).toEqual([0, 1, 2, 3, 4, 0, 1]);
+  });
+});
+
+describe("zoomView", () => {
+  test("names the whole torus only at zoom 1, and a held 1.03 as itself", () => {
+    expect(zoomView(1)).toEqual({ short: "whole", long: "the whole torus" });
+    expect(zoomView(1.03)).toEqual({ short: "×1.03", long: "zoom 1.03" });
+    expect(zoomView(1.6)).toEqual({ short: "×1.6", long: "zoom 1.6" });
+    expect(zoomView(2.97)).toEqual({ short: "×3.0", long: "zoom 3.0" });
   });
 });

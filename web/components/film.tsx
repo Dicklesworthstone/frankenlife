@@ -47,6 +47,17 @@ export function scaleBarWidthCqw(
 
 type Shot = { from: number; to: number; label: string; hold: boolean };
 
+/**
+ * What a view at `zoom` shows, as the readout names it: the whole torus only
+ * at zoom 1 (to rounding), so that a view held at 1.03 is not called whole;
+ * below 1.1 to two decimals, so it does not read as ×1.0.
+ */
+export function zoomView(zoom: number): { short: string; long: string } {
+  if (zoom < 1.005) return { short: "whole", long: "the whole torus" };
+  const shown = zoom < 1.1 ? zoom.toFixed(2) : zoom.toFixed(1);
+  return { short: `×${shown}`, long: `zoom ${shown}` };
+}
+
 const HOLD_NOW = "absolute inset-y-0 rounded-full bg-green-300/80";
 const HOLD_THEN = "absolute inset-y-0 rounded-full bg-green-500/35";
 
@@ -67,7 +78,11 @@ function filmModel(manifest: FilmManifest) {
    */
   const shots: Shot[] = (() => {
     const keys = render.camera?.keys ?? [];
-    if (keys.length < 2) return [{ from: world.from.tick, to: world.to.tick, label: "whole torus", hold: true }];
+    // No camera, or one key flife render holds for the whole film (scripts/media.ts --camera fixed): one shot.
+    if (keys.length < 2) {
+      const held = keys[0]?.zoom ?? 1;
+      return [{ from: world.from.tick, to: world.to.tick, label: held < 1.005 ? "whole torus" : `held at ×${held}`, hold: true }];
+    }
     return keys.slice(1).map((key, index) => {
       const start = keys[index]!;
       const hold = start.zoom === key.zoom;
@@ -75,7 +90,7 @@ function filmModel(manifest: FilmManifest) {
         from: start.tick,
         to: key.tick,
         hold,
-        label: !hold ? "" : key.zoom < 1.05 ? "whole" : `×${key.zoom}`,
+        label: !hold ? "" : zoomView(key.zoom).short === "whole" ? "whole" : `×${key.zoom}`,
       };
     });
   })();
@@ -93,11 +108,11 @@ function filmModel(manifest: FilmManifest) {
       tickText: grouped(tick),
       simulated: `+${((tick - world.from.tick) * secondsPerTick).toFixed(1)} s`,
       live: grouped(world.live[frame] ?? 0),
-      view: zoom < 1.05 ? "whole" : `×${zoom.toFixed(1)}`,
+      view: zoomView(zoom).short,
       barWidth: `${scaleBarWidthCqw(barUnits, zoom, torusExtent, frameSize)}cqw`,
       barText: `${barUnits} world units`,
       elapsed: (tick - world.from.tick) / span,
-      described: `tick ${grouped(tick)}, ${zoom < 1.05 ? "the whole torus" : `zoom ${zoom.toFixed(1)}`}`,
+      described: `tick ${grouped(tick)}, ${zoomView(zoom).long}`,
     };
   };
 

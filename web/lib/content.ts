@@ -38,7 +38,7 @@ function alive(id: string, ceiling?: number): string {
   const high = capped > 0 ? most : Math.floor(most / 1000) * 1000;
   // Within one thousand of each other, rounding would cross: give them exactly.
   const span = low <= high ? `${n(low)} to ${n(high)}` : `${n(fewest)} to ${n(most)}`;
-  const ceilingNote = capped > 0 ? `, at its population ceiling, where births are refused, in ${capped} of its ${live.length} frames` : "";
+  const ceilingNote = capped > 0 ? `, and at its population ceiling, where births are refused, in ${capped} of its ${live.length} frames` : "";
   return `with ${span} alive during the film${ceilingNote}`;
 }
 
@@ -70,7 +70,7 @@ export const filmChoice = {
   ],
   v2: [
     "The v2 films show denser worlds built from the committed presets, so that the frame fills as the confluent film's does. The tissue's has 144 times the preset's food, from 6 wide sources, and crowding that stops division at 24 neighbours instead of 3.25. The supercolony's has 48 oases where the preset has 16, 24 times its food, and children landing up to 2.5 world units from their parent instead of 1. Both allow twice the presets' population, a ceiling of 524,288 rather than 262,144. Every v2 mechanism and every other parameter is the preset's. The changes were chosen by eye from 31 variants in two rounds, each rendered from tick 0, for the fullest frame; experiments/website-films/README.md lists them with their counts, and each preset's header names every key it changes. No Stage-2 claim covers these worlds: every measured figure on this page is the committed presets'.",
-    `Each film runs 3,200 ticks at seed 42, from a tick chosen by eye once its world fills the frame: ${opening("tissue").tick} for the tissue, with ${opening("tissue").live} cells, and ${opening("supercolony").tick} for the supercolony, with ${opening("supercolony").live} organisms. The supercolony runs ${alive("supercolony", FILM_CEILING)}; the confluent world stays at its own ceiling throughout. Both are drawn as the confluent film is, as spheres in their founder's colour, lighter the more energy they hold, with no field beneath them. The veins film draws the supercolony's world over its field coloured by vascular conductance, at 1440 × 1440, held still on nearly the whole torus (zoom 1.03): with every organism on screen at the ceiling, the glowing look needs one more draw row than the renderer allows.`,
+    `Each film runs 3,200 ticks at seed 42, from a tick chosen by eye once its world fills the frame: ${opening("tissue").tick} for the tissue, with ${opening("tissue").live} cells, and ${opening("supercolony").tick} for the supercolony, with ${opening("supercolony").live} organisms. The supercolony runs ${alive("supercolony", FILM_CEILING)}. The confluent world stays at its own ceiling throughout. Both are drawn as the confluent film is, as spheres in their founder's colour, lighter the more energy they hold, with no field beneath them. The veins film draws the supercolony's world over its field coloured by vascular conductance, at 1440 × 1440, held still on nearly the whole torus (zoom 1.03): drawn whole at the ceiling, the glowing look would need one more draw row than the renderer allows.`,
     `The camera is the director's, described below, with each shot's zoom given by hand: ${zoomSpan("tissue")} for the tissue and ${zoomSpan("supercolony")} for the supercolony.`,
   ],
   camera:

@@ -342,7 +342,7 @@ mod tests {
         let topology = DenseTopology::new(&[4]).expect("topology");
         let in_w = topology.input_width();
         let out_w = topology.raw_output_width();
-        let params = vec![0.05_f32; topology.parameters()];
+        let params = vec![0.05_f32; topology.parameter_count()];
         let controller =
             ReferenceController::new(&topology, Weights::F32(&params), 4.0).expect("controller");
 

@@ -1369,7 +1369,7 @@ fn metal_backend_flat_f32_matches_evaluate_bit_for_bit_across_full_and_partial_b
         .map(|case| {
             case.parameters
                 .iter()
-                .map(|&v| F16::from_f32_nearest(v))
+                .map(|&v| F16::from_f64(f64::from(v)))
                 .collect()
         })
         .collect();
@@ -1380,8 +1380,12 @@ fn metal_backend_flat_f32_matches_evaluate_bit_for_bit_across_full_and_partial_b
         .map(|((job, case), weights)| ControllerJob {
             genome: job.genome,
             slot: job.slot,
-            controller: ReferenceController::new_f16(&catalog[case.topology], weights, BOUND)
-                .expect("admitted f16 controller"),
+            controller: ReferenceController::new(
+                &catalog[case.topology],
+                weights.as_slice(),
+                BOUND,
+            )
+            .expect("admitted f16 controller"),
             inputs: job.inputs,
         })
         .collect();

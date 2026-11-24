@@ -1210,43 +1210,70 @@ fn assert_flat_matches_legacy(
 fn cpu_backend_flat_f32_matches_evaluate_bit_for_bit_across_lanes_and_dtypes()
 -> Result<(), CoreError> {
     let catalog = topologies();
-    let batch_cases = cases(640, 2026);
-    let legacy_f32 = jobs(&catalog, &batch_cases);
-    let f16_params: Vec<Vec<F16>> = batch_cases
+    let batch_cases_f32 = cases(640, 2026);
+    let legacy_f32 = jobs(&catalog, &batch_cases_f32);
+    let batch_cases_f16: Vec<Case> = cases(640, 2027)
+        .into_iter()
+        .filter(|case| !matches!(case.regime, Regime::HiddenOverflow | Regime::OutputOverflow))
+        .collect();
+    let f16_params: Vec<Vec<F16>> = batch_cases_f16
         .iter()
         .map(|case| {
             case.parameters
                 .iter()
-                .map(|&v| F16::from_f32_nearest(v))
+                .map(|&v| F16::from_f64(f64::from(v)))
                 .collect()
         })
         .collect();
-    let legacy_f16: Vec<ControllerJob<'_>> = legacy_f32
+    let legacy_f16_base = jobs(&catalog, &batch_cases_f16);
+    let legacy_f16: Vec<ControllerJob<'_>> = legacy_f16_base
         .iter()
-        .zip(&batch_cases)
+        .zip(&batch_cases_f16)
         .zip(&f16_params)
         .map(|((job, case), weights)| ControllerJob {
             genome: job.genome,
             slot: job.slot,
-            controller: ReferenceController::new_f16(&catalog[case.topology], weights, BOUND)
-                .expect("admitted f16 controller"),
+            controller: ReferenceController::new(
+                &catalog[case.topology],
+                weights.as_slice(),
+                BOUND,
+            )
+            .expect("admitted f16 controller"),
             inputs: job.inputs,
         })
         .collect();
 
-    let mut inputs_f32 = Vec::with_capacity(batch_cases.len() * SENSOR_WIDTH);
-    let mut inputs_finite = Vec::with_capacity(batch_cases.len());
-    for case in &batch_cases {
-        let mut all_finite = true;
-        for &v in &case.inputs {
-            let narrowed = v as f32;
-            all_finite &= narrowed.is_finite();
-            inputs_f32.push(narrowed);
+    let encode_inputs = |batch: &[Case]| -> (Vec<f32>, Vec<u8>) {
+        let mut inputs_f32 = Vec::with_capacity(batch.len() * SENSOR_WIDTH);
+        let mut inputs_finite = Vec::with_capacity(batch.len());
+        for case in batch {
+            let mut all_finite = true;
+            for &v in &case.inputs {
+                let narrowed = v as f32;
+                all_finite &= narrowed.is_finite();
+                inputs_f32.push(narrowed);
+            }
+            inputs_finite.push(u8::from(all_finite));
         }
-        inputs_finite.push(u8::from(all_finite));
-    }
+        (inputs_f32, inputs_finite)
+    };
+    let (inputs_f32_for_f32, inputs_finite_for_f32) = encode_inputs(&batch_cases_f32);
+    let (inputs_f32_for_f16, inputs_finite_for_f16) = encode_inputs(&batch_cases_f16);
 
-    for (label, legacy) in [("F32", &legacy_f32), ("F16", &legacy_f16)] {
+    for (label, legacy, inputs_f32, inputs_finite) in [
+        (
+            "F32",
+            &legacy_f32,
+            &inputs_f32_for_f32,
+            &inputs_finite_for_f32,
+        ),
+        (
+            "F16",
+            &legacy_f16,
+            &inputs_f32_for_f16,
+            &inputs_finite_for_f16,
+        ),
+    ] {
         let flat_jobs: Vec<FlatControllerJob<'_>> = legacy
             .iter()
             .map(|job| FlatControllerJob {

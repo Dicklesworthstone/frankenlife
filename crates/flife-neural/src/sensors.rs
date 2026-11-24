@@ -558,11 +558,14 @@ fn saturate_4(xs: [f64; 4]) -> Result<[f32; 4], CoreError> {
     })
 }
 
+type NormalizedSingle = ([f64; PLANES], [[f64; 2]; PLANES], f64, f64);
+type SaturatedSingle = ([f32; PLANES], [f32; PLANES], f32, f32, f32);
+
 fn normalize_single(
     raw: &RawSample,
     intrinsic: &Intrinsic,
     scales: &SensorScales,
-) -> Result<([f64; PLANES], [[f64; 2]; PLANES], f64, f64), CoreError> {
+) -> Result<NormalizedSingle, CoreError> {
     let invalid =
         |quantity: &'static str, detail: String| CoreError::NumericalInvalid { quantity, detail };
     let [density, moments @ ..] = raw.values;
@@ -633,7 +636,7 @@ fn saturate_single_gradients_f32(
     gradients: &[[f64; 2]; PLANES],
     intrinsic: &Intrinsic,
     scales: &SensorScales,
-) -> Result<([f32; PLANES], [f32; PLANES], f32, f32, f32), CoreError> {
+) -> Result<SaturatedSingle, CoreError> {
     let l = scales.gradient_length;
     let mut x_f32 = [0.0_f32; PLANES];
     let mut y_f32 = [0.0_f32; PLANES];
@@ -646,9 +649,11 @@ fn saturate_single_gradients_f32(
     x_f32[0] = ex;
     y_f32[0] = ey;
     for ((x_chunk, y_chunk), grad_chunk) in x_f32[1..]
-        .chunks_exact_mut(4)
-        .zip(y_f32[1..].chunks_exact_mut(4))
-        .zip(gradients[1..].chunks_exact(4))
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(y_f32[1..].as_chunks_mut::<4>().0.iter_mut())
+        .zip(gradients[1..].as_chunks::<4>().0)
     {
         let tx = saturate_4([
             l * grad_chunk[0][0],
@@ -662,8 +667,8 @@ fn saturate_single_gradients_f32(
             l * grad_chunk[2][1],
             l * grad_chunk[3][1],
         ])?;
-        x_chunk.copy_from_slice(&tx);
-        y_chunk.copy_from_slice(&ty);
+        *x_chunk = tx;
+        *y_chunk = ty;
     }
     let de_arg = intrinsic.energy_change_per_second / scales.energy_change_per_second;
     let de = tanh_f64_as_f32(de_arg).ok_or_else(|| CoreError::NumericalInvalid {
@@ -1058,9 +1063,11 @@ fn saturate_dual_gradients_f32(
     x_f32[0] = ex;
     y_f32[0] = ey;
     for ((x_chunk, y_chunk), grad_chunk) in x_f32[1..]
-        .chunks_exact_mut(4)
-        .zip(y_f32[1..].chunks_exact_mut(4))
-        .zip(gradients[1..].chunks_exact(4))
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(y_f32[1..].as_chunks_mut::<4>().0.iter_mut())
+        .zip(gradients[1..].as_chunks::<4>().0)
     {
         let tx = saturate_4([
             l * grad_chunk[0][0],
@@ -1074,8 +1081,8 @@ fn saturate_dual_gradients_f32(
             l * grad_chunk[2][1],
             l * grad_chunk[3][1],
         ])?;
-        x_chunk.copy_from_slice(&tx);
-        y_chunk.copy_from_slice(&ty);
+        *x_chunk = tx;
+        *y_chunk = ty;
     }
     let [de, t1x, t1y, _] = saturate_4([
         intrinsic.energy_change_per_second / scales.energy_change_per_second,
@@ -1165,6 +1172,8 @@ mod batch_sensor_tests {
             age_seconds: 60.0,
             velocity: 1.0,
             energy_change_per_second: 1.0,
+            minimum_scale: 1.0,
+            maximum_scale: 8.0,
         }
     }
 

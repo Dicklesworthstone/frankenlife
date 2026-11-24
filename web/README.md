@@ -74,52 +74,17 @@ film has a committed manifest, `lib/films/<id>.json`, written by `bun run media 
 each file by its SHA-256 and records how it was made: the world (preset, configuration hash, seed, torus,
 the starting tick and digest), every frame's tick and live count, the render command, flife's revision and
 binary hash, and the ffmpeg arguments. `lib/films/index.ts` lists the films the page shows, in the hero's
-order; the first opens the page. The confluent film keeps the explainers cut from it (the zoom ladder, the
-controls); the share card is cut from the tissue film.
+order; the first opens the page and the share card is cut from it. The page shows one film, the confluent
+world, which the explainers are also cut from (the zoom ladder, the controls). To add a film, list its
+manifest in `lib/films/index.ts` and move the files of any film it replaces from `public/media` to
+`media-retired/`.
 
-The v2 films, all 801 frames at 60 fps, split into segments of at most 22 MiB: the tissue and supercolony
-films at 2160 × 2160, the veins film at 1440 × 1440. The tissue's packed frames barely compress: at CRF 20 its
-film came to 338 MB, so it is CRF 26, which halves that with every sphere still distinct at full size; the
-other two are CRF 20 (153 MB and 79 MB). `scripts/media.ts` encodes a finished `--work` again, without
-simulating, when only `--crf` changes.
-They show denser worlds built from the committed presets (`presets/morphogenesis-tissue-v2-dense.toml`,
-`presets/supercolony-v2-dense.toml`): more food, crowding arrest at 24 neighbours for the tissue, 48
-oases with farther-landing children for the supercolony, and for both twice the presets' population ceiling,
-524,288, which the supercolony reaches whenever its oases bloom. `experiments/website-films/README.md`
-records how they were chosen, and each preset's header names every key it changes. The page says "every
-other parameter is the preset's", so `bun run build` runs `scripts/check-film-words.ts` after check-media:
-it refuses to build unless the words beside the films name every key the film presets change, with the
-presets' own numbers.
-
-```bash
-# From the repository root: each world, seed 42, kept in a run directory. The supercolony run is
-# made twice so that its two films can render at once (a render locks its run directory); both
-# reach the same digest.
-target/release/flife run presets/morphogenesis-tissue-v2-dense.toml --ticks 1024 --checkpoint-every 0 --run-dir RUN-A
-target/release/flife run presets/supercolony-v2-dense.toml --ticks 768 --checkpoint-every 0 --run-dir RUN-B
-target/release/flife run presets/supercolony-v2-dense.toml --ticks 768 --checkpoint-every 0 --run-dir RUN-B2
-
-# From web/: 3,200 ticks, a frame every 4, founder lineage lit by energy, as spheres with no field.
-# Pass --cpu-workers: without it flife render uses the configuration's single worker.
-bun run media -- --film tissue --flife ../target/release/flife --run-dir ../RUN-A --work WORK-A \
-  --ticks 3200 --every 4 --size 2160 --fps 60 --crf 26 --look sphere --color lineage-energy --field none \
-  --zooms 1.6,3,2.2 --cpu-workers 12
-bun run media -- --film supercolony --flife ../target/release/flife --run-dir ../RUN-B --work WORK-B \
-  --ticks 3200 --every 4 --size 2160 --fps 60 --crf 20 --look sphere --color lineage-energy --field none \
-  --zooms 1.5,2.2,1.8 --cpu-workers 12
-# The supercolony again, glowing over its field coloured by vascular conductance, at 1440 × 1440 and held
-# at zoom 1.03: at the ceiling of 524,288 the whole torus needs 2^20 + 1 draw rows (a halo and a dot per
-# organism, and the field), one more than flife-manim allows (bead flife-ovd); the zoom culls the rim.
-bun run media -- --film veins --flife ../target/release/flife --run-dir ../RUN-B2 --work WORK-VEINS \
-  --ticks 3200 --every 4 --size 1440 --fps 60 --crf 20 --look glow --color lineage-energy \
-  --field vascular-conductance --camera fixed --zooms 1.03 --cpu-workers 12
-```
-
-A 3,200-tick film has room for three shots, one zoom each. Then list each new manifest in
-`lib/films/index.ts` and move the files of the films it replaces from `public/media` to
-`media-retired/`. Each film starts at a tick chosen by eye once its world fills the frame: tick 1,024 for the
-tissue (about 258,000 cells) and 768 for the supercolony (at its ceiling). The looks are the confluent
-film's, chosen by eye from 4K test frames. The page says so beside the films.
+Three v2 films of denser worlds (`presets/morphogenesis-tissue-v2-dense.toml`,
+`presets/supercolony-v2-dense.toml`, rendered 2026-11-24) were taken down the same day: in motion they
+shimmer and are hard to read, nothing like the confluent film. `experiments/website-films/README.md`
+records them. Before rendering a film, render a few dozen consecutive frames small and look at them in
+motion beside the confluent film's; run one render at a time, since three 2160 × 2160 renders of 524,288
+organisms at once exhausted the machine's memory.
 
 The confluent film (`lib/films/confluent.json`) was made this way:
 

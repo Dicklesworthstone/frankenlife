@@ -116,7 +116,7 @@ export type FilmManifest = {
 /** Every film the page shows, in lib/films/index.ts's order; the first is the hero's opening film. */
 export const films: FilmManifest[] = FILM_MANIFESTS;
 
-/** The lead film, which the hero opens on (the share card is the tissue film's, the zoom ladder the confluent film's). */
+/** The lead film, which the hero opens on and the share card is cut from. */
 export const film: FilmManifest = (() => {
   const lead = films[0];
   if (!lead) throw new Error("lib/films/index.ts lists no film");

@@ -1,6 +1,14 @@
 # Website film worlds: how the v2 film presets were chosen
 
-The website's tissue, supercolony and veins films show
+**Outcome (2026-11-24): the films were taken off the site the day they went up.** In motion the dense
+worlds shimmer and are hard to read, nothing like the confluent film, though their single frames
+looked full. Every choice below was made from stills 256 ticks apart, so none of them judged motion.
+The page now shows the confluent film alone, and the v2 panels lead with the committed presets' own
+stills. The films' manifests and media are in `web/media-retired/rejected-dense-v2-2026-11-24/`
+(not in git; commit 4d76075 has the manifests). A new film should start from a few dozen consecutive
+frames rendered small and looked at in motion beside the confluent film's.
+
+The website's tissue, supercolony and veins films showed
 `presets/morphogenesis-tissue-v2-dense.toml` and
 `presets/supercolony-v2-dense.toml`, chosen in a second round (below) from the
 first round's `presets/morphogenesis-tissue-v2-abundant.toml` and

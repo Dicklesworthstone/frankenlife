@@ -16,4 +16,4 @@ if (errors.length > 0) {
   for (const error of errors) console.error(`check-media: ${error}`);
   process.exit(1);
 }
-console.error(`check-media: every file the ${films.length} films and the stills name is present, byte for byte`);
+console.error(`check-media: every file the ${films.length === 1 ? "film" : `${films.length} films`} and the stills name is present, byte for byte`);

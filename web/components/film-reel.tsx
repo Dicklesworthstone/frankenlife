@@ -96,7 +96,11 @@ export function FilmReel({
           })}
         </div>
       ) : null}
-      <div id={`${idPrefix}-panel`} role="tabpanel" aria-labelledby={`${idPrefix}-tab-${shown.id}`}>
+      <div
+        id={`${idPrefix}-panel`}
+        role={films.length > 1 ? "tabpanel" : undefined}
+        aria-labelledby={films.length > 1 ? `${idPrefix}-tab-${shown.id}` : undefined}
+      >
         <Film key={shown.id} manifest={shown} feather={feather} />
         {note ? (
           <p className="mt-3 px-1 text-[13px] leading-relaxed text-slate-400 lg:px-2">

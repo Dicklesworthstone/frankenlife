@@ -136,7 +136,7 @@ export default function Home() {
                 <GreenTitle lit text="Evolution, [bit for bit]." />
               </h1>
               <p className="lede mt-7 max-w-[36rem]">
-                A real-time artificial-life laboratory. Every organism in these films carries its own heritable neural
+                A real-time artificial-life laboratory. Every organism in this film carries its own heritable neural
                 network; they feed, signal, move, split and die through one shared field of energy and chemistry,
                 and nothing is scripted or trained. A run can be paused, inspected, branched and replayed, and every
                 replay reaches the same world, bit for bit.
@@ -388,7 +388,7 @@ export default function Home() {
             kicker={
               <>
                 <code className="text-green-300">flife render</code> drew each frame from the committed world at its
-                tick. Each world is deterministic: the same commands reach the same digests, listed below, on any
+                tick. The world is deterministic: the same commands reach the same digests, listed below, on any
                 machine.
               </>
             }
@@ -398,30 +398,16 @@ export default function Home() {
             </Reveal>
             <Reveal className="mt-5">
               <div className="panel rounded-[1.75rem] p-6 sm:p-8">
-                <MicroLabel>How these worlds were chosen</MicroLabel>
-                <div className="mt-5 grid grid-cols-1 gap-x-10 gap-y-6 text-[14.5px] leading-relaxed text-slate-300 lg:grid-cols-2">
-                  <div className="space-y-3">
-                    <h3 className="text-[17px] font-bold text-white">The v2 worlds</h3>
-                    {filmChoice.v2.map((paragraph) => (
-                      <p key={paragraph.slice(0, 24)}>{paragraph}</p>
-                    ))}
-                    <h3 className="pt-3 text-[17px] font-bold text-white">The camera</h3>
-                    <p>{filmChoice.camera}</p>
-                  </div>
-                  <div className="space-y-3">
-                    <h3 className="text-[17px] font-bold text-white">The confluent world</h3>
-                    {filmChoice.world.map((paragraph) => (
-                      <p key={paragraph.slice(0, 24)}>{paragraph}</p>
-                    ))}
-                  </div>
+                <MicroLabel>How this world was chosen</MicroLabel>
+                <div className="mt-5 text-[14.5px] leading-relaxed text-slate-300 lg:columns-2 lg:gap-x-10 [&>p]:mb-3">
+                  {filmChoice.world.map((paragraph) => (
+                    <p key={paragraph.slice(0, 24)}>{paragraph}</p>
+                  ))}
+                  <p>{filmChoice.camera}</p>
                 </div>
                 <p className="mt-6 border-t border-white/[0.06] pt-4 text-[14px] text-slate-400">
                   <a className={link} href={siteConfig.showcase}>
                     The confluent world&apos;s search, every sample&apos;s score and the held-out seeds
-                  </a>
-                  ;{" "}
-                  <a className={link} href={siteConfig.v2Report}>
-                    the v2 campaign&apos;s report
                   </a>
                   .
                 </p>

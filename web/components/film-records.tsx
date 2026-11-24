@@ -1,7 +1,7 @@
 "use client";
 
 // The films' records, one at a time: a tab per film, in the hero's order, and
-// the chosen film's FilmProvenance beneath.
+// the chosen film's FilmProvenance beneath. One film needs no tabs.
 
 import { type KeyboardEvent, useRef, useState } from "react";
 
@@ -28,6 +28,7 @@ export function FilmRecords() {
   };
 
   if (!shown) return null;
+  if (films.length === 1) return <FilmProvenance film={shown} />;
   return (
     <div>
       <div role="tablist" aria-label="Which film's record" className="flex flex-wrap gap-1.5">

@@ -16,9 +16,9 @@ use std::time::Instant;
 
 use flife_backend_metal::ControllerChoice;
 use flife_core::memory::total;
-use flife_core::{CoreError, ValidatedConfig};
+use flife_core::{ConfigIssue, CoreError, V2Feature, ValidatedConfig};
 use flife_engine::{Intervention, Stepped, World};
-use flife_manim::{Style, WorldView, hex_rgb};
+use flife_manim::{ColorMapping, FieldMapping, Style, WorldView, hex_rgb};
 use flife_render::{AffinityProjection, Publisher};
 use flife_runtime::{CommandBook, Durability, Journal as _, replay_journal};
 use flife_store::CommandJournal;
@@ -194,11 +194,77 @@ pub enum RenderRecord {
     },
 }
 
+/// Resolve the organism colour mapping for `flife render` / `flife discover`:
+/// an explicit `--color` flag is preserved verbatim (so
+/// [`validate_v2_visual_style`] refuses a disallowed v2 mapping), while a
+/// `field-ecology-v2*` preset's default v2 `color_mapping` (such as
+/// `morphogenesis-tissue-v2.toml`'s `cell-state-v1`) falls back cleanly to
+/// [`ColorMapping::Lineage`] when `v2-visual-mappings` is disabled via
+/// `--v1-compat` or `--disable v2-visual-mappings`. A v1 TOML file configured
+/// with a v2 mapping never falls back silently and is refused by
+/// [`validate_v2_visual_style`].
+///
+/// # Errors
+/// [`ColorMapping::configured`]'s error when the configuration names an unknown
+/// colour mapping.
+pub fn resolve_color_mapping(
+    config: &ValidatedConfig,
+    explicit: Option<ColorMapping>,
+) -> Result<ColorMapping, CoreError> {
+    if let Some(mapping) = explicit {
+        return Ok(mapping);
+    }
+    let configured = ColorMapping::configured(config)?;
+    if configured.is_v2()
+        && flife_core::model::is_v2_model(&config.config().model)
+        && !config.is_v2_feature_enabled(V2Feature::V2VisualMappings)
+    {
+        Ok(ColorMapping::Lineage)
+    } else {
+        Ok(configured)
+    }
+}
+
+/// Refuse `V2-16` colour mappings (`cell-state`, `polarity`) and field
+/// overlays (`trail-carrier`, `vascular-conductance`) on `field-ecology-v1*`
+/// models or when `v2-visual-mappings` is disabled, matching `flife-studio`.
+///
+/// # Errors
+/// [`CoreError::InvalidConfig`] naming the disallowed presentation mapping.
+pub fn validate_v2_visual_style(
+    config: &ValidatedConfig,
+    mapping: ColorMapping,
+    field_mapping: FieldMapping,
+) -> Result<(), CoreError> {
+    if config.is_v2_feature_enabled(V2Feature::V2VisualMappings) {
+        return Ok(());
+    }
+    if mapping.is_v2() {
+        return Err(CoreError::InvalidConfig(vec![ConfigIssue {
+            path: "presentation.color_mapping".into(),
+            problem: format!(
+                "`{}` requires a field-ecology-v2 model with `v2-visual-mappings` enabled",
+                mapping.name()
+            ),
+        }]));
+    }
+    if field_mapping.is_v2_overlay() {
+        return Err(CoreError::InvalidConfig(vec![ConfigIssue {
+            path: "presentation.field_mapping".into(),
+            problem: format!(
+                "`{}` requires a field-ecology-v2 model with `v2-visual-mappings` enabled",
+                field_mapping.name()
+            ),
+        }]));
+    }
+    Ok(())
+}
+
 /// Render `config` per `options`, passing each record to `emit`.
 ///
 /// # Errors
-/// [`video_encoder`]'s, before anything is founded or written, when a video
-/// is asked for. The world's founding and stepping errors;
+/// [`validate_v2_visual_style`]'s and [`video_encoder`]'s, before anything is
+/// founded or written. The world's founding and stepping errors;
 /// [`CoreError::StateConflict`] for a capacity pause, an unwritable frame
 /// or a failed encoder; and the view's errors.
 pub fn render(
@@ -207,6 +273,7 @@ pub fn render(
     emit: impl FnMut(&RenderRecord),
 ) -> Result<(), CoreError> {
     let clock = Instant::now();
+    validate_v2_visual_style(config, options.style.mapping, options.style.field_mapping)?;
     // A video's encoder runs after every frame is drawn, so it is checked
     // before the first.
     if options.video.is_some() {
@@ -256,6 +323,7 @@ pub fn render_run(
     } = recover(run_dir, |_| {})?;
     // Nothing more is read from the store, and nothing is written to it.
     drop(checkpoints);
+    validate_v2_visual_style(&config, options.style.mapping, options.style.field_mapping)?;
     background(&config)?;
     let journal = if limits.durability == Durability::WriteAhead {
         let catalog = run_dir.join(CATALOG_FILE);

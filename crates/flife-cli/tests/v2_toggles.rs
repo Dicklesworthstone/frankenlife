@@ -621,3 +621,433 @@ mode = "sensor-neighbor-mean-v1"
         .expect("last_neighbor_h0 exposed");
     assert!((-1.0..=1.0).contains(&neighbor_h0));
 }
+
+fn preset_path(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../presets")
+        .join(name)
+}
+
+/// Produce a small 64×64 (`h = 0.25`, 24 founders) copy of a showcase preset
+/// preserving its exact `[contact]` and `[v2]` feature closure for fast E2E
+/// `flife run` / `flife render` execution.
+fn scale_v2_preset_for_fast_e2e(raw_toml: &str) -> String {
+    let mut lines: Vec<String> = raw_toml.lines().map(str::to_owned).collect();
+    for (section, key, value) in [
+        ("world", "width", "16.0"),
+        ("world", "height", "16.0"),
+        ("world", "grid_width", "64"),
+        ("world", "grid_height", "64"),
+        ("population", "initial_count", "24"),
+        ("population", "maximum_count", "256"),
+        ("sources", "count", "3"),
+        ("sources", "power_per_source", "200.0"),
+        ("sources", "sigma_world_units", "1.5"),
+        ("v2.oases", "sigma_min_world_units", "1.0"),
+        ("v2.oases", "sigma_max_world_units", "1.8"),
+    ] {
+        let header = format!("[{section}]");
+        let first = lines
+            .iter()
+            .position(|line| line.trim() == header)
+            .expect("preset section");
+        let line = lines[first + 1..]
+            .iter()
+            .take_while(|line| !line.starts_with('['))
+            .position(|line| line.split('=').next().map(str::trim) == Some(key))
+            .map(|offset| first + 1 + offset)
+            .expect("preset key");
+        lines[line] = format!("{key} = {value}");
+    }
+    lines.join("\n")
+}
+
+fn json_strings(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .expect("JSON string array")
+        .iter()
+        .map(|entry| entry.as_str().expect("string element").to_owned())
+        .collect()
+}
+
+/// `flife render` enforces the same `v2-visual-mappings` gate as `flife-studio`:
+/// explicit `--color cell-state|polarity` or `--field-mapping trail-carrier|vascular-conductance`
+/// is refused (exit 2) on `field-ecology-v1*` and whenever `v2-visual-mappings`
+/// is disabled (`--v1-compat` or `--disable v2-visual-mappings`), while omitting
+/// `--color` on a `field-ecology-v2*` preset whose default is `cell-state-v1`
+/// falls back cleanly to `lineage`.
+#[test]
+fn v2_17_render_visual_mappings_gate_and_v1_compat_fallback() {
+    let dir = scratch("v2_17_render_gate");
+    let v1_preset = preset_path("reference-small-world.toml");
+    let bundle_a_raw = include_str!("../../../presets/morphogenesis-tissue-v2.toml");
+    let bundle_a_small = dir.join("bundle_a_small.toml");
+    fs::write(&bundle_a_small, scale_v2_preset_for_fast_e2e(bundle_a_raw))
+        .expect("writes scaled Bundle A");
+
+    let refused_dir = dir.join("refused_out");
+
+    // 1. Explicit V2 colour/field mappings on a v1 preset are refused before founding.
+    for extra in [
+        ["--color", "cell-state"],
+        ["--color", "polarity"],
+        ["--field-mapping", "trail-carrier"],
+        ["--field-mapping", "vascular-conductance"],
+    ] {
+        let (status, _, err) = flife(&[
+            "render",
+            text(&v1_preset),
+            "--ticks",
+            "0",
+            "--every",
+            "1",
+            "--width",
+            "32",
+            "--height",
+            "32",
+            "--out",
+            text(&refused_dir),
+            extra[0],
+            extra[1],
+        ]);
+        assert_eq!(status, Some(2), "v1 must refuse {extra:?}: {err:?}");
+        assert_eq!(err[0]["schema"], ERROR_SCHEMA);
+        assert!(
+            err[0]["detail"]
+                .as_str()
+                .expect("error detail")
+                .contains("v2-visual-mappings"),
+            "v1 refusal for {extra:?} must mention v2-visual-mappings: {err:?}"
+        );
+    }
+
+    // 2. Explicit V2 colour/field mappings under `--v1-compat` or `--disable v2-visual-mappings`
+    //    are refused before founding.
+    for (flag, extra) in [
+        (&["--v1-compat"][..], ["--color", "cell-state"]),
+        (&["--v1-compat"][..], ["--color", "polarity"]),
+        (
+            &["--disable", "v2-visual-mappings"][..],
+            ["--field-mapping", "trail-carrier"],
+        ),
+        (
+            &["--disable", "v2-visual-mappings"][..],
+            ["--field-mapping", "vascular-conductance"],
+        ),
+    ] {
+        let mut args = vec![
+            "render",
+            text(&bundle_a_small),
+            "--ticks",
+            "0",
+            "--every",
+            "1",
+            "--width",
+            "32",
+            "--height",
+            "32",
+            "--out",
+            text(&refused_dir),
+        ];
+        args.extend_from_slice(flag);
+        args.extend_from_slice(&extra);
+        let (status, _, err) = flife(&args);
+        assert_eq!(status, Some(2), "{flag:?} must refuse {extra:?}: {err:?}");
+        assert_eq!(err[0]["schema"], ERROR_SCHEMA);
+        assert!(
+            err[0]["detail"]
+                .as_str()
+                .expect("error detail")
+                .contains("v2-visual-mappings"),
+            "{flag:?} refusal for {extra:?} must mention v2-visual-mappings: {err:?}"
+        );
+    }
+
+    // 3. Omitting `--color` on Bundle A (`color_mapping = "cell-state-v1"`) with
+    //    `--v1-compat` falls back cleanly to `lineage` and renders frame 0.
+    let compat_out = dir.join("compat_out");
+    let (status, out, err) = flife(&[
+        "render",
+        text(&bundle_a_small),
+        "--v1-compat",
+        "--ticks",
+        "0",
+        "--every",
+        "1",
+        "--width",
+        "32",
+        "--height",
+        "32",
+        "--controllers",
+        "cpu",
+        "--out",
+        text(&compat_out),
+    ]);
+    assert_eq!(
+        status,
+        Some(0),
+        "Bundle A --v1-compat render failed: {err:?}"
+    );
+    let end = out
+        .iter()
+        .find(|record| record["record"] == "end")
+        .expect("end record");
+    assert_eq!(end["mapping"], "lineage");
+    assert_eq!(end["field_mapping"], "energy");
+
+    // 4. Default Bundle A (with `v2-visual-mappings` enabled) renders `cell-state`.
+    let v2_out = dir.join("v2_out");
+    let (status, out, err) = flife(&[
+        "render",
+        text(&bundle_a_small),
+        "--ticks",
+        "0",
+        "--every",
+        "1",
+        "--width",
+        "32",
+        "--height",
+        "32",
+        "--controllers",
+        "cpu",
+        "--out",
+        text(&v2_out),
+    ]);
+    assert_eq!(status, Some(0), "Bundle A default render failed: {err:?}");
+    let end = out
+        .iter()
+        .find(|record| record["record"] == "end")
+        .expect("end record");
+    assert_eq!(end["mapping"], "cell-state");
+}
+
+/// Fast `V2-17` modular CLI toggle E2E matrix: validates unmodified Bundle A
+/// (`presets/morphogenesis-tissue-v2.toml`) and Bundle B
+/// (`presets/supercolony-v2.toml`) across defaults, `--enable all-v2`,
+/// `--v1-compat`, dependency refusals, and representative leave-one-out
+/// `--disable` toggles, then runs fast 64×64 live simulations for each family.
+#[test]
+fn v2_17_bundle_a_bundle_b_all_v2_and_leave_one_out_toggles_e2e() {
+    let dir = scratch("v2_17_modular_matrix");
+    let bundle_a_preset = preset_path("morphogenesis-tissue-v2.toml");
+    let bundle_b_preset = preset_path("supercolony-v2.toml");
+
+    // 1. Validate unmodified Bundle A preset defaults (13 Scope::Model features; contact-coupled).
+    let (status, a_val, err) = flife(&["validate", text(&bundle_a_preset)]);
+    assert_eq!(status, Some(0), "Bundle A validate failed: {err:?}");
+    assert_eq!(a_val[0]["inv08_pure_field"], false);
+    let a_features = json_strings(&a_val[0]["v2_features"]);
+    assert_eq!(
+        a_features,
+        [
+            "cadherin-4d",
+            "epigenetic-recurrence",
+            "hippo-crowding",
+            "lysis-recycling",
+            "notch-delta",
+            "pcp-polarity",
+            "senescence",
+            "so2-motor",
+            "surplus-emission",
+            "symplectic-waste",
+            "tight-junctions",
+            "trophallaxis",
+            "wake-offset",
+        ]
+    );
+    let a_hash = a_val[0]["config_hash"].as_str().expect("a hash").to_owned();
+
+    // 2. Validate unmodified Bundle B preset defaults (10 Scope::Model features; pure-field INV-08).
+    let (status, b_val, err) = flife(&["validate", text(&bundle_b_preset)]);
+    assert_eq!(status, Some(0), "Bundle B validate failed: {err:?}");
+    assert_eq!(b_val[0]["inv08_pure_field"], true);
+    let b_features = json_strings(&b_val[0]["v2_features"]);
+    assert_eq!(
+        b_features,
+        [
+            "dual-carrier-trails",
+            "excitable-relay",
+            "lysis-recycling",
+            "oases",
+            "senescence",
+            "so2-motor",
+            "surplus-emission",
+            "tight-junctions",
+            "vascular-field",
+            "wake-offset",
+        ]
+    );
+    let b_hash = b_val[0]["config_hash"].as_str().expect("b hash").to_owned();
+
+    // 3. `--enable all-v2` enables all 20 Scope::Model features on Bundle A (which has `[contact]`),
+    //    and is refused on pure-field Bundle B (no `[contact]`, INV-08 guard).
+    let (status, all_val, err) = flife(&["validate", text(&bundle_a_preset), "--enable", "all-v2"]);
+    assert_eq!(status, Some(0), "Bundle A --enable all-v2 failed: {err:?}");
+    assert_eq!(all_val[0]["inv08_pure_field"], false);
+    let all_features = json_strings(&all_val[0]["v2_features"]);
+    assert_eq!(all_features.len(), 20);
+    assert_ne!(all_val[0]["config_hash"], a_hash);
+
+    let (status, _, err) = flife(&["validate", text(&bundle_b_preset), "--enable", "all-v2"]);
+    assert_eq!(
+        status,
+        Some(2),
+        "Bundle B (no [contact]) must refuse --enable all-v2: {err:?}"
+    );
+    assert_eq!(err[0]["schema"], ERROR_SCHEMA);
+
+    // 4. Dependency guard: disabling `epigenetic-recurrence` while `notch-delta` stays active
+    //    is refused; disabling both succeeds cleanly.
+    let (status, _, err) = flife(&[
+        "validate",
+        text(&bundle_a_preset),
+        "--disable",
+        "epigenetic-recurrence",
+    ]);
+    assert_eq!(
+        status,
+        Some(2),
+        "Bundle A must refuse disabling epigenetic-recurrence alone: {err:?}"
+    );
+    assert_eq!(err[0]["schema"], ERROR_SCHEMA);
+
+    // 5. Representative leave-one-out `--disable` toggles on unmodified Bundle A.
+    for disable_arg in [
+        "pcp-polarity",
+        "cadherin-4d",
+        "trophallaxis",
+        "so2-motor",
+        "hippo-crowding",
+        "symplectic-waste",
+        "epigenetic-recurrence,notch-delta",
+    ] {
+        let (status, val, err) =
+            flife(&["validate", text(&bundle_a_preset), "--disable", disable_arg]);
+        assert_eq!(
+            status,
+            Some(0),
+            "Bundle A --disable {disable_arg} failed: {err:?}"
+        );
+        let removed: Vec<&str> = disable_arg.split(',').collect();
+        let expected: Vec<String> = a_features
+            .iter()
+            .filter(|slug| !removed.contains(&slug.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(json_strings(&val[0]["v2_features"]), expected);
+        assert_ne!(val[0]["config_hash"], a_hash);
+    }
+
+    // 6. Representative leave-one-out `--disable` toggles & pure-field `--enable` on Bundle B.
+    for disable_arg in [
+        "vascular-field",
+        "dual-carrier-trails",
+        "excitable-relay",
+        "oases",
+        "so2-motor",
+    ] {
+        let (status, val, err) =
+            flife(&["validate", text(&bundle_b_preset), "--disable", disable_arg]);
+        assert_eq!(
+            status,
+            Some(0),
+            "Bundle B --disable {disable_arg} failed: {err:?}"
+        );
+        assert_eq!(val[0]["inv08_pure_field"], true);
+        let expected: Vec<String> = b_features
+            .iter()
+            .filter(|slug| slug.as_str() != disable_arg)
+            .cloned()
+            .collect();
+        assert_eq!(json_strings(&val[0]["v2_features"]), expected);
+        assert_ne!(val[0]["config_hash"], b_hash);
+    }
+
+    let (status, b_plus, err) = flife(&[
+        "validate",
+        text(&bundle_b_preset),
+        "--enable",
+        "so2-budding,symplectic-waste",
+    ]);
+    assert_eq!(
+        status,
+        Some(0),
+        "Bundle B pure-field enable failed: {err:?}"
+    );
+    assert_eq!(b_plus[0]["inv08_pure_field"], true);
+    assert_eq!(json_strings(&b_plus[0]["v2_features"]).len(), 12);
+
+    // 7. `--v1-compat` clears all Scope::Model features on both presets.
+    for preset in [&bundle_a_preset, &bundle_b_preset] {
+        let (status, val, err) = flife(&["validate", text(preset), "--v1-compat"]);
+        assert_eq!(status, Some(0), "--v1-compat validate failed: {err:?}");
+        assert!(json_strings(&val[0]["v2_features"]).is_empty());
+    }
+
+    // 8. Fast live 4-tick E2E `flife run` across scaled 64×64 Bundle A, Bundle A --enable all-v2,
+    //    Bundle B, and representative leave-one-out ablations.
+    let bundle_a_small = dir.join("bundle_a_64.toml");
+    let bundle_b_small = dir.join("bundle_b_64.toml");
+    fs::write(
+        &bundle_a_small,
+        scale_v2_preset_for_fast_e2e(include_str!(
+            "../../../presets/morphogenesis-tissue-v2.toml"
+        )),
+    )
+    .expect("writes scaled Bundle A");
+    fs::write(
+        &bundle_b_small,
+        scale_v2_preset_for_fast_e2e(include_str!("../../../presets/supercolony-v2.toml")),
+    )
+    .expect("writes scaled Bundle B");
+
+    let run_4_ticks = |cfg: &Path, extra: &[&str]| -> String {
+        let mut args = vec![
+            "run",
+            text(cfg),
+            "--ticks",
+            "4",
+            "--every",
+            "0",
+            "--controllers",
+            "cpu",
+        ];
+        args.extend_from_slice(extra);
+        let (status, out, err) = flife(&args);
+        assert_eq!(
+            status,
+            Some(0),
+            "flife run {} {extra:?} failed: {err:?}",
+            cfg.display()
+        );
+        let end = out
+            .iter()
+            .find(|record| record["record"] == "end")
+            .expect("end record");
+        assert_eq!(end["tick"], 4);
+        assert!(
+            end["survey"]["live"].as_u64().expect("live count") > 0,
+            "population vanished in 4 ticks for {} {extra:?}",
+            cfg.display()
+        );
+        end["digest"].as_str().expect("digest").to_owned()
+    };
+
+    let digest_a_base = run_4_ticks(&bundle_a_small, &[]);
+    let digest_a_all = run_4_ticks(&bundle_a_small, &["--enable", "all-v2"]);
+    let digest_a_no_pcp = run_4_ticks(&bundle_a_small, &["--disable", "pcp-polarity"]);
+    let digest_a_no_diff = run_4_ticks(
+        &bundle_a_small,
+        &["--disable", "epigenetic-recurrence,notch-delta"],
+    );
+    assert_ne!(digest_a_all, digest_a_base);
+    assert_ne!(digest_a_no_pcp, digest_a_base);
+    assert_ne!(digest_a_no_diff, digest_a_base);
+
+    let digest_b_base = run_4_ticks(&bundle_b_small, &[]);
+    let digest_b_no_vasc = run_4_ticks(&bundle_b_small, &["--disable", "vascular-field"]);
+    let digest_b_no_trails = run_4_ticks(&bundle_b_small, &["--disable", "dual-carrier-trails"]);
+    assert_ne!(digest_b_no_vasc, digest_b_base);
+    assert_ne!(digest_b_no_trails, digest_b_base);
+}

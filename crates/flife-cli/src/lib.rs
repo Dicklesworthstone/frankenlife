@@ -139,7 +139,8 @@ pub use persist::{
 pub use render::{
     ENCODERS, ENCODING_BYTES_FIXED, ENCODING_BYTES_PER_PIXEL, PNG_TO_H264, RENDER_SCHEMA,
     RenderOptions, RenderProjection, RenderRecord, RenderedRun, Y4M_TO_H264, encode_y4m,
-    encoding_bytes, render, render_run, video_encoder,
+    encoding_bytes, render, render_run, resolve_color_mapping, validate_v2_visual_style,
+    video_encoder,
 };
 pub use run::{
     AUTO_WORKER_CEILING, CheckpointAt, Finished, JournalMarks, Persisted, RUN_SCHEMA, RUN_SESSION,

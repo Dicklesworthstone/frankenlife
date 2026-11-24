@@ -811,10 +811,14 @@ fn main() -> ExitCode {
                 Ok(config) => config,
                 Err(error) => return fail(error.kind(), error.to_string()),
             };
-            let mapping = match color.map_or_else(|| ColorMapping::configured(&config), Ok) {
+            let mapping = match flife_cli::resolve_color_mapping(&config, color) {
                 Ok(mapping) => mapping,
                 Err(error) => return fail(error.kind(), error.to_string()),
             };
+            if let Err(error) = flife_cli::validate_v2_visual_style(&config, mapping, field_mapping)
+            {
+                return fail(error.kind(), error.to_string());
+            }
             let selection = match (region, lineage) {
                 (Some(disk), _) => Selection::Region(disk),
                 (None, Some(lineage)) => Selection::Lineage(lineage),
@@ -1090,10 +1094,14 @@ fn render(
         },
         (None, None) => return fail("usage", "a configuration or --run-dir".to_owned()),
     };
-    let style = match color.map_or_else(|| ColorMapping::configured(&config), Ok) {
-        Ok(mapping) => Style { mapping, ..style },
+    let mapping = match flife_cli::resolve_color_mapping(&config, color) {
+        Ok(mapping) => mapping,
         Err(error) => return fail(error.kind(), error.to_string()),
     };
+    if let Err(error) = flife_cli::validate_v2_visual_style(&config, mapping, style.field_mapping) {
+        return fail(error.kind(), error.to_string());
+    }
+    let style = Style { mapping, ..style };
     let options = flife_cli::RenderOptions {
         ticks,
         every,
@@ -1324,5 +1332,89 @@ mod tests {
                 "flife render must accept {argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn render_color_mapping_falls_back_on_v2_compat_and_refuses_explicit_v2_flags() {
+        let bundle_a = include_str!("../../../presets/morphogenesis-tissue-v2.toml");
+        let v1_toml = include_str!("../../../presets/reference-small-world.toml");
+        let default_cfg = ValidatedConfig::from_toml(bundle_a).expect("Bundle A loads");
+        let v1_cfg = ValidatedConfig::from_toml(v1_toml).expect("v1 preset loads");
+
+        let default_mapping =
+            flife_cli::resolve_color_mapping(&default_cfg, None).expect("Bundle A default");
+        assert_eq!(default_mapping, ColorMapping::CellState);
+        flife_cli::validate_v2_visual_style(&default_cfg, default_mapping, FieldMapping::Energy)
+            .expect("Bundle A default cell-state mapping is valid");
+
+        for mapping in [ColorMapping::CellState, ColorMapping::Polarity] {
+            flife_cli::validate_v2_visual_style(&default_cfg, mapping, FieldMapping::Energy)
+                .expect("v2 color mapping allowed when v2-visual-mappings enabled");
+            assert!(matches!(
+                flife_cli::validate_v2_visual_style(&v1_cfg, mapping, FieldMapping::Energy),
+                Err(flife_core::CoreError::InvalidConfig(_))
+            ));
+        }
+        for field_mapping in [
+            FieldMapping::TrailCarrier,
+            FieldMapping::VascularConductance,
+        ] {
+            flife_cli::validate_v2_visual_style(&default_cfg, ColorMapping::Lineage, field_mapping)
+                .expect("v2 field overlay allowed when v2-visual-mappings enabled");
+            assert!(matches!(
+                flife_cli::validate_v2_visual_style(&v1_cfg, ColorMapping::Lineage, field_mapping),
+                Err(flife_core::CoreError::InvalidConfig(_))
+            ));
+        }
+
+        for overrides in [
+            [FeatureOverride::V1Compat],
+            [FeatureOverride::Disable("v2-visual-mappings".to_owned())],
+        ] {
+            let disabled = ValidatedConfig::from_toml_with_overrides(bundle_a, &overrides)
+                .expect("v2 preset with override loads");
+            let fallback = flife_cli::resolve_color_mapping(&disabled, None)
+                .expect("omitted --color falls back cleanly");
+            assert_eq!(fallback, ColorMapping::Lineage);
+            flife_cli::validate_v2_visual_style(&disabled, fallback, FieldMapping::Energy)
+                .expect("fallback lineage passes v2 visual gate");
+
+            for mapping in [ColorMapping::CellState, ColorMapping::Polarity] {
+                let explicit = flife_cli::resolve_color_mapping(&disabled, Some(mapping))
+                    .expect("explicit --color preserved");
+                assert_eq!(explicit, mapping);
+                assert!(matches!(
+                    flife_cli::validate_v2_visual_style(&disabled, explicit, FieldMapping::Energy),
+                    Err(flife_core::CoreError::InvalidConfig(_))
+                ));
+            }
+            for field_mapping in [
+                FieldMapping::TrailCarrier,
+                FieldMapping::VascularConductance,
+            ] {
+                assert!(matches!(
+                    flife_cli::validate_v2_visual_style(
+                        &disabled,
+                        ColorMapping::Lineage,
+                        field_mapping
+                    ),
+                    Err(flife_core::CoreError::InvalidConfig(_))
+                ));
+            }
+        }
+
+        // A v1 TOML file configured with a v2 colour mapping must NOT fall back silently.
+        let bad_v1_toml = v1_toml.replacen(
+            "color_mapping = \"founder-lineage-v1\"",
+            "color_mapping = \"cell-state-v1\"",
+            1,
+        );
+        let bad_v1 = ValidatedConfig::from_toml(&bad_v1_toml).expect("v1 toml parses");
+        let configured = flife_cli::resolve_color_mapping(&bad_v1, None).expect("reads v1 mapping");
+        assert_eq!(configured, ColorMapping::CellState);
+        assert!(matches!(
+            flife_cli::validate_v2_visual_style(&bad_v1, configured, FieldMapping::Energy),
+            Err(flife_core::CoreError::InvalidConfig(_))
+        ));
     }
 }

@@ -521,12 +521,13 @@ fn auto_takes_metal_only_up_to_its_worker_ceiling() {
     let small = [
         (1, Metal, Torch),
         (2, Metal, Torch),
-        (AUTO_TORCH_MAX_WORKERS, Metal, Torch),
-        (AUTO_TORCH_MAX_WORKERS + 1, Metal, Cpu),
-        (AUTO_METAL_MAX_WORKERS, Metal, Cpu),
-        (AUTO_METAL_MAX_WORKERS + 1, Cpu, Cpu),
-        (16, Cpu, Cpu),
-        (64, Cpu, Cpu),
+        (AUTO_METAL_MAX_WORKERS, Metal, Torch),
+        (AUTO_METAL_MAX_WORKERS + 1, Torch, Torch),
+        (8, Torch, Torch),
+        (16, Torch, Torch),
+        (AUTO_TORCH_MAX_WORKERS, Torch, Torch),
+        (AUTO_TORCH_MAX_WORKERS + 1, Cpu, Cpu),
+        (128, Cpu, Cpu),
     ];
     let large = small.map(|(workers, with_device, _)| {
         let with_device = if with_device == Metal { Metal } else { Torch };

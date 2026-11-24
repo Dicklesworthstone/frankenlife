@@ -621,3 +621,148 @@ expose_sensor = false
         "expected wound-rim birth rate ({rim_rate:.5}) >= 3x interior ({interior_rate:.5})"
     );
 }
+
+#[test]
+fn round2b_parallel_prepare_contact_crowding_and_checkpoint_bit_exact() {
+    let profile = NumericalProfile::reference_f32().expect("profile");
+    for dtype in ["f32", "f16"] {
+        let dtype_toml = format!("\"{dtype}\"");
+        let toml = ecology_toml(
+            "field-ecology-v2",
+            &[
+                ("world", "width", "16.0"),
+                ("world", "height", "16.0"),
+                ("world", "grid_width", "32"),
+                ("world", "grid_height", "32"),
+                ("world", "tick_numerator", "1"),
+                ("world", "tick_denominator", "32"),
+                ("population", "initial_count", "640"),
+                ("population", "maximum_count", "2048"),
+                ("population", "initial_energy", "3.5"),
+                ("controller", "canonical_weight_dtype", &dtype_toml),
+                ("sources", "count", "4"),
+                ("sources", "power_per_source", "400.0"),
+                ("execution", "command_durability", "\"volatile-in-memory\""),
+            ],
+            r#"
+[contact]
+diameter = 0.5
+stiffness = 0.7
+adhesion = 0.35
+adhesion_range = 2.0
+sweeps = 2
+
+[v2]
+profile = "minimal"
+
+[v2.crowding]
+enabled = true
+mode = "local-neighbors-v1"
+radius_world_units = 0.85
+arrest_threshold = 4.5
+expose_sensor = true
+
+[v2.barrier]
+mode = "harmonic-v1"
+minimum_permeability = 0.04
+occupancy_impedance = 1.5
+
+[v2.trophallaxis]
+enabled = true
+
+[v2.contact.cadherin]
+enabled = true
+
+[v2.contact.velocity_alignment]
+enabled = true
+
+[v2.metabolism.waste]
+enabled = true
+byproduct_recycle_fraction = 0.4
+
+[v2.carriers]
+enabled = true
+"#,
+        );
+        let cfg = ValidatedConfig::from_toml_with_overrides(
+            &toml,
+            &[FeatureOverride::Enable("tight-junctions".to_owned())],
+        )
+        .expect("valid round2b v2 config");
+
+        let mut w1 = World::found_on(
+            &cfg,
+            Arrangement::Compact,
+            profile,
+            NonZeroUsize::new(1).expect("1"),
+        )
+        .expect("w1");
+        let mut w4 = World::found_on(
+            &cfg,
+            Arrangement::FreeList,
+            profile,
+            NonZeroUsize::new(4).expect("4"),
+        )
+        .expect("w4");
+        let mut w8 = World::found_on(
+            &cfg,
+            Arrangement::Compact,
+            profile,
+            NonZeroUsize::new(8).expect("8"),
+        )
+        .expect("w8");
+
+        let scratch_before_w4 = w4.footprint().scratch;
+        let scratch_before_w8 = w8.footprint().scratch;
+        for tick in 0..8 {
+            assert!(
+                matches!(w1.step().expect("w1 step"), Stepped::Published(_)),
+                "{dtype} tick {tick}: w1 paused"
+            );
+            assert!(
+                matches!(w4.step().expect("w4 step"), Stepped::Published(_)),
+                "{dtype} tick {tick}: w4 paused"
+            );
+            assert!(
+                matches!(w8.step().expect("w8 step"), Stepped::Published(_)),
+                "{dtype} tick {tick}: w8 paused"
+            );
+            assert_eq!(w4.digest(), w1.digest(), "{dtype} tick {tick}: w4 vs w1");
+            assert_eq!(w8.digest(), w1.digest(), "{dtype} tick {tick}: w8 vs w1");
+        }
+        assert!(
+            w1.population().len() >= 512,
+            "{dtype}: must stay >= 512 live to cover Round-2b parallel paths"
+        );
+        assert_eq!(
+            w4.footprint().scratch,
+            scratch_before_w4,
+            "{dtype}: w4 scratch grew"
+        );
+        assert_eq!(
+            w8.footprint().scratch,
+            scratch_before_w8,
+            "{dtype}: w8 scratch grew"
+        );
+
+        // Bulk f32_slice / f16_slice checkpoint write + restore round-trip.
+        let mut writer = CheckpointWriter::new(&cfg.config().model);
+        w8.write_checkpoint(&mut writer).expect("write checkpoint");
+        let bytes = writer.finish().expect("finish checkpoint");
+        let reader = CheckpointReader::parse(&bytes, &WORLD_CHECKPOINT_CHUNKS).expect("parse");
+        let mut restored = World::read_checkpoint(&reader, profile).expect("restore");
+        assert_eq!(restored.digest(), w1.digest(), "{dtype}: restored digest");
+        for tick in 0..4 {
+            assert!(matches!(w1.step().expect("w1 post"), Stepped::Published(_)));
+            assert!(matches!(
+                restored.step().expect("restored post"),
+                Stepped::Published(_)
+            ));
+            assert_eq!(
+                restored.digest(),
+                w1.digest(),
+                "{dtype}: post-restore tick {tick}"
+            );
+        }
+    }
+}

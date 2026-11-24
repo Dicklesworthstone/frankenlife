@@ -12,8 +12,12 @@ in frankentorch, added for this item. This crate is `forbid(unsafe_code)`.
   and its 104 F64 observation inputs.
 - A lane count, at construction: the world's `cpu_workers`.
 - The composition root selects it with `--controllers torch` (`flife run`, `render`, `resume`, `experiment` and
-  `flife-studio`): `flife_backend_metal::ControllerChoice::Torch`, whose `backend(cpu_workers, budget)` gives this
-  backend on that many lanes, on any host. `auto` does not take it (see Measurements).
+  `flife-studio`): `flife_backend_metal::ControllerChoice::Torch`, whose `backend(cpu_workers, organisms, budget)`
+  gives this backend on that many lanes, on any host. `auto` selects `torch` whenever Metal is not selected and
+  `cpu_workers <= AUTO_TORCH_MAX_WORKERS` (64), or on Apple Silicon (`TORCH_AT_SCALE`) for worlds with at least
+  `AUTO_TORCH_MIN_ORGANISMS` (25,000) live organisms.
+- `ControllerBackend::evaluate_flat_f32` (`supports_flat_f32() == true`) accepts pre-narrowed flat F32 inputs and
+  writes directly into `FlatOutputs` with zero `f64 -> f32` narrowing and zero `Option<RawOutputs>` allocation.
 - FL-043: a `flife_neural::BackendBudget` (bytes, and the organisms the world can hold), at construction:
   `CpuBackend::with_budget(lanes, shard_slots, budget)`. `new` and `with_shard_slots` are unbounded. The CLI grants
   what its preflight leaves (`flife-cli`'s `memory`).
@@ -26,7 +30,8 @@ in frankentorch, added for this item. This crate is `forbid(unsafe_code)`.
 - Each layer is one kernel call. Output `o` is the bias, then each input's product in ascending index, in F32.
   Every product and every sum is rounded, and there is no fused multiply-add: the reference's declared order.
 - The hidden activation is `flife_core::numerics::tanh` of the F32 pre-activation in F64, rounded once to F32,
-  computed as the reference computes it (`flife_core::numerics::tanh_f32`).
+  computed in four-lane lockstep via `flife_core::numerics::tanh_f32_4` (bit-identical to four scalar `tanh_f32`
+  calls) with a scalar `tanh_f32` tail for non-multiple-of-four hidden widths.
 - The output layer is linear.
 - The CPU keeps subnormal results as the reference does, so, unlike the Metal backend, nothing is deferred for
   being small.
@@ -53,15 +58,17 @@ before returning. The controllers of a tick therefore use at most `lanes` thread
 thread, between its lane phases, so the backend's threads never run alongside the engine's. The result does not
 depend on the split.
 
-**Residency.** A genome's parameters are packed once, each layer's `weight[out][in]` transposed to
-`[in][out]`: the kernel's `[B, I, O]` with `B = 1`, so its output loop reads contiguous memory. FL-026: each
-topology has a bucket of fixed-size shards, `SHARD_SLOTS` (256) genomes to a shard unless `with_shard_slots` says
-otherwise, and at most `MAXIMUM_SHARD_ELEMENTS` (2^28) values. A job's `ArenaSlot` locates its packed set
-(`ShardGeometry::locate`: shard, offset and extent, checked in 64 bits). The set is used only while its slot holds
-the same generation and genome, so a newborn at the next generation of a dead genome's slot is packed in its
-place. A batch drops nothing: a genome due one tick in K is not packed again when it is next due. A shard is
-reserved at its full size when first touched, so memory follows the peak population in whole shards until
-`forget`.
+**Residency.** A genome's parameters are packed once via an 8×8 register-tiled transpose, each layer's
+`weight[out][in]` transposed to `[in][out]`: the kernel's `[B, I, O]` with `B = 1`, so its output loop reads
+contiguous memory. When a batch admits at least 64 new genomes on more than one lane, shard zero-fill and slot
+transposition fan out across the persistent private `flife_core::pool` while preserving deterministic serial
+admission, FL-043 byte budgets, and last-writer-wins duplicate-slot semantics. FL-026: each topology has a bucket
+of fixed-size shards, `SHARD_SLOTS` (256) genomes to a shard unless `with_shard_slots` says otherwise, and at most
+`MAXIMUM_SHARD_ELEMENTS` (2^28) values. A job's `ArenaSlot` locates its packed set (`ShardGeometry::locate`: shard,
+offset and extent, checked in 64 bits). The set is used only while its slot holds the same generation and genome,
+so a newborn at the next generation of a dead genome's slot is packed in its place. A batch drops nothing: a genome
+due one tick in K is not packed again when it is next due. A shard is reserved at its full size when first touched,
+so memory follows the peak population in whole shards until `forget`.
 
 FL-043: a shard, its parameters and its occupants' records alike, is reserved whole when it is made, and is made
 only if it fits in what the budget leaves after the shards already held and the lanes' activation scratch. A job

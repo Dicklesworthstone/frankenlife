@@ -106,9 +106,10 @@ use flife_field::{
     resolve_uptake_with_on_workers, state::CHANNELS,
 };
 use flife_genome::{
-    CadherinTraits, CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES,
-    MutationParameters, MutationRecord, Mutator, ParameterBuffer, TopologyCatalog, TopologyId,
-    TraitLimits, Traits, founder_topology, founder_traits_v2, grow_founder, initial_scale,
+    AFFINITY_TERMS, CADHERIN_TERMS, CadherinTraits, CandidateRejection, Genome, GenomeQuota,
+    MAXIMUM_CANDIDATES, MutationParameters, MutationRecord, Mutator, ParameterBuffer,
+    TopologyCatalog, TopologyId, TraitLimits, Traits, founder_topology, founder_traits_v2,
+    grow_founder, initial_scale,
 };
 use flife_neural::actions::EMISSION_SPEND;
 use flife_neural::{
@@ -2679,12 +2680,18 @@ impl World {
             positions.clear();
             positions.extend(rows.iter().map(|organism| organism.position));
             match crowding_rules.mode {
-                CrowdingMode::LocalNeighbors { radius_world_units } => crowding
-                    .count_buffered_local_neighbors(&rules.grid, radius_world_units, lanes.len())?,
+                CrowdingMode::LocalNeighbors { radius_world_units } => {
+                    let _ = crowding.count_buffered_local_neighbors(
+                        &rules.grid,
+                        radius_world_units,
+                        lanes.len(),
+                    )?;
+                }
                 CrowdingMode::CellOccupancy => {
-                    crowding.count_buffered_cell_occupancy(&rules.grid)?
+                    let _ = crowding.count_buffered_cell_occupancy(&rules.grid)?;
                 }
             }
+            crowding.counts()
         } else {
             crowding.clear();
             &[]
@@ -2696,9 +2703,14 @@ impl World {
         let tight_junctions = rules.v2.tight_junctions();
         let vascular = rules.v2.vascular();
         if tight_junctions.is_some() {
-            barrier_positions.clear();
-            barrier_positions.extend(rows.iter().map(|organism| organism.position));
-            count_cell_occupancy(&rules.grid, barrier_positions, barrier_occupancy)?;
+            let pos_slice: &[[f64; 2]] = if rules.v2.crowding().is_some() {
+                crowding.positions()
+            } else {
+                barrier_positions.clear();
+                barrier_positions.extend(rows.iter().map(|organism| organism.position));
+                barrier_positions.as_slice()
+            };
+            count_cell_occupancy(&rules.grid, pos_slice, barrier_occupancy)?;
         }
         if let (Some(vasc), Some(edges)) = (vascular.as_ref(), flux_edges.as_mut()) {
             let (gx, gy) =
@@ -2807,41 +2819,139 @@ impl World {
             sensors.report.failure = Some(failure);
             sensors.backend = None;
         }
-        working.clear();
-        let mut evaluated = 0;
-        let decisions = lanes.iter().flat_map(|lane| lane.decisions.iter());
-        for (row_index, (&organism, decision)) in rows.iter().zip(decisions).enumerate() {
-            evaluated += usize::from(decision.evaluated);
-            let basal_multiplier =
-                rules
-                    .v2
-                    .basal_multiplier(organism.birth_tick, from, rules.step)?;
-            let local_crowding = crowding_counts.get(row_index).copied().unwrap_or(0);
-            working.push(Working {
-                committed: organism,
-                budget: EnergyBudget::new(organism.energy)?,
+        let total_decisions: usize = lanes.iter().map(|lane| lane.decisions.len()).sum();
+        if total_decisions != rows.len() {
+            return Err(CoreError::StateConflict {
+                operation: "gather decisions",
+                detail: format!("{total_decisions} decisions for {} organisms", rows.len()),
+            });
+        }
+        let mut evaluated = 0_usize;
+        if rows.len() >= 512 && lanes.len() > 1 {
+            let placeholder = Working {
+                committed: rows[0],
+                budget: EnergyBudget::new(0.0)?,
                 vitality: Vitality::new(),
-                held: decision.held,
-                evaluated: decision.evaluated,
-                actions: decision.actions,
-                gradients: decision.gradients,
-                basal_multiplier,
-                local_crowding,
-                position: organism.position,
-                velocity: organism.velocity,
-                cooldown_deadline: organism.cooldown_deadline,
-                secretory_readiness: organism.secretory_readiness,
-                emission_cooldown_deadline: organism.emission_cooldown_deadline,
+                held: rows[0].held,
+                evaluated: false,
+                actions: DecodedActions::default(),
+                gradients: [[0.0; 2]; RESPONSE_TERMS],
+                basal_multiplier: 1.0,
+                local_crowding: 0,
+                position: [0.0, 0.0],
+                velocity: [0.0, 0.0],
+                cooldown_deadline: Tick::new(0),
+                secretory_readiness: 0.0,
+                emission_cooldown_deadline: Tick::new(0),
                 emitted: false,
                 lysed_residual: 0.0,
                 intent: None,
-            });
-        }
-        if working.len() != rows.len() {
-            return Err(CoreError::StateConflict {
-                operation: "gather decisions",
-                detail: format!("{} decisions for {} organisms", working.len(), rows.len()),
-            });
+            };
+            set_len_reuse(working, rows.len(), placeholder);
+            let active_lanes: Vec<(usize, &[Decision])> = {
+                let mut v = Vec::with_capacity(lanes.len());
+                let mut offset = 0_usize;
+                for lane in lanes.iter() {
+                    let len = lane.decisions.len();
+                    if len > 0 {
+                        v.push((offset, lane.decisions.as_slice()));
+                        offset += len;
+                    }
+                }
+                v
+            };
+            let fill_working = |start: usize,
+                                row_c: &[Organism],
+                                dec_c: &[Decision],
+                                out_c: &mut [Working]|
+             -> Result<usize, CoreError> {
+                let mut local_eval = 0_usize;
+                for (i, ((&organism, decision), slot)) in
+                    row_c.iter().zip(dec_c).zip(out_c.iter_mut()).enumerate()
+                {
+                    local_eval += usize::from(decision.evaluated);
+                    let basal_multiplier =
+                        rules
+                            .v2
+                            .basal_multiplier(organism.birth_tick, from, rules.step)?;
+                    let local_crowding = crowding_counts.get(start + i).copied().unwrap_or(0);
+                    *slot = Working {
+                        committed: organism,
+                        budget: EnergyBudget::new(organism.energy)?,
+                        vitality: Vitality::new(),
+                        held: decision.held,
+                        evaluated: decision.evaluated,
+                        actions: decision.actions,
+                        gradients: decision.gradients,
+                        basal_multiplier,
+                        local_crowding,
+                        position: organism.position,
+                        velocity: organism.velocity,
+                        cooldown_deadline: organism.cooldown_deadline,
+                        secretory_readiness: organism.secretory_readiness,
+                        emission_cooldown_deadline: organism.emission_cooldown_deadline,
+                        emitted: false,
+                        lysed_residual: 0.0,
+                        intent: None,
+                    };
+                }
+                Ok(local_eval)
+            };
+            if let Some((&(head_start, head_decs), tail_decs)) = active_lanes.split_first() {
+                let (head_out, mut rest_out) = working.as_mut_slice().split_at_mut(head_decs.len());
+                let mut tail_results: Vec<Result<usize, CoreError>> =
+                    (0..tail_decs.len()).map(|_| Ok(0)).collect();
+                let mut head_result = Ok(0_usize);
+                let fill_working = &fill_working;
+                flife_core::pool::scope_workers(lanes.len(), "gather decisions", |scope| {
+                    for (&(start, decs), res_slot) in tail_decs.iter().zip(tail_results.iter_mut())
+                    {
+                        let (out_c, next_out) =
+                            core::mem::take(&mut rest_out).split_at_mut(decs.len());
+                        rest_out = next_out;
+                        let row_c = &rows[start..start + decs.len()];
+                        scope.spawn(move || {
+                            *res_slot = fill_working(start, row_c, decs, out_c);
+                        });
+                    }
+                    let head_rows = &rows[head_start..head_start + head_decs.len()];
+                    head_result = fill_working(head_start, head_rows, head_decs, head_out);
+                })?;
+                evaluated += head_result?;
+                for res in tail_results {
+                    evaluated += res?;
+                }
+            }
+        } else {
+            working.clear();
+            let decisions = lanes.iter().flat_map(|lane| lane.decisions.iter());
+            for (row_index, (&organism, decision)) in rows.iter().zip(decisions).enumerate() {
+                evaluated += usize::from(decision.evaluated);
+                let basal_multiplier =
+                    rules
+                        .v2
+                        .basal_multiplier(organism.birth_tick, from, rules.step)?;
+                let local_crowding = crowding_counts.get(row_index).copied().unwrap_or(0);
+                working.push(Working {
+                    committed: organism,
+                    budget: EnergyBudget::new(organism.energy)?,
+                    vitality: Vitality::new(),
+                    held: decision.held,
+                    evaluated: decision.evaluated,
+                    actions: decision.actions,
+                    gradients: decision.gradients,
+                    basal_multiplier,
+                    local_crowding,
+                    position: organism.position,
+                    velocity: organism.velocity,
+                    cooldown_deadline: organism.cooldown_deadline,
+                    secretory_readiness: organism.secretory_readiness,
+                    emission_cooldown_deadline: organism.emission_cooldown_deadline,
+                    emitted: false,
+                    lysed_residual: 0.0,
+                    intent: None,
+                });
+            }
         }
 
         // Phase 5: requests from the observation field, resolved per cell,
@@ -2895,20 +3005,105 @@ impl World {
             settle_state,
         )?;
         let mut total_emission_paid = CompensatedSum::ZERO;
-        for lane in lanes.iter_mut() {
-            lane.flows.replay(&mut tick_ledger)?;
-            emissions.append(&mut lane.emissions)?;
-            if let (Some(dst), Some(src)) =
-                (trail_emissions.as_mut(), lane.trail_emissions.as_mut())
-            {
-                dst.append(src)?;
+        if lanes.len() > 1 && working.len() >= 512 {
+            let mut lane_emissions: Vec<&mut Deposits> = Vec::with_capacity(lanes.len());
+            let mut lane_trails: Vec<&mut Deposits> = if trail_emissions.is_some() {
+                Vec::with_capacity(lanes.len())
+            } else {
+                Vec::new()
+            };
+            let mut lane_byproducts: Vec<&mut Deposits> = if byproducts.is_some() {
+                Vec::with_capacity(lanes.len())
+            } else {
+                Vec::new()
+            };
+            let merge_workers = lanes.len();
+            let mut lane_flows: Vec<(&mut LedgerLog, f64, Option<Transactions>)> =
+                Vec::with_capacity(merge_workers);
+            for lane in lanes.iter_mut() {
+                lane_emissions.push(&mut lane.emissions);
+                if let Some(src) = lane.trail_emissions.as_mut() {
+                    lane_trails.push(src);
+                }
+                if let Some(src) = lane.byproducts.as_mut() {
+                    lane_byproducts.push(src);
+                }
+                lane_flows.push((
+                    &mut lane.flows,
+                    lane.emission_paid.value(),
+                    lane.transactions.take(),
+                ));
             }
-            if let (Some(dst), Some(src)) = (byproducts.as_mut(), lane.byproducts.as_mut()) {
-                dst.append(src)?;
-            }
-            total_emission_paid.add(lane.emission_paid.value());
-            if let Some(record) = lane.transactions.take() {
-                transactions = Some(record);
+            let mut em_res: Result<(), CoreError> = Ok(());
+            let mut tr_res: Result<(), CoreError> = Ok(());
+            let mut bp_res: Result<(), CoreError> = Ok(());
+            let mut flow_res: Result<(), CoreError> = Ok(());
+            let em_dst: &mut Deposits = emissions;
+            let mut trail_dst = trail_emissions.as_mut();
+            let mut bp_dst = byproducts.as_mut();
+            flife_core::pool::scope_workers(merge_workers, "merge settle lanes", |scope| {
+                let em_res_ref = &mut em_res;
+                scope.spawn(move || {
+                    for src in lane_emissions {
+                        if let Err(err) = em_dst.append(src) {
+                            *em_res_ref = Err(err);
+                            break;
+                        }
+                    }
+                });
+                if let Some(dst) = trail_dst.take() {
+                    let tr_res_ref = &mut tr_res;
+                    scope.spawn(move || {
+                        for src in lane_trails {
+                            if let Err(err) = dst.append(src) {
+                                *tr_res_ref = Err(err);
+                                break;
+                            }
+                        }
+                    });
+                }
+                if let Some(dst) = bp_dst.take() {
+                    let bp_res_ref = &mut bp_res;
+                    scope.spawn(move || {
+                        for src in lane_byproducts {
+                            if let Err(err) = dst.append(src) {
+                                *bp_res_ref = Err(err);
+                                break;
+                            }
+                        }
+                    });
+                }
+                for (flows, paid, tx) in lane_flows {
+                    if let Err(err) = flows.replay(&mut tick_ledger) {
+                        flow_res = Err(err);
+                        break;
+                    }
+                    total_emission_paid.add(paid);
+                    if let Some(record) = tx {
+                        transactions = Some(record);
+                    }
+                }
+            })?;
+            flow_res?;
+            em_res?;
+            tr_res?;
+            bp_res?;
+        } else {
+            for lane in lanes.iter_mut() {
+                lane.flows.replay(&mut tick_ledger)?;
+                emissions.append(&mut lane.emissions)?;
+                if let (Some(dst), Some(src)) =
+                    (trail_emissions.as_mut(), lane.trail_emissions.as_mut())
+                {
+                    dst.append(src)?;
+                }
+                if let (Some(dst), Some(src)) = (byproducts.as_mut(), lane.byproducts.as_mut()) {
+                    dst.append(src)?;
+                }
+                total_emission_paid.add(lane.emission_paid.value());
+                if let Some(record) = lane.transactions.take() {
+                    transactions = Some(record);
+                }
             }
         }
 
@@ -7253,11 +7448,55 @@ fn effective_emt_factor(rules: &Rules, organism: &Working) -> f64 {
     }
 }
 
+/// Resize `vec` to `len` without zeroing existing elements when shrinking,
+/// avoiding redundant single-threaded memsets before workers overwrite `0..len`.
+#[inline]
+fn set_len_reuse<T: Copy>(vec: &mut Vec<T>, len: usize, fill: T) {
+    if vec.len() >= len {
+        vec.truncate(len);
+    } else {
+        vec.resize(len, fill);
+    }
+}
+
+/// Carve up to `take` elements from the front of a mutable slice without
+/// extending the borrow on the slice binding itself (safe for parallel fanout).
+#[inline]
+fn split_prefix<'a, T>(slice: &mut &'a mut [T], take: usize) -> &'a mut [T] {
+    let n = take.min(slice.len());
+    let (head, tail) = core::mem::take(slice).split_at_mut(n);
+    *slice = tail;
+    head
+}
+
+/// Disjoint per-worker output slices for parallel [`contact_displacements`]
+/// input staging into [`ContactWork`].
+struct ContactPrepChunk<'a> {
+    pos: &'a mut [[f64; 2]],
+    ids: &'a mut [u64],
+    alive: &'a mut [bool],
+    aff: &'a mut [[f32; AFFINITY_TERMS]],
+    pol: &'a mut [[f64; 2]],
+    pol_s: &'a mut [f64],
+    wedge: &'a mut [f64],
+    grad: &'a mut [[f64; 2]],
+    emt: &'a mut [f64],
+    h0: &'a mut [f32],
+    cad_tag: &'a mut [[f64; CADHERIN_TERMS]],
+    cad_coh: &'a mut [f64],
+    energies: &'a mut [f64],
+    vels: &'a mut [[f64; 2]],
+}
+
 /// Every working organism's contact displacement into `work`, from the
 /// settled positions of those that survive the tick, together with any active
 /// `field-ecology-v2` Sweep-1 channels (`V2-08` PCP/EMT, `V2-12` Notch-Delta,
 /// `V2-13` cadherin-4d, passive exact-quantum trophallaxis, and dissipative
 /// velocity alignment).
+#[expect(
+    clippy::too_many_lines,
+    reason = "parallel contiguous ContactWork input staging across all optional V2 Sweep-1 channels"
+)]
 fn contact_displacements(
     rules: &Rules,
     bodies: &ContactRules,
@@ -7266,24 +7505,7 @@ fn contact_displacements(
     work: &mut ContactWork,
     workers: usize,
 ) -> Result<(), CoreError> {
-    work.positions.clear();
-    work.ids.clear();
-    work.alive.clear();
-    work.affinities.clear();
-    work.polarities.clear();
-    work.next_polarities.clear();
-    work.polarity_strengths.clear();
-    work.wedge_curvatures.clear();
-    work.energy_gradients.clear();
-    work.emt_factors.clear();
-    work.cell_states_h0.clear();
-    work.neighbor_h0.clear();
-    work.cadherin_tags.clear();
-    work.cadherin_cohesiveness.clear();
-    work.energies.clear();
-    work.trophallaxis_delta_quanta.clear();
-    work.velocities.clear();
-    work.next_velocities.clear();
+    let count = working.len();
     let pcp = rules.v2.polarity();
     let needs_emt_factors = rules.v2.emt_gate() || rules.v2.emt_h1_adhesion_enabled();
     let notch_delta = rules.v2.notch_delta().is_some();
@@ -7296,14 +7518,40 @@ fn contact_displacements(
         || trophallaxis.is_some()
         || (velocity_alignment.is_some() && !cadherin);
     let needs_genome = needs_affinities || pcp.is_some() || cadherin;
-    let mut live_genomes = needs_genome.then(|| population.ascending());
-    for organism in working {
-        work.positions.push(organism.position);
-        work.ids.push(organism.committed.id.get());
-        work.alive
-            .push(matches!(organism.vitality.fate()?, Fate::Survives));
-        let genome =
-            if let Some(walk) = live_genomes.as_mut() {
+
+    work.next_polarities.clear();
+    work.neighbor_h0.clear();
+    work.trophallaxis_delta_quanta.clear();
+    work.next_velocities.clear();
+
+    let prep_used = if count >= 512 && workers > 1 {
+        workers.min(count.div_ceil(256)).max(1)
+    } else {
+        1
+    };
+
+    if prep_used == 1 {
+        work.positions.clear();
+        work.ids.clear();
+        work.alive.clear();
+        work.affinities.clear();
+        work.polarities.clear();
+        work.polarity_strengths.clear();
+        work.wedge_curvatures.clear();
+        work.energy_gradients.clear();
+        work.emt_factors.clear();
+        work.cell_states_h0.clear();
+        work.cadherin_tags.clear();
+        work.cadherin_cohesiveness.clear();
+        work.energies.clear();
+        work.velocities.clear();
+        let mut live_genomes = needs_genome.then(|| population.ascending());
+        for organism in working {
+            work.positions.push(organism.position);
+            work.ids.push(organism.committed.id.get());
+            work.alive
+                .push(matches!(organism.vitality.fate()?, Fate::Survives));
+            let genome = if let Some(walk) = live_genomes.as_mut() {
                 Some(walk.next(organism.committed.id).0.ok_or_else(|| {
                     CoreError::StateConflict {
                         operation: "read genome",
@@ -7313,49 +7561,229 @@ fn contact_displacements(
             } else {
                 None
             };
-        if needs_affinities && let Some(genome) = genome {
-            // CRITICAL V2-12 / V2-13 clonal kin rule: contact kin weighting
-            // (and ALWAYS trophallaxis & Notch-Delta) MUST use GENETIC
-            // `traits.affinity()`, NEVER rotated `a_eff(h_0)`, so
-            // differentiated clonal sisters retain kin signaling and freely
-            // pipe metabolic energy inward. `Traits::unit_affinity()` caches
-            // the bit-identical normalized F32 vector at genome creation.
-            work.affinities.push(*genome.traits().unit_affinity());
+            if needs_affinities && let Some(genome) = genome {
+                // CRITICAL V2-12 / V2-13 clonal kin rule: contact kin weighting
+                // (and ALWAYS trophallaxis & Notch-Delta) MUST use GENETIC
+                // `traits.affinity()`, NEVER rotated `a_eff(h_0)`, so
+                // differentiated clonal sisters retain kin signaling and freely
+                // pipe metabolic energy inward. `Traits::unit_affinity()` caches
+                // the bit-identical normalized F32 vector at genome creation.
+                work.affinities.push(*genome.traits().unit_affinity());
+            }
+            if pcp.is_some() {
+                let traits = genome.map(Genome::traits);
+                work.polarities.push(organism.committed.polarity);
+                work.polarity_strengths
+                    .push(traits.and_then(Traits::polarity_strength).unwrap_or(0.0));
+                work.wedge_curvatures
+                    .push(traits.and_then(Traits::wedge_curvature).unwrap_or(0.0));
+                work.energy_gradients.push(organism.gradients[0]);
+            }
+            if needs_emt_factors {
+                work.emt_factors.push(effective_emt_factor(rules, organism));
+            }
+            if notch_delta {
+                work.cell_states_h0
+                    .push(organism.held.recurrent_state_array()[0]);
+            }
+            if cadherin {
+                let cad = genome
+                    .and_then(|g| g.traits().cadherin_traits())
+                    .ok_or_else(|| CoreError::StateConflict {
+                        operation: "contact",
+                        detail: format!(
+                            "{} is missing cadherin traits while cadherin-4d is enabled",
+                            organism.committed.id
+                        ),
+                    })?;
+                work.cadherin_tags.push(*cad.tag());
+                work.cadherin_cohesiveness.push(cad.cohesiveness());
+            }
+            if trophallaxis.is_some() {
+                work.energies.push(organism.budget.remaining());
+            }
+            if velocity_alignment.is_some() {
+                work.velocities.push(organism.velocity);
+            }
+        }
+    } else {
+        set_len_reuse(&mut work.positions, count, [0.0, 0.0]);
+        set_len_reuse(&mut work.ids, count, 0_u64);
+        set_len_reuse(&mut work.alive, count, false);
+        if needs_affinities {
+            set_len_reuse(&mut work.affinities, count, [0.0_f32; AFFINITY_TERMS]);
+        } else {
+            work.affinities.clear();
         }
         if pcp.is_some() {
-            let traits = genome.map(Genome::traits);
-            work.polarities.push(organism.committed.polarity);
-            work.polarity_strengths
-                .push(traits.and_then(Traits::polarity_strength).unwrap_or(0.0));
-            work.wedge_curvatures
-                .push(traits.and_then(Traits::wedge_curvature).unwrap_or(0.0));
-            work.energy_gradients.push(organism.gradients[0]);
+            set_len_reuse(&mut work.polarities, count, [1.0, 0.0]);
+            set_len_reuse(&mut work.polarity_strengths, count, 0.0);
+            set_len_reuse(&mut work.wedge_curvatures, count, 0.0);
+            set_len_reuse(&mut work.energy_gradients, count, [0.0, 0.0]);
+        } else {
+            work.polarities.clear();
+            work.polarity_strengths.clear();
+            work.wedge_curvatures.clear();
+            work.energy_gradients.clear();
         }
         if needs_emt_factors {
-            work.emt_factors.push(effective_emt_factor(rules, organism));
+            set_len_reuse(&mut work.emt_factors, count, 1.0);
+        } else {
+            work.emt_factors.clear();
         }
         if notch_delta {
-            work.cell_states_h0
-                .push(organism.held.recurrent_state_array()[0]);
+            set_len_reuse(&mut work.cell_states_h0, count, 0.0_f32);
+        } else {
+            work.cell_states_h0.clear();
         }
         if cadherin {
-            let cad = genome
-                .and_then(|g| g.traits().cadherin_traits())
-                .ok_or_else(|| CoreError::StateConflict {
-                    operation: "contact",
-                    detail: format!(
-                        "{} is missing cadherin traits while cadherin-4d is enabled",
-                        organism.committed.id
-                    ),
-                })?;
-            work.cadherin_tags.push(*cad.tag());
-            work.cadherin_cohesiveness.push(cad.cohesiveness());
+            set_len_reuse(&mut work.cadherin_tags, count, [0.0_f64; CADHERIN_TERMS]);
+            set_len_reuse(&mut work.cadherin_cohesiveness, count, 0.0);
+        } else {
+            work.cadherin_tags.clear();
+            work.cadherin_cohesiveness.clear();
         }
         if trophallaxis.is_some() {
-            work.energies.push(organism.budget.remaining());
+            set_len_reuse(&mut work.energies, count, 0.0);
+        } else {
+            work.energies.clear();
         }
         if velocity_alignment.is_some() {
-            work.velocities.push(organism.velocity);
+            set_len_reuse(&mut work.velocities, count, [0.0, 0.0]);
+        } else {
+            work.velocities.clear();
+        }
+
+        let fill_chunk = |chunk: &[Working], out: ContactPrepChunk<'_>| -> Result<(), CoreError> {
+            let mut live_genomes = if needs_genome {
+                chunk
+                    .first()
+                    .map(|first| population.ascending_from(first.committed.id))
+            } else {
+                None
+            };
+            for (i, organism) in chunk.iter().enumerate() {
+                out.pos[i] = organism.position;
+                out.ids[i] = organism.committed.id.get();
+                out.alive[i] = matches!(organism.vitality.fate()?, Fate::Survives);
+                let genome = if let Some(walk) = live_genomes.as_mut() {
+                    Some(walk.next(organism.committed.id).0.ok_or_else(|| {
+                        CoreError::StateConflict {
+                            operation: "read genome",
+                            detail: format!("{} has no genome", organism.committed.id),
+                        }
+                    })?)
+                } else {
+                    None
+                };
+                if needs_affinities && let Some(genome) = genome {
+                    out.aff[i] = *genome.traits().unit_affinity();
+                }
+                if pcp.is_some() {
+                    let traits = genome.map(Genome::traits);
+                    out.pol[i] = organism.committed.polarity;
+                    out.pol_s[i] = traits.and_then(Traits::polarity_strength).unwrap_or(0.0);
+                    out.wedge[i] = traits.and_then(Traits::wedge_curvature).unwrap_or(0.0);
+                    out.grad[i] = organism.gradients[0];
+                }
+                if needs_emt_factors {
+                    out.emt[i] = effective_emt_factor(rules, organism);
+                }
+                if notch_delta {
+                    out.h0[i] = organism.held.recurrent_state_array()[0];
+                }
+                if cadherin {
+                    let cad = genome
+                        .and_then(|g| g.traits().cadherin_traits())
+                        .ok_or_else(|| CoreError::StateConflict {
+                            operation: "contact",
+                            detail: format!(
+                                "{} is missing cadherin traits while cadherin-4d is enabled",
+                                organism.committed.id
+                            ),
+                        })?;
+                    out.cad_tag[i] = *cad.tag();
+                    out.cad_coh[i] = cad.cohesiveness();
+                }
+                if trophallaxis.is_some() {
+                    out.energies[i] = organism.budget.remaining();
+                }
+                if velocity_alignment.is_some() {
+                    out.vels[i] = organism.velocity;
+                }
+            }
+            Ok(())
+        };
+
+        let chunk_len = count.div_ceil(prep_used);
+        let mut r_pos = work.positions.as_mut_slice();
+        let mut r_ids = work.ids.as_mut_slice();
+        let mut r_alive = work.alive.as_mut_slice();
+        let mut r_aff = work.affinities.as_mut_slice();
+        let mut r_pol = work.polarities.as_mut_slice();
+        let mut r_pol_s = work.polarity_strengths.as_mut_slice();
+        let mut r_wedge = work.wedge_curvatures.as_mut_slice();
+        let mut r_grad = work.energy_gradients.as_mut_slice();
+        let mut r_emt = work.emt_factors.as_mut_slice();
+        let mut r_h0 = work.cell_states_h0.as_mut_slice();
+        let mut r_cad_tag = work.cadherin_tags.as_mut_slice();
+        let mut r_cad_coh = work.cadherin_cohesiveness.as_mut_slice();
+        let mut r_energies = work.energies.as_mut_slice();
+        let mut r_vels = work.velocities.as_mut_slice();
+
+        let mut chunks_in = working.chunks(chunk_len);
+        let head_in = chunks_in.next().unwrap_or(&[]);
+        let take_head = head_in.len();
+        let head_out = ContactPrepChunk {
+            pos: split_prefix(&mut r_pos, take_head),
+            ids: split_prefix(&mut r_ids, take_head),
+            alive: split_prefix(&mut r_alive, take_head),
+            aff: split_prefix(&mut r_aff, take_head),
+            pol: split_prefix(&mut r_pol, take_head),
+            pol_s: split_prefix(&mut r_pol_s, take_head),
+            wedge: split_prefix(&mut r_wedge, take_head),
+            grad: split_prefix(&mut r_grad, take_head),
+            emt: split_prefix(&mut r_emt, take_head),
+            h0: split_prefix(&mut r_h0, take_head),
+            cad_tag: split_prefix(&mut r_cad_tag, take_head),
+            cad_coh: split_prefix(&mut r_cad_coh, take_head),
+            energies: split_prefix(&mut r_energies, take_head),
+            vels: split_prefix(&mut r_vels, take_head),
+        };
+
+        let tail_count = chunks_in.len();
+        let mut tail_results: Vec<Result<(), CoreError>> =
+            (0..tail_count).map(|_| Ok(())).collect();
+        let mut head_result = Ok(());
+        let fill_chunk = &fill_chunk;
+        flife_core::pool::scope_workers(workers, "contact prep", |scope| {
+            for (chunk, res_slot) in chunks_in.zip(tail_results.iter_mut()) {
+                let take = chunk.len();
+                let out = ContactPrepChunk {
+                    pos: split_prefix(&mut r_pos, take),
+                    ids: split_prefix(&mut r_ids, take),
+                    alive: split_prefix(&mut r_alive, take),
+                    aff: split_prefix(&mut r_aff, take),
+                    pol: split_prefix(&mut r_pol, take),
+                    pol_s: split_prefix(&mut r_pol_s, take),
+                    wedge: split_prefix(&mut r_wedge, take),
+                    grad: split_prefix(&mut r_grad, take),
+                    emt: split_prefix(&mut r_emt, take),
+                    h0: split_prefix(&mut r_h0, take),
+                    cad_tag: split_prefix(&mut r_cad_tag, take),
+                    cad_coh: split_prefix(&mut r_cad_coh, take),
+                    energies: split_prefix(&mut r_energies, take),
+                    vels: split_prefix(&mut r_vels, take),
+                };
+                scope.spawn(move || {
+                    *res_slot = fill_chunk(chunk, out);
+                });
+            }
+            head_result = fill_chunk(head_in, head_out);
+        })?;
+        head_result?;
+        for result in tail_results {
+            result?;
         }
     }
     let dt = rules.step.seconds_per_tick();

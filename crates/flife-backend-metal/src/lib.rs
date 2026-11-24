@@ -836,7 +836,7 @@ const PARALLEL_INPUT_MAX_THREADS: usize = 8;
 
 /// Maximum touched shards dispatched from stack storage in [`MetalBackend::evaluate`]
 /// without heap allocation for bindings and [`Kernel`] descriptors.
-const INLINE_SHARDS: usize = 16;
+const INLINE_SHARDS: usize = 32;
 
 /// Fixed per-topology intra-batch pointer cache slots (`0..8` covers the entire
 /// 5-topology catalog with zero heap allocation and eliminates repeated
@@ -1187,7 +1187,9 @@ impl MetalBackend {
     /// otherwise `self.input_finite` (populated by [`narrow_inputs`]) is used.
     ///
     /// Writes touched `(topology, shard)` keys into `self.touched` (sorted) and
-    /// returns `all_dispatched`.
+    /// returns `(all_dispatched, dispatched_count)`. Populates `self.dispatched`
+    /// lazily only when a job is skipped or an existing slot is overwritten,
+    /// avoiding per-tick index-vector writes on steady-state full-dispatch ticks.
     #[expect(
         clippy::too_many_lines,
         reason = "single-pass placement and staging with duplicate-slot fallback and cached shard lease"
@@ -1197,7 +1199,7 @@ impl MetalBackend {
         jobs: &[J],
         external_finite: Option<&[u8]>,
         batch_dims: (usize, usize),
-    ) -> Result<bool, CoreError> {
+    ) -> Result<(bool, usize), CoreError> {
         if u32::try_from(jobs.len()).is_err() {
             return Err(CoreError::LayoutMismatch {
                 buffer: "metal controller batch",
@@ -1219,6 +1221,16 @@ impl MetalBackend {
             ..
         } = self;
         let finite_flags = external_finite.unwrap_or(input_finite.as_slice());
+        if finite_flags.len() < jobs.len() {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "metal controller input flags",
+                detail: format!(
+                    "expected at least {} finite flags, got {}",
+                    jobs.len(),
+                    finite_flags.len()
+                ),
+            });
+        }
         let owner = &controllers.owner;
         let budget = *budget;
         let shard_slots = *shard_slots;
@@ -1228,10 +1240,9 @@ impl MetalBackend {
             }
         }
         dispatched.clear();
-        if dispatched.capacity() < jobs.len() {
-            reserve(dispatched, jobs.len(), "metal controller dispatch")?;
-        }
         touched.clear();
+        let mut dispatched_count = 0_usize;
+        let mut tracking_dispatched = false;
         let mut overwrote_existing = false;
         let mut all_dispatched = true;
         let budget_share = match budget.bytes {
@@ -1257,8 +1268,8 @@ impl MetalBackend {
         // new shard allocation or before `place_and_stage` returns.
         let mut active_lease: Option<(usize, u64, ShardWriteLease)> = None;
 
-        for (index, job) in jobs.iter().enumerate() {
-            if finite_flags.get(index).copied().unwrap_or(0) == 0 {
+        for (index, (job, &is_finite)) in jobs.iter().zip(finite_flags).enumerate() {
+            if is_finite == 0 {
                 all_dispatched = false;
                 continue;
             }
@@ -1495,8 +1506,18 @@ impl MetalBackend {
                 shard.live_count += 1;
                 *uploads += 1;
             }
-            let row = dispatched.len();
-            dispatched.push(index);
+            let row = dispatched_count;
+            dispatched_count += 1;
+            if !all_dispatched || overwrote_existing {
+                if !tracking_dispatched {
+                    if dispatched.capacity() < jobs.len() {
+                        reserve(dispatched, jobs.len(), "metal controller dispatch")?;
+                    }
+                    dispatched.extend(0..row);
+                    tracking_dispatched = true;
+                }
+                dispatched.push(index);
+            }
             if !overwrote_existing {
                 let row_word = u32::try_from(row).map_err(|_| CoreError::Overflow {
                     quantity: "metal controller batch row",
@@ -1523,6 +1544,13 @@ impl MetalBackend {
             }
         }
         drop(active_lease);
+
+        if (!all_dispatched || overwrote_existing) && !tracking_dispatched && dispatched_count > 0 {
+            if dispatched.capacity() < dispatched_count {
+                reserve(dispatched, dispatched_count, "metal controller dispatch")?;
+            }
+            dispatched.extend(0..dispatched_count);
+        }
 
         if overwrote_existing {
             // At least one live slot was overwritten during this batch; drop
@@ -1590,11 +1618,12 @@ impl MetalBackend {
                     shape_words[2],
                 ]);
             }
+            dispatched_count = dispatched.len();
         }
         if touched.len() > 1 && !touched.is_sorted() {
             touched.sort_unstable();
         }
-        Ok(all_dispatched)
+        Ok((all_dispatched, dispatched_count))
     }
 
     /// Grow the per-organism buffers to hold `count` organisms of
@@ -1867,7 +1896,7 @@ impl MetalBackend {
                 shard.job_capacity = capacity;
             }
             if let Some(words) = shard.jobs.as_ref() {
-                owner.write(words.buffer())?.write(0, &shard.staged)?;
+                owner.write_slice(words.buffer(), 0, &shard.staged)?;
             }
         }
         let (Some(inputs), Some(raw), Some(faults), Some(dims)) = (
@@ -1890,14 +1919,14 @@ impl MetalBackend {
             })?,
         ];
         if self.cached_dims != Some(dims_words) {
-            owner.write(dims)?.write(0, &dims_words)?;
+            owner.write_slice(dims, 0, &dims_words)?;
             self.cached_dims = Some(dims_words);
         }
         let input_slice = match external_inputs {
             Some(ext) => &ext[..count * input_width],
             None => &self.staged_inputs[..count * input_width],
         };
-        owner.write(inputs)?.write(0, input_slice)?;
+        owner.write_slice(inputs, 0, input_slice)?;
         let receipt = if touched_len <= INLINE_SHARDS {
             type InlineShardSpec<'a> = (&'a Pipeline, [Binding; 6], usize, usize);
             let mut inline_specs: [Option<InlineShardSpec<'_>>; INLINE_SHARDS] =
@@ -2085,8 +2114,8 @@ impl MetalBackend {
             &mut self.staged_inputs,
             &mut self.input_finite,
         )?;
-        let all_dispatched = self.place_and_stage(jobs, None, (input_width, output_width))?;
-        let count = self.dispatched.len();
+        let (all_dispatched, count) =
+            self.place_and_stage(jobs, None, (input_width, output_width))?;
         if count > 0 {
             if !all_dispatched {
                 for (row, &index) in self.dispatched.iter().enumerate() {
@@ -2188,10 +2217,9 @@ impl MetalBackend {
             outputs.prepare(jobs.len(), fallback_width)?;
             return Ok(());
         };
-        let all_dispatched =
+        let (all_dispatched, count) =
             self.place_and_stage(jobs, Some(inputs_finite), (input_width, output_width))?;
         outputs.prepare(jobs.len(), output_width)?;
-        let count = self.dispatched.len();
         if count == 0 {
             return Ok(());
         }
@@ -2368,22 +2396,30 @@ pub enum ControllerChoice {
 }
 
 /// The most CPU workers at which [`ControllerChoice::Auto`] takes Metal.
-/// Measured on the preset (M5 Ultra, `flife run`, whole ticks): Metal is
-/// 2.2x faster on one worker, 1.7x on two, 1.3x on four and 1.1x on eight,
-/// and no faster on sixteen, where the serial phases bound the tick. In the
-/// Studio on sixteen, whose presentation uses the same GPU, it measured
-/// slower under FrankenManim dfdc7d18 (72 against 119 ticks per second, one
-/// 12 s run each) and level under f401a947 (132 against 120 at 960x540, 152
-/// against 161 at 1920x1080, four interleaved 10 s runs each).
-pub const AUTO_METAL_MAX_WORKERS: usize = 8;
+/// Measured on an Apple M5 Ultra: Metal beats CPU/Torch at 1–4 workers
+/// (2.2x on 1 worker, 1.7x on 2, 1.3x on 4 on the preset), whereas with the
+/// flat-F32 `ControllerBackend::evaluate_flat_f32` path (`phase_profile`,
+/// bit-exact digests, 2026-11-23), [`ControllerChoice::Torch`] beats Metal at
+/// 8, 12 and 16 workers across every measured workload — Bundle A (~11k, 32
+/// ticks): `torch 28.87 / 25.17 / 23.76 ms/t` vs `metal 30.36 / 27.14 /
+/// 28.26 ms/t`; Bundle B (~18k, 32 ticks): `torch 31.73 / 27.74 / 27.49 ms/t`
+/// vs `metal 34.15 / 32.12 / 31.63 ms/t`; Confluent 65k (65,536 -> 69,463,
+/// F16, 8 ticks): `torch 152.42 / 132.64 / 120.51 ms/t` vs `metal 176.95 /
+/// 154.39 / 160.56 ms/t`.
+pub const AUTO_METAL_MAX_WORKERS: usize = 4;
 
 /// The most CPU workers at which [`ControllerChoice::Auto`] takes
-/// FrankenTorch's CPU route where it does not take Metal (FL-025). Measured
-/// on the preset (`tick_throughput`, whole ticks, each against the reference
-/// in the same process, cv at most 5%, the same digests): 1.41x on one
-/// worker, 1.11x on four and 0.91x on eight on Linux x86-64 (2026-11-10),
-/// and 1.62x on one and 1.26x on four on an M5 Ultra.
-pub const AUTO_TORCH_MAX_WORKERS: usize = 4;
+/// FrankenTorch's CPU route where it does not take Metal (FL-025). With
+/// `ControllerBackend::evaluate_flat_f32` and the persistent private worker
+/// pool, measured on an Apple M5 Ultra (`phase_profile`, bit-exact digests,
+/// 2026-11-23), `Torch` beats the scalar CPU reference across 8, 12 and 16
+/// workers on every measured workload — Bundle A: `28.87 / 25.17 / 23.76 ms/t`
+/// vs `cpu 35.92 / 28.79 / 27.15 ms/t` (1.24x / 1.14x / 1.14x); Bundle B:
+/// `31.73 / 27.74 / 27.49 ms/t` vs `cpu 44.91 / 35.53 / 33.03 ms/t` (1.42x /
+/// 1.28x / 1.20x); Confluent 65k: `152.42 / 132.64 / 120.51 ms/t` vs
+/// `cpu 181.82 / 147.12 / 140.03 ms/t` (1.19x / 1.11x / 1.16x) — as well as
+/// 1–4 workers on both macOS (1.62x / 1.26x) and Linux x86-64 (1.41x / 1.11x).
+pub const AUTO_TORCH_MAX_WORKERS: usize = 64;
 
 /// The fewest organisms at which [`ControllerChoice::Auto`] takes
 /// FrankenTorch's CPU route on any number of CPU workers where it does not

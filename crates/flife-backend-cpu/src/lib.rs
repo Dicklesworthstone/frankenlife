@@ -52,7 +52,7 @@ use std::num::NonZeroUsize;
 use flife_core::ids::GenomeId;
 use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_core::model::MAXIMUM_HIDDEN_LAYERS;
-use flife_core::numerics::tanh_f32;
+use flife_core::numerics::{tanh_f32, tanh_f32_4};
 use flife_core::{CoreError, pool};
 use flife_neural::{
     ArenaSlot, BackendBudget, ControllerBackend, ControllerJob, DenseTopology, FlatControllerJob,
@@ -64,6 +64,10 @@ use ft_kernel_cpu::population_affine_f32_into;
 /// The fewest jobs worth handing to another thread, as for the engine's own
 /// decision lanes.
 pub const MINIMUM_JOBS_PER_LANE: usize = 128;
+
+/// Minimum newly-admitted genomes in one batch before [`CpuBackend`] runs
+/// shard zero-fill and weight transposition across the persistent worker pool.
+const PARALLEL_PACK_MIN_JOBS: usize = 64;
 
 /// Slots per packed shard, unless [`CpuBackend::with_shard_slots`] says
 /// otherwise: 10 MB of the preset's 9,988-parameter topology.
@@ -216,30 +220,66 @@ fn pack_as<W: Weight>(
     layers: &[Layer],
     out: &mut [f32],
 ) -> Result<(), CoreError> {
+    const TILE: usize = 8;
     let outside = || CoreError::LayoutMismatch {
         buffer: "controller parameters",
         detail: format!("a layer outside {} parameters", parameters.len()),
     };
     for (source, layer) in topology.layers().iter().zip(layers) {
+        let inputs = layer.inputs;
+        let outputs = layer.outputs;
+        let weight_count = inputs.checked_mul(outputs).ok_or_else(outside)?;
         let weights = parameters
             .get(source.weights..source.biases)
             .ok_or_else(outside)?;
+        if weights.len() != weight_count {
+            return Err(outside());
+        }
         let biases = parameters
-            .get(source.biases..source.biases + layer.outputs)
+            .get(source.biases..source.biases + outputs)
             .ok_or_else(outside)?;
         let packed = out
-            .get_mut(layer.weights..layer.biases + layer.outputs)
+            .get_mut(layer.weights..layer.biases + outputs)
             .ok_or_else(outside)?;
-        let (packed_weights, packed_biases) = packed.split_at_mut(layer.inputs * layer.outputs);
-        // Input `i`'s column, `weight[0][i], weight[1][i], …`, becomes the
-        // packed row `i`.
-        for (input, row) in packed_weights.chunks_exact_mut(layer.outputs).enumerate() {
-            for (slot, &value) in row
-                .iter_mut()
-                .zip(weights.iter().skip(input).step_by(layer.inputs))
-            {
-                *slot = value.widen();
+        if packed.len() != weight_count.saturating_add(outputs) {
+            return Err(outside());
+        }
+        let (packed_weights, packed_biases) = packed.split_at_mut(weight_count);
+        // Register-tiled 8x8 transpose: source `weight[out][in]` becomes packed
+        // `packed[in][out]`, keeping reads and writes contiguous within each tile.
+        let mut o_base = 0;
+        while o_base < outputs {
+            let o_end = o_base.saturating_add(TILE).min(outputs);
+            let mut i_base = 0;
+            while i_base < inputs {
+                let i_end = i_base.saturating_add(TILE).min(inputs);
+                if o_end - o_base == TILE && i_end - i_base == TILE {
+                    let mut tile = [[0.0_f32; TILE]; TILE];
+                    for (do_, row) in tile.iter_mut().enumerate() {
+                        let src_start = (o_base + do_) * inputs + i_base;
+                        let src = &weights[src_start..src_start + TILE];
+                        for (dst, &value) in row.iter_mut().zip(src) {
+                            *dst = value.widen();
+                        }
+                    }
+                    for di in 0..TILE {
+                        let dst_start = (i_base + di) * outputs + o_base;
+                        let dst = &mut packed_weights[dst_start..dst_start + TILE];
+                        for (slot, row) in dst.iter_mut().zip(&tile) {
+                            *slot = row[di];
+                        }
+                    }
+                } else {
+                    for o in o_base..o_end {
+                        let src_row = &weights[o * inputs + i_base..o * inputs + i_end];
+                        for (di, &value) in src_row.iter().enumerate() {
+                            packed_weights[(i_base + di) * outputs + o] = value.widen();
+                        }
+                    }
+                }
+                i_base = i_end;
             }
+            o_base = o_end;
         }
         for (slot, bias) in packed_biases.iter_mut().zip(biases) {
             *slot = bias.widen();
@@ -325,9 +365,19 @@ fn evaluate(
 
 /// The reference's hidden activation in place: `tanh` of each F32
 /// pre-activation in F64, rounded once to F32, as `tanh_f32` computes it.
-/// False where it refuses one.
+/// False where it refuses one. Processes four lanes in lockstep via
+/// [`tanh_f32_4`] (bit-identical to four scalar [`tanh_f32`] calls) with a
+/// scalar tail for non-multiple-of-four hidden widths.
+#[inline]
 fn activate(values: &mut [f32]) -> bool {
-    for value in values {
+    let (chunks, tail) = values.as_chunks_mut::<4>();
+    for chunk in chunks {
+        let Some(activated) = tanh_f32_4(*chunk) else {
+            return false;
+        };
+        *chunk = activated;
+    }
+    for value in tail {
         let Some(activated) = tanh_f32(*value) else {
             return false;
         };
@@ -487,12 +537,46 @@ fn locate_cached(
     }
 }
 
-/// Outcome of attempting to ensure one job's parameters are resident.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlaceOutcome {
+/// Pre-located slot coordinates passed to [`Packing::admit_located`].
+#[derive(Debug, Clone, Copy)]
+struct LocatedSlot {
+    topology: usize,
+    job_idx: usize,
+    slot: ArenaSlot,
+    genome: GenomeId,
+    shard_key: u64,
+    local: u64,
+    offset: u64,
+}
+
+/// One newly-admitted slot waiting for shard growth and weight transposition.
+#[derive(Debug, Clone, Copy)]
+struct PendingPack {
+    topology: usize,
+    shard_key: u64,
+    local: usize,
+    offset: usize,
+    end: usize,
+    job_idx: usize,
+    generation: u32,
+    genome: GenomeId,
+}
+
+/// Outcome of attempting to admit one job's parameters into a shard slot.
+#[derive(Debug, Clone, Copy)]
+enum AdmitOutcome {
     Resident,
-    Packed,
+    Queued(PendingPack),
     Deferred,
+}
+
+/// One disjoint slot-packing work item executed across worker lanes.
+struct PackTask<'a> {
+    layers: &'a [Layer],
+    job_idx: usize,
+    dst: &'a mut [f32],
+    pending_idx: usize,
+    failed: bool,
 }
 
 /// One catalog member's packed slots, in shards.
@@ -527,31 +611,26 @@ impl Packing {
         shard.values.get(offset..offset.checked_add(length)?)
     }
 
-    /// Pack `job`'s parameters into its pre-located slot, in place of any
-    /// earlier occupant's, unless they are resident, or their shard is not made
-    /// yet and would need more than `room` bytes (FL-043). Updates `held`
-    /// atomically on shard creation or error-path reclamation so a packing
-    /// failure never leaves a zombie shard or desyncs memory accounting.
-    fn place_located(
+    /// Admit `loc`'s pre-located slot into its shard (reserving shard capacity
+    /// without zero-filling `shard.values` or transposing weights yet) unless
+    /// it is already resident or its new shard would exceed `room` (FL-043).
+    /// Returns a [`PendingPack`] to be flushed in Pass 2 before evaluation.
+    fn admit_located(
         &mut self,
-        job: &impl JobView,
-        shard_key: u64,
-        local_u64: u64,
-        offset_u64: u64,
+        loc: LocatedSlot,
         room: u64,
         held: &mut u64,
-    ) -> Result<PlaceOutcome, CoreError> {
-        let slot = job.slot();
-        let genome = job.genome();
-        if self
-            .resident_located(slot, genome, shard_key, local_u64, offset_u64)
-            .is_some()
+    ) -> Result<AdmitOutcome, CoreError> {
+        let generation = loc.slot.generation();
+        if let Some(shard) = self.shards.get(loc.shard_key)
+            && let Ok(local) = usize::try_from(loc.local)
+            && shard.occupants.get(local).copied().flatten() == Some((generation, loc.genome))
         {
-            return Ok(PlaceOutcome::Resident);
+            return Ok(AdmitOutcome::Resident);
         }
         let too_large = |quantity: &'static str| CoreError::Overflow { quantity };
-        let local = usize::try_from(local_u64).map_err(|_| too_large("arena slot"))?;
-        let offset = usize::try_from(offset_u64).map_err(|_| too_large("arena offset"))?;
+        let local = usize::try_from(loc.local).map_err(|_| too_large("arena slot"))?;
+        let offset = usize::try_from(loc.offset).map_err(|_| too_large("arena offset"))?;
         let length = usize::try_from(self.geometry.parameters())
             .map_err(|_| too_large("arena slot length"))?;
         let end = offset
@@ -562,75 +641,53 @@ impl Packing {
         let slots = usize::try_from(self.geometry.slots_per_shard())
             .map_err(|_| too_large("arena shard slots"))?;
         let bytes = shard_bytes(&self.geometry);
-        let controller = job.controller();
-        let mut drop_empty_error = None;
-        if let Some(shard) = self.shards.get_mut(shard_key) {
-            if shard.values.len() < end {
-                shard.values.resize(end, 0.0);
-            }
+        if let Some(shard) = self.shards.get_mut(loc.shard_key) {
             if shard.occupants.len() <= local {
                 let more = local + 1 - shard.occupants.len();
                 reserve(&mut shard.occupants, more, "cpu controller slots")?;
                 shard.occupants.resize(local + 1, None);
             }
-            // The old occupant is gone before anything of the new one is
-            // written, so a failure leaves the slot empty, never mixed.
-            if shard.occupants[local].take().is_some() {
-                shard.live_count = shard.live_count.saturating_sub(1);
-            }
-            if let Err(error) = pack(
-                controller.parameters(),
-                controller.topology(),
-                &self.layers,
-                &mut shard.values[offset..end],
-            ) {
-                if shard.live_count == 0 {
-                    drop_empty_error = Some(error);
-                } else {
-                    return Err(error);
-                }
-            } else {
-                shard.occupants[local] = Some((slot.generation(), genome));
+            if shard.occupants[local]
+                .replace((generation, loc.genome))
+                .is_none()
+            {
                 shard.live_count += 1;
-                return Ok(PlaceOutcome::Packed);
             }
+        } else {
+            if bytes > room {
+                return Ok(AdmitOutcome::Deferred);
+            }
+            let mut shard = Shard::default();
+            shard
+                .values
+                .try_reserve_exact(shard_elements)
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "cpu controller shard",
+                    bytes: self.geometry.shard_elements().saturating_mul(4),
+                })?;
+            shard
+                .occupants
+                .try_reserve_exact(slots)
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "cpu controller slots",
+                    bytes: bytes_for::<Option<(u32, GenomeId)>>(slots),
+                })?;
+            shard.occupants.resize(local + 1, None);
+            shard.occupants[local] = Some((generation, loc.genome));
+            shard.live_count = 1;
+            self.shards.insert(loc.shard_key, shard);
+            *held = held.saturating_add(bytes);
         }
-        if let Some(error) = drop_empty_error {
-            self.shards.remove(shard_key);
-            *held = held.saturating_sub(bytes);
-            return Err(error);
-        }
-        if bytes > room {
-            return Ok(PlaceOutcome::Deferred);
-        }
-        let mut shard = Shard::default();
-        shard
-            .values
-            .try_reserve_exact(shard_elements)
-            .map_err(|_| CoreError::AllocationFailed {
-                buffer: "cpu controller shard",
-                bytes: self.geometry.shard_elements().saturating_mul(4),
-            })?;
-        shard
-            .occupants
-            .try_reserve_exact(slots)
-            .map_err(|_| CoreError::AllocationFailed {
-                buffer: "cpu controller slots",
-                bytes: bytes_for::<Option<(u32, GenomeId)>>(slots),
-            })?;
-        shard.values.resize(end, 0.0);
-        shard.occupants.resize(local + 1, None);
-        pack(
-            controller.parameters(),
-            controller.topology(),
-            &self.layers,
-            &mut shard.values[offset..end],
-        )?;
-        shard.occupants[local] = Some((slot.generation(), genome));
-        shard.live_count = 1;
-        self.shards.insert(shard_key, shard);
-        *held = held.saturating_add(bytes);
-        Ok(PlaceOutcome::Packed)
+        Ok(AdmitOutcome::Queued(PendingPack {
+            topology: loc.topology,
+            shard_key: loc.shard_key,
+            local,
+            offset,
+            end,
+            job_idx: loc.job_idx,
+            generation,
+            genome: loc.genome,
+        }))
     }
 }
 
@@ -793,7 +850,13 @@ impl CpuBackend {
 
     /// Pack every job's parameters that are not resident and whose shard
     /// fits the budget, and give the widest hidden layer among them.
-    fn place_jobs<J: JobView>(
+    ///
+    /// Pass 1 admits shards and slot metadata serially in batch order
+    /// (preserving exact FL-043 byte budgets and last-writer-wins duplicate-slot
+    /// semantics). Pass 2 flushes newly-admitted packs, parallelizing shard
+    /// zero-fill and weight transposition across the persistent worker pool
+    /// once at least [`PARALLEL_PACK_MIN_JOBS`] new genomes are queued.
+    fn place_jobs<J: JobView + Sync>(
         &mut self,
         jobs: &[J],
         finite: Option<&[u8]>,
@@ -806,72 +869,274 @@ impl CpuBackend {
         let mut cached_topos = TopoPointerCache::new();
         let mut cached_ranges: [Option<(u64, u64, u64)>; TOPO_CACHE_SLOTS] =
             [None; TOPO_CACHE_SLOTS];
-        for (job_idx, job) in jobs.iter().enumerate() {
-            if let Some(flags) = finite
-                && flags[job_idx] == 0
-            {
-                continue;
-            }
-            let slot = job.slot();
-            let Ok(index) = usize::try_from(slot.topology()) else {
-                continue;
-            };
-            let controller = job.controller();
-            let topo_ptr = std::ptr::from_ref(controller.topology());
-            let length_u64 = controller.parameters().len() as u64;
-            let Some(bucket) = (if cached_topos.contains(index, topo_ptr, length_u64) {
-                self.buckets.get_mut(index).and_then(Option::as_mut)
-            } else {
-                let found =
-                    Self::ensure_bucket(&mut self.buckets, self.shard_slots, index, controller)?;
-                if found.is_some() {
-                    cached_topos.insert(index, topo_ptr, length_u64);
-                }
-                found
-            }) else {
-                continue;
-            };
-            let Some(packing) = bucket.packing.as_mut() else {
-                continue;
-            };
-            if let Some((in_w, out_w)) = expected_dims {
-                if packing.input_width != in_w || packing.output_width != out_w {
+        let mut pending: Vec<PendingPack> = Vec::new();
+        let admit_result = (|| -> Result<(), CoreError> {
+            for (job_idx, job) in jobs.iter().enumerate() {
+                if let Some(flags) = finite
+                    && flags[job_idx] == 0
+                {
                     continue;
                 }
-            } else if input_len(job) != packing.input_width {
-                continue;
-            }
-            let (shard_key, local_u64, offset_u64) =
-                locate_cached(&packing.geometry, index, slot.slot(), &mut cached_ranges);
-            // The lanes' activations: two buffers of the widest layer served,
-            // or what they already hold.
-            let activations = lanes
-                .saturating_mul(2)
-                .saturating_mul(bytes_for::<f32>(widest.max(packing.widest)))
-                .max(current_scratch_bytes);
-            let room = self
-                .budget
-                .bytes
-                .saturating_sub(self.held.saturating_add(activations));
-            match packing.place_located(
-                job,
-                shard_key,
-                local_u64,
-                offset_u64,
-                room,
-                &mut self.held,
-            )? {
-                PlaceOutcome::Packed => {
-                    self.packs += 1;
-                    widest = widest.max(packing.widest);
+                let slot = job.slot();
+                let Ok(index) = usize::try_from(slot.topology()) else {
+                    continue;
+                };
+                let controller = job.controller();
+                let topo_ptr = std::ptr::from_ref(controller.topology());
+                let length_u64 = controller.parameters().len() as u64;
+                let Some(bucket) = (if cached_topos.contains(index, topo_ptr, length_u64) {
+                    self.buckets.get_mut(index).and_then(Option::as_mut)
+                } else {
+                    let found = Self::ensure_bucket(
+                        &mut self.buckets,
+                        self.shard_slots,
+                        index,
+                        controller,
+                    )?;
+                    if found.is_some() {
+                        cached_topos.insert(index, topo_ptr, length_u64);
+                    }
+                    found
+                }) else {
+                    continue;
+                };
+                let Some(packing) = bucket.packing.as_mut() else {
+                    continue;
+                };
+                if let Some((in_w, out_w)) = expected_dims {
+                    if packing.input_width != in_w || packing.output_width != out_w {
+                        continue;
+                    }
+                } else if input_len(job) != packing.input_width {
+                    continue;
                 }
-                PlaceOutcome::Resident => {
-                    widest = widest.max(packing.widest);
+                let (shard_key, local_u64, offset_u64) =
+                    locate_cached(&packing.geometry, index, slot.slot(), &mut cached_ranges);
+                let packing_widest = packing.widest;
+                let activations = lanes
+                    .saturating_mul(2)
+                    .saturating_mul(bytes_for::<f32>(widest.max(packing_widest)))
+                    .max(current_scratch_bytes);
+                let room = self
+                    .budget
+                    .bytes
+                    .saturating_sub(self.held.saturating_add(activations));
+                match packing.admit_located(
+                    LocatedSlot {
+                        topology: index,
+                        job_idx,
+                        slot,
+                        genome: job.genome(),
+                        shard_key,
+                        local: local_u64,
+                        offset: offset_u64,
+                    },
+                    room,
+                    &mut self.held,
+                )? {
+                    AdmitOutcome::Queued(entry) => {
+                        if pending.len() == pending.capacity()
+                            && let Err(error) =
+                                reserve(&mut pending, 1, "cpu controller pending packs")
+                        {
+                            rollback_pending(&mut self.buckets, &mut self.held, &[entry]);
+                            return Err(error);
+                        }
+                        pending.push(entry);
+                        widest = widest.max(packing_widest);
+                    }
+                    AdmitOutcome::Resident => widest = widest.max(packing_widest),
+                    AdmitOutcome::Deferred => {}
                 }
-                PlaceOutcome::Deferred => {}
             }
+            Ok(())
+        })();
+        if let Err(error) = admit_result {
+            dedup_pending_packs(&mut pending);
+            rollback_pending(&mut self.buckets, &mut self.held, &pending);
+            return Err(error);
+        }
+        if !pending.is_empty() {
+            self.flush_pending_packs(jobs, &mut pending)?;
         }
         Ok(widest)
+    }
+
+    /// Flush every admitted [`PendingPack`] into its shard, deduplicating
+    /// duplicate-slot overwrites so only the last writer per slot is packed.
+    fn flush_pending_packs<J: JobView + Sync>(
+        &mut self,
+        jobs: &[J],
+        pending: &mut Vec<PendingPack>,
+    ) -> Result<(), CoreError> {
+        dedup_pending_packs(pending);
+        if pending.len() < PARALLEL_PACK_MIN_JOBS || self.lanes.get() <= 1 {
+            self.flush_pending_serial(jobs, pending)
+        } else {
+            self.flush_pending_parallel(jobs, pending)
+        }
+    }
+
+    fn flush_pending_serial<J: JobView>(
+        &mut self,
+        jobs: &[J],
+        pending: &[PendingPack],
+    ) -> Result<(), CoreError> {
+        for (idx, p) in pending.iter().enumerate() {
+            let result = (|| -> Result<(), CoreError> {
+                let Some(packing) = self
+                    .buckets
+                    .get_mut(p.topology)
+                    .and_then(Option::as_mut)
+                    .and_then(|bucket| bucket.packing.as_mut())
+                else {
+                    return Err(CoreError::StateConflict {
+                        operation: "cpu controller pack",
+                        detail: format!("bucket {} missing", p.topology),
+                    });
+                };
+                let Some(shard) = packing.shards.get_mut(p.shard_key) else {
+                    return Err(CoreError::StateConflict {
+                        operation: "cpu controller pack",
+                        detail: format!("shard {} missing", p.shard_key),
+                    });
+                };
+                if shard.values.len() < p.end {
+                    shard.values.resize(p.end, 0.0);
+                }
+                let controller = jobs[p.job_idx].controller();
+                pack(
+                    controller.parameters(),
+                    controller.topology(),
+                    &packing.layers,
+                    &mut shard.values[p.offset..p.end],
+                )
+            })();
+            match result {
+                Ok(()) => self.packs += 1,
+                Err(error) => {
+                    rollback_pending(&mut self.buckets, &mut self.held, &pending[idx..]);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_pending_parallel<J: JobView + Sync>(
+        &mut self,
+        jobs: &[J],
+        pending: &[PendingPack],
+    ) -> Result<(), CoreError> {
+        // Sub-step A: grow every touched shard's `values` to its peak `end`
+        // (capacity was already reserved via `try_reserve_exact` in Pass 1).
+        if let Err(error) = self.parallel_resize_shards(pending) {
+            rollback_pending(&mut self.buckets, &mut self.held, pending);
+            return Err(error);
+        }
+        // Sub-step B: transpose all newly-admitted slots in parallel across
+        // disjoint `&mut [f32]` slices on the persistent worker pool.
+        self.parallel_pack_slots(jobs, pending)
+    }
+
+    fn parallel_resize_shards(&mut self, pending: &[PendingPack]) -> Result<(), CoreError> {
+        let mut resize_tasks: Vec<(&mut Vec<f32>, usize)> = Vec::new();
+        visit_touched_shards_mut(&mut self.buckets, pending, |_layers, shard, _start, end| {
+            let max_end = pending[end - 1].end;
+            if shard.values.len() < max_end {
+                resize_tasks.push((&mut shard.values, max_end));
+            }
+            Ok(())
+        })?;
+        if resize_tasks.len() <= 1 {
+            for (values, max_end) in resize_tasks {
+                values.resize(max_end, 0.0);
+            }
+            return Ok(());
+        }
+        let workers = self.lanes.get().min(resize_tasks.len());
+        let chunk_len = resize_tasks.len().div_ceil(workers);
+        pool::scope_workers(self.lanes.get(), "cpu controller shard init", |scope| {
+            let mut chunks = resize_tasks.chunks_mut(chunk_len);
+            let head = chunks.next();
+            for chunk in chunks {
+                scope.spawn(move || {
+                    for (values, max_end) in chunk {
+                        values.resize(*max_end, 0.0);
+                    }
+                });
+            }
+            if let Some(head) = head {
+                for (values, max_end) in head {
+                    values.resize(*max_end, 0.0);
+                }
+            }
+        })
+    }
+
+    fn parallel_pack_slots<J: JobView + Sync>(
+        &mut self,
+        jobs: &[J],
+        pending: &[PendingPack],
+    ) -> Result<(), CoreError> {
+        let mut pack_tasks = match build_pack_tasks(&mut self.buckets, pending) {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                rollback_pending(&mut self.buckets, &mut self.held, pending);
+                return Err(error);
+            }
+        };
+        let workers = self.lanes.get().min(pack_tasks.len().div_ceil(16)).max(1);
+        let chunk_len = pack_tasks.len().div_ceil(workers);
+        let mut chunks = pack_tasks.chunks_mut(chunk_len);
+        let head = chunks.next();
+        let tail_count = chunks.len();
+        let mut tail_errors: Vec<Option<(usize, CoreError)>> =
+            (0..tail_count).map(|_| None).collect();
+        let scoped = pool::scope_workers(self.lanes.get(), "cpu controller pack", |scope| {
+            for (chunk, slot) in chunks.zip(tail_errors.iter_mut()) {
+                scope.spawn(move || {
+                    *slot = run_pack_chunk(jobs, chunk);
+                });
+            }
+            head.and_then(|chunk| run_pack_chunk(jobs, chunk))
+        });
+        let mut first_err = match scoped {
+            Ok(head_err) => head_err,
+            Err(error) => {
+                drop(pack_tasks);
+                rollback_pending(&mut self.buckets, &mut self.held, pending);
+                return Err(error);
+            }
+        };
+        for tail_err in tail_errors {
+            if let Some((idx, error)) = tail_err
+                && first_err
+                    .as_ref()
+                    .is_none_or(|(best_idx, _)| idx < *best_idx)
+            {
+                first_err = Some((idx, error));
+            }
+        }
+        if let Some((_, error)) = first_err {
+            let mut succeeded = 0_u64;
+            let mut failed: Vec<PendingPack> = Vec::new();
+            for task in &pack_tasks {
+                if task.failed {
+                    failed.push(pending[task.pending_idx]);
+                } else {
+                    succeeded += 1;
+                }
+            }
+            drop(pack_tasks);
+            self.packs = self.packs.saturating_add(succeeded);
+            rollback_pending(&mut self.buckets, &mut self.held, &failed);
+            return Err(error);
+        }
+        let packed_count = pack_tasks.len() as u64;
+        drop(pack_tasks);
+        self.packs = self.packs.saturating_add(packed_count);
+        Ok(())
     }
 
     fn prepare_lanes(&mut self, job_count: usize, widest: usize) -> Result<usize, CoreError> {
@@ -995,6 +1260,232 @@ impl CpuBackend {
         }
         result
     }
+}
+
+/// Sort `pending` by `(topology, shard_key, local, job_idx)` and keep only the
+/// last (highest `job_idx`) entry for each `(topology, shard_key, local)`.
+fn dedup_pending_packs(pending: &mut Vec<PendingPack>) {
+    if pending.len() <= 1 {
+        return;
+    }
+    if !pending.is_sorted_by_key(|p| (p.topology, p.shard_key, p.local, p.job_idx)) {
+        pending.sort_unstable_by_key(|p| (p.topology, p.shard_key, p.local, p.job_idx));
+    }
+    let mut write = 0_usize;
+    for read in 0..pending.len() {
+        let item = pending[read];
+        if write > 0 {
+            let prev = pending[write - 1];
+            if prev.topology == item.topology
+                && prev.shard_key == item.shard_key
+                && prev.local == item.local
+            {
+                pending[write - 1] = item;
+                continue;
+            }
+        }
+        pending[write] = item;
+        write += 1;
+    }
+    pending.truncate(write);
+}
+
+/// Revert Pass-1 slot admissions for any failed or unexecuted [`PendingPack`]
+/// entries, reclaiming emptied shards and updating `held` atomically.
+fn rollback_pending(buckets: &mut [Option<Bucket>], held: &mut u64, entries: &[PendingPack]) {
+    for p in entries {
+        let Some(packing) = buckets
+            .get_mut(p.topology)
+            .and_then(Option::as_mut)
+            .and_then(|bucket| bucket.packing.as_mut())
+        else {
+            continue;
+        };
+        let drop_shard = match packing.shards.get_mut(p.shard_key) {
+            Some(shard) => {
+                if let Some(occupant) = shard.occupants.get_mut(p.local)
+                    && *occupant == Some((p.generation, p.genome))
+                {
+                    *occupant = None;
+                    shard.live_count = shard.live_count.saturating_sub(1);
+                }
+                shard.live_count == 0
+            }
+            None => false,
+        };
+        if drop_shard && packing.shards.remove(p.shard_key).is_some() {
+            *held = held.saturating_sub(shard_bytes(&packing.geometry));
+        }
+    }
+}
+
+/// Visit every `(topology, shard_key)` group in a sorted, deduplicated
+/// `pending` slice with disjoint `&'a mut Shard` borrows (safe `split_at_mut`
+/// over dense shards plus `sparse.iter_mut()` for high sparse shard IDs).
+fn visit_touched_shards_mut<'a, F>(
+    buckets: &'a mut [Option<Bucket>],
+    pending: &[PendingPack],
+    mut visit: F,
+) -> Result<(), CoreError>
+where
+    F: FnMut(&'a [Layer], &'a mut Shard, usize, usize) -> Result<(), CoreError>,
+{
+    for (topo_idx, bucket_slot) in buckets.iter_mut().enumerate() {
+        let topo_start = pending.partition_point(|p| p.topology < topo_idx);
+        let topo_end = pending.partition_point(|p| p.topology <= topo_idx);
+        if topo_start == topo_end {
+            continue;
+        }
+        let Some(bucket) = bucket_slot.as_mut() else {
+            return Err(CoreError::StateConflict {
+                operation: "cpu controller pack",
+                detail: format!("bucket {topo_idx} missing"),
+            });
+        };
+        let Some(packing) = bucket.packing.as_mut() else {
+            return Err(CoreError::StateConflict {
+                operation: "cpu controller pack",
+                detail: format!("bucket {topo_idx} has no packing"),
+            });
+        };
+        let Packing { layers, shards, .. } = packing;
+        let layers: &'a [Layer] = layers.as_slice();
+        let ShardTable { dense, sparse } = shards;
+        let mut dense_tail: &'a mut [Option<Shard>] = dense.as_mut_slice();
+        let mut dense_base = 0_usize;
+        let mut g_start = topo_start;
+        while g_start < topo_end {
+            let shard_key = pending[g_start].shard_key;
+            let Ok(key_usize) = usize::try_from(shard_key) else {
+                break;
+            };
+            if key_usize >= DENSE_SHARDS {
+                break;
+            }
+            let mut g_end = g_start + 1;
+            while g_end < topo_end && pending[g_end].shard_key == shard_key {
+                g_end += 1;
+            }
+            let Some(rel) = key_usize.checked_sub(dense_base) else {
+                return Err(CoreError::StateConflict {
+                    operation: "cpu controller pack",
+                    detail: "unsorted dense shard keys".to_owned(),
+                });
+            };
+            let slice = std::mem::take(&mut dense_tail);
+            if rel >= slice.len() {
+                return Err(CoreError::StateConflict {
+                    operation: "cpu controller pack",
+                    detail: format!("dense shard {shard_key} missing"),
+                });
+            }
+            let (_, rest) = slice.split_at_mut(rel);
+            let Some((slot_opt, after)) = rest.split_first_mut() else {
+                return Err(CoreError::StateConflict {
+                    operation: "cpu controller pack",
+                    detail: format!("dense shard {shard_key} missing"),
+                });
+            };
+            dense_tail = after;
+            dense_base = key_usize + 1;
+            let Some(shard) = slot_opt else {
+                return Err(CoreError::StateConflict {
+                    operation: "cpu controller pack",
+                    detail: format!("dense shard {shard_key} vacant"),
+                });
+            };
+            visit(layers, shard, g_start, g_end)?;
+            g_start = g_end;
+        }
+        if g_start < topo_end {
+            let sparse_pending = &pending[g_start..topo_end];
+            for (&key, shard) in sparse.iter_mut() {
+                let rel_start = sparse_pending.partition_point(|p| p.shard_key < key);
+                let rel_end = sparse_pending.partition_point(|p| p.shard_key <= key);
+                if rel_start < rel_end {
+                    visit(layers, shard, g_start + rel_start, g_start + rel_end)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Slice every touched shard's `values` into disjoint mutable slot spans for
+/// parallel transposition across worker lanes.
+fn build_pack_tasks<'a>(
+    buckets: &'a mut [Option<Bucket>],
+    pending: &[PendingPack],
+) -> Result<Vec<PackTask<'a>>, CoreError> {
+    let mut pack_tasks: Vec<PackTask<'a>> = Vec::new();
+    reserve(&mut pack_tasks, pending.len(), "cpu controller pack tasks")?;
+    visit_touched_shards_mut(buckets, pending, |layers, shard, start, end| {
+        let mut tail = shard.values.as_mut_slice();
+        let mut base = 0_usize;
+        for (offset_in_group, p) in pending[start..end].iter().enumerate() {
+            let rel_start = p
+                .offset
+                .checked_sub(base)
+                .ok_or_else(|| CoreError::StateConflict {
+                    operation: "cpu controller pack",
+                    detail: "overlapping or unsorted pending pack offsets".to_owned(),
+                })?;
+            let len = p
+                .end
+                .checked_sub(p.offset)
+                .ok_or_else(|| CoreError::StateConflict {
+                    operation: "cpu controller pack",
+                    detail: "invalid pending pack range".to_owned(),
+                })?;
+            if rel_start.checked_add(len).is_none_or(|n| n > tail.len()) {
+                return Err(CoreError::StateConflict {
+                    operation: "cpu controller pack",
+                    detail: "pending pack range outside shard values".to_owned(),
+                });
+            }
+            let cur = std::mem::take(&mut tail);
+            let (_, from_start) = cur.split_at_mut(rel_start);
+            let (dst, after) = from_start.split_at_mut(len);
+            tail = after;
+            base = p.end;
+            pack_tasks.push(PackTask {
+                layers,
+                job_idx: p.job_idx,
+                dst,
+                pending_idx: start + offset_in_group,
+                failed: false,
+            });
+        }
+        Ok(())
+    })?;
+    Ok(pack_tasks)
+}
+
+/// Transpose one worker lane's slice of disjoint [`PackTask`]s, recording the
+/// lowest `job_idx` error deterministically if any task fails.
+fn run_pack_chunk<J: JobView>(
+    jobs: &[J],
+    chunk: &mut [PackTask<'_>],
+) -> Option<(usize, CoreError)> {
+    let mut first_err: Option<(usize, CoreError)> = None;
+    for task in chunk {
+        let controller = jobs[task.job_idx].controller();
+        if let Err(error) = pack(
+            controller.parameters(),
+            controller.topology(),
+            task.layers,
+            task.dst,
+        ) {
+            task.failed = true;
+            if first_err
+                .as_ref()
+                .is_none_or(|(best_idx, _)| task.job_idx < *best_idx)
+            {
+                first_err = Some((task.job_idx, error));
+            }
+        }
+    }
+    first_err
 }
 
 /// Safe intra-batch per-topology pointer cache: every `&'a DenseTopology`

@@ -511,7 +511,31 @@ pub fn rotate_unit_polarity(p: [f64; 2], dtheta: f64) -> Result<[f64; 2], CoreEr
 const MAXIMUM_BINS_PER_SIDE: usize = 2048;
 
 /// The fewest bodies a worker sums; smaller worlds use fewer workers.
-const MINIMUM_BODIES_PER_WORKER: usize = 4096;
+/// Tuned for the persistent [`flife_core::pool::scope_workers`] pool so
+/// mid-sized worlds (1k–12k live) scale across all worker cores.
+const MINIMUM_BODIES_PER_WORKER: usize = 256;
+
+/// Resize `vec` to `len` without zeroing existing elements when shrinking,
+/// avoiding redundant single-threaded memsets on steady-state ticks where
+/// workers overwrite every slot `0..len`.
+#[inline]
+fn set_len_reuse<T: Copy>(vec: &mut Vec<T>, len: usize, fill: T) {
+    if vec.len() >= len {
+        vec.truncate(len);
+    } else {
+        vec.resize(len, fill);
+    }
+}
+
+/// Carve up to `take` elements from the front of a mutable slice without
+/// extending the borrow on the slice binding itself.
+#[inline]
+fn split_prefix<'a, T>(slice: &mut &'a mut [T], take: usize) -> &'a mut [T] {
+    let n = take.min(slice.len());
+    let (head, tail) = core::mem::take(slice).split_at_mut(n);
+    *slice = tail;
+    head
+}
 
 /// A contact model's `[contact]` table.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1179,23 +1203,104 @@ impl ContactWork {
                     workers,
                 )?;
             }
-            for (index, &[dx, dy]) in sweep.iter().enumerate() {
-                if dx != 0.0 || dy != 0.0 {
-                    let total = &mut displacements[index];
-                    total[0] += dx;
-                    total[1] += dy;
-                    let from = settled[index];
-                    positions[index] =
-                        grid.wrap_position([from[0] + total[0], from[1] + total[1]])?;
-                }
-            }
-            for (sum, push) in pressed.iter_mut().zip(&scratch.pressed) {
-                sum[0] += push[0];
-                sum[1] += push[1];
-            }
+            combine_sweep_displacements(
+                grid,
+                (displacements, positions, pressed),
+                (settled, sweep, &scratch.pressed),
+                workers,
+            )?;
         }
         Ok(())
     }
+}
+
+type SweepOut<'a> = (&'a mut [[f64; 2]], &'a mut [[f64; 2]], &'a mut [[f64; 2]]);
+type SweepIn<'a> = (&'a [[f64; 2]], &'a [[f64; 2]], &'a [[f64; 2]]);
+
+/// Accumulate one contact sweep's displacements and push sums into the running
+/// multi-sweep totals, wrapping moved positions in parallel for large worlds.
+fn combine_sweep_displacements(
+    grid: &FieldGrid,
+    out: SweepOut<'_>,
+    input: SweepIn<'_>,
+    workers: usize,
+) -> Result<(), CoreError> {
+    let (displacements, positions, pressed) = out;
+    let (settled, sweep, push) = input;
+    let count = sweep.len();
+    let combine_chunk = |disp_c: &mut [[f64; 2]],
+                         pos_c: &mut [[f64; 2]],
+                         settled_c: &[[f64; 2]],
+                         sweep_c: &[[f64; 2]],
+                         pressed_c: &mut [[f64; 2]],
+                         push_c: &[[f64; 2]]|
+     -> Result<(), CoreError> {
+        for (i, &[dx, dy]) in sweep_c.iter().enumerate() {
+            if dx != 0.0 || dy != 0.0 {
+                let total = &mut disp_c[i];
+                total[0] += dx;
+                total[1] += dy;
+                let from = settled_c[i];
+                pos_c[i] = grid.wrap_position([from[0] + total[0], from[1] + total[1]])?;
+            }
+        }
+        for (sum, delta) in pressed_c.iter_mut().zip(push_c) {
+            sum[0] += delta[0];
+            sum[1] += delta[1];
+        }
+        Ok(())
+    };
+    let combine_used = workers
+        .max(1)
+        .min(count.div_ceil(MINIMUM_BODIES_PER_WORKER * 2))
+        .max(1);
+    if combine_used == 1 {
+        return combine_chunk(displacements, positions, settled, sweep, pressed, push);
+    }
+    let chunk_len = count.div_ceil(combine_used);
+    let mut r_disp = displacements;
+    let mut r_pos = positions;
+    let mut r_settled = settled;
+    let mut r_sweep = sweep;
+    let mut r_pressed = pressed;
+    let mut r_push = push;
+    let take_head = chunk_len.min(r_sweep.len());
+    let h_disp = split_prefix(&mut r_disp, take_head);
+    let h_pos = split_prefix(&mut r_pos, take_head);
+    let (h_settled, next_s) = r_settled.split_at(take_head);
+    r_settled = next_s;
+    let (h_sweep, next_sw) = r_sweep.split_at(take_head);
+    r_sweep = next_sw;
+    let h_pressed = split_prefix(&mut r_pressed, take_head);
+    let (h_push, next_pu) = r_push.split_at(take_head.min(r_push.len()));
+    r_push = next_pu;
+    let tail_count = r_sweep.len().div_ceil(chunk_len);
+    let mut tail_results: Vec<Result<(), CoreError>> = (0..tail_count).map(|_| Ok(())).collect();
+    let mut head_result = Ok(());
+    let combine_chunk = &combine_chunk;
+    flife_core::pool::scope_workers(workers, "contact combine", |scope| {
+        for slot in &mut tail_results {
+            let take = chunk_len.min(r_sweep.len());
+            let dc = split_prefix(&mut r_disp, take);
+            let pc = split_prefix(&mut r_pos, take);
+            let (sc, next_s) = r_settled.split_at(take);
+            r_settled = next_s;
+            let (swc, next_sw) = r_sweep.split_at(take);
+            r_sweep = next_sw;
+            let prc = split_prefix(&mut r_pressed, take);
+            let (puc, next_pu) = r_push.split_at(take.min(r_push.len()));
+            r_push = next_pu;
+            scope.spawn(move || {
+                *slot = combine_chunk(dc, pc, sc, swc, prc, puc);
+            });
+        }
+        head_result = combine_chunk(h_disp, h_pos, h_settled, h_sweep, h_pressed, h_push);
+    })?;
+    head_result?;
+    for result in tail_results {
+        result?;
+    }
+    Ok(())
 }
 
 /// `affinity` as a unit direction in `f32`; zero for no direction.
@@ -1398,8 +1503,7 @@ pub fn relax(
         *slot = running;
     }
     starts[total_bins] = running;
-    members.clear();
-    members.resize(running as usize, 0);
+    set_len_reuse(members, running as usize, 0);
     // Fill each bin from its end, walking the bodies backwards, so that
     // `starts[b]` ends as bin b's first member with no shift or memmove.
     for (index, &bin) in bins.iter().enumerate().rev() {
@@ -1415,11 +1519,11 @@ pub fn relax(
         }
     }
 
-    displacements.clear();
-    displacements.resize(count, [0.0, 0.0]);
-    pressed.clear();
+    set_len_reuse(displacements, count, [0.0, 0.0]);
     if inhibits {
-        pressed.resize(count, [0.0, 0.0]);
+        set_len_reuse(pressed, count, [0.0, 0.0]);
+    } else {
+        pressed.clear();
     }
     let push_factor = 0.5 * stiffness;
     let pull_factor = if range > 1.0 {
@@ -1931,8 +2035,7 @@ pub fn relax_sweep1_with_context(
         *slot = running;
     }
     starts[total_bins] = running;
-    members.clear();
-    members.resize(running as usize, 0);
+    set_len_reuse(members, running as usize, 0);
     for (index, &bin) in bins.iter().enumerate().rev() {
         if bin != u32::MAX {
             let b = bin as usize;
@@ -1954,38 +2057,26 @@ pub fn relax_sweep1_with_context(
         mut trophallaxis_summary,
         mut next_velocities,
     } = output;
-    displacements.clear();
-    displacements.resize(count, [0.0, 0.0]);
-    pressed.clear();
+    set_len_reuse(displacements, count, [0.0, 0.0]);
     if inhibits {
-        pressed.resize(count, [0.0, 0.0]);
+        set_len_reuse(pressed, count, [0.0, 0.0]);
+    } else {
+        pressed.clear();
     }
     if let Some(pol_out) = next_polarities.as_deref_mut() {
-        pol_out.clear();
-        if let Some((_, polarities, _, _, _)) = pcp_inputs {
-            pol_out.extend_from_slice(polarities);
-        } else {
-            pol_out.resize(count, [1.0, 0.0]);
-        }
+        set_len_reuse(pol_out, count, [1.0, 0.0]);
     }
     if let Some(notch_out) = neighbor_h0.as_deref_mut() {
-        notch_out.clear();
-        notch_out.resize(count, 0.0_f32);
+        set_len_reuse(notch_out, count, 0.0_f32);
     }
     if let Some(delta_out) = trophallaxis_delta_quanta.as_deref_mut() {
-        delta_out.clear();
-        delta_out.resize(count, 0_i64);
+        set_len_reuse(delta_out, count, 0_i64);
     }
     if let Some(summary_out) = trophallaxis_summary.as_mut() {
         **summary_out = TrophallaxisSummary::default();
     }
     if let Some(vel_out) = next_velocities.as_deref_mut() {
-        vel_out.clear();
-        if let Some((_, vels)) = velocity_inputs {
-            vel_out.extend_from_slice(vels);
-        } else {
-            vel_out.resize(count, [0.0, 0.0]);
-        }
+        set_len_reuse(vel_out, count, [0.0, 0.0]);
     }
 
     let push_factor = 0.5 * stiffness;
@@ -2008,16 +2099,14 @@ pub fn relax_sweep1_with_context(
     // and populate the bounded per-worker neighbor cache so Pass 2 never
     // re-scans 9 spatial bins, re-calls `hypot`, or recomputes Pass-1 32-D
     // cosines for cached donors.
-    trophallaxis_scales.clear();
-    neighbor_spans.clear();
     let mut has_neighbor_cache = false;
     if let Some((tr_cfg, energies)) = trophallaxis_inputs {
         let aff = affinities.ok_or_else(|| CoreError::StateConflict {
             operation: "contact",
             detail: "trophallaxis requires genetic affinities".to_owned(),
         })?;
-        trophallaxis_scales.resize(count, 0.0_f64);
-        neighbor_spans.resize(count, (0_u32, u32::MAX));
+        set_len_reuse(trophallaxis_scales, count, 0.0_f64);
+        set_len_reuse(neighbor_spans, count, (0_u32, u32::MAX));
         let cache_cap = neighbor_cache.capacity();
         if neighbor_cache.len() < cache_cap {
             neighbor_cache.resize(cache_cap, CachedNeighbor::default());
@@ -2182,6 +2271,9 @@ pub fn relax_sweep1_with_context(
                 fill_scales_and_cache(0, scale_head, span_head, 0, cache_head);
             })?;
         }
+    } else {
+        trophallaxis_scales.clear();
+        neighbor_spans.clear();
     }
     let tr_scales = trophallaxis_scales.as_slice();
     let tr_spans = neighbor_spans.as_slice();
@@ -2673,7 +2765,9 @@ pub struct CrowdingWork {
     /// Spatial counting-sort buffers used only by `local-neighbors-v1`.
     bins: Vec<u32>,
     starts: Vec<u32>,
-    members: Vec<u32>,
+    /// Positions scattered in spatial bin order for L1-sequential 9-bin scans
+    /// with zero indirect gathers and zero self-identity branches.
+    sorted_positions: Vec<[f64; 2]>,
     /// Cell occupancy buffers used only by `cell-occupancy-v1`.
     cell_counts: Vec<u32>,
     cells: Vec<usize>,
@@ -2703,7 +2797,11 @@ impl CrowdingWork {
         reserve(&mut work.positions, rows, "crowding positions")?;
         reserve(&mut work.bins, rows, "crowding bins")?;
         reserve(&mut work.starts, bins + 1, "crowding bin starts")?;
-        reserve(&mut work.members, rows, "crowding members")?;
+        reserve(
+            &mut work.sorted_positions,
+            rows,
+            "crowding sorted positions",
+        )?;
         Ok(work)
     }
 
@@ -2732,7 +2830,7 @@ impl CrowdingWork {
             bytes(&self.positions),
             bytes(&self.bins),
             bytes(&self.starts),
-            bytes(&self.members),
+            bytes(&self.sorted_positions),
             bytes(&self.cell_counts),
             bytes(&self.cells),
         ]
@@ -2744,6 +2842,13 @@ impl CrowdingWork {
     #[must_use]
     pub fn counts(&self) -> &[u32] {
         &self.counts
+    }
+
+    /// Contiguous post-Phase-1 positions buffered for crowding (reusable by
+    /// same-phase `tight-junctions` occupancy without copying `rows` again).
+    #[must_use]
+    pub fn positions(&self) -> &[[f64; 2]] {
+        &self.positions
     }
 
     /// Mutable access to the pre-reserved position scratch buffer.
@@ -2812,11 +2917,11 @@ impl CrowdingWork {
             });
         }
         let count = positions.len();
-        self.counts.clear();
-        self.counts.resize(count, 0);
         if count == 0 {
+            self.counts.clear();
             return Ok(&self.counts);
         }
+        set_len_reuse(&mut self.counts, count, 0);
         if count >= u32::MAX as usize {
             return Err(CoreError::Overflow {
                 quantity: "crowding bodies",
@@ -2849,17 +2954,11 @@ impl CrowdingWork {
             *slot = running;
         }
         self.starts[total_bins] = running;
-        self.members.clear();
-        self.members.resize(count, 0);
-        for (index, &bin) in self.bins.iter().enumerate().rev() {
+        set_len_reuse(&mut self.sorted_positions, count, [0.0, 0.0]);
+        for (&pos, &bin) in positions.iter().zip(&self.bins) {
             let b = bin as usize;
             self.starts[b] -= 1;
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "count < u32::MAX checked above"
-            )]
-            let body = index as u32;
-            self.members[self.starts[b] as usize] = body;
+            self.sorted_positions[self.starts[b] as usize] = pos;
         }
 
         let radius_sq = radius * radius;
@@ -2867,7 +2966,8 @@ impl CrowdingWork {
         let inside_sq = radius_sq * (1.0 - 1e-9);
         let beyond = radius_sq * (1.0 + 1e-9);
         let (half_width, half_height) = (0.5 * width, 0.5 * height);
-        let (starts, members, bins) = (&*self.starts, &*self.members, &*self.bins);
+        let (starts, sorted_positions, bins) =
+            (&*self.starts, &*self.sorted_positions, &*self.bins);
         let neighbors_for = |index: usize| -> u32 {
             let [here_x, here_y] = positions[index];
             let bin = bins[index] as usize;
@@ -2881,17 +2981,12 @@ impl CrowdingWork {
                     let neighbour = row_base + column;
                     let lo = starts[neighbour] as usize;
                     let hi = starts[neighbour + 1] as usize;
-                    for &other_u32 in &members[lo..hi] {
-                        let other = other_u32 as usize;
-                        if other == index {
-                            continue;
-                        }
-                        let there = positions[other];
-                        let dx = image(there[0], here_x, width, half_width);
+                    for &[tx, ty] in &sorted_positions[lo..hi] {
+                        let dx = image(tx, here_x, width, half_width);
                         if dx.abs() >= radius {
                             continue;
                         }
-                        let dy = image(there[1], here_y, height, half_height);
+                        let dy = image(ty, here_y, height, half_height);
                         if dy.abs() >= radius {
                             continue;
                         }
@@ -2907,7 +3002,9 @@ impl CrowdingWork {
                     }
                 }
             }
-            n
+            // Body `index` itself sits in its own bin (`dx = dy = 0 < radius`)
+            // and is counted exactly once.
+            n.saturating_sub(1)
         };
         let fill = |first: usize, out: &mut [u32]| {
             for (offset, slot) in out.iter_mut().enumerate() {
@@ -3647,8 +3744,16 @@ mod tests {
     fn crowding_local_neighbors_u32_bins_and_boundary_band_match_exact_hypot() {
         let grid = grid(16.0, 16);
         let radius = 1.25_f64;
-        // Include pairs well inside, right around radius*(1 +/- 1e-10), and outside.
+        // Include coincident bodies (verifying self-exclusion via saturating_sub(1)
+        // never drops coincident peers), an isolated singleton, pairs right around
+        // radius*(1 +/- 1e-10), and > 2 * MINIMUM_BODIES_PER_WORKER bodies to
+        // exercise multi-worker splitting.
         let mut positions = vec![
+            [0.5, 0.5],
+            [8.0, 8.0],
+            [8.0, 8.0],
+            [8.0, 8.0],
+            [8.0, 8.0],
             [8.0, 8.0],
             [8.0 + radius * (1.0 - 1e-10), 8.0],
             [8.0 + radius * (1.0 + 1e-10), 8.0],
@@ -3657,7 +3762,7 @@ mod tests {
             [8.0 + 0.5, 8.0 + 0.5],
         ];
         positions.extend(
-            pile(120, 4.0)
+            pile(600, 4.0)
                 .into_iter()
                 .map(|p| [p[0].rem_euclid(16.0), p[1].rem_euclid(16.0)]),
         );
@@ -3674,15 +3779,84 @@ mod tests {
                 }
             }
         }
+        assert_eq!(expected[0], 0, "isolated singleton has zero neighbors");
+        assert!(
+            expected[1] >= 4,
+            "coincident bodies must each count their 4 identical peers"
+        );
         let mut work = CrowdingWork::with_capacity_local_neighbors(&grid, radius, positions.len())
             .expect("cw");
         let bytes_before = work.allocated_bytes();
-        for workers in [1, 4] {
+        for workers in [1, 2, 4, 16] {
             let got = work
                 .count_local_neighbors(&grid, radius, &positions, workers)
                 .expect("count");
             assert_eq!(got, expected.as_slice(), "workers={workers}");
             assert_eq!(work.allocated_bytes(), bytes_before, "workers={workers}");
+        }
+    }
+
+    #[test]
+    fn contact_multi_sweep_parallel_combine_matches_serial_bit_for_bit() {
+        let grid = grid(32.0, 32);
+        let rules = ContactRules {
+            diameter: 0.5,
+            stiffness: 0.6,
+            adhesion: 0.8,
+            range: 1.5,
+            sweeps: 4,
+            inhibits: true,
+            inhibition: 0.5,
+            repulsion: 0.25,
+        };
+        let count = 640;
+        let positions: Vec<[f64; 2]> = pile(count, 6.0)
+            .into_iter()
+            .map(|p| [p[0].rem_euclid(32.0), p[1].rem_euclid(32.0)])
+            .collect();
+        let ids: Vec<u64> = (1..=count as u64).collect();
+        let alive: Vec<bool> = (0..count).map(|i| i % 19 != 0).collect();
+        let affinities: Vec<[f32; AFFINITY_TERMS]> = (0..count).map(|i| axis(i % 4)).collect();
+        let run = |workers: usize| {
+            let mut work = ContactWork::with_capacity(&grid, &rules, count).expect("work");
+            let bytes_before = work.allocated_bytes();
+            work.positions.extend_from_slice(&positions);
+            work.ids.extend_from_slice(&ids);
+            work.alive.extend_from_slice(&alive);
+            work.affinities.extend_from_slice(&affinities);
+            work.relax(&grid, &rules, workers).expect("relax");
+            assert_eq!(work.allocated_bytes(), bytes_before, "workers={workers}");
+            work
+        };
+        let serial = run(1);
+        for workers in [2, 4, 16] {
+            let par = run(workers);
+            for (i, (g, w)) in par
+                .displacements
+                .iter()
+                .zip(&serial.displacements)
+                .enumerate()
+            {
+                assert_eq!(
+                    (g[0].to_bits(), g[1].to_bits()),
+                    (w[0].to_bits(), w[1].to_bits()),
+                    "workers={workers} disp[{i}]"
+                );
+            }
+            for (i, (g, w)) in par.pressed.iter().zip(&serial.pressed).enumerate() {
+                assert_eq!(
+                    (g[0].to_bits(), g[1].to_bits()),
+                    (w[0].to_bits(), w[1].to_bits()),
+                    "workers={workers} pressed[{i}]"
+                );
+            }
+            for (i, (g, w)) in par.positions.iter().zip(&serial.positions).enumerate() {
+                assert_eq!(
+                    (g[0].to_bits(), g[1].to_bits()),
+                    (w[0].to_bits(), w[1].to_bits()),
+                    "workers={workers} pos[{i}]"
+                );
+            }
         }
     }
 }

@@ -1449,6 +1449,74 @@ fn metal_backend_flat_f32_matches_evaluate_bit_for_bit_across_full_and_partial_b
         )?;
         assert_flat_matches_legacy(&format!("{label} partial"), &partial_legacy_out, &flat_out);
 
+        // 2b. Tail-only non-finite skip (exercises post-loop lazy `dispatched`
+        //     backfill when all preceding jobs succeeded) and same-batch
+        //     duplicate-slot overwrite (exercises `overwrote_existing` backfill
+        //     and reconciliation on `evaluate_flat_f32`).
+        let last_idx = batch_cases.len() - 1;
+        let mut tail_skip_finite = inputs_finite.clone();
+        tail_skip_finite[last_idx] = 0;
+        let mut tail_skip_legacy = legacy.clone();
+        tail_skip_legacy[last_idx].inputs = &non_finite_inputs;
+        let mut tail_skip_legacy_out = Vec::new();
+        device.evaluate(&tail_skip_legacy, &mut tail_skip_legacy_out)?;
+        device.evaluate_flat_f32(
+            &flat_jobs,
+            SENSOR_WIDTH,
+            &inputs_f32,
+            &tail_skip_finite,
+            &mut flat_out,
+        )?;
+        assert_flat_matches_legacy(
+            &format!("{label} tail-skip"),
+            &tail_skip_legacy_out,
+            &flat_out,
+        );
+
+        let mut dup_flat_jobs = flat_jobs.clone();
+        let mut dup_legacy = legacy.clone();
+        let mut dup_inputs_f32 = inputs_f32.clone();
+        let mut dup_finite = inputs_finite.clone();
+        let first_slot = dup_flat_jobs[0].slot;
+        let replacement = dup_flat_jobs
+            .iter()
+            .find(|job| job.slot.topology() == first_slot.topology() && job.slot != first_slot)
+            .copied()
+            .expect("second job sharing topology 0");
+        let overwrite_slot = ArenaSlot::new(
+            first_slot.topology(),
+            first_slot.slot(),
+            first_slot.generation() + 1,
+        );
+        dup_flat_jobs.push(FlatControllerJob {
+            genome: GenomeId::new(9_000_001),
+            slot: overwrite_slot,
+            controller: replacement.controller,
+        });
+        dup_legacy.push(ControllerJob {
+            genome: GenomeId::new(9_000_001),
+            slot: overwrite_slot,
+            controller: replacement.controller,
+            inputs: legacy[0].inputs,
+        });
+        dup_inputs_f32.extend_from_slice(&inputs_f32[..SENSOR_WIDTH]);
+        dup_finite.push(1);
+        device.evaluate_flat_f32(
+            &dup_flat_jobs,
+            SENSOR_WIDTH,
+            &dup_inputs_f32,
+            &dup_finite,
+            &mut flat_out,
+        )?;
+        let mut dup_legacy_out = Vec::new();
+        device.evaluate(&dup_legacy, &mut dup_legacy_out)?;
+        assert_eq!(dup_legacy_out[0], None);
+        assert_flat_matches_legacy(
+            &format!("{label} dup-overwrite"),
+            &dup_legacy_out,
+            &flat_out,
+        );
+
         // 3. Reuse across shrink, empty, and malformed-input error cleanup.
         let half = flat_jobs.len() / 2;
         device.evaluate_flat_f32(

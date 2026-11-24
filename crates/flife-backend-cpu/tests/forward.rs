@@ -1293,8 +1293,8 @@ fn cpu_backend_flat_f32_matches_evaluate_bit_for_bit_across_lanes_and_dtypes()
             backend.evaluate_flat_f32(
                 &flat_jobs,
                 SENSOR_WIDTH,
-                &inputs_f32,
-                &inputs_finite,
+                inputs_f32,
+                inputs_finite,
                 &mut flat_out,
             )?;
             let packs_after_first = backend.packs();
@@ -1309,8 +1309,8 @@ fn cpu_backend_flat_f32_matches_evaluate_bit_for_bit_across_lanes_and_dtypes()
             backend.evaluate_flat_f32(
                 &flat_jobs,
                 SENSOR_WIDTH,
-                &inputs_f32,
-                &inputs_finite,
+                inputs_f32,
+                inputs_finite,
                 &mut flat_out,
             )?;
             assert_eq!(backend.packs(), packs_after_first);
@@ -1352,6 +1352,198 @@ fn cpu_backend_flat_f32_matches_evaluate_bit_for_bit_across_lanes_and_dtypes()
             assert!(flat_out.valid.is_empty() && flat_out.values.is_empty());
             assert_eq!(flat_out.output_width, 0);
         }
+    }
+    Ok(())
+}
+
+/// Round-2b bit-exact parity for `tanh_f32_4` + scalar tail activation, 8x8
+/// register-tiled transpose (`pack_as`), and parallel bulk shard resize+pack
+/// (`>= 64` newly-admitted jobs on multi-lane `CpuBackend`):
+/// - covers all 5 catalog topologies plus an odd non-multiple-of-4 hidden
+///   topology `[7, 5]` (exercising both `tanh_f32_4` and scalar `tanh_f32`
+///   tails as well as interior 8x8 tiles and odd remainder strips);
+/// - covers F32 and F16 weights, multi-shard parallel resize (`shard_slots=16`),
+///   far sparse shard IDs (`1 << 40`), same-batch duplicate-slot overwrite
+///   (last writer wins, earlier deferred), steady-state zero-repack tick 2, and
+///   cold `evaluate_flat_f32` bulk pack.
+#[test]
+fn cpu_backend_parallel_bulk_pack_and_tanh_f32_4_match_serial_and_reference_bit_for_bit()
+-> Result<(), CoreError> {
+    let mut catalog = topologies();
+    catalog.push(DenseTopology::with_io(
+        SENSOR_WIDTH as u32,
+        &[7, 5],
+        ACTION_WIDTH as u32,
+    )?);
+    let odd_topo_idx = catalog.len() - 1;
+    let mut draws = Draws(0x2026_020B);
+    let mut custom_cases = Vec::with_capacity(320);
+    for idx in 0..320_usize {
+        let topology = if idx % 6 == 0 {
+            odd_topo_idx
+        } else {
+            idx % (catalog.len() - 1)
+        };
+        let regime = match idx % 16 {
+            0..=9 => Regime::Typical,
+            10..=12 => Regime::Saturating,
+            13 | 14 => Regime::Tiny,
+            _ => Regime::WideInput,
+        };
+        custom_cases.push(Case {
+            topology,
+            regime,
+            parameters: parameters(&catalog[topology], regime, &mut draws),
+            inputs: inputs(regime, &mut draws),
+        });
+    }
+    let f16_params: Vec<Vec<F16>> = custom_cases
+        .iter()
+        .map(|case| {
+            case.parameters
+                .iter()
+                .map(|&v| F16::from_f64(f64::from(v)))
+                .collect()
+        })
+        .collect();
+
+    for (label, first_slot, shard_slots, as_f16) in [
+        ("F32 dense multi-shard", 0_u64, 16_u64, false),
+        ("F16 dense multi-shard", 0_u64, 16_u64, true),
+        ("F32 sparse 1<<40", 1_u64 << 40, 32_u64, false),
+    ] {
+        let mut next = vec![first_slot; catalog.len()];
+        let mut batch = Vec::with_capacity(custom_cases.len() + 1);
+        for (idx, case) in custom_cases.iter().enumerate() {
+            let slot = next[case.topology];
+            next[case.topology] += 1;
+            let controller = if as_f16 {
+                ReferenceController::new(&catalog[case.topology], &f16_params[idx], BOUND)?
+            } else {
+                ReferenceController::new(&catalog[case.topology], &case.parameters, BOUND)?
+            };
+            batch.push(ControllerJob {
+                genome: GenomeId::new(idx as u64 + 1),
+                slot: ArenaSlot::new(case.topology as u32, slot, 1),
+                controller,
+                inputs: &case.inputs,
+            });
+        }
+        // Append a same-batch duplicate-slot overwrite (higher generation on
+        // slot 0 of the odd `[7, 5]` topology) inside the `>= 64` bulk batch.
+        let dup_target = batch[0];
+        let dup_source = batch
+            .iter()
+            .find(|job| {
+                job.slot.topology() == dup_target.slot.topology() && job.slot != dup_target.slot
+            })
+            .copied()
+            .expect("second odd-topology job");
+        batch.push(ControllerJob {
+            genome: GenomeId::new(999_001),
+            slot: ArenaSlot::new(
+                dup_target.slot.topology(),
+                dup_target.slot.slot(),
+                dup_target.slot.generation() + 1,
+            ),
+            controller: dup_source.controller,
+            inputs: dup_target.inputs,
+        });
+        let mut serial = CpuBackend::with_shard_slots(lanes(1), shard_slots);
+        let mut serial_out = Vec::new();
+        serial.evaluate(&batch, &mut serial_out)?;
+
+        // Earlier generation of overwritten slot 0 must be deferred; later
+        // generation at the tail must evaluate and match the reference.
+        assert_eq!(serial_out[0], None, "{label}: overwritten slot 0 deferred");
+        assert!(
+            serial_out.last().and_then(Option::as_ref).is_some(),
+            "{label}: overwriting tail job evaluated"
+        );
+
+        let mut parallel = CpuBackend::with_shard_slots(lanes(4), shard_slots);
+        let mut parallel_out = Vec::new();
+        parallel.evaluate(&batch, &mut parallel_out)?;
+        assert_eq!(
+            bits(&parallel_out),
+            bits(&serial_out),
+            "{label}: 4-lane vs 1-lane"
+        );
+        assert_eq!(
+            parallel.resident(),
+            serial.resident(),
+            "{label}: resident count matches"
+        );
+        assert_eq!(
+            parallel.shards(),
+            serial.shards(),
+            "{label}: shard count matches"
+        );
+        assert_eq!(
+            parallel.packs(),
+            custom_cases.len() as u64,
+            "{label}: deduplicated unique slot pack count"
+        );
+
+        // Steady-state second tick over the surviving unique slots packs 0.
+        let steady = &batch[1..];
+        let mut steady_out = Vec::new();
+        parallel.evaluate(steady, &mut steady_out)?;
+        assert_eq!(
+            parallel.packs(),
+            custom_cases.len() as u64,
+            "{label}: 0 repacks on steady-state tick"
+        );
+        assert_eq!(bits(&steady_out), bits(&serial_out)[1..].to_vec());
+
+        // Verify cold bulk parallel pack on `evaluate_flat_f32` matches bit-for-bit.
+        let mut inputs_f32 = Vec::with_capacity(batch.len() * SENSOR_WIDTH);
+        let mut inputs_finite = Vec::with_capacity(batch.len());
+        for job in &batch {
+            let mut all_finite = true;
+            for &v in job.inputs {
+                let narrowed = v as f32;
+                all_finite &= narrowed.is_finite();
+                inputs_f32.push(narrowed);
+            }
+            inputs_finite.push(u8::from(all_finite));
+        }
+        let flat_jobs: Vec<FlatControllerJob<'_>> = batch
+            .iter()
+            .map(|job| FlatControllerJob {
+                genome: job.genome,
+                slot: job.slot,
+                controller: job.controller,
+            })
+            .collect();
+        let mut flat_parallel = CpuBackend::with_shard_slots(lanes(4), shard_slots);
+        let mut flat_out = FlatOutputs::default();
+        flat_parallel.evaluate_flat_f32(
+            &flat_jobs,
+            SENSOR_WIDTH,
+            &inputs_f32,
+            &inputs_finite,
+            &mut flat_out,
+        )?;
+        assert_flat_matches_legacy(&format!("{label} flat"), &serial_out, &flat_out);
+
+        // Cross-check non-deferred odd-topology `[7, 5]` rows directly against ReferenceController.
+        let mut ref_scratch = ControllerScratch::new(&catalog[odd_topo_idx])?;
+        let mut checked_odd = 0_usize;
+        for (job, got) in batch.iter().zip(&parallel_out) {
+            if job.slot.topology() == odd_topo_idx as u32
+                && let Some(got_raw) = got
+            {
+                let want = job.controller.evaluate_raw(job.inputs, &mut ref_scratch)?;
+                assert_eq!(
+                    got_raw.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{label}: odd [7, 5] bit-exact vs ReferenceController"
+                );
+                checked_odd += 1;
+            }
+        }
+        assert!(checked_odd >= 40, "{label}: checked {checked_odd} odd rows");
     }
     Ok(())
 }

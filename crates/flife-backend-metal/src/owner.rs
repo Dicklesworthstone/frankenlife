@@ -864,12 +864,13 @@ impl ReleaseOutcome {
 
 /// Unique buffers per command served from stack storage without heap
 /// allocation (`MetalField`, `MetalSensors`, `MetalUptake`, `MetalSettle`, and
-/// up to 14-shard `MetalBackend` batches all stay well within 32 buffers).
-const INLINE_BOUND: usize = 32;
+/// up to 30-shard `MetalBackend` batches stay within 64 buffers).
+const INLINE_BOUND: usize = 64;
 
 /// Total buffer bindings across all kernels of a command served from stack
-/// storage without heap allocation.
-const INLINE_BINDINGS: usize = 64;
+/// storage without heap allocation (covers up to 32 six-binding controller
+/// shards without heap spill).
+const INLINE_BINDINGS: usize = 192;
 
 /// Placeholder value for unused slots of an inline `UsesBuf` array.
 const DUMMY_USE: (Binding, bool) = (
@@ -1604,13 +1605,126 @@ impl DeviceOwner {
         Ok(Owned::new(self.clone(), self.upload(data)?))
     }
 
+    /// Overwrite `data.len()` elements of `buffer` from element `offset` under
+    /// a transient host write lease without cloning the owner's `Arc`.
+    ///
+    /// # Errors
+    /// As [`DeviceOwner::write`] and [`WriteLease::write`].
+    pub fn write_slice<T: Element>(
+        &self,
+        buffer: Buffer<T>,
+        offset: usize,
+        data: &[T],
+    ) -> Result<(), CoreError> {
+        let memory = {
+            let mut table = self.shared.table();
+            let resident = table.resident(self.shared.id, buffer.handle)?;
+            if resident.retiring {
+                return Err(conflict(format!("{buffer:?} is retiring")));
+            }
+            if resident.writer.is_some() || resident.readers() > 0 {
+                return Err(conflict(format!(
+                    "{buffer:?} is {:?}: a writer needs it unread and unwritten",
+                    resident.state()
+                )));
+            }
+            resident.writer = Some(Writer::Host);
+            let memory = Arc::clone(&resident.memory);
+            table.write_leases += 1;
+            memory
+        };
+        let _guard = ScopedWrite {
+            shared: &self.shared,
+            handle: buffer.handle,
+        };
+        let mut guard = memory.write().unwrap_or_else(PoisonError::into_inner);
+        T::write(&mut guard, offset, data).map_err(metal)
+    }
+
     /// The first `out.len()` elements of `buffer`, read under a readback
-    /// lease.
+    /// lease without cloning the owner's `Arc`.
     ///
     /// # Errors
     /// As [`DeviceOwner::read`] and [`ReadLease::read`].
     pub fn read_back<T: Element>(&self, buffer: Buffer<T>, out: &mut [T]) -> Result<(), CoreError> {
-        self.read(buffer, Purpose::Readback)?.read(out)
+        let purpose = Purpose::Readback;
+        let memory = {
+            let limit = self.shared.limits.leases_per_purpose;
+            let mut table = self.shared.table();
+            let held = table.leases[purpose.index()];
+            let resident = table.resident(self.shared.id, buffer.handle)?;
+            if resident.retiring {
+                return Err(conflict(format!("{buffer:?} is retiring")));
+            }
+            if resident.writer.is_some() {
+                return Err(conflict(format!("{buffer:?} is being written")));
+            }
+            if resident.contents == Contents::Undefined {
+                return Err(conflict(format!(
+                    "{buffer:?} is undefined: a command failed while writing it"
+                )));
+            }
+            if held >= limit {
+                return Err(CoreError::BudgetExhausted {
+                    budget: "metal read leases",
+                    required: u64::from(held) + 1,
+                    available: u64::from(limit),
+                });
+            }
+            resident.leases[purpose.index()] += 1;
+            let memory = Arc::clone(&resident.memory);
+            table.leases[purpose.index()] += 1;
+            memory
+        };
+        let _guard = ScopedRead {
+            shared: &self.shared,
+            handle: buffer.handle,
+            purpose,
+        };
+        let guard = memory.read().unwrap_or_else(PoisonError::into_inner);
+        T::read(&guard, out).map_err(metal)
+    }
+}
+
+/// Stack-borrowed RAII guard releasing a transient host write lease on return
+/// or unwind while preserving the Level-1 (`table`) / Level-2 (`memory`) lock
+/// hierarchy.
+struct ScopedWrite<'a> {
+    shared: &'a Shared,
+    handle: Handle,
+}
+
+impl Drop for ScopedWrite<'_> {
+    fn drop(&mut self) {
+        let mut table = self.shared.table();
+        if let Ok(resident) = table.resident(self.shared.id, self.handle) {
+            resident.writer = None;
+            resident.contents = Contents::Defined;
+            resident.epoch = resident.epoch.saturating_add(1);
+        }
+        table.write_leases = table.write_leases.saturating_sub(1);
+        table.settle(self.handle);
+    }
+}
+
+/// Stack-borrowed RAII guard releasing a transient readback lease on return or
+/// unwind while preserving the Level-1 (`table`) / Level-2 (`memory`) lock
+/// hierarchy.
+struct ScopedRead<'a> {
+    shared: &'a Shared,
+    handle: Handle,
+    purpose: Purpose,
+}
+
+impl Drop for ScopedRead<'_> {
+    fn drop(&mut self) {
+        let index = self.purpose.index();
+        let mut table = self.shared.table();
+        if let Ok(resident) = table.resident(self.shared.id, self.handle) {
+            resident.leases[index] = resident.leases[index].saturating_sub(1);
+        }
+        table.leases[index] = table.leases[index].saturating_sub(1);
+        table.settle(self.handle);
     }
 }
 

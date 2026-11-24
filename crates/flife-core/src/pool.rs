@@ -403,13 +403,14 @@ where
     if tasks.is_empty() {
         return Ok(());
     }
+    let lane_count = lanes.len();
     let Some((first_lane, rest_lanes)) = lanes.split_first_mut() else {
         return Err(CoreError::StateConflict {
             operation,
             detail: "no worker lane".to_owned(),
         });
     };
-    let active = workers.min(lanes.len()).min(tasks.len()).max(1);
+    let active = workers.min(lane_count).min(tasks.len()).max(1);
     if active == 1 || in_worker_dispatch() {
         return catch_unwind(AssertUnwindSafe(|| {
             for (index, task) in tasks.iter_mut().enumerate() {
@@ -885,5 +886,53 @@ mod tests {
         let top_level_parallel =
             scope_workers(4, "after_nested", |scope| scope.is_parallel()).expect("top-level ok");
         assert!(top_level_parallel);
+    }
+
+    #[test]
+    fn dynamic_task_work_stealing_and_lanes_preserve_order_and_errors() {
+        let mut tasks: Vec<usize> = (0..64).collect();
+        parallel_tasks(4, "dyn tasks", &mut tasks, |idx, slot| {
+            *slot = idx * 7 + 3;
+        })
+        .expect("parallel_tasks ok");
+        for (idx, &val) in tasks.iter().enumerate() {
+            assert_eq!(val, idx * 7 + 3);
+        }
+
+        let mut lane_counts = [0_usize; 4];
+        let mut out = [0_usize; 48];
+        try_parallel_tasks_with_lanes(
+            4,
+            "dyn lanes",
+            &mut lane_counts,
+            &mut out,
+            |idx, slot, count| {
+                *count += 1;
+                *slot = idx + 100;
+                Ok(())
+            },
+        )
+        .expect("try_parallel_tasks_with_lanes ok");
+        assert_eq!(lane_counts.iter().sum::<usize>(), 48);
+        for (idx, &val) in out.iter().enumerate() {
+            assert_eq!(val, idx + 100);
+        }
+
+        let mut fail_tasks = [0_usize; 32];
+        let err = try_parallel_tasks(4, "dyn err", &mut fail_tasks, |idx, slot| {
+            *slot = idx;
+            if idx == 9 || idx == 27 {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "task",
+                    detail: format!("boom at {idx}"),
+                });
+            }
+            Ok(())
+        })
+        .expect_err("must report lowest-index error");
+        assert!(
+            err.to_string().contains("boom at 9"),
+            "expected deterministic lowest-index error, got: {err}"
+        );
     }
 }

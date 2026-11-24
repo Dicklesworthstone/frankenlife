@@ -206,7 +206,15 @@ impl FieldState {
         let (c0_moments, c1) = split_carrier_moments(self.is_dual_carrier(), moments);
         let width = u64::from(grid.cells_x());
         let cells = energy.len();
-        let ranges = workers.min(cells / CELLS_PER_RANGE).max(1);
+        let ranges = if workers <= 1 {
+            1
+        } else {
+            workers
+                .saturating_mul(4)
+                .min(64)
+                .min(cells / CELLS_PER_RANGE)
+                .max(1)
+        };
         let bounds = CheckBounds { tolerance, trigger };
         let check = |range: usize| {
             let start = cells / ranges * range + cells % ranges * range / ranges;
@@ -235,7 +243,7 @@ impl FieldState {
         } else {
             let mut checked: Vec<Option<Result<RangeSummary, CoreError>>> =
                 (0..ranges).map(|_| None).collect();
-            flife_core::pool::parallel_for_each_mut(
+            flife_core::pool::parallel_tasks(
                 workers,
                 "check field invariants",
                 &mut checked,

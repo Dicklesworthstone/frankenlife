@@ -605,9 +605,7 @@ pub struct Population {
 /// under [`Arrangement::FreeList`].
 #[derive(Debug)]
 enum AscendingCursor<'a> {
-    Compact {
-        cursor: usize,
-    },
+    Compact { cursor: usize },
     Tree(Peekable<btree_map::Range<'a, OrganismId, usize>>),
 }
 
@@ -1091,7 +1089,8 @@ impl Population {
     }
 
     /// Copy every live organism into `rows` in ascending identity order, using
-    /// up to `workers` threads on the dense [`Arrangement::Compact`] fast path.
+    /// up to `workers` threads on both dense [`Arrangement::Compact`] and
+    /// [`Arrangement::FreeList`] populations without zero-filling existing rows.
     ///
     /// # Errors
     /// [`CoreError::AllocationFailed`] if `rows` cannot hold `self.len()`, or
@@ -1102,19 +1101,53 @@ impl Population {
         workers: usize,
     ) -> Result<(), CoreError> {
         let len = self.len();
-        rows.clear();
         if len == 0 {
+            rows.clear();
             return Ok(());
         }
-        if self.is_compact_dense() && len >= 1_024 && workers > 1 {
-            rows.try_reserve(len)
+        if len >= 1_024 && workers > 1 {
+            if rows.len() >= len {
+                rows.truncate(len);
+            } else {
+                let extra = len - rows.len();
+                rows.try_reserve(extra)
+                    .map_err(|_| CoreError::AllocationFailed {
+                        buffer: "organism rows",
+                        bytes: u64::try_from(extra.saturating_mul(size_of::<Organism>()))
+                            .unwrap_or(u64::MAX),
+                    })?;
+                let first_slot = if self.is_compact_dense() {
+                    0
+                } else {
+                    self.index.values().next().copied().unwrap_or(0)
+                };
+                let placeholder = self.read(first_slot);
+                rows.resize(len, placeholder);
+            }
+            if self.is_compact_dense() {
+                flife_core::pool::parallel_chunks_mut(
+                    workers,
+                    "copy organism rows",
+                    rows.as_mut_slice(),
+                    512,
+                    |start, chunk| {
+                        for (offset, dst) in chunk.iter_mut().enumerate() {
+                            *dst = self.read(start + offset);
+                        }
+                    },
+                )?;
+                return Ok(());
+            }
+            let mut slots: Vec<usize> = Vec::new();
+            slots
+                .try_reserve_exact(len)
                 .map_err(|_| CoreError::AllocationFailed {
-                    buffer: "organism rows",
-                    bytes: u64::try_from(len.saturating_mul(size_of::<Organism>()))
+                    buffer: "organism row slots",
+                    bytes: u64::try_from(len.saturating_mul(size_of::<usize>()))
                         .unwrap_or(u64::MAX),
                 })?;
-            let placeholder = self.read(0);
-            rows.resize(len, placeholder);
+            slots.extend(self.index.values().copied());
+            let slots_slice: &[usize] = &slots;
             flife_core::pool::parallel_chunks_mut(
                 workers,
                 "copy organism rows",
@@ -1122,12 +1155,13 @@ impl Population {
                 512,
                 |start, chunk| {
                     for (offset, dst) in chunk.iter_mut().enumerate() {
-                        *dst = self.read(start + offset);
+                        *dst = self.read(slots_slice[start + offset]);
                     }
                 },
             )?;
             return Ok(());
         }
+        rows.clear();
         rows.extend(self.iter());
         Ok(())
     }
@@ -1426,6 +1460,80 @@ impl Population {
                         &mut tiles,
                         |_, chunk| {
                             for organism in *chunk {
+                                organism.check()?;
+                            }
+                            Ok(())
+                        },
+                    )
+                    .is_ok();
+                    if ok {
+                        fast_validated = true;
+                    }
+                }
+            }
+        } else if !self.is_compact_dense()
+            && survivors.len() >= 1_024
+            && workers > 1
+            && survivors.len() + dying.len() == self.len()
+        {
+            // FreeList parallel validation: match ascending survivors to slots
+            // in one linear BTreeMap walk, then validate lineage_key and INV-01
+            // in parallel across workers (any mismatch falls back to the exact
+            // serial validator below so canonical error ordering is preserved).
+            let mut survivor_slots: Vec<usize> = Vec::new();
+            if survivor_slots.try_reserve_exact(survivors.len()).is_ok() {
+                let mut previous: Option<OrganismId> = None;
+                let mut live = self.index.iter();
+                let mut all_matched = true;
+                for organism in survivors {
+                    if previous.is_some_and(|prev| organism.id <= prev)
+                        || dying.contains_key(&organism.id)
+                    {
+                        all_matched = false;
+                        break;
+                    }
+                    previous = Some(organism.id);
+                    let mut found_slot = None;
+                    for (&id, &slot) in live.by_ref() {
+                        if id == organism.id {
+                            found_slot = Some(slot);
+                            break;
+                        }
+                        if !dying.contains_key(&id) {
+                            all_matched = false;
+                            break;
+                        }
+                    }
+                    if let Some(slot) = found_slot {
+                        survivor_slots.push(slot);
+                    } else {
+                        all_matched = false;
+                        break;
+                    }
+                }
+                if all_matched {
+                    let tile_count = workers
+                        .saturating_mul(4)
+                        .min(64)
+                        .min(survivors.len().div_ceil(512))
+                        .max(1);
+                    let tile_len = survivors.len().div_ceil(tile_count);
+                    let mut tiles: Vec<(&[Organism], &[usize])> = survivors
+                        .chunks(tile_len)
+                        .zip(survivor_slots.chunks(tile_len))
+                        .collect();
+                    let ok = flife_core::pool::try_parallel_tasks(
+                        workers,
+                        "check tick survivors",
+                        &mut tiles,
+                        |_, (chunk, slots)| {
+                            for (organism, &slot) in chunk.iter().zip(*slots) {
+                                if self.lineage_key_at(slot) != organism.lineage_key() {
+                                    return Err(conflict(format!(
+                                        "{} cannot change its genome, ancestry, birth tick or phase",
+                                        organism.id
+                                    )));
+                                }
                                 organism.check()?;
                             }
                             Ok(())

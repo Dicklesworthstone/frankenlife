@@ -687,9 +687,12 @@ fn resolve_into(
             }
             Ok(())
         };
-        flife_core::pool::try_parallel_tasks(workers, "resolve uptake", &mut slices, |_, slice| {
-            work(slice)
-        })?;
+        flife_core::pool::try_parallel_tasks(
+            workers,
+            "resolve uptake",
+            &mut slices,
+            |_, slice| work(slice),
+        )?;
 
         for debit in debits.iter() {
             let len = (offsets[debit.cell + 1] - offsets[debit.cell]) as usize;
@@ -1288,12 +1291,9 @@ pub fn apply_grants_on(
     } else {
         let mut plane_tasks: Vec<&mut [f32]> =
             field.moments_mut().chunks_exact_mut(cells.max(1)).collect();
-        flife_core::pool::parallel_tasks(
-            workers,
-            "apply grants",
-            &mut plane_tasks,
-            |_, plane| scale(plane),
-        )?;
+        flife_core::pool::parallel_tasks(workers, "apply grants", &mut plane_tasks, |_, plane| {
+            scale(plane)
+        })?;
     }
     grants.applied = true;
     Ok(grants.summary.granted)

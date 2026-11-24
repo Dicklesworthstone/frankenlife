@@ -314,67 +314,45 @@ impl SensorPyramid {
                 }
             }
         } else {
-            // Split each coarse level into disjoint whole-plane slices per
-            // worker so all levels `1..=L` of each plane run in one thread
-            // scope while staying hot in L2 cache.
-            let per = planes.div_ceil(used);
-            let mut per_worker: Vec<(usize, usize, Vec<&mut [f64]>)> = Vec::with_capacity(used);
-            for w in 0..used {
-                let first = w * per;
-                if first >= planes {
-                    break;
-                }
-                let count = (planes - first).min(per);
-                per_worker.push((first, count, Vec::with_capacity(self.coarse.len())));
-            }
+            // Split each coarse level into disjoint single-plane slices so
+            // all levels `1..=L` of each plane run dynamically via work
+            // stealing while staying hot in L2 cache.
+            let mut per_plane: Vec<Vec<&mut [f64]>> = (0..planes)
+                .map(|_| Vec::with_capacity(self.coarse.len()))
+                .collect();
             for (level_idx, level_buf) in self.coarse.iter_mut().enumerate() {
                 let level = level_idx + 1;
                 let coarse_cells = (cells_x >> level) * (cells_y >> level);
                 let mut rest = level_buf.as_mut_slice();
-                for &mut (_, count, ref mut levels) in &mut per_worker {
+                for plane_levels in &mut per_plane {
                     let (head, tail) = rest
-                        .split_at_mut_checked(count * coarse_cells)
+                        .split_at_mut_checked(coarse_cells)
                         .ok_or_else(overflow)?;
-                    levels.push(head);
+                    plane_levels.push(head);
                     rest = tail;
                 }
             }
-            let build_planes = |first_plane: usize, count: usize, levels: &mut [&mut [f64]]| {
-                for local_plane in 0..count {
-                    let plane = first_plane + local_plane;
+            flife_core::pool::parallel_tasks(
+                workers,
+                "build sensor pyramid",
+                &mut per_plane,
+                |plane, levels| {
                     for level_idx in 0..levels.len() {
                         let level = level_idx + 1;
                         let fine_x = cells_x >> (level - 1);
-                        let fine_cells = fine_x * (cells_y >> (level - 1));
-                        let coarse_cells = (cells_x >> level) * (cells_y >> level);
                         let (finer, rest) = levels.split_at_mut(level_idx);
-                        let target = &mut rest[0]
-                            [local_plane * coarse_cells..(local_plane + 1) * coarse_cells];
+                        let target = &mut rest[0];
                         if level == 1 {
                             let start = plane * base_cells;
                             let source = &field_slice[start..start + base_cells];
                             average_base(source, fine_x, target, area, inv_area);
                         } else {
-                            let prev = &finer[level_idx - 1];
-                            let source =
-                                &prev[local_plane * fine_cells..(local_plane + 1) * fine_cells];
+                            let source = &finer[level_idx - 1];
                             average(source, fine_x, target, |density| density);
                         }
                     }
-                }
-            };
-            let build_planes = &build_planes;
-            flife_core::pool::scope_workers(workers, "build sensor pyramid", |scope| {
-                let mut iter = per_worker.iter_mut();
-                let head = iter.next();
-                for (first, count, levels) in iter {
-                    let (first, count) = (*first, *count);
-                    scope.spawn(move || build_planes(first, count, levels));
-                }
-                if let Some((first, count, levels)) = head {
-                    build_planes(*first, *count, levels);
-                }
-            })?;
+                },
+            )?;
         }
         Ok(PyramidView {
             field,

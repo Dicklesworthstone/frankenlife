@@ -652,6 +652,27 @@ impl LedgerLog {
         }
         Ok(())
     }
+
+    /// Move every logged entry from `other` onto the end of `self`, preserving
+    /// order.
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] if `self` cannot reserve room for `other`.
+    pub fn append(&mut self, other: &mut Self) -> Result<(), CoreError> {
+        let extra = other.entries.len();
+        if extra == 0 {
+            return Ok(());
+        }
+        self.entries
+            .try_reserve(extra)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "ledger log",
+                bytes: u64::try_from(extra.saturating_mul(std::mem::size_of::<Logged>()))
+                    .unwrap_or(u64::MAX),
+            })?;
+        self.entries.append(&mut other.entries);
+        Ok(())
+    }
 }
 
 impl Ledger for LedgerLog {

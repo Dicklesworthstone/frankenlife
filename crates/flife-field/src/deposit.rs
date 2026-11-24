@@ -1486,7 +1486,7 @@ pub fn apply_deposits_to_carrier_on(
         "apply deposits",
         &mut work_tiles,
         |_, (run, slot)| {
-            *slot = reduce(run);
+            **slot = reduce(run);
         },
     )?;
 

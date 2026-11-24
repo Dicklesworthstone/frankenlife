@@ -1073,48 +1073,47 @@ fn supports_on(
     supports: &mut [SourceSupport],
     workers: usize,
 ) -> Result<Option<(usize, CoreError)>, CoreError> {
-    let used = workers.clamp(1, sources.len().max(1));
-    let per = sources.len().div_ceil(used).max(1);
-    let run = |first: usize, sources: &[Source], supports: &mut [SourceSupport]| {
-        sources
-            .iter()
-            .zip(supports)
-            .enumerate()
-            .find_map(|(offset, (source, support))| {
-                if source.power() == 0.0 {
-                    support.clear_for_zero_power();
-                    return None;
-                }
-                let active_kernel = per_source
-                    .and_then(|kernels| kernels.get(first + offset))
-                    .unwrap_or(kernel);
-                active_kernel
-                    .support_into(grid, source.center(), support)
-                    .err()
-                    .map(|error| (first + offset, error))
-            })
-    };
-    let mut runs = sources.chunks(per).zip(supports.chunks_mut(per));
-    let Some((head_sources, head_supports)) = runs.next() else {
+    if sources.is_empty() {
         return Ok(None);
-    };
-    let run = &run;
-    if used <= 1 {
-        return Ok(run(0, head_sources, head_supports));
     }
-    let mut tail_results: Vec<Option<(usize, CoreError)>> =
-        (0..used.saturating_sub(1)).map(|_| None).collect();
-    let mut head_result = None;
-    flife_core::pool::scope_workers(workers, "source supports", |scope| {
-        for (index, ((sources, supports), slot)) in runs.zip(tail_results.iter_mut()).enumerate() {
-            scope.spawn(move || {
-                *slot = run((index + 1) * per, sources, supports);
-            });
+    let build_one =
+        |index: usize, source: &Source, support: &mut SourceSupport| -> Option<CoreError> {
+            if source.power() == 0.0 {
+                support.clear_for_zero_power();
+                return None;
+            }
+            let active_kernel = per_source
+                .and_then(|kernels| kernels.get(index))
+                .unwrap_or(kernel);
+            active_kernel
+                .support_into(grid, source.center(), support)
+                .err()
+        };
+    if workers <= 1 || sources.len() == 1 {
+        for (index, (source, support)) in sources.iter().zip(supports.iter_mut()).enumerate() {
+            if let Some(error) = build_one(index, source, support) {
+                return Ok(Some((index, error)));
+            }
         }
-        head_result = run(0, head_sources, head_supports);
-    })?;
-    if head_result.is_some() {
-        return Ok(head_result);
+        return Ok(None);
     }
-    Ok(tail_results.into_iter().flatten().next())
+    let mut tasks: Vec<(&Source, &mut SourceSupport, Option<CoreError>)> = sources
+        .iter()
+        .zip(supports.iter_mut())
+        .map(|(source, support)| (source, support, None))
+        .collect();
+    flife_core::pool::parallel_tasks(
+        workers,
+        "source supports",
+        &mut tasks,
+        |index, (source, support, err)| {
+            *err = build_one(index, source, support);
+        },
+    )?;
+    for (index, (_, _, err)) in tasks.into_iter().enumerate() {
+        if let Some(error) = err {
+            return Ok(Some((index, error)));
+        }
+    }
+    Ok(None)
 }

@@ -235,7 +235,6 @@ impl Bins {
                 })
             })
             .collect();
-        let active_chunks = chunk_counts.len();
 
         flife_core::pool::try_parallel_tasks(
             workers,
@@ -292,11 +291,12 @@ impl Bins {
                 .collect();
             let mut rem = staged.as_mut_slice();
             for s in 0..stripe_count {
-                for c in 0..active_chunks {
-                    let count = chunk_counts[c].counts[s];
+                let _stripe_end = stripe_bases[s + 1];
+                for (chunk, task) in chunk_counts.iter().zip(&mut scatter_tasks) {
+                    let count = chunk.counts[s];
                     let (slice, tail) = rem.split_at_mut(count);
                     rem = tail;
-                    scatter_tasks[c].dsts.push(slice);
+                    task.dsts.push(slice);
                 }
             }
             flife_core::pool::try_parallel_tasks(
@@ -399,8 +399,10 @@ impl Bins {
                     nonempty += usize::from(c > 0);
                 }
                 task.occupied.reserve_exact(nonempty);
-                for (local_b, (count_slot, out_off)) in
-                    counts.iter_mut().zip(task.offsets_out.iter_mut()).enumerate()
+                for (local_b, (count_slot, out_off)) in counts
+                    .iter_mut()
+                    .zip(task.offsets_out.iter_mut())
+                    .enumerate()
                 {
                     let c = *count_slot;
                     *count_slot = local_run;
@@ -604,5 +606,72 @@ impl Bins {
     #[must_use]
     pub fn allocated(&self) -> (usize, usize) {
         (self.offsets.capacity(), self.order.capacity())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_group_on_matches_serial_group_bit_for_bit() {
+        let buckets = 65_536_usize;
+        let items = 40_000_usize;
+        // Mix of hashed uniform positions, a heavy hotspot bucket, and empty stripes.
+        let keys: Vec<usize> = (0..items)
+            .map(|i| {
+                if i % 17 == 0 {
+                    42_123
+                } else {
+                    let mixed = (i.wrapping_mul(2_654_435_761)) ^ (i >> 3);
+                    let raw = mixed % buckets;
+                    // Leave a whole stripe empty to verify empty-stripe offset fill.
+                    if (8_192..10_240).contains(&raw) {
+                        raw + 4_096
+                    } else {
+                        raw
+                    }
+                }
+            })
+            .collect();
+
+        let mut serial = Bins::new("serial");
+        serial
+            .group(buckets, items, |i| keys[i])
+            .expect("serial group succeeds");
+
+        for workers in [1_usize, 2, 4, 8] {
+            let mut parallel = Bins::new("parallel");
+            parallel
+                .group_on(buckets, items, workers, |i| keys[i])
+                .expect("parallel group_on succeeds");
+            assert_eq!(parallel.offsets(), serial.offsets(), "workers={workers}");
+            assert_eq!(parallel.order(), serial.order(), "workers={workers}");
+            assert_eq!(
+                parallel.occupied_buckets(),
+                serial.occupied_buckets(),
+                "workers={workers}"
+            );
+            assert_eq!(parallel.largest(), serial.largest(), "workers={workers}");
+        }
+
+        // Verify exact lowest-index out-of-range error reporting.
+        let mut bad_keys = keys;
+        bad_keys[10_001] = buckets;
+        bad_keys[35_000] = buckets + 7;
+        let serial_err = serial
+            .group(buckets, items, |i| bad_keys[i])
+            .expect_err("serial rejects out-of-range bucket");
+        let mut parallel = Bins::new("parallel");
+        let parallel_err = parallel
+            .group_on(buckets, items, 4, |i| bad_keys[i])
+            .expect_err("parallel rejects out-of-range bucket");
+        assert!(
+            serial_err.to_string().contains("item 10001")
+                && parallel_err.to_string().contains("item 10001"),
+            "serial={serial_err}, parallel={parallel_err}"
+        );
+        assert!(parallel.offsets().is_empty());
+        assert!(parallel.order().is_empty());
     }
 }

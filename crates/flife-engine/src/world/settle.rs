@@ -46,18 +46,19 @@ use flife_field::settle::{
     MutationLayer, MutationValues, ProposalOrganism, ProposalOutcome, SettleBackend,
 };
 use flife_field::state::CHANNELS;
-use flife_field::{Bins, Deposits, FieldState, GrantPacket, split_dual_carrier_emission};
+use flife_field::{
+    Bins, Deposits, ExchangeScratch, FieldState, GrantPacket, split_dual_carrier_emission,
+};
 use flife_genome::{BirthAttempt, Mutator, ParameterValues, Prepared, TopologyId};
 use flife_neural::{DenseTopology, WeightDtype, Weights};
 
 use super::{
     DecisionLane, ModelVariant, PACKETS_PER_ORGANISM, Rules, SettleReport, Settled, Stages,
-    Working, compositions_into, fit, genome_of, in_runs_mut, parameter_count, settle_all,
-    settle_stages,
+    Working, compositions_into, fit, in_runs_mut, parameter_count, settle_all, settle_stages,
 };
 use crate::chemistry::{UptakeSettlement, effective_affinity};
 use crate::costs::{MaintenanceBill, MaintenanceSettlement};
-use crate::emission::EmissionSettlement;
+use crate::emission::{CachedFootprint, EmissionSettlement};
 use crate::lifecycle::{BudgetStage, Vitality};
 use crate::motion::MotionSettlement;
 use crate::population::Population;
@@ -264,8 +265,15 @@ fn settle_on(
 
     // Each organism's packets, in cell order as the reference settles them,
     // and what its genome gives maintenance and motion.
+    let mut live = population.ascending();
     for (index, organism) in working.iter().enumerate() {
-        let genome = genome_of(population, organism.committed.id)?;
+        let genome = live
+            .next(organism.committed.id)
+            .0
+            .ok_or_else(|| CoreError::StateConflict {
+                operation: "read genome",
+                detail: format!("{} has no genome", organism.committed.id),
+            })?;
         let traits = genome.traits();
         let first = packets.len();
         for packet in by_demand
@@ -349,13 +357,14 @@ fn settle_on(
             let (deposit_position, effective_emission) = if emission_v2_active {
                 let ctx =
                     rules.emission_context(organism, outcome.position, outcome.velocity, from)?;
-                let plan = rules.v2.emission().plan(
+                let plan = rules.v2.emission().plan_with_recovery_alpha(
                     &rules.grid,
                     rules.step,
                     outcome.remaining,
                     false,
                     organism.actions.emission.as_ref(),
                     &ctx,
+                    rules.v2.emission_recovery_alpha(),
                 )?;
                 (
                     plan.deposit_position,
@@ -446,6 +455,7 @@ fn settle_on(
             "settle on a backend",
             &|start, run, lane| {
                 let DecisionLane {
+                    exchange,
                     flows,
                     emissions,
                     trail_emissions,
@@ -454,11 +464,21 @@ fn settle_on(
                     transactions,
                     ..
                 } = lane;
+                let mut live = rows
+                    .get(start)
+                    .map(|first| population.ascending_from(first.committed.id));
                 for (offset, slot) in run.iter_mut().enumerate() {
                     let index = start + offset;
                     let missing = || differ(format!("no outcome for row {index}"));
                     let organism = rows.get(index).ok_or_else(missing)?;
-                    let traits = genome_of(population, organism.committed.id)?.traits();
+                    let traits = live
+                        .as_mut()
+                        .and_then(|walk| walk.next(organism.committed.id).0)
+                        .ok_or_else(|| CoreError::StateConflict {
+                            operation: "read genome",
+                            detail: format!("{} has no genome", organism.committed.id),
+                        })?
+                        .traits();
                     let mut stages = Device {
                         chemistry: chemistry_out.get(index).ok_or_else(missing)?,
                         motion: motion_out.get(index).ok_or_else(missing)?,
@@ -478,6 +498,7 @@ fn settle_on(
                         trail_emissions.as_mut(),
                         byproducts.as_mut(),
                         emission_paid,
+                        exchange,
                         record,
                     )?;
                     stages.check_fate(organism.committed.id, &slot.vitality)?;
@@ -767,6 +788,8 @@ impl Stages for Device<'_> {
         budget: &mut EnergyBudget,
         emissions: &mut Deposits,
         trail_emissions: Option<&mut Deposits>,
+        exchange_scratch: &mut ExchangeScratch,
+        footprint: &mut CachedFootprint,
     ) -> Result<(EmissionSettlement, f32, Tick), CoreError> {
         // EmissionPolicy::emit, its request and offer recomputed here, its
         // footprint split the backend's (at the position the backend moved
@@ -798,13 +821,14 @@ impl Stages for Device<'_> {
             next_cooldown_deadline,
         ) = if rules.v2.emission().any_enabled() {
             let ctx = rules.emission_context(organism, position, velocity, from)?;
-            let plan = rules.v2.emission().plan(
+            let plan = rules.v2.emission().plan_with_recovery_alpha(
                 &rules.grid,
                 rules.step,
                 available,
                 budget.is_exhausted(),
                 organism.actions.emission.as_ref(),
                 &ctx,
+                rules.v2.emission_recovery_alpha(),
             )?;
             (
                 plan.deposit_position,
@@ -872,7 +896,8 @@ impl Stages for Device<'_> {
                     dc.trail_emission_share(),
                     &action.direction,
                 )?;
-                emissions.push_with(
+                footprint.push_deposit(
+                    emissions,
                     &rules.grid,
                     rules.exchange,
                     organism.committed.id,
@@ -880,8 +905,10 @@ impl Stages for Device<'_> {
                     split.paid_0,
                     split.offered_0,
                     &split.direction_0,
+                    exchange_scratch,
                 )?;
-                trail_deposits.push_with(
+                footprint.push_deposit(
+                    trail_deposits,
                     &rules.grid,
                     rules.exchange,
                     organism.committed.id,
@@ -889,6 +916,7 @@ impl Stages for Device<'_> {
                     split.paid_1,
                     split.offered_1,
                     &split.direction_1,
+                    exchange_scratch,
                 )?;
                 split.offered_0 + split.offered_1
             } else {

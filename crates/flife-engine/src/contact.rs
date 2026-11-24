@@ -624,6 +624,16 @@ pub fn body_radius(config: &ValidatedConfig) -> Option<f64> {
         .map(|contact| 0.5 * contact.diameter)
 }
 
+/// One cached in-reach neighbor from Trophallaxis Pass 1 reused by Sweep 1
+/// Pass 2 so donors never re-scan 9 spatial bins, re-call `hypot`, or
+/// recompute Pass-1 32-D genetic cosines (`24 B`, `alike < 0.0` = uncomputed).
+#[derive(Debug, Clone, Copy, Default)]
+struct CachedNeighbor {
+    distance: f64,
+    alike: f64,
+    other: u32,
+}
+
 /// Reusable buffers for [`relax`].
 #[derive(Debug, Default)]
 pub struct ContactScratch {
@@ -638,6 +648,13 @@ pub struct ContactScratch {
     pressed: Vec<[f64; 2]>,
     /// Pass-1 donor export scale factors (`V2-13` `trophallaxis`; `0 B` when disabled).
     trophallaxis_scales: Vec<f64>,
+    /// Per-body `(start, len)` span into `neighbor_cache` populated during
+    /// Trophallaxis Pass 1 (`len == u32::MAX` falls back to the 9-bin scan;
+    /// `0 B` when trophallaxis is disabled).
+    neighbor_spans: Vec<(u32, u32)>,
+    /// Bounded flat cache of in-reach neighbors shared from Trophallaxis Pass 1
+    /// to Pass 2 (`0 B` when trophallaxis is disabled).
+    neighbor_cache: Vec<CachedNeighbor>,
 }
 
 /// Which `field-ecology-v2` Sweep-1 buffers [`ContactWork::with_capacity_v2_features`]
@@ -865,6 +882,17 @@ impl ContactWork {
                 rows,
                 "contact trophallaxis scales",
             )?;
+            reserve(
+                &mut work.scratch.neighbor_spans,
+                rows,
+                "contact neighbor spans",
+            )?;
+            let cache_entries = rows.saturating_mul(24).min(1_048_576);
+            reserve(
+                &mut work.scratch.neighbor_cache,
+                cache_entries,
+                "contact neighbor cache",
+            )?;
         }
         if buffers.velocity_alignment {
             reserve(&mut work.velocities, rows, "contact velocities")?;
@@ -916,6 +944,8 @@ impl ContactWork {
             bytes(&self.scratch.starts),
             bytes(&self.scratch.pressed),
             bytes(&self.scratch.trophallaxis_scales),
+            bytes(&self.scratch.neighbor_spans),
+            bytes(&self.scratch.neighbor_cache),
         ]
         .into_iter()
         .fold(0_u64, u64::saturating_add)
@@ -1334,6 +1364,8 @@ pub fn relax(
         bins,
         pressed,
         trophallaxis_scales: _,
+        neighbor_spans: _,
+        neighbor_cache: _,
     } = scratch;
     starts.clear();
     starts.resize(total_bins + 1, 0);
@@ -1865,6 +1897,8 @@ pub fn relax_sweep1_with_context(
         bins,
         pressed,
         trophallaxis_scales,
+        neighbor_spans,
+        neighbor_cache,
     } = scratch;
     starts.clear();
     starts.resize(total_bins + 1, 0);
@@ -1970,105 +2004,187 @@ pub fn relax_sweep1_with_context(
         .max(1);
 
     // Trophallaxis Pass 1 (donor export cap, INV-01 / INV-05): compute each
-    // donor's scale factor `scale_i in [0, 1]` over the immutable Sweep-1 bins.
+    // donor's scale factor `scale_i in [0, 1]` over the immutable Sweep-1 bins,
+    // and populate the bounded per-worker neighbor cache so Pass 2 never
+    // re-scans 9 spatial bins, re-calls `hypot`, or recomputes Pass-1 32-D
+    // cosines for cached donors.
     trophallaxis_scales.clear();
+    neighbor_spans.clear();
+    let mut has_neighbor_cache = false;
     if let Some((tr_cfg, energies)) = trophallaxis_inputs {
         let aff = affinities.ok_or_else(|| CoreError::StateConflict {
             operation: "contact",
             detail: "trophallaxis requires genetic affinities".to_owned(),
         })?;
         trophallaxis_scales.resize(count, 0.0_f64);
-        let compute_scale = |index: usize| -> f64 {
-            let bin = bins[index];
-            if bin == u32::MAX {
-                return 0.0;
-            }
-            let e_i = energies[index];
-            let cap = tr_cfg.maximum_export_fraction * (e_i - tr_cfg.reserve_energy).max(0.0);
-            if cap <= 0.0 {
-                return 0.0;
-            }
-            let bin = bin as usize;
-            let [here_x, here_y] = positions[index];
-            let aff_i = &aff[index];
-            let (bx, by) = (bin % bins_x, bin / bins_x);
-            let (rows, row_count) = neighbours(by, bins_y);
-            let (columns, column_count) = neighbours(bx, bins_x);
-            let mut out_sum = CompensatedSum::ZERO;
-            for &row in &rows[..row_count] {
-                let row_base = row * bins_x;
-                for &column in &columns[..column_count] {
-                    let neighbour = row_base + column;
-                    let lo = starts[neighbour] as usize;
-                    let hi = starts[neighbour + 1] as usize;
-                    for &other_u32 in &members[lo..hi] {
-                        let other = other_u32 as usize;
-                        if other == index {
-                            continue;
-                        }
-                        let e_j = energies[other];
-                        if e_j >= e_i {
-                            continue;
-                        }
-                        let there = positions[other];
-                        let dx = image(there[0], here_x, width, half_width);
-                        if dx.abs() >= reach_distance {
-                            continue;
-                        }
-                        let dy = image(there[1], here_y, height, half_height);
-                        if dy.abs() >= reach_distance || dx * dx + dy * dy > beyond {
-                            continue;
-                        }
-                        let distance = dx.abs().hypot(dy.abs());
-                        if distance >= reach_distance {
-                            continue;
-                        }
-                        let alike = cosine(aff_i, &aff[other]).max(0.0);
-                        let raw = pair_trophallaxis_raw(
-                            e_i,
-                            e_j,
-                            distance,
-                            reach_distance,
-                            alike,
-                            &tr_cfg,
-                        );
-                        if raw > 0.0 {
-                            out_sum.add(raw);
+        neighbor_spans.resize(count, (0_u32, u32::MAX));
+        let cache_cap = neighbor_cache.capacity();
+        if neighbor_cache.len() < cache_cap {
+            neighbor_cache.resize(cache_cap, CachedNeighbor::default());
+        }
+        has_neighbor_cache = cache_cap > 0;
+        let fill_scales_and_cache = |first: usize,
+                                     out_scales: &mut [f64],
+                                     out_spans: &mut [(u32, u32)],
+                                     cache_base: usize,
+                                     cache_slice: &mut [CachedNeighbor]| {
+            let mut cursor = 0_usize;
+            let cache_len = cache_slice.len();
+            for (offset, (scale_slot, span_slot)) in
+                out_scales.iter_mut().zip(out_spans.iter_mut()).enumerate()
+            {
+                let index = first + offset;
+                let bin = bins[index];
+                if bin == u32::MAX {
+                    *scale_slot = 0.0;
+                    *span_slot = (0, u32::MAX);
+                    continue;
+                }
+                let e_i = energies[index];
+                let cap = tr_cfg.maximum_export_fraction * (e_i - tr_cfg.reserve_energy).max(0.0);
+                if cap <= 0.0 {
+                    *scale_slot = 0.0;
+                    *span_slot = (0, u32::MAX);
+                    continue;
+                }
+                let bin = bin as usize;
+                let [here_x, here_y] = positions[index];
+                let aff_i = &aff[index];
+                let (bx, by) = (bin % bins_x, bin / bins_x);
+                let (rows, row_count) = neighbours(by, bins_y);
+                let (columns, column_count) = neighbours(bx, bins_x);
+                let mut out_sum = CompensatedSum::ZERO;
+                let span_start = cursor;
+                let mut can_cache = cache_len > 0;
+                for &row in &rows[..row_count] {
+                    let row_base = row * bins_x;
+                    for &column in &columns[..column_count] {
+                        let neighbour = row_base + column;
+                        let lo = starts[neighbour] as usize;
+                        let hi = starts[neighbour + 1] as usize;
+                        for &other_u32 in &members[lo..hi] {
+                            let other = other_u32 as usize;
+                            if other == index {
+                                continue;
+                            }
+                            let there = positions[other];
+                            let dx = image(there[0], here_x, width, half_width);
+                            if dx.abs() >= reach_distance {
+                                continue;
+                            }
+                            let dy = image(there[1], here_y, height, half_height);
+                            if dy.abs() >= reach_distance || dx * dx + dy * dy > beyond {
+                                continue;
+                            }
+                            let distance = dx.abs().hypot(dy.abs());
+                            let in_reach = distance < reach_distance;
+                            let overlaps = distance < diameter;
+                            if !overlaps && !in_reach {
+                                continue;
+                            }
+                            let e_j = energies[other];
+                            let alike = if in_reach && e_j < e_i {
+                                let a = cosine(aff_i, &aff[other]).max(0.0);
+                                let raw = pair_trophallaxis_raw(
+                                    e_i,
+                                    e_j,
+                                    distance,
+                                    reach_distance,
+                                    a,
+                                    &tr_cfg,
+                                );
+                                if raw > 0.0 {
+                                    out_sum.add(raw);
+                                }
+                                a
+                            } else {
+                                -1.0
+                            };
+                            if can_cache {
+                                if cursor < cache_len {
+                                    cache_slice[cursor] = CachedNeighbor {
+                                        distance,
+                                        alike,
+                                        other: other_u32,
+                                    };
+                                    cursor += 1;
+                                } else {
+                                    cursor = span_start;
+                                    can_cache = false;
+                                }
+                            }
                         }
                     }
                 }
-            }
-            let total_out = out_sum.value();
-            if total_out <= 0.0 {
-                return 0.0;
-            }
-            let mut scale = (cap / total_out).min(1.0);
-            while scale > 0.0 && scale * total_out > cap {
-                scale = scale.next_down();
-            }
-            scale
-        };
-        let fill_scales = |first: usize, out: &mut [f64]| {
-            for (offset, slot) in out.iter_mut().enumerate() {
-                *slot = compute_scale(first + offset);
+                if can_cache {
+                    let span_len = cursor - span_start;
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "neighbor_cache length is capped at 1_048_576 < u32::MAX"
+                    )]
+                    {
+                        *span_slot = ((cache_base + span_start) as u32, span_len as u32);
+                    }
+                } else {
+                    *span_slot = (0, u32::MAX);
+                }
+                let total_out = out_sum.value();
+                if total_out <= 0.0 {
+                    *scale_slot = 0.0;
+                } else {
+                    let mut scale = (cap / total_out).min(1.0);
+                    while scale > 0.0 && scale * total_out > cap {
+                        scale = scale.next_down();
+                    }
+                    *scale_slot = scale;
+                }
             }
         };
         if used == 1 {
-            fill_scales(0, trophallaxis_scales);
+            fill_scales_and_cache(
+                0,
+                trophallaxis_scales,
+                neighbor_spans,
+                0,
+                neighbor_cache.as_mut_slice(),
+            );
         } else {
             let length = count.div_ceil(used);
-            let mut chunks = trophallaxis_scales.chunks_mut(length);
-            let head = chunks.next().unwrap_or_default();
-            let fill_scales = &fill_scales;
+            let chunk_count = count.div_ceil(length);
+            let cache_per_worker = neighbor_cache.len() / chunk_count.max(1);
+            let mut scale_chunks = trophallaxis_scales.chunks_mut(length);
+            let mut span_chunks = neighbor_spans.chunks_mut(length);
+            let mut cache_rest = neighbor_cache.as_mut_slice();
+            let take_head = cache_per_worker.min(cache_rest.len());
+            let (cache_head, tail_after_head) = cache_rest.split_at_mut(take_head);
+            cache_rest = tail_after_head;
+            let scale_head = scale_chunks.next().unwrap_or_default();
+            let span_head = span_chunks.next().unwrap_or_default();
+            let fill_scales_and_cache = &fill_scales_and_cache;
             flife_core::pool::scope_workers(workers, "contact", |scope| {
-                for (index, chunk) in chunks.enumerate() {
-                    scope.spawn(move || fill_scales((index + 1) * length, chunk));
+                for (index, (s_chunk, sp_chunk)) in scale_chunks.zip(span_chunks).enumerate() {
+                    let worker_idx = index + 1;
+                    let take = cache_per_worker.min(cache_rest.len());
+                    let (c_chunk, next_rest) = core::mem::take(&mut cache_rest).split_at_mut(take);
+                    cache_rest = next_rest;
+                    let c_base = worker_idx * cache_per_worker;
+                    scope.spawn(move || {
+                        fill_scales_and_cache(
+                            worker_idx * length,
+                            s_chunk,
+                            sp_chunk,
+                            c_base,
+                            c_chunk,
+                        );
+                    });
                 }
-                fill_scales(0, head);
+                fill_scales_and_cache(0, scale_head, span_head, 0, cache_head);
             })?;
         }
     }
     let tr_scales = trophallaxis_scales.as_slice();
+    let tr_spans = neighbor_spans.as_slice();
+    let tr_cache = neighbor_cache.as_slice();
 
     type BodyEval = (
         [f64; 2],
@@ -2098,9 +2214,6 @@ pub fn relax_sweep1_with_context(
         let bin = bin as usize;
         let [here_x, here_y] = positions[index];
         let aff_i = affinities.map(|aff| &aff[index]);
-        let (bx, by) = (bin % bins_x, bin / bins_x);
-        let (rows, row_count) = neighbours(by, bins_y);
-        let (columns, column_count) = neighbours(bx, bins_x);
         let mut sum = [0.0_f64, 0.0_f64];
         let mut overlapping = [0.0_f64, 0.0_f64];
         let mut tau_neighbors = 0.0_f64;
@@ -2114,215 +2227,239 @@ pub fn relax_sweep1_with_context(
         let mut align_w = 0.0_f64;
         let has_pcp = pcp_inputs.is_some();
         let has_vel = velocity_inputs.is_some();
-        for &row in &rows[..row_count] {
-            let row_base = row * bins_x;
-            for &column in &columns[..column_count] {
-                let neighbour = row_base + column;
-                let lo = starts[neighbour] as usize;
-                let hi = starts[neighbour + 1] as usize;
-                for &other_u32 in &members[lo..hi] {
-                    let other = other_u32 as usize;
-                    if other == index {
-                        continue;
-                    }
-                    // From the other body to this one (`u_ij = (x_i - x_j) / d`).
-                    let there = positions[other];
-                    let dx = image(there[0], here_x, width, half_width);
-                    if dx.abs() >= reach_distance {
-                        continue;
-                    }
-                    let dy = image(there[1], here_y, height, half_height);
-                    if dy.abs() >= reach_distance || dx * dx + dy * dy > beyond {
-                        continue;
-                    }
-                    // Commutative distance `|dx|.hypot(|dy|)` guarantees bit-identical
-                    // `distance` on both sides of pair `(i, j)`.
-                    let distance = dx.abs().hypot(dy.abs());
-                    let overlaps = distance < diameter;
-                    let in_reach = distance < reach_distance;
-                    if !overlaps && !in_reach {
-                        continue;
-                    }
-                    let (ux, uy) = if distance > 0.0 {
-                        (dx / distance, dy / distance)
-                    } else if ids[index] > ids[other] {
-                        (1.0, 0.0)
-                    } else {
-                        (-1.0, 0.0)
+        let mut process_pair = |other: usize,
+                                dx: f64,
+                                dy: f64,
+                                distance: f64,
+                                precomputed_alike: Option<f64>|
+         -> Result<(), CoreError> {
+            let overlaps = distance < diameter;
+            let in_reach = distance < reach_distance;
+            if !overlaps && !in_reach {
+                return Ok(());
+            }
+            let (ux, uy) = if distance > 0.0 {
+                (dx / distance, dy / distance)
+            } else if ids[index] > ids[other] {
+                (1.0, 0.0)
+            } else {
+                (-1.0, 0.0)
+            };
+            // `r_hat = (x_j - x_i) / d = -u_ij` for `d > 0`.
+            let r_hat = [-ux, -uy];
+            // Reuse Pass-1 32-D cosine when cached, otherwise evaluate lazily
+            // only when an active consumer actually needs it.
+            let mut cached_genetic_alike = precomputed_alike;
+            let mut get_genetic_alike = || -> Option<f64> {
+                if let Some(cached) = cached_genetic_alike {
+                    Some(cached)
+                } else {
+                    let val = affinities
+                        .zip(aff_i)
+                        .map(|(aff, a_i)| cosine(a_i, &aff[other]).max(0.0));
+                    cached_genetic_alike = val;
+                    val
+                }
+            };
+            let kin_weight = |alike: f64| -> f64 {
+                if repulsion > 0.0 {
+                    (1.0 + repulsion) * (alike * alike) - repulsion
+                } else {
+                    alike * alike
+                }
+            };
+            let need_adhesion = (!overlaps && adheres && in_reach)
+                || (in_reach && ((has_pcp && distance > 0.0) || has_vel));
+            let adhesion_weight = if need_adhesion {
+                match cadherin_inputs {
+                    Some((tags, cohesions)) => cadherin_sorting_weight(
+                        &tags[index],
+                        cohesions[index],
+                        &tags[other],
+                        cohesions[other],
+                        repulsion,
+                    ),
+                    None => get_genetic_alike().map_or(0.0, kin_weight),
+                }
+            } else {
+                0.0
+            };
+            let adhesion_kin_pos = adhesion_weight.max(0.0);
+            if overlaps {
+                let push = push_factor * (diameter - distance);
+                sum[0] += push * ux;
+                sum[1] += push * uy;
+                overlapping[0] += push * ux;
+                overlapping[1] += push * uy;
+            } else if adheres && in_reach {
+                let eff_weight = if adhesion_weight > 0.0 {
+                    let emt_pair = emt_factors
+                        .map_or(1.0, |factors| (factors[index] * factors[other]).sqrt());
+                    let pcp_factor = match pcp_inputs {
+                        Some((_, polarities, strengths, curvatures, _)) => {
+                            let alpha_ij = (strengths[index] * strengths[other]).sqrt();
+                            let beta_bar = 0.5 * (curvatures[index] + curvatures[other]);
+                            pcp_lateral_wedge_weight(
+                                polarities[index],
+                                polarities[other],
+                                r_hat,
+                                alpha_ij,
+                                beta_bar,
+                            )
+                        }
+                        None => 1.0,
                     };
-                    // `r_hat = (x_j - x_i) / d = -u_ij` for `d > 0`.
-                    let r_hat = [-ux, -uy];
-                    // Lazily evaluate the 32-D genetic cosine only when an
-                    // active consumer actually needs it (e.g. skip on pure
-                    // cadherin pairs with inactive trophallaxis, or on plain
-                    // overlap pairs without PCP/Notch/trophallaxis/alignment).
-                    let mut cached_genetic_alike: Option<f64> = None;
-                    let mut get_genetic_alike = || -> Option<f64> {
-                        if let Some(cached) = cached_genetic_alike {
-                            Some(cached)
-                        } else {
-                            let val = affinities
-                                .zip(aff_i)
-                                .map(|(aff, a_i)| cosine(a_i, &aff[other]).max(0.0));
-                            cached_genetic_alike = val;
-                            val
-                        }
-                    };
-                    let kin_weight = |alike: f64| -> f64 {
-                        if repulsion > 0.0 {
-                            (1.0 + repulsion) * (alike * alike) - repulsion
-                        } else {
-                            alike * alike
-                        }
-                    };
-                    let need_adhesion = (!overlaps && adheres && in_reach)
-                        || (in_reach && ((has_pcp && distance > 0.0) || has_vel));
-                    let adhesion_weight = if need_adhesion {
-                        match cadherin_inputs {
-                            Some((tags, cohesions)) => cadherin_sorting_weight(
-                                &tags[index],
-                                cohesions[index],
-                                &tags[other],
-                                cohesions[other],
-                                repulsion,
-                            ),
-                            None => get_genetic_alike().map_or(0.0, kin_weight),
-                        }
-                    } else {
-                        0.0
-                    };
-                    let adhesion_kin_pos = adhesion_weight.max(0.0);
-                    if overlaps {
-                        let push = push_factor * (diameter - distance);
-                        sum[0] += push * ux;
-                        sum[1] += push * uy;
-                        overlapping[0] += push * ux;
-                        overlapping[1] += push * uy;
-                    } else if adheres && in_reach {
-                        let eff_weight = if adhesion_weight > 0.0 {
-                            let emt_pair = emt_factors
-                                .map_or(1.0, |factors| (factors[index] * factors[other]).sqrt());
-                            let pcp_factor = match pcp_inputs {
-                                Some((_, polarities, strengths, curvatures, _)) => {
-                                    let alpha_ij = (strengths[index] * strengths[other]).sqrt();
-                                    let beta_bar = 0.5 * (curvatures[index] + curvatures[other]);
-                                    pcp_lateral_wedge_weight(
-                                        polarities[index],
-                                        polarities[other],
-                                        r_hat,
-                                        alpha_ij,
-                                        beta_bar,
-                                    )
-                                }
-                                None => 1.0,
-                            };
-                            emt_pair * adhesion_weight * pcp_factor
-                        } else {
-                            adhesion_weight
-                        };
-                        let push = -pull_factor
-                            * eff_weight
-                            * (distance - diameter)
-                            * (reach_distance - distance);
-                        sum[0] += push * ux;
-                        sum[1] += push * uy;
+                    emt_pair * adhesion_weight * pcp_factor
+                } else {
+                    adhesion_weight
+                };
+                let push = -pull_factor
+                    * eff_weight
+                    * (distance - diameter)
+                    * (reach_distance - distance);
+                sum[0] += push * ux;
+                sum[1] += push * uy;
+            }
+            if let Some((_, polarities, strengths, curvatures, _)) = pcp_inputs
+                && distance > 0.0
+                && in_reach
+                && adhesion_kin_pos > 0.0
+            {
+                let w_torque = adhesion_kin_pos * (1.0 - distance / reach_distance);
+                let alpha_ij = (strengths[index] * strengths[other]).sqrt();
+                let beta_bar = 0.5 * (curvatures[index] + curvatures[other]);
+                let pair_term = pcp_pair_torque_term(
+                    polarities[index],
+                    polarities[other],
+                    r_hat,
+                    beta_bar,
+                );
+                tau_neighbors += alpha_ij * w_torque * pair_term;
+            }
+            if let Some(states_h0) = notch_h0
+                && in_reach
+            {
+                let kin_pos = get_genetic_alike().map_or(0.0, kin_weight).max(0.0);
+                if kin_pos > 0.0 {
+                    notch_num += kin_pos * f64::from(states_h0[other]);
+                    notch_den += kin_pos;
+                }
+            }
+            if let Some((tr_cfg, energies)) = trophallaxis_inputs
+                && in_reach
+            {
+                let e_i = energies[index];
+                let e_j = energies[other];
+                if e_i > e_j && tr_scales[index] > 0.0 {
+                    let alike = get_genetic_alike().unwrap_or(0.0);
+                    let (q_out, _q_in, q_tax) = pair_trophallaxis_quanta(
+                        e_i,
+                        tr_scales[index],
+                        e_j,
+                        distance,
+                        reach_distance,
+                        alike,
+                        &tr_cfg,
+                    );
+                    if q_out > 0 {
+                        delta_k = delta_k.checked_sub(q_out).ok_or(CoreError::Overflow {
+                            quantity: "trophallaxis organism delta quanta",
+                        })?;
+                        let q_out_u = u64::try_from(q_out).map_err(|_| CoreError::Overflow {
+                            quantity: "trophallaxis outgoing quanta",
+                        })?;
+                        let q_tax_u = u64::try_from(q_tax).map_err(|_| CoreError::Overflow {
+                            quantity: "trophallaxis tax quanta",
+                        })?;
+                        body_out = body_out.checked_add(q_out_u).ok_or(CoreError::Overflow {
+                            quantity: "trophallaxis outgoing quanta",
+                        })?;
+                        body_tax = body_tax.checked_add(q_tax_u).ok_or(CoreError::Overflow {
+                            quantity: "trophallaxis tax quanta",
+                        })?;
                     }
-                    if let Some((_, polarities, strengths, curvatures, _)) = pcp_inputs
-                        && distance > 0.0
-                        && in_reach
-                        && adhesion_kin_pos > 0.0
-                    {
-                        let w_torque = adhesion_kin_pos * (1.0 - distance / reach_distance);
-                        let alpha_ij = (strengths[index] * strengths[other]).sqrt();
-                        let beta_bar = 0.5 * (curvatures[index] + curvatures[other]);
-                        let pair_term = pcp_pair_torque_term(
-                            polarities[index],
-                            polarities[other],
-                            r_hat,
-                            beta_bar,
-                        );
-                        tau_neighbors += alpha_ij * w_torque * pair_term;
+                } else if e_j > e_i && tr_scales[other] > 0.0 {
+                    let alike = get_genetic_alike().unwrap_or(0.0);
+                    let (_q_out, q_in, _q_tax) = pair_trophallaxis_quanta(
+                        e_j,
+                        tr_scales[other],
+                        e_i,
+                        distance,
+                        reach_distance,
+                        alike,
+                        &tr_cfg,
+                    );
+                    if q_in > 0 {
+                        delta_k = delta_k.checked_add(q_in).ok_or(CoreError::Overflow {
+                            quantity: "trophallaxis organism delta quanta",
+                        })?;
+                        let q_in_u = u64::try_from(q_in).map_err(|_| CoreError::Overflow {
+                            quantity: "trophallaxis incoming quanta",
+                        })?;
+                        body_in = body_in.checked_add(q_in_u).ok_or(CoreError::Overflow {
+                            quantity: "trophallaxis incoming quanta",
+                        })?;
                     }
-                    if let Some(states_h0) = notch_h0
-                        && in_reach
-                    {
-                        let kin_pos = get_genetic_alike().map_or(0.0, kin_weight).max(0.0);
-                        if kin_pos > 0.0 {
-                            notch_num += kin_pos * f64::from(states_h0[other]);
-                            notch_den += kin_pos;
+                }
+            }
+            if let Some((_, vels)) = velocity_inputs
+                && in_reach
+                && adhesion_kin_pos > 0.0
+            {
+                align_v[0] += adhesion_kin_pos * vels[other][0];
+                align_v[1] += adhesion_kin_pos * vels[other][1];
+                align_w += adhesion_kin_pos;
+            }
+            Ok(())
+        };
+
+        let cached_span = if has_neighbor_cache {
+            tr_spans.get(index).copied()
+        } else {
+            None
+        };
+        if let Some((span_start, span_len)) = cached_span
+            && span_len != u32::MAX
+        {
+            let s = span_start as usize;
+            let e = s + span_len as usize;
+            for entry in &tr_cache[s..e] {
+                let other = entry.other as usize;
+                let there = positions[other];
+                let dx = image(there[0], here_x, width, half_width);
+                let dy = image(there[1], here_y, height, half_height);
+                let pre_alike = (entry.alike >= 0.0).then_some(entry.alike);
+                process_pair(other, dx, dy, entry.distance, pre_alike)?;
+            }
+        } else {
+            let (bx, by) = (bin % bins_x, bin / bins_x);
+            let (rows, row_count) = neighbours(by, bins_y);
+            let (columns, column_count) = neighbours(bx, bins_x);
+            for &row in &rows[..row_count] {
+                let row_base = row * bins_x;
+                for &column in &columns[..column_count] {
+                    let neighbour = row_base + column;
+                    let lo = starts[neighbour] as usize;
+                    let hi = starts[neighbour + 1] as usize;
+                    for &other_u32 in &members[lo..hi] {
+                        let other = other_u32 as usize;
+                        if other == index {
+                            continue;
                         }
-                    }
-                    if let Some((tr_cfg, energies)) = trophallaxis_inputs
-                        && in_reach
-                    {
-                        let e_i = energies[index];
-                        let e_j = energies[other];
-                        if e_i > e_j && tr_scales[index] > 0.0 {
-                            let alike = get_genetic_alike().unwrap_or(0.0);
-                            let (q_out, _q_in, q_tax) = pair_trophallaxis_quanta(
-                                e_i,
-                                tr_scales[index],
-                                e_j,
-                                distance,
-                                reach_distance,
-                                alike,
-                                &tr_cfg,
-                            );
-                            if q_out > 0 {
-                                delta_k =
-                                    delta_k.checked_sub(q_out).ok_or(CoreError::Overflow {
-                                        quantity: "trophallaxis organism delta quanta",
-                                    })?;
-                                let q_out_u =
-                                    u64::try_from(q_out).map_err(|_| CoreError::Overflow {
-                                        quantity: "trophallaxis outgoing quanta",
-                                    })?;
-                                let q_tax_u =
-                                    u64::try_from(q_tax).map_err(|_| CoreError::Overflow {
-                                        quantity: "trophallaxis tax quanta",
-                                    })?;
-                                body_out =
-                                    body_out.checked_add(q_out_u).ok_or(CoreError::Overflow {
-                                        quantity: "trophallaxis outgoing quanta",
-                                    })?;
-                                body_tax =
-                                    body_tax.checked_add(q_tax_u).ok_or(CoreError::Overflow {
-                                        quantity: "trophallaxis tax quanta",
-                                    })?;
-                            }
-                        } else if e_j > e_i && tr_scales[other] > 0.0 {
-                            let alike = get_genetic_alike().unwrap_or(0.0);
-                            let (_q_out, q_in, _q_tax) = pair_trophallaxis_quanta(
-                                e_j,
-                                tr_scales[other],
-                                e_i,
-                                distance,
-                                reach_distance,
-                                alike,
-                                &tr_cfg,
-                            );
-                            if q_in > 0 {
-                                delta_k = delta_k.checked_add(q_in).ok_or(CoreError::Overflow {
-                                    quantity: "trophallaxis organism delta quanta",
-                                })?;
-                                let q_in_u =
-                                    u64::try_from(q_in).map_err(|_| CoreError::Overflow {
-                                        quantity: "trophallaxis incoming quanta",
-                                    })?;
-                                body_in =
-                                    body_in.checked_add(q_in_u).ok_or(CoreError::Overflow {
-                                        quantity: "trophallaxis incoming quanta",
-                                    })?;
-                            }
+                        // From the other body to this one (`u_ij = (x_i - x_j) / d`).
+                        let there = positions[other];
+                        let dx = image(there[0], here_x, width, half_width);
+                        if dx.abs() >= reach_distance {
+                            continue;
                         }
-                    }
-                    if let Some((_, vels)) = velocity_inputs
-                        && in_reach
-                        && adhesion_kin_pos > 0.0
-                    {
-                        align_v[0] += adhesion_kin_pos * vels[other][0];
-                        align_v[1] += adhesion_kin_pos * vels[other][1];
-                        align_w += adhesion_kin_pos;
+                        let dy = image(there[1], here_y, height, half_height);
+                        if dy.abs() >= reach_distance || dx * dx + dy * dy > beyond {
+                            continue;
+                        }
+                        // Commutative distance `|dx|.hypot(|dy|)` guarantees bit-identical
+                        // `distance` on both sides of pair `(i, j)`.
+                        let distance = dx.abs().hypot(dy.abs());
+                        process_pair(other, dx, dy, distance, None)?;
                     }
                 }
             }
@@ -2539,9 +2676,9 @@ pub struct CrowdingWork {
     /// and improves spatial-scan cache locality).
     positions: Vec<[f64; 2]>,
     /// Spatial counting-sort buffers used only by `local-neighbors-v1`.
-    bins: Vec<usize>,
-    starts: Vec<usize>,
-    members: Vec<usize>,
+    bins: Vec<u32>,
+    starts: Vec<u32>,
+    members: Vec<u32>,
     /// Cell occupancy buffers used only by `cell-occupancy-v1`.
     cell_counts: Vec<u32>,
     cells: Vec<usize>,
@@ -2685,6 +2822,11 @@ impl CrowdingWork {
         if count == 0 {
             return Ok(&self.counts);
         }
+        if count >= u32::MAX as usize {
+            return Err(CoreError::Overflow {
+                quantity: "crowding bodies",
+            });
+        }
         let (width, height) = (grid.world_width(), grid.world_height());
         let (bins_x, bins_y) = (bins_along(width, radius), bins_along(height, radius));
         let total_bins = bins_x * bins_y;
@@ -2698,11 +2840,15 @@ impl CrowdingWork {
                     detail: format!("[{x:?}, {y:?}] is not wrapped"),
                 });
             }
-            let bin = bin_of(y, height, bins_y) * bins_x + bin_of(x, width, bins_x);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "total_bins <= MAXIMUM_BINS_PER_SIDE^2 = 4_194_304 < u32::MAX"
+            )]
+            let bin = (bin_of(y, height, bins_y) * bins_x + bin_of(x, width, bins_x)) as u32;
             self.bins.push(bin);
-            self.starts[bin] += 1;
+            self.starts[bin as usize] += 1;
         }
-        let mut running = 0_usize;
+        let mut running = 0_u32;
         for slot in &mut self.starts[..total_bins] {
             running += *slot;
             *slot = running;
@@ -2711,18 +2857,25 @@ impl CrowdingWork {
         self.members.clear();
         self.members.resize(count, 0);
         for (index, &bin) in self.bins.iter().enumerate().rev() {
-            self.starts[bin] -= 1;
-            self.members[self.starts[bin]] = index;
+            let b = bin as usize;
+            self.starts[b] -= 1;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "count < u32::MAX checked above"
+            )]
+            let body = index as u32;
+            self.members[self.starts[b] as usize] = body;
         }
 
         let radius_sq = radius * radius;
-        let inside_sq = radius_sq * (1.0 - 1e-12);
+        let use_sq_bounds = radius_sq.is_finite() && radius_sq > 0.0;
+        let inside_sq = radius_sq * (1.0 - 1e-9);
         let beyond = radius_sq * (1.0 + 1e-9);
         let (half_width, half_height) = (0.5 * width, 0.5 * height);
         let (starts, members, bins) = (&*self.starts, &*self.members, &*self.bins);
         let neighbors_for = |index: usize| -> u32 {
             let [here_x, here_y] = positions[index];
-            let bin = bins[index];
+            let bin = bins[index] as usize;
             let (bx, by) = (bin % bins_x, bin / bins_x);
             let (rows, row_count) = neighbours(by, bins_y);
             let (columns, column_count) = neighbours(bx, bins_x);
@@ -2731,7 +2884,10 @@ impl CrowdingWork {
                 let row_base = row * bins_x;
                 for &column in &columns[..column_count] {
                     let neighbour = row_base + column;
-                    for &other in &members[starts[neighbour]..starts[neighbour + 1]] {
+                    let lo = starts[neighbour] as usize;
+                    let hi = starts[neighbour + 1] as usize;
+                    for &other_u32 in &members[lo..hi] {
+                        let other = other_u32 as usize;
                         if other == index {
                             continue;
                         }
@@ -2744,8 +2900,13 @@ impl CrowdingWork {
                         if dy.abs() >= radius {
                             continue;
                         }
-                        let dist_sq = dx * dx + dy * dy;
-                        if dist_sq < inside_sq || (dist_sq <= beyond && dx.hypot(dy) < radius) {
+                        let within = if use_sq_bounds {
+                            let dist_sq = dx * dx + dy * dy;
+                            dist_sq < inside_sq || (dist_sq <= beyond && dx.hypot(dy) < radius)
+                        } else {
+                            dx.hypot(dy) < radius
+                        };
+                        if within {
                             n = n.saturating_add(1);
                         }
                     }
@@ -3351,6 +3512,185 @@ mod tests {
         let one = bits(1);
         for workers in [2, 3, 4, 16] {
             assert_eq!(bits(workers), one, "{workers} workers");
+        }
+    }
+
+    #[test]
+    fn trophallaxis_fused_neighbor_cache_matches_uncached_and_worker_counts_bit_for_bit() {
+        let grid = grid(32.0, 32);
+        let rules = ContactRules {
+            diameter: 0.5,
+            stiffness: 0.5,
+            adhesion: 0.8,
+            range: 2.0,
+            sweeps: 1,
+            inhibits: true,
+            inhibition: 0.5,
+            repulsion: 0.25,
+        };
+        let count = 512;
+        let positions: Vec<[f64; 2]> = pile(count, 6.0)
+            .into_iter()
+            .map(|p| [p[0].rem_euclid(32.0), p[1].rem_euclid(32.0)])
+            .collect();
+        let ids: Vec<u64> = (1..=count as u64).collect();
+        let alive = vec![true; count];
+        let affinities: Vec<[f32; AFFINITY_TERMS]> =
+            (0..count).map(|i| axis(i % 4)).collect();
+        let energies: Vec<f64> = (0..count)
+            .map(|i| 0.5 + 3.0 * ((i * 37) % 101) as f64 / 100.0)
+            .collect();
+        let tr_params = TrophallaxisSweepParams {
+            dt: 0.05,
+            conductance_per_second: 1.5,
+            transfer_efficiency: 0.9,
+            reserve_energy: 1.0,
+            maximum_export_fraction: 0.25,
+            kin_cosine_exponent: 4,
+            kin_threshold: 0.5,
+        };
+        let bodies = Bodies {
+            positions: &positions,
+            ids: &ids,
+            alive: &alive,
+            affinities: Some(&affinities),
+        };
+        let context = Sweep1Context {
+            trophallaxis: Some(tr_params),
+            energies: Some(&energies),
+            ..Sweep1Context::default()
+        };
+
+        // Baseline: uncached (ContactScratch::default() has 0 neighbor_cache capacity).
+        let mut uncached_disp = Vec::new();
+        let mut uncached_deltas = Vec::new();
+        let mut uncached_summary = TrophallaxisSummary::default();
+        let mut uncached_scratch = ContactScratch::default();
+        relax_sweep1_with_context(
+            &grid,
+            &rules,
+            bodies,
+            &context,
+            Sweep1Output {
+                displacements: &mut uncached_disp,
+                next_polarities: None,
+                neighbor_h0: None,
+                trophallaxis_delta_quanta: Some(&mut uncached_deltas),
+                trophallaxis_summary: Some(&mut uncached_summary),
+                next_velocities: None,
+            },
+            &mut uncached_scratch,
+            1,
+        )
+        .expect("uncached sweep1");
+        assert!(
+            uncached_summary.total_out_quanta > 0,
+            "fixture must exercise live trophallaxis transfers"
+        );
+        assert_eq!(
+            uncached_summary.total_out_quanta,
+            uncached_summary.total_in_quanta + uncached_summary.total_tax_quanta
+        );
+
+        // Cached (ContactWork pre-reserves neighbor_cache) across workers 1, 2, 4,
+        // plus tiny forced-overflow cache (capacity = 32 entries).
+        for (label, workers, tiny_cap) in [
+            ("cached w=1", 1, None),
+            ("cached w=2", 2, None),
+            ("cached w=4", 4, None),
+            ("overflow w=1", 1, Some(32)),
+            ("overflow w=4", 4, Some(32)),
+        ] {
+            let mut work = ContactWork::with_capacity_v2_features(
+                &grid,
+                &rules,
+                count,
+                ContactV2Buffers {
+                    trophallaxis: true,
+                    ..ContactV2Buffers::default()
+                },
+            )
+            .expect("contact work");
+            if let Some(cap) = tiny_cap {
+                work.scratch.neighbor_cache = Vec::with_capacity(cap);
+            }
+            let bytes_before = work.allocated_bytes();
+            work.positions.extend_from_slice(&positions);
+            work.ids.extend_from_slice(&ids);
+            work.alive.extend_from_slice(&alive);
+            work.affinities.extend_from_slice(&affinities);
+            work.energies.extend_from_slice(&energies);
+            work.relax_v2_features(
+                &grid,
+                &rules,
+                ContactV2Sweep {
+                    trophallaxis: Some(tr_params),
+                    ..ContactV2Sweep::default()
+                },
+                workers,
+            )
+            .expect(label);
+            assert_eq!(work.allocated_bytes(), bytes_before, "{label}: allocated");
+            assert_eq!(work.trophallaxis_summary, uncached_summary, "{label}: summary");
+            assert_eq!(
+                work.trophallaxis_delta_quanta, uncached_deltas,
+                "{label}: deltas"
+            );
+            for (i, (got, want)) in work
+                .displacements
+                .iter()
+                .zip(&uncached_disp)
+                .enumerate()
+            {
+                assert_eq!(
+                    (got[0].to_bits(), got[1].to_bits()),
+                    (want[0].to_bits(), want[1].to_bits()),
+                    "{label}: body {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crowding_local_neighbors_u32_bins_and_boundary_band_match_exact_hypot() {
+        let grid = grid(16.0, 16);
+        let radius = 1.25_f64;
+        // Include pairs well inside, right around radius*(1 +/- 1e-10), and outside.
+        let mut positions = vec![
+            [8.0, 8.0],
+            [8.0 + radius * (1.0 - 1e-10), 8.0],
+            [8.0 + radius * (1.0 + 1e-10), 8.0],
+            [8.0, 8.0 + radius * (1.0 - 1e-12)],
+            [8.0, 8.0 + radius],
+            [8.0 + 0.5, 8.0 + 0.5],
+        ];
+        positions.extend(
+            pile(120, 4.0)
+                .into_iter()
+                .map(|p| [p[0].rem_euclid(16.0), p[1].rem_euclid(16.0)]),
+        );
+        let mut expected = vec![0_u32; positions.len()];
+        for (i, &[xi, yi]) in positions.iter().enumerate() {
+            for (j, &[xj, yj]) in positions.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let dx = image(xj, xi, 16.0, 8.0);
+                let dy = image(yj, yi, 16.0, 8.0);
+                if dx.hypot(dy) < radius {
+                    expected[i] += 1;
+                }
+            }
+        }
+        let mut work =
+            CrowdingWork::with_capacity_local_neighbors(&grid, radius, positions.len()).expect("cw");
+        let bytes_before = work.allocated_bytes();
+        for workers in [1, 4] {
+            let got = work
+                .count_local_neighbors(&grid, radius, &positions, workers)
+                .expect("count");
+            assert_eq!(got, expected.as_slice(), "workers={workers}");
+            assert_eq!(work.allocated_bytes(), bytes_before, "workers={workers}");
         }
     }
 }

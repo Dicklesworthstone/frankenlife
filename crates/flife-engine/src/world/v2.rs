@@ -225,6 +225,9 @@ pub struct V2Rules {
     trail_plan: Option<TransportPlan>,
     senescence: Option<SenescenceRules>,
     emission: EmissionV2Rules,
+    /// Precomputed constant `expm1_neg(dt / recovery_time_seconds)` for
+    /// `vesicle-readiness-v1` (avoids 11 sequential `fdiv`s per organism per tick).
+    emission_recovery_alpha: Option<f64>,
     motor: Option<MotorSteeringConstants>,
     budding: Option<BuddingRules>,
     crowding: Option<CrowdingRules>,
@@ -295,6 +298,7 @@ impl V2Rules {
                 maximum_multiplier: v2.senescence.maximum_multiplier,
             });
         let emission = EmissionV2Rules::from_config(config)?;
+        let emission_recovery_alpha = emission.recovery_alpha(config.report().timestep)?;
         let motor = v2_config
             .as_ref()
             .filter(|v2| v2.is_enabled(V2Feature::So2Motor))
@@ -705,6 +709,7 @@ impl V2Rules {
             trail_plan,
             senescence,
             emission,
+            emission_recovery_alpha,
             motor,
             budding,
             crowding,
@@ -838,6 +843,13 @@ impl V2Rules {
     #[must_use]
     pub const fn emission(&self) -> &EmissionV2Rules {
         &self.emission
+    }
+
+    /// Precomputed `expm1_neg(dt / recovery_time_seconds)` for
+    /// `vesicle-readiness-v1` excitable recovery, if active.
+    #[must_use]
+    pub const fn emission_recovery_alpha(&self) -> Option<f64> {
+        self.emission_recovery_alpha
     }
 
     /// Resolved `V2-05` (`so2-motor`) steering constants, if enabled.

@@ -29,7 +29,10 @@ use flife_core::ids::OrganismId;
 use flife_core::ledger::{EnergyBudget, Payment};
 use flife_core::numerics::{expm1_neg, sigmoid, tanh};
 use flife_core::{CoreError, TimeStep, V2Feature, ValidatedConfig};
-use flife_field::{Deposits, ExchangeKernel, FieldGrid, split_dual_carrier_emission};
+use flife_field::{
+    Deposits, ExchangeKernel, ExchangeScratch, ExchangeStencil, FieldGrid,
+    split_dual_carrier_emission,
+};
 use flife_neural::Emission;
 
 /// The emission position this module implements.
@@ -250,6 +253,33 @@ impl EmissionV2Rules {
         }
     }
 
+    /// Precompute the tick-invariant exponential recovery factor
+    /// `α_rec = 1 − exp(−Δt / τ_rec)` for `vesicle-readiness-v1`, avoiding one
+    /// [`expm1_neg`] call per non-firing organism per tick (`V2-04`).
+    ///
+    /// Returns `Ok(None)` when `excitable` is disabled or `tick-cooldown-v1`.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] when `dt / recovery_time_seconds` is out
+    /// of range for [`expm1_neg`].
+    pub fn recovery_alpha(&self, step: TimeStep) -> Result<Option<f64>, CoreError> {
+        let Some(ExcitableMode::VesicleReadiness {
+            recovery_time_seconds,
+            ..
+        }) = self.excitable
+        else {
+            return Ok(None);
+        };
+        let dt = step.seconds_per_tick();
+        let alpha = expm1_neg(dt / recovery_time_seconds).ok_or_else(|| {
+            CoreError::NumericalInvalid {
+                quantity: "excitable recovery rate",
+                detail: format!("dt={dt}, tau={recovery_time_seconds} out of range"),
+            }
+        })?;
+        Ok(Some(alpha))
+    }
+
     /// Resolve deposit coordinate, effective emission action, surplus floor,
     /// and next-tick excitable state for one organism at Phase 7 emission.
     ///
@@ -268,6 +298,29 @@ impl EmissionV2Rules {
         exhausted: bool,
         emission: Option<&Emission>,
         ctx: &EmissionContext,
+    ) -> Result<EmissionPlan, CoreError> {
+        self.plan_with_recovery_alpha(grid, step, available, exhausted, emission, ctx, None)
+    }
+
+    /// [`EmissionV2Rules::plan`] using an optional precomputed
+    /// `recovery_alpha` from [`EmissionV2Rules::recovery_alpha`], bit-identical
+    /// to [`EmissionV2Rules::plan`].
+    ///
+    /// # Errors
+    /// As [`EmissionV2Rules::plan`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors EmissionV2Rules::plan plus hoisted tick-invariant recovery_alpha"
+    )]
+    pub fn plan_with_recovery_alpha(
+        &self,
+        grid: &FieldGrid,
+        step: TimeStep,
+        available: f64,
+        exhausted: bool,
+        emission: Option<&Emission>,
+        ctx: &EmissionContext,
+        recovery_alpha: Option<f64>,
     ) -> Result<EmissionPlan, CoreError> {
         let energy_floor = self.energy_floor();
         let surplus = if energy_floor == 0.0 {
@@ -297,12 +350,15 @@ impl EmissionV2Rules {
                     });
                 }
                 let recover = || -> Result<f32, CoreError> {
-                    let alpha = expm1_neg(dt / recovery_time_seconds).ok_or_else(|| {
-                        CoreError::NumericalInvalid {
-                            quantity: "excitable recovery rate",
-                            detail: format!("dt={dt}, tau={recovery_time_seconds} out of range"),
-                        }
-                    })?;
+                    let alpha = match recovery_alpha {
+                        Some(precomputed) => precomputed,
+                        None => expm1_neg(dt / recovery_time_seconds).ok_or_else(|| {
+                            CoreError::NumericalInvalid {
+                                quantity: "excitable recovery rate",
+                                detail: format!("dt={dt}, tau={recovery_time_seconds} out of range"),
+                            }
+                        })?,
+                    };
                     let recovered = (r + (1.0 - r) * alpha).min(1.0);
                     #[expect(
                         clippy::cast_possible_truncation,
@@ -532,6 +588,76 @@ pub struct EmissionPlan {
     pub next_cooldown_deadline: Tick,
 }
 
+/// Reusable single-organism exchange footprint cache shared across Phase 6/7
+/// deposit sites (metabolic byproducts, Carrier-0 emissions, Carrier-1 trail
+/// emissions) so a fixed-world Gaussian or CIC stencil is computed at most once
+/// per unique `(x, y)` coordinate and never allocates an ephemeral
+/// [`ExchangeScratch`] per deposit (`FL-043`, `FL-053`).
+#[derive(Debug, Default)]
+pub struct CachedFootprint {
+    position_bits: Option<[u64; 2]>,
+    stencil: Option<ExchangeStencil>,
+}
+
+impl CachedFootprint {
+    /// Empty cache for one organism's Phase 6/7 settlement.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            position_bits: None,
+            stencil: None,
+        }
+    }
+
+    /// Stage one deposit at `position` under `exchange`, computing the
+    /// exchange footprint into `self` / `scratch` only when `position` differs
+    /// bitwise from the cached coordinate.
+    ///
+    /// # Errors
+    /// As [`ExchangeStencil::at`], [`ExchangeKernel::footprint_into`],
+    /// [`Deposits::push_stencil`], or [`Deposits::push_footprint`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors Deposits::push_with plus reusable ExchangeScratch"
+    )]
+    pub fn push_deposit(
+        &mut self,
+        deposits: &mut Deposits,
+        grid: &FieldGrid,
+        exchange: ExchangeKernel,
+        organism: OrganismId,
+        position: [f64; 2],
+        paid: f64,
+        offered: f64,
+        direction: &[f64],
+        scratch: &mut ExchangeScratch,
+    ) -> Result<(), CoreError> {
+        let bits = [position[0].to_bits(), position[1].to_bits()];
+        match exchange {
+            ExchangeKernel::GridCicV1 => {
+                let stencil = match (self.position_bits, self.stencil) {
+                    (Some(cached), Some(stencil)) if cached == bits => stencil,
+                    _ => {
+                        let stencil = ExchangeStencil::at(grid, position)?;
+                        self.position_bits = Some(bits);
+                        self.stencil = Some(stencil);
+                        stencil
+                    }
+                };
+                deposits.push_stencil(&stencil, organism, paid, offered, direction)
+            }
+            ExchangeKernel::FixedWorldGaussianV1 { .. } => {
+                if self.position_bits != Some(bits) {
+                    exchange.footprint_into(grid, position, scratch)?;
+                    self.position_bits = Some(bits);
+                    self.stencil = None;
+                }
+                deposits.push_footprint(scratch.cells(), organism, paid, offered, direction)
+            }
+        }
+    }
+}
+
 /// The `[emission]` transfer rule.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EmissionPolicy {
@@ -659,6 +785,44 @@ impl EmissionPolicy {
         budget: &mut EnergyBudget,
         deposits: &mut Deposits,
     ) -> Result<EmissionSettlement, CoreError> {
+        let mut scratch = ExchangeScratch::new();
+        let mut footprint = CachedFootprint::new();
+        self.emit_with_floor_reusing_footprint(
+            grid,
+            exchange,
+            organism,
+            position,
+            emission,
+            energy_floor,
+            budget,
+            deposits,
+            &mut scratch,
+            &mut footprint,
+        )
+    }
+
+    /// [`EmissionPolicy::emit_with_floor`] reusing a lane's pre-reserved
+    /// [`ExchangeScratch`] and per-organism [`CachedFootprint`].
+    ///
+    /// # Errors
+    /// As [`EmissionPolicy::emit_with_floor`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors emit_with_floor plus lane ExchangeScratch and CachedFootprint"
+    )]
+    pub fn emit_with_floor_reusing_footprint(
+        &self,
+        grid: &FieldGrid,
+        exchange: ExchangeKernel,
+        organism: OrganismId,
+        position: [f64; 2],
+        emission: Option<&Emission>,
+        energy_floor: f64,
+        budget: &mut EnergyBudget,
+        deposits: &mut Deposits,
+        scratch: &mut ExchangeScratch,
+        footprint: &mut CachedFootprint,
+    ) -> Result<EmissionSettlement, CoreError> {
         if !energy_floor.is_finite() || energy_floor < 0.0 {
             return Err(CoreError::NumericalInvalid {
                 quantity: "emission energy floor",
@@ -699,7 +863,8 @@ impl EmissionPolicy {
             return Ok(nothing);
         }
         let offered = self.efficiency * requested;
-        deposits.push_with(
+        footprint.push_deposit(
+            deposits,
             grid,
             exchange,
             organism,
@@ -707,6 +872,7 @@ impl EmissionPolicy {
             requested,
             offered,
             &emission.direction,
+            scratch,
         )?;
         let cost = budget.pay(requested)?;
         Ok(EmissionSettlement {
@@ -738,15 +904,59 @@ impl EmissionPolicy {
         budget: &mut EnergyBudget,
         deposits: &mut Deposits,
     ) -> Result<(EmissionSettlement, EmissionPlan), CoreError> {
-        let plan = v2.plan(
+        let mut scratch = ExchangeScratch::new();
+        let mut footprint = CachedFootprint::new();
+        self.emit_v2_reusing_footprint(
+            grid,
+            exchange,
+            step,
+            v2,
+            None,
+            organism,
+            emission,
+            ctx,
+            budget,
+            deposits,
+            &mut scratch,
+            &mut footprint,
+        )
+    }
+
+    /// [`EmissionPolicy::emit_v2`] reusing a hoisted `recovery_alpha`, a
+    /// lane's pre-reserved [`ExchangeScratch`], and a per-organism
+    /// [`CachedFootprint`].
+    ///
+    /// # Errors
+    /// As [`EmissionPolicy::emit_v2`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Phase 7 emission stage inputs plus V2-04 rules, hoisted recovery_alpha, and footprint cache"
+    )]
+    pub fn emit_v2_reusing_footprint(
+        &self,
+        grid: &FieldGrid,
+        exchange: ExchangeKernel,
+        step: TimeStep,
+        v2: &EmissionV2Rules,
+        recovery_alpha: Option<f64>,
+        organism: OrganismId,
+        emission: Option<&Emission>,
+        ctx: &EmissionContext,
+        budget: &mut EnergyBudget,
+        deposits: &mut Deposits,
+        scratch: &mut ExchangeScratch,
+        footprint: &mut CachedFootprint,
+    ) -> Result<(EmissionSettlement, EmissionPlan), CoreError> {
+        let plan = v2.plan_with_recovery_alpha(
             grid,
             step,
             budget.remaining(),
             budget.is_exhausted(),
             emission,
             ctx,
+            recovery_alpha,
         )?;
-        let settlement = self.emit_with_floor(
+        let settlement = self.emit_with_floor_reusing_footprint(
             grid,
             exchange,
             organism,
@@ -755,6 +965,8 @@ impl EmissionPolicy {
             plan.energy_floor,
             budget,
             deposits,
+            scratch,
+            footprint,
         )?;
         Ok((settlement, plan))
     }
@@ -762,7 +974,9 @@ impl EmissionPolicy {
     /// Dual-carrier (`V2-15`) variant of [`EmissionPolicy::emit_with_floor`]:
     /// splits the single paid emission `requested` between Carrier 0 (`24`
     /// metabolic channels, `deposits`) and Carrier 1 (`8` non-destructive trail
-    /// channels, `trail_deposits`) via [`split_dual_carrier_emission`].
+    /// channels, `trail_deposits`) via [`split_dual_carrier_emission`],
+    /// computing the exchange footprint once and sharing it across both
+    /// carriers.
     ///
     /// # Errors
     /// As [`EmissionPolicy::emit_with_floor`] and [`split_dual_carrier_emission`].
@@ -782,6 +996,48 @@ impl EmissionPolicy {
         budget: &mut EnergyBudget,
         deposits: &mut Deposits,
         trail_deposits: &mut Deposits,
+    ) -> Result<EmissionSettlement, CoreError> {
+        let mut scratch = ExchangeScratch::new();
+        let mut footprint = CachedFootprint::new();
+        self.emit_dual_with_floor_reusing_footprint(
+            grid,
+            exchange,
+            organism,
+            position,
+            emission,
+            energy_floor,
+            trail_share,
+            budget,
+            deposits,
+            trail_deposits,
+            &mut scratch,
+            &mut footprint,
+        )
+    }
+
+    /// [`EmissionPolicy::emit_dual_with_floor`] reusing a lane's pre-reserved
+    /// [`ExchangeScratch`] and per-organism [`CachedFootprint`].
+    ///
+    /// # Errors
+    /// As [`EmissionPolicy::emit_dual_with_floor`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors emit_dual_with_floor plus lane ExchangeScratch and CachedFootprint"
+    )]
+    pub fn emit_dual_with_floor_reusing_footprint(
+        &self,
+        grid: &FieldGrid,
+        exchange: ExchangeKernel,
+        organism: OrganismId,
+        position: [f64; 2],
+        emission: Option<&Emission>,
+        energy_floor: f64,
+        trail_share: f64,
+        budget: &mut EnergyBudget,
+        deposits: &mut Deposits,
+        trail_deposits: &mut Deposits,
+        scratch: &mut ExchangeScratch,
+        footprint: &mut CachedFootprint,
     ) -> Result<EmissionSettlement, CoreError> {
         if !energy_floor.is_finite() || energy_floor < 0.0 {
             return Err(CoreError::NumericalInvalid {
@@ -826,7 +1082,8 @@ impl EmissionPolicy {
             trail_share,
             &emission.direction,
         )?;
-        deposits.push_with(
+        footprint.push_deposit(
+            deposits,
             grid,
             exchange,
             organism,
@@ -834,8 +1091,10 @@ impl EmissionPolicy {
             split.paid_0,
             split.offered_0,
             &split.direction_0,
+            scratch,
         )?;
-        trail_deposits.push_with(
+        footprint.push_deposit(
+            trail_deposits,
             grid,
             exchange,
             organism,
@@ -843,6 +1102,7 @@ impl EmissionPolicy {
             split.paid_1,
             split.offered_1,
             &split.direction_1,
+            scratch,
         )?;
         let cost = budget.pay(requested)?;
         Ok(EmissionSettlement {
@@ -874,15 +1134,63 @@ impl EmissionPolicy {
         deposits: &mut Deposits,
         trail_deposits: &mut Deposits,
     ) -> Result<(EmissionSettlement, EmissionPlan), CoreError> {
-        let plan = v2.plan(
+        let mut scratch = ExchangeScratch::new();
+        let mut footprint = CachedFootprint::new();
+        self.emit_v2_dual_reusing_footprint(
+            grid,
+            exchange,
+            step,
+            v2,
+            None,
+            organism,
+            emission,
+            ctx,
+            trail_share,
+            budget,
+            deposits,
+            trail_deposits,
+            &mut scratch,
+            &mut footprint,
+        )
+    }
+
+    /// [`EmissionPolicy::emit_v2_dual`] reusing a hoisted `recovery_alpha`, a
+    /// lane's pre-reserved [`ExchangeScratch`], and a per-organism
+    /// [`CachedFootprint`].
+    ///
+    /// # Errors
+    /// As [`EmissionPolicy::emit_v2_dual`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Phase 7 dual-carrier emission stage inputs plus V2-04 rules, hoisted recovery_alpha, and footprint cache"
+    )]
+    pub fn emit_v2_dual_reusing_footprint(
+        &self,
+        grid: &FieldGrid,
+        exchange: ExchangeKernel,
+        step: TimeStep,
+        v2: &EmissionV2Rules,
+        recovery_alpha: Option<f64>,
+        organism: OrganismId,
+        emission: Option<&Emission>,
+        ctx: &EmissionContext,
+        trail_share: f64,
+        budget: &mut EnergyBudget,
+        deposits: &mut Deposits,
+        trail_deposits: &mut Deposits,
+        scratch: &mut ExchangeScratch,
+        footprint: &mut CachedFootprint,
+    ) -> Result<(EmissionSettlement, EmissionPlan), CoreError> {
+        let plan = v2.plan_with_recovery_alpha(
             grid,
             step,
             budget.remaining(),
             budget.is_exhausted(),
             emission,
             ctx,
+            recovery_alpha,
         )?;
-        let settlement = self.emit_dual_with_floor(
+        let settlement = self.emit_dual_with_floor_reusing_footprint(
             grid,
             exchange,
             organism,
@@ -893,6 +1201,8 @@ impl EmissionPolicy {
             budget,
             deposits,
             trail_deposits,
+            scratch,
+            footprint,
         )?;
         Ok((settlement, plan))
     }

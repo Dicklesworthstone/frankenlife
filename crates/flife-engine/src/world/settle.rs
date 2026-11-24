@@ -267,13 +267,13 @@ fn settle_on(
     // and what its genome gives maintenance and motion.
     let mut live = population.ascending();
     for (index, organism) in working.iter().enumerate() {
-        let genome = live
-            .next(organism.committed.id)
-            .0
-            .ok_or_else(|| CoreError::StateConflict {
-                operation: "read genome",
-                detail: format!("{} has no genome", organism.committed.id),
-            })?;
+        let genome =
+            live.next(organism.committed.id)
+                .0
+                .ok_or_else(|| CoreError::StateConflict {
+                    operation: "read genome",
+                    detail: format!("{} has no genome", organism.committed.id),
+                })?;
         let traits = genome.traits();
         let first = packets.len();
         for packet in by_demand

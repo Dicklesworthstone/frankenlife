@@ -4,9 +4,13 @@
 //! These run on every host with a CPU batch backend; the Metal backend's own
 //! world test is in `flife-backend-metal`.
 
+use std::num::NonZeroUsize;
+
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
-use flife_neural::{ControllerBackend, ControllerJob, ControllerScratch, RawOutputs};
+use flife_neural::{
+    ControllerBackend, ControllerJob, ControllerScratch, FlatControllerJob, FlatOutputs, RawOutputs,
+};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 
@@ -209,4 +213,114 @@ fn a_failing_backend_is_dropped_and_the_world_is_unchanged() {
     // Three batched ticks, then the reference alone.
     assert!(report.batched + report.deferred < evaluated);
     assert!(report.batched + report.deferred > 0);
+}
+
+/// Reference controller implementing the Round-2 `supports_flat_f32` /
+/// `evaluate_flat_f32` fast path, deferring every `defer_every`-th job.
+#[derive(Debug, Default)]
+struct FlatReferenceBatch {
+    defer_every: usize,
+    scratch: ControllerScratch,
+}
+
+impl ControllerBackend for FlatReferenceBatch {
+    fn describe(&self) -> String {
+        "flat f32 reference batch (test)".to_owned()
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.scratch.allocated_bytes()
+    }
+
+    fn forget(&mut self) {}
+
+    fn supports_flat_f32(&self) -> bool {
+        true
+    }
+
+    fn evaluate(
+        &mut self,
+        _jobs: &[ControllerJob<'_>],
+        _outputs: &mut Vec<Option<RawOutputs>>,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::StateConflict {
+            operation: "test flat backend",
+            detail: "supports_flat_f32 backend should be called via evaluate_flat_f32".to_owned(),
+        })
+    }
+
+    fn evaluate_flat_f32(
+        &mut self,
+        jobs: &[FlatControllerJob<'_>],
+        input_width: usize,
+        inputs_f32: &[f32],
+        inputs_finite: &[u8],
+        outputs: &mut FlatOutputs,
+    ) -> Result<(), CoreError> {
+        let Some(first) = jobs.first() else {
+            outputs.clear();
+            return Ok(());
+        };
+        let out_w = first.controller.topology().raw_output_width();
+        outputs.prepare(jobs.len(), out_w)?;
+        let mut wide = vec![0.0_f64; input_width];
+        for (index, (job, &finite)) in jobs.iter().zip(inputs_finite).enumerate() {
+            if finite == 0 || (self.defer_every > 0 && index % self.defer_every == 0) {
+                continue;
+            }
+            let src = &inputs_f32[index * input_width..(index + 1) * input_width];
+            for (dst, &v) in wide.iter_mut().zip(src) {
+                *dst = f64::from(v);
+            }
+            if let Ok(raw) = job.controller.evaluate_raw(&wide, &mut self.scratch) {
+                let dst = &mut outputs.values[index * out_w..(index + 1) * out_w];
+                dst.copy_from_slice(raw.as_slice());
+                outputs.valid[index] = 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn flat_f32_batched_world_matches_reference_bit_for_bit_and_never_grows() {
+    let config = config();
+    for workers in [1, 4] {
+        let w = NonZeroUsize::new(workers).expect("nonzero");
+        let mut reference = found(&config);
+        let mut batched = found(&config);
+        reference.set_cpu_workers(w).expect("workers");
+        batched.set_cpu_workers(w).expect("workers");
+
+        let before = batched.allocated();
+        let batched_bytes = batched.batched_bytes();
+        batched.set_controller_backend(Some(Box::new(FlatReferenceBatch {
+            defer_every: 5,
+            ..FlatReferenceBatch::default()
+        })));
+        assert_eq!(batched.controller_report().failure, None);
+        let installed = batched.allocated();
+        assert_eq!(
+            installed.scratch,
+            before.scratch + batched_bytes,
+            "workers={workers}"
+        );
+
+        let (difference, evaluated, births) = race(&mut reference, &mut batched, 200);
+        assert_eq!(difference, None, "workers={workers}: flat-f32 diverged");
+        assert!(births > 0, "workers={workers}: must exercise newborns");
+        assert_eq!(
+            batched.allocated().scratch,
+            installed.scratch,
+            "workers={workers}: flat-f32 scratch grew"
+        );
+        let report = batched.controller_report();
+        assert_eq!(report.failure, None);
+        assert_eq!(report.reference_ticks, 0);
+        assert_eq!(report.batched + report.deferred, evaluated);
+        assert!(report.deferred > 0 && report.batched > 3 * report.deferred);
+
+        batched.set_controller_backend(None);
+        assert_eq!(batched.allocated().scratch, before.scratch);
+    }
 }

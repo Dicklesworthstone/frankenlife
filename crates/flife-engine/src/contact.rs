@@ -2023,123 +2023,125 @@ pub fn relax_sweep1_with_context(
             neighbor_cache.resize(cache_cap, CachedNeighbor::default());
         }
         has_neighbor_cache = cache_cap > 0;
-        let fill_scales_and_cache = |first: usize,
-                                     out_scales: &mut [f64],
-                                     out_spans: &mut [(u32, u32)],
-                                     cache_base: usize,
-                                     cache_slice: &mut [CachedNeighbor]| {
-            let mut cursor = 0_usize;
-            let cache_len = cache_slice.len();
-            for (offset, (scale_slot, span_slot)) in
-                out_scales.iter_mut().zip(out_spans.iter_mut()).enumerate()
-            {
-                let index = first + offset;
-                let bin = bins[index];
-                if bin == u32::MAX {
-                    *scale_slot = 0.0;
-                    *span_slot = (0, u32::MAX);
-                    continue;
-                }
-                let e_i = energies[index];
-                let cap = tr_cfg.maximum_export_fraction * (e_i - tr_cfg.reserve_energy).max(0.0);
-                if cap <= 0.0 {
-                    *scale_slot = 0.0;
-                    *span_slot = (0, u32::MAX);
-                    continue;
-                }
-                let bin = bin as usize;
-                let [here_x, here_y] = positions[index];
-                let aff_i = &aff[index];
-                let (bx, by) = (bin % bins_x, bin / bins_x);
-                let (rows, row_count) = neighbours(by, bins_y);
-                let (columns, column_count) = neighbours(bx, bins_x);
-                let mut out_sum = CompensatedSum::ZERO;
-                let span_start = cursor;
-                let mut can_cache = cache_len > 0;
-                for &row in &rows[..row_count] {
-                    let row_base = row * bins_x;
-                    for &column in &columns[..column_count] {
-                        let neighbour = row_base + column;
-                        let lo = starts[neighbour] as usize;
-                        let hi = starts[neighbour + 1] as usize;
-                        for &other_u32 in &members[lo..hi] {
-                            let other = other_u32 as usize;
-                            if other == index {
-                                continue;
-                            }
-                            let there = positions[other];
-                            let dx = image(there[0], here_x, width, half_width);
-                            if dx.abs() >= reach_distance {
-                                continue;
-                            }
-                            let dy = image(there[1], here_y, height, half_height);
-                            if dy.abs() >= reach_distance || dx * dx + dy * dy > beyond {
-                                continue;
-                            }
-                            let distance = dx.abs().hypot(dy.abs());
-                            let in_reach = distance < reach_distance;
-                            let overlaps = distance < diameter;
-                            if !overlaps && !in_reach {
-                                continue;
-                            }
-                            let e_j = energies[other];
-                            let alike = if in_reach && e_j < e_i {
-                                let a = cosine(aff_i, &aff[other]).max(0.0);
-                                let raw = pair_trophallaxis_raw(
-                                    e_i,
-                                    e_j,
-                                    distance,
-                                    reach_distance,
-                                    a,
-                                    &tr_cfg,
-                                );
-                                if raw > 0.0 {
-                                    out_sum.add(raw);
+        let fill_scales_and_cache =
+            |first: usize,
+             out_scales: &mut [f64],
+             out_spans: &mut [(u32, u32)],
+             cache_base: usize,
+             cache_slice: &mut [CachedNeighbor]| {
+                let mut cursor = 0_usize;
+                let cache_len = cache_slice.len();
+                for (offset, (scale_slot, span_slot)) in
+                    out_scales.iter_mut().zip(out_spans.iter_mut()).enumerate()
+                {
+                    let index = first + offset;
+                    let bin = bins[index];
+                    if bin == u32::MAX {
+                        *scale_slot = 0.0;
+                        *span_slot = (0, u32::MAX);
+                        continue;
+                    }
+                    let e_i = energies[index];
+                    let cap =
+                        tr_cfg.maximum_export_fraction * (e_i - tr_cfg.reserve_energy).max(0.0);
+                    if cap <= 0.0 {
+                        *scale_slot = 0.0;
+                        *span_slot = (0, u32::MAX);
+                        continue;
+                    }
+                    let bin = bin as usize;
+                    let [here_x, here_y] = positions[index];
+                    let aff_i = &aff[index];
+                    let (bx, by) = (bin % bins_x, bin / bins_x);
+                    let (rows, row_count) = neighbours(by, bins_y);
+                    let (columns, column_count) = neighbours(bx, bins_x);
+                    let mut out_sum = CompensatedSum::ZERO;
+                    let span_start = cursor;
+                    let mut can_cache = cache_len > 0;
+                    for &row in &rows[..row_count] {
+                        let row_base = row * bins_x;
+                        for &column in &columns[..column_count] {
+                            let neighbour = row_base + column;
+                            let lo = starts[neighbour] as usize;
+                            let hi = starts[neighbour + 1] as usize;
+                            for &other_u32 in &members[lo..hi] {
+                                let other = other_u32 as usize;
+                                if other == index {
+                                    continue;
                                 }
-                                a
-                            } else {
-                                -1.0
-                            };
-                            if can_cache {
-                                if cursor < cache_len {
-                                    cache_slice[cursor] = CachedNeighbor {
+                                let there = positions[other];
+                                let dx = image(there[0], here_x, width, half_width);
+                                if dx.abs() >= reach_distance {
+                                    continue;
+                                }
+                                let dy = image(there[1], here_y, height, half_height);
+                                if dy.abs() >= reach_distance || dx * dx + dy * dy > beyond {
+                                    continue;
+                                }
+                                let distance = dx.abs().hypot(dy.abs());
+                                let in_reach = distance < reach_distance;
+                                let overlaps = distance < diameter;
+                                if !overlaps && !in_reach {
+                                    continue;
+                                }
+                                let e_j = energies[other];
+                                let alike = if in_reach && e_j < e_i {
+                                    let a = cosine(aff_i, &aff[other]).max(0.0);
+                                    let raw = pair_trophallaxis_raw(
+                                        e_i,
+                                        e_j,
                                         distance,
-                                        alike,
-                                        other: other_u32,
-                                    };
-                                    cursor += 1;
+                                        reach_distance,
+                                        a,
+                                        &tr_cfg,
+                                    );
+                                    if raw > 0.0 {
+                                        out_sum.add(raw);
+                                    }
+                                    a
                                 } else {
-                                    cursor = span_start;
-                                    can_cache = false;
+                                    -1.0
+                                };
+                                if can_cache {
+                                    if cursor < cache_len {
+                                        cache_slice[cursor] = CachedNeighbor {
+                                            distance,
+                                            alike,
+                                            other: other_u32,
+                                        };
+                                        cursor += 1;
+                                    } else {
+                                        cursor = span_start;
+                                        can_cache = false;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                if can_cache {
-                    let span_len = cursor - span_start;
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "neighbor_cache length is capped at 1_048_576 < u32::MAX"
-                    )]
-                    {
-                        *span_slot = ((cache_base + span_start) as u32, span_len as u32);
+                    if can_cache {
+                        let span_len = cursor - span_start;
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "neighbor_cache length is capped at 1_048_576 < u32::MAX"
+                        )]
+                        {
+                            *span_slot = ((cache_base + span_start) as u32, span_len as u32);
+                        }
+                    } else {
+                        *span_slot = (0, u32::MAX);
                     }
-                } else {
-                    *span_slot = (0, u32::MAX);
-                }
-                let total_out = out_sum.value();
-                if total_out <= 0.0 {
-                    *scale_slot = 0.0;
-                } else {
-                    let mut scale = (cap / total_out).min(1.0);
-                    while scale > 0.0 && scale * total_out > cap {
-                        scale = scale.next_down();
+                    let total_out = out_sum.value();
+                    if total_out <= 0.0 {
+                        *scale_slot = 0.0;
+                    } else {
+                        let mut scale = (cap / total_out).min(1.0);
+                        while scale > 0.0 && scale * total_out > cap {
+                            scale = scale.next_down();
+                        }
+                        *scale_slot = scale;
                     }
-                    *scale_slot = scale;
                 }
-            }
-        };
+            };
         if used == 1 {
             fill_scales_and_cache(
                 0,
@@ -2154,10 +2156,9 @@ pub fn relax_sweep1_with_context(
             let cache_per_worker = neighbor_cache.len() / chunk_count.max(1);
             let mut scale_chunks = trophallaxis_scales.chunks_mut(length);
             let mut span_chunks = neighbor_spans.chunks_mut(length);
-            let mut cache_rest = neighbor_cache.as_mut_slice();
-            let take_head = cache_per_worker.min(cache_rest.len());
-            let (cache_head, tail_after_head) = cache_rest.split_at_mut(take_head);
-            cache_rest = tail_after_head;
+            let cache_all = neighbor_cache.as_mut_slice();
+            let take_head = cache_per_worker.min(cache_all.len());
+            let (cache_head, mut cache_rest) = cache_all.split_at_mut(take_head);
             let scale_head = scale_chunks.next().unwrap_or_default();
             let span_head = span_chunks.next().unwrap_or_default();
             let fill_scales_and_cache = &fill_scales_and_cache;
@@ -2293,8 +2294,8 @@ pub fn relax_sweep1_with_context(
                 overlapping[1] += push * uy;
             } else if adheres && in_reach {
                 let eff_weight = if adhesion_weight > 0.0 {
-                    let emt_pair = emt_factors
-                        .map_or(1.0, |factors| (factors[index] * factors[other]).sqrt());
+                    let emt_pair =
+                        emt_factors.map_or(1.0, |factors| (factors[index] * factors[other]).sqrt());
                     let pcp_factor = match pcp_inputs {
                         Some((_, polarities, strengths, curvatures, _)) => {
                             let alpha_ij = (strengths[index] * strengths[other]).sqrt();
@@ -2313,10 +2314,8 @@ pub fn relax_sweep1_with_context(
                 } else {
                     adhesion_weight
                 };
-                let push = -pull_factor
-                    * eff_weight
-                    * (distance - diameter)
-                    * (reach_distance - distance);
+                let push =
+                    -pull_factor * eff_weight * (distance - diameter) * (reach_distance - distance);
                 sum[0] += push * ux;
                 sum[1] += push * uy;
             }
@@ -2328,12 +2327,8 @@ pub fn relax_sweep1_with_context(
                 let w_torque = adhesion_kin_pos * (1.0 - distance / reach_distance);
                 let alpha_ij = (strengths[index] * strengths[other]).sqrt();
                 let beta_bar = 0.5 * (curvatures[index] + curvatures[other]);
-                let pair_term = pcp_pair_torque_term(
-                    polarities[index],
-                    polarities[other],
-                    r_hat,
-                    beta_bar,
-                );
+                let pair_term =
+                    pcp_pair_torque_term(polarities[index], polarities[other], r_hat, beta_bar);
                 tau_neighbors += alpha_ij * w_torque * pair_term;
             }
             if let Some(states_h0) = notch_h0
@@ -3535,8 +3530,7 @@ mod tests {
             .collect();
         let ids: Vec<u64> = (1..=count as u64).collect();
         let alive = vec![true; count];
-        let affinities: Vec<[f32; AFFINITY_TERMS]> =
-            (0..count).map(|i| axis(i % 4)).collect();
+        let affinities: Vec<[f32; AFFINITY_TERMS]> = (0..count).map(|i| axis(i % 4)).collect();
         let energies: Vec<f64> = (0..count)
             .map(|i| 0.5 + 3.0 * ((i * 37) % 101) as f64 / 100.0)
             .collect();
@@ -3631,17 +3625,15 @@ mod tests {
             )
             .expect(label);
             assert_eq!(work.allocated_bytes(), bytes_before, "{label}: allocated");
-            assert_eq!(work.trophallaxis_summary, uncached_summary, "{label}: summary");
+            assert_eq!(
+                work.trophallaxis_summary, uncached_summary,
+                "{label}: summary"
+            );
             assert_eq!(
                 work.trophallaxis_delta_quanta, uncached_deltas,
                 "{label}: deltas"
             );
-            for (i, (got, want)) in work
-                .displacements
-                .iter()
-                .zip(&uncached_disp)
-                .enumerate()
-            {
+            for (i, (got, want)) in work.displacements.iter().zip(&uncached_disp).enumerate() {
                 assert_eq!(
                     (got[0].to_bits(), got[1].to_bits()),
                     (want[0].to_bits(), want[1].to_bits()),
@@ -3682,8 +3674,8 @@ mod tests {
                 }
             }
         }
-        let mut work =
-            CrowdingWork::with_capacity_local_neighbors(&grid, radius, positions.len()).expect("cw");
+        let mut work = CrowdingWork::with_capacity_local_neighbors(&grid, radius, positions.len())
+            .expect("cw");
         let bytes_before = work.allocated_bytes();
         for workers in [1, 4] {
             let got = work

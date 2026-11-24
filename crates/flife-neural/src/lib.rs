@@ -40,7 +40,9 @@ pub use actions::{
     SO2_MOTOR_OUTPUTS, WAKE_PUMP_OUTPUTS, decode, decode_slice, decode_with_layout,
 };
 pub use arena::{ArenaSlot, F16_SLOT_ALIGNMENT_ELEMENTS, Placement, ShardGeometry};
-pub use backend::{BackendBudget, ControllerBackend, ControllerJob};
+pub use backend::{
+    BackendBudget, ControllerBackend, ControllerJob, FlatControllerJob, FlatOutputs,
+};
 pub use controller::{
     ControllerScratch, DenseTopology, INDEPENDENT_DENSE_MLP_V1, INDEPENDENT_RECURRENT_MLP_V1,
     LayerShape, MAXIMUM_RECURRENT_STATE_WIDTH, RawOutputs, RawTrace, RecurrentTrace,
@@ -49,6 +51,7 @@ pub use controller::{
 };
 pub use sensors::{
     DualObservation, Intrinsic, MAX_SENSOR_WIDTH, Observation, SENSOR_WIDTH, SensorLayout,
-    SensorScales, observe, observe_dual, observe_dual_for_controller, observe_for_controller,
+    SensorScales, observe, observe_dual, observe_dual_for_controller,
+    observe_dual_for_controller_f32, observe_for_controller, observe_for_controller_f32,
 };
 pub use weights::{Weight, WeightDtype, Weights};

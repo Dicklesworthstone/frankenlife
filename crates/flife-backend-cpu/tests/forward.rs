@@ -13,7 +13,7 @@ use flife_core::binary16::F16;
 use flife_core::ids::GenomeId;
 use flife_neural::{
     ACTION_WIDTH, ArenaSlot, BackendBudget, ControllerBackend, ControllerJob, ControllerScratch,
-    DenseTopology, RawOutputs, ReferenceController, SENSOR_WIDTH,
+    DenseTopology, FlatControllerJob, FlatOutputs, RawOutputs, ReferenceController, SENSOR_WIDTH,
 };
 use rayon::prelude::*;
 
@@ -1178,5 +1178,153 @@ fn cpu_backend_budget_holds_strictly_when_widening_hidden_layers_and_across_rele
     backend.release_slots(&wide_slots);
     assert_eq!(backend.shards(), 0);
     assert_eq!(backend.resident_bytes(), exact_wide_activations);
+    Ok(())
+}
+
+#[expect(clippy::panic, reason = "test helper: a mismatch is a test failure")]
+fn assert_flat_matches_legacy(
+    label: &str,
+    legacy_out: &[Option<RawOutputs>],
+    flat_out: &FlatOutputs,
+) {
+    assert_eq!(flat_out.valid.len(), legacy_out.len(), "{label}: valid len");
+    for (i, want) in legacy_out.iter().enumerate() {
+        match (want, flat_out.row(i)) {
+            (Some(w), Some(g)) => assert_eq!(
+                g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{label} row {i} differs"
+            ),
+            (None, None) => {}
+            (w, g) => panic!("{label} row {i} deferred mismatch: {w:?} vs {g:?}"),
+        }
+    }
+}
+
+/// Round-2 flat-F32 fast path (`ControllerBackend::evaluate_flat_f32`) must
+/// match `CpuBackend::evaluate` bit-for-bit across all 5 interleaved catalog
+/// topologies, all numerical regimes (including subnormals and overflows),
+/// F32 and F16 weights, single-lane and multi-lane persistent-pool execution,
+/// non-finite input flags, shrink/empty reuse, and error cleanup.
+#[test]
+fn cpu_backend_flat_f32_matches_evaluate_bit_for_bit_across_lanes_and_dtypes()
+-> Result<(), CoreError> {
+    let catalog = topologies();
+    let batch_cases = cases(640, 2026);
+    let legacy_f32 = jobs(&catalog, &batch_cases);
+    let f16_params: Vec<Vec<F16>> = batch_cases
+        .iter()
+        .map(|case| {
+            case.parameters
+                .iter()
+                .map(|&v| F16::from_f32_nearest(v))
+                .collect()
+        })
+        .collect();
+    let legacy_f16: Vec<ControllerJob<'_>> = legacy_f32
+        .iter()
+        .zip(&batch_cases)
+        .zip(&f16_params)
+        .map(|((job, case), weights)| ControllerJob {
+            genome: job.genome,
+            slot: job.slot,
+            controller: ReferenceController::new_f16(&catalog[case.topology], weights, BOUND)
+                .expect("admitted f16 controller"),
+            inputs: job.inputs,
+        })
+        .collect();
+
+    let mut inputs_f32 = Vec::with_capacity(batch_cases.len() * SENSOR_WIDTH);
+    let mut inputs_finite = Vec::with_capacity(batch_cases.len());
+    for case in &batch_cases {
+        let mut all_finite = true;
+        for &v in &case.inputs {
+            let narrowed = v as f32;
+            all_finite &= narrowed.is_finite();
+            inputs_f32.push(narrowed);
+        }
+        inputs_finite.push(u8::from(all_finite));
+    }
+
+    for (label, legacy) in [("F32", &legacy_f32), ("F16", &legacy_f16)] {
+        let flat_jobs: Vec<FlatControllerJob<'_>> = legacy
+            .iter()
+            .map(|job| FlatControllerJob {
+                genome: job.genome,
+                slot: job.slot,
+                controller: job.controller,
+            })
+            .collect();
+        let mut legacy_backend = CpuBackend::new(lanes(1));
+        let mut legacy_out = Vec::new();
+        legacy_backend.evaluate(legacy, &mut legacy_out)?;
+
+        for lane_count in [1_usize, 4] {
+            let mut backend = CpuBackend::with_shard_slots(lanes(lane_count), 32);
+            assert!(backend.supports_flat_f32());
+            let mut flat_out = FlatOutputs::default();
+            backend.evaluate_flat_f32(
+                &flat_jobs,
+                SENSOR_WIDTH,
+                &inputs_f32,
+                &inputs_finite,
+                &mut flat_out,
+            )?;
+            let packs_after_first = backend.packs();
+            assert_eq!(flat_out.output_width, ACTION_WIDTH);
+            assert_flat_matches_legacy(
+                &format!("{label} lanes={lane_count}"),
+                &legacy_out,
+                &flat_out,
+            );
+
+            // Steady-state second tick must reuse packed shards with 0 repacks.
+            backend.evaluate_flat_f32(
+                &flat_jobs,
+                SENSOR_WIDTH,
+                &inputs_f32,
+                &inputs_finite,
+                &mut flat_out,
+            )?;
+            assert_eq!(backend.packs(), packs_after_first);
+
+            // Shrink, empty, and malformed-length error cleanup.
+            let half = flat_jobs.len() / 2;
+            backend.evaluate_flat_f32(
+                &flat_jobs[..half],
+                SENSOR_WIDTH,
+                &inputs_f32[..half * SENSOR_WIDTH],
+                &inputs_finite[..half],
+                &mut flat_out,
+            )?;
+            assert_flat_matches_legacy(
+                &format!("{label} shrink lanes={lane_count}"),
+                &legacy_out[..half],
+                &flat_out,
+            );
+
+            backend.evaluate_flat_f32(&[], SENSOR_WIDTH, &[], &[], &mut flat_out)?;
+            assert!(flat_out.valid.is_empty() && flat_out.values.is_empty());
+            assert_eq!(flat_out.output_width, 0);
+
+            backend.evaluate_flat_f32(
+                &flat_jobs[..8],
+                SENSOR_WIDTH,
+                &inputs_f32[..8 * SENSOR_WIDTH],
+                &inputs_finite[..8],
+                &mut flat_out,
+            )?;
+            let err = backend.evaluate_flat_f32(
+                &flat_jobs[..8],
+                SENSOR_WIDTH,
+                &inputs_f32[..4 * SENSOR_WIDTH],
+                &inputs_finite[..8],
+                &mut flat_out,
+            );
+            assert!(matches!(err, Err(CoreError::LayoutMismatch { .. })));
+            assert!(flat_out.valid.is_empty() && flat_out.values.is_empty());
+            assert_eq!(flat_out.output_width, 0);
+        }
+    }
     Ok(())
 }

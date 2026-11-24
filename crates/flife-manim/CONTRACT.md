@@ -299,7 +299,9 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     for a dot and a halo per organism of the ceiling, `PREPARATION_BYTES_PER_TRIANGLE` (640) for the two quads', the
     ring's and a disc region's triangles (plus `2 * capacity` triangles when optional `Epoch::polarities()` are
     present, `0` otherwise), and `PREPARATION_BYTES_FIXED` (1 MiB), whatever the style. `job()` compiles within it
-    (FrankenManim's `max_working_bytes`): a tile bin past it is left out, which only slows the frame, and rows past
+    (FrankenManim's `max_working_bytes`, lifting `max_draws` and `max_raster_triangles` from their defaults whenever
+    the compiled draw list or budgeted geometry exceeds them, so un-culled glow frames at `≥ 524,288` organisms
+    compile cleanly): a tile bin past `max_working_bytes` is left out, which only slows the frame, and rows past
     it refuse the frame. `set_preparation_threads(threads)` (FL-033) has `job()` compile the frame's dots on up to
     that many threads (FrankenManim's `ThreeDJob::new_with_threads`). The job keeps the count
     (`ThreeDJob::preparation_threads`), and the Metal route flattens and checks its triangle rows, and builds its

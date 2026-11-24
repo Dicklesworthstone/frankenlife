@@ -1213,9 +1213,23 @@ impl WorldView {
     /// FrankenManim refuses to compile the draws.
     pub fn job(&self) -> Result<ThreeDJob<'_>, CoreError> {
         let draws = self.draws()?;
+        let default = ThreeDPreparationLimits::default();
+        let (dots, triangles) = self.preparation_counts();
+        let draw_count = u64::try_from(draws.len()).unwrap_or(u64::MAX);
+        // Every compiled draw row and its derived raster triangles are already
+        // bounded by `self.preparation_limit()` (`max_working_bytes`, admitted
+        // under INV-15); lift FrankenManim's default row-count ceilings when
+        // the view's compiled draws or budgeted geometry exceed them, while
+        // keeping its 4× clipping headroom per triangle.
         let limits = ThreeDPreparationLimits {
+            max_draws: default.max_draws.max(draw_count),
+            max_raster_triangles: default.max_raster_triangles.max(
+                dots.saturating_mul(2)
+                    .saturating_add(triangles)
+                    .saturating_mul(4),
+            ),
             max_working_bytes: self.preparation_limit(),
-            ..ThreeDPreparationLimits::default()
+            ..default
         };
         let job = ThreeDJob::new_with_threads(
             self.camera.camera(),
@@ -1330,17 +1344,9 @@ impl WorldView {
         ])
     }
 
-    /// The preparation bytes a frame's job is compiled within (FL-043):
-    /// [`PREPARATION_BYTES_PER_DOT`] for a dot and a halo per organism the
-    /// view can hold, [`PREPARATION_BYTES_PER_TRIANGLE`] for every triangle
-    /// of the field's and the density's quads, the ring, the brush region at
-    /// its most (a disc), and (when optional `V2-16` polarities are present)
-    /// two triangles per organism for bulk apical ticks, and
-    /// [`PREPARATION_BYTES_FIXED`], whatever the style, which a host may
-    /// change from frame to frame. The layers' texels are not preparation:
-    /// a job samples them in place ([`WorldView::texel_bytes`]).
-    #[must_use]
-    pub fn preparation_limit(&self) -> u64 {
+    /// Worst-case true-dot and surface-triangle counts budgeted by
+    /// [`WorldView::preparation_limit`].
+    fn preparation_counts(&self) -> (u64, u64) {
         let dots = (self.cloud.capacity() as u64).saturating_mul(2);
         let ring = 2 * SELECTION_RING_SEGMENTS as u64;
         let region = 2 * REGION_SEGMENTS as u64;
@@ -1355,6 +1361,21 @@ impl WorldView {
             0
         };
         let triangles = total([QUAD.1, QUAD.1, ring, region, overlay, apical_ticks]);
+        (dots, triangles)
+    }
+
+    /// The preparation bytes a frame's job is compiled within (FL-043):
+    /// [`PREPARATION_BYTES_PER_DOT`] for a dot and a halo per organism the
+    /// view can hold, [`PREPARATION_BYTES_PER_TRIANGLE`] for every triangle
+    /// of the field's and the density's quads, the ring, the brush region at
+    /// its most (a disc), and (when optional `V2-16` polarities are present)
+    /// two triangles per organism for bulk apical ticks, and
+    /// [`PREPARATION_BYTES_FIXED`], whatever the style, which a host may
+    /// change from frame to frame. The layers' texels are not preparation:
+    /// a job samples them in place ([`WorldView::texel_bytes`]).
+    #[must_use]
+    pub fn preparation_limit(&self) -> u64 {
+        let (dots, triangles) = self.preparation_counts();
         total([
             dots.saturating_mul(PREPARATION_BYTES_PER_DOT),
             triangles.saturating_mul(PREPARATION_BYTES_PER_TRIANGLE),

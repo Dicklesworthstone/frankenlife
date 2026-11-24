@@ -1065,48 +1065,23 @@ fn hidden_field_tracks_scale_without_rebuilding_and_sphere_reuses_raw_texture() 
             assert!(z.texture().is_some());
         }
     }
-    // NaN and negative texels are ignored by display-scale tracking, leaving
-    // the largest finite positive value (3.0) as the scale and producing all
-    // finite texels.
-    let messy_nan_neg = texture(
-        [4, 4],
-        &[
-            f32::NAN,
-            -1.0,
-            2.0,
-            0.0,
-            1.0,
-            0.5,
-            0.25,
-            -4.0,
-            0.0,
-            3.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
-            f32::NAN,
-        ],
-    );
-    for look in [Look::Glow, Look::Raw] {
-        let mut m = FieldLayer::new(&fit([4.0, 4.0], [40, 40]));
-        m.update_look(&messy_nan_neg, look).expect("messy field");
-        assert_eq!(m.scale(), 3.0);
-        let (colours, dims) = drawn(&m);
-        assert_eq!(dims, [4, 4]);
+    // Non-finite or negative cell energy is refused up front by `FieldTexture::from_plane`,
+    // preserving INV-01 before any display layer touches the field.
+    for bad in [f32::NAN, -1.0, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut plane = [0.0_f32; 16];
+        plane[0] = bad;
         assert!(
-            colours.iter().flatten().all(|c| c.is_finite()),
-            "all texels must stay finite"
+            FieldTexture::from_plane([4, 4], [1.0, 1.0], &plane).is_err(),
+            "FieldTexture::from_plane must refuse {bad:?}"
         );
     }
-    // `FieldTexture::from_plane` saturates ±inf into ±f32::MAX, so display
-    // scale tracks `f64::from(f32::MAX)` while every rendered texel stays finite.
-    let saturated_inf = texture(
+    // Extreme finite energy (`f32::MAX`) tracks `f64::from(f32::MAX)` while every
+    // rendered texel stays finite in both looks.
+    let huge = texture(
         [4, 4],
         &[
-            f32::INFINITY,
-            f32::NEG_INFINITY,
+            f32::MAX,
+            0.0,
             3.0,
             0.0,
             0.0,
@@ -1125,13 +1100,13 @@ fn hidden_field_tracks_scale_without_rebuilding_and_sphere_reuses_raw_texture() 
     );
     for look in [Look::Glow, Look::Raw] {
         let mut m = FieldLayer::new(&fit([4.0, 4.0], [40, 40]));
-        m.update_look(&saturated_inf, look).expect("saturated inf");
+        m.update_look(&huge, look).expect("huge finite field");
         assert_eq!(m.scale(), f64::from(f32::MAX));
         let (colours, dims) = drawn(&m);
         assert_eq!(dims, [4, 4]);
         assert!(
             colours.iter().flatten().all(|c| c.is_finite()),
-            "saturated-inf texels must stay finite"
+            "huge-energy texels must stay finite"
         );
     }
 }

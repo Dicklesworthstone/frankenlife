@@ -410,3 +410,58 @@ fn offscreen_center_with_onscreen_halo_is_preserved_bit_for_bit() {
         "edge-straddling halo must render byte-identically"
     );
 }
+
+/// Regression for `flife-ovd`: an un-culled (`zoom == 1.0`) glow frame at
+/// `2^19 = 524,288` organisms with the field drawn produces `1,048,577` draw
+/// rows (524,288 halos + 524,288 dots + 1 field quad), exceeding
+/// FrankenManim's default `ThreeDPreparationLimits::max_draws` (`1 << 20 =
+/// 1,048,576`). `WorldView::job` must size `max_draws` and
+/// `max_raster_triangles` from the compiled frame / budgeted geometry while
+/// keeping `max_working_bytes = preparation_limit()`.
+#[test]
+fn glow_frame_at_half_million_organisms_with_field_compiles_past_default_draw_cap() {
+    let count = 1_usize << 19; // 524,288 organisms
+    let count_str = count.to_string();
+    let config = common::config(&[
+        ("world", "width", "16.0"),
+        ("world", "height", "16.0"),
+        ("world", "grid_width", "16"),
+        ("world", "grid_height", "16"),
+        ("population", "initial_count", &count_str),
+        ("population", "maximum_count", &count_str),
+        ("controller", "hidden_widths", "[8]"),
+        ("controller", "canonical_weight_dtype", "\"f16\""),
+        ("architecture_mutation", "enabled", "false"),
+        ("execution", "cpu_workers", "8"),
+        ("execution", "maximum_logical_genome_bytes", "2147483648"),
+        ("execution", "maximum_allocated_genome_bytes", "2147483648"),
+        ("execution", "maximum_total_bytes", "8589934592"),
+    ]);
+    let world = common::found(&config);
+    let epoch = flife_render::Epoch::standalone(&world).expect("standalone epoch");
+    assert_eq!(epoch.len(), count);
+
+    let mut view = WorldView::for_epoch(&epoch, [640, 360], [0, 0, 0]).expect("a view");
+    let threads = std::num::NonZeroUsize::new(8).expect("eight");
+    view.set_preparation_threads(threads);
+    view.set_style(Style::default());
+    view.show(&epoch).expect("shows");
+
+    let draws = view.draws().expect("draws");
+    assert_eq!(
+        draws.len(),
+        2 * count + 1,
+        "glow look at 2^19 organisms + field emits 1,048,577 draws (> 1 << 20)"
+    );
+    assert!(draws.len() > (1_usize << 20));
+
+    let job = view
+        .job()
+        .expect("WorldView::job must compile un-culled 2^19 glow frame with field drawn");
+    assert!(
+        job.preparation_bytes() <= view.preparation_limit(),
+        "compiled preparation {} exceeded limit {}",
+        job.preparation_bytes(),
+        view.preparation_limit()
+    );
+}

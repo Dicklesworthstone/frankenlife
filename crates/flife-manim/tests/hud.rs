@@ -608,8 +608,8 @@ fn flatten_quadratic_caps_infinite_bend_and_hud_refuses_overflowing_em() {
     assert_eq!(huge_bend.len(), HUD_MAX_CURVE_SEGMENTS);
 
     let font = font();
-    assert!(font.text("A", 1e308).is_err());
-    assert!(font.text("   ", 1e308).is_err());
+    assert!(font.text("AAAA", 1e308).is_err());
+    assert!(font.text("   \n   \n   ", 1e308).is_err());
 
     let palette = [
         linear([0xFF, 0x00, 0x00]),

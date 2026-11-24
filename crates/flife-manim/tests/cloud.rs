@@ -459,13 +459,34 @@ fn update_between_handles_out_of_order_fading_and_zero_population() -> Result<()
     let config = common::small();
     let mut world = common::found(&config);
     let prior = common::epoch(&world);
-    // Wipe out the population to produce a real extinct epoch (0 organisms).
+    // Wipe out the population to produce a real extinct epoch (0 organisms):
+    // four discs of radius `ext[0]/2` at the quarter-torus grid cover every
+    // point on the torus (max distance √2 · L/4 < L/2) within the legal radius cap.
     let ext = prior.extent();
-    match world.step_with(&[Intervention::RemoveOrganisms {
-        center: [ext[0] / 2.0, ext[1] / 2.0],
-        radius: ext[0].hypot(ext[1]),
-        disposition: Disposition::Remove,
-    }])? {
+    let r = ext[0].min(ext[1]) / 2.0;
+    let [hx, hy] = [ext[0] / 2.0, ext[1] / 2.0];
+    match world.step_with(&[
+        Intervention::RemoveOrganisms {
+            center: [0.0, 0.0],
+            radius: r,
+            disposition: Disposition::Remove,
+        },
+        Intervention::RemoveOrganisms {
+            center: [hx, 0.0],
+            radius: r,
+            disposition: Disposition::Remove,
+        },
+        Intervention::RemoveOrganisms {
+            center: [0.0, hy],
+            radius: r,
+            disposition: Disposition::Remove,
+        },
+        Intervention::RemoveOrganisms {
+            center: [hx, hy],
+            radius: r,
+            disposition: Disposition::Remove,
+        },
+    ])? {
         Stepped::Published(_) => {}
         Stepped::Paused(shortfall) => panic!("paused: {shortfall:?}"),
     }

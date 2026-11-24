@@ -4,8 +4,9 @@
 //! - CPU reference baselines at multiple worker counts (default `w = 1, 8, 12`);
 //! - EACH individual Metal backend (`MetalBackend` controllers, `MetalField`,
 //!   `MetalSensors`, `MetalUptake`, `MetalSettle`) and all 5 combined on ONE
-//!   shared `DeviceOwner` (`metal_all`);
-//! on Bundle A (`presets/morphogenesis-tissue-v2.toml`), Bundle B
+//!   shared `DeviceOwner` (`metal_all`).
+//!
+//! Runs on Bundle A (`presets/morphogenesis-tissue-v2.toml`), Bundle B
 //! (`presets/supercolony-v2.toml`), and Confluent (`presets/confluent-world.toml`,
 //! defaulted to 262,144 founders via `--confluent-initial 262144` so the 262k
 //! live regime is measured immediately without multi-minute warmup).
@@ -16,9 +17,10 @@
 //! - **Host↔device staging, copy, and command-buffer submit/wait overhead**
 //!   (`phase_wall_ms - gpu_compute_ms`),
 //! - **Metal command buffer round-trips per tick** (`commands / ticks`), and
-//! - **Net whole-tick delta vs the paired CPU baseline** (`delta_vs_cpu_ms`),
-//! while verifying **bit-exact `World::digest()`** parity across every
-//! configuration after every interleaved rotating block.
+//! - **Net whole-tick delta vs the paired CPU baseline** (`delta_vs_cpu_ms`).
+//!
+//! Every configuration is verified for **bit-exact `World::digest()`** parity
+//! after every interleaved rotating block.
 //!
 //! Usage:
 //! ```text

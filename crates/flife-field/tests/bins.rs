@@ -1094,7 +1094,7 @@ fn pyramid_mixed_scale_chunks_match_scalar_bit_for_bit_single_and_dual() {
         let mut dual_pyr = SensorPyramid::new_with_planes(
             g,
             3,
-            usize::from(dual_state.planes()),
+            dual_state.planes() as usize,
             &BufferLimits::host(),
         )
         .expect("dual pyramid");

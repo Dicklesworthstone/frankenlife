@@ -1562,7 +1562,9 @@ fn step_with_render_false_skips_projection_and_matches_digest_bit_for_bit() {
             let mut reports = Vec::new();
             for _ in 0..6 {
                 let outcome = handle.step(&cx).await.expect("step");
-                let (_, _, report) = published(&outcome);
+                let StepOutcome::Published { report, .. } = outcome else {
+                    panic!("expected published step, got {outcome:?}");
+                };
                 reports.push((
                     report.tick,
                     report.live,
@@ -1597,7 +1599,12 @@ fn step_with_render_false_skips_projection_and_matches_digest_bit_for_bit() {
                     .step_with_render(&cx, false)
                     .await
                     .expect("step false");
-                let (boundary, _, report) = published(&outcome);
+                let StepOutcome::Published {
+                    boundary, report, ..
+                } = outcome
+                else {
+                    panic!("expected published quiet step, got {outcome:?}");
+                };
                 assert_eq!(boundary.tick, Tick::new(expected_tick));
                 reports.push((
                     report.tick,
@@ -1619,7 +1626,14 @@ fn step_with_render_false_skips_projection_and_matches_digest_bit_for_bit() {
 
             // Tick 5: request render projection; tally must still cover ticks 1..=5.
             let outcome_5 = handle.step_with_render(&cx, true).await.expect("step true");
-            let (b5, _, r5) = published(&outcome_5);
+            let StepOutcome::Published {
+                boundary: b5,
+                report: r5,
+                ..
+            } = outcome_5
+            else {
+                panic!("expected published step 5, got {outcome_5:?}");
+            };
             assert_eq!(b5.tick, Tick::new(5));
             reports.push((r5.tick, r5.live, r5.births.len(), r5.deaths.len()));
             let snap_5 = handle.inspect(&cx).await.expect("inspect 5");
@@ -1637,7 +1651,14 @@ fn step_with_render_false_skips_projection_and_matches_digest_bit_for_bit() {
                 .step_with_render(&cx, false)
                 .await
                 .expect("step 6 false");
-            let (b6, _, r6) = published(&outcome_6);
+            let StepOutcome::Published {
+                boundary: b6,
+                report: r6,
+                ..
+            } = outcome_6
+            else {
+                panic!("expected published step 6, got {outcome_6:?}");
+            };
             assert_eq!(b6.tick, Tick::new(6));
             reports.push((r6.tick, r6.live, r6.births.len(), r6.deaths.len()));
             let snap_6 = handle.inspect(&cx).await.expect("inspect 6");
@@ -1663,7 +1684,7 @@ fn step_with_render_false_skips_projection_and_matches_digest_bit_for_bit() {
     assert_eq!(opt_closed.boundary, ref_closed.boundary);
     assert_eq!(opt_closed.world.digest(), ref_closed.world.digest());
     assert_eq!(
-        opt_closed.snapshot.render.published, 2,
+        opt_closed.render.published, 2,
         "shutdown must not project a skipped boundary"
     );
 }

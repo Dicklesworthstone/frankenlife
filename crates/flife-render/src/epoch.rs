@@ -1240,11 +1240,7 @@ impl Rows<'_> {
         let width = self.width;
         let whole = block_x == 1 && block_y == 1;
         let plane_cells = cells_x * cells_y;
-        let num_channels = if plane_cells > 0 {
-            self.moments.len() / plane_cells
-        } else {
-            0
-        };
+        let num_channels = self.moments.len().checked_div(plane_cells).unwrap_or(0);
         let full_x = cells_x / block_x;
         let inv_cell_area = exact_power_of_two_recip(self.cell_area);
         let sqrt_channels = (CHANNELS as f64).sqrt();
@@ -1469,9 +1465,9 @@ impl Rows<'_> {
             // `row_components` (channels `num_channels..CHANNELS` stay zeroed
             // on 24-channel dual-carrier fields automatically).
             let out_active = &mut row_components[first_nz..last_nz];
-            let mut chunks = out_active.chunks_exact_mut(8);
+            let (chunks, rem) = out_active.as_chunks_mut::<8>();
             let mut base = 0_usize;
-            for out_block in chunks.by_ref() {
+            for out_block in chunks {
                 let mut tile = [[0_i8; CHANNELS]; 8];
                 for (channel, src_row) in channel_steps[..num_channels].iter().enumerate() {
                     let src = &src_row[base..base + 8];
@@ -1479,10 +1475,9 @@ impl Rows<'_> {
                         dst[channel] = val;
                     }
                 }
-                out_block.copy_from_slice(&tile);
+                *out_block = tile;
                 base += 8;
             }
-            let rem = chunks.into_remainder();
             if !rem.is_empty() {
                 for (offset, texel) in rem.iter_mut().enumerate() {
                     let mut col = [0_i8; CHANNELS];
@@ -1627,7 +1622,7 @@ fn validate_scalar_plane(
     // cleanly across 4 f32 lanes without `enumerate()` tracking on the happy path.
     if plane
         .iter()
-        .all(|&value| value >= 0.0 && value < f32::INFINITY)
+        .all(|value| (0.0..f32::INFINITY).contains(value))
     {
         return Ok(());
     }
@@ -1668,7 +1663,7 @@ fn validate_vascular_edges(
     for (axis, edges) in [("east", edge_x), ("north", edge_y)] {
         if edges
             .iter()
-            .all(|&value| value >= 0.0 && value < f32::INFINITY)
+            .all(|value| (0.0..f32::INFINITY).contains(value))
         {
             continue;
         }
@@ -3069,7 +3064,7 @@ mod tests {
             0.3_f32,
             1.7_f32,
             2.0_f32,
-            3.141_592_7_f32,
+            std::f32::consts::PI,
             137.0_f32,
             254.0_f32,
             1.0e-35_f32,
@@ -3080,13 +3075,13 @@ mod tests {
         let n = gx * gy;
         let mut planes = vec![0.0_f32; n * (1 + CHANNELS)];
         for y in 0..gy {
-            for x in 0..gx {
+            for (x, &probe_e) in energies_probe.iter().enumerate() {
                 let idx = y * gx + x;
                 let e = if y == 0 || y == 8 {
                     // Empty rows to exercise whole-row skipping.
                     0.0_f32
                 } else {
-                    energies_probe[x]
+                    probe_e
                 };
                 planes[idx] = e;
                 for c in 0..CHANNELS {

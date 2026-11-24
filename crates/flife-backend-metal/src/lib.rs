@@ -1352,7 +1352,7 @@ impl MetalBackend {
                     Some((lt, ls, _)) if lt == topology && ls == shard_key
                 );
                 if !reuse_lease {
-                    active_lease = None;
+                    drop(active_lease.take());
                     let lease = match &shard.parameters {
                         ShardParameters::F32(buffer) => {
                             ShardWriteLease::F32(owner.write(buffer.buffer())?)
@@ -1835,8 +1835,9 @@ impl MetalBackend {
                 .write(inputs)?
                 .write(0, &self.staged_inputs[..count * input_width])?;
             let receipt = if touched_len <= INLINE_SHARDS {
-                let mut inline_specs: [Option<(&Pipeline, [Binding; 6], usize, usize)>;
-                    INLINE_SHARDS] = [const { None }; INLINE_SHARDS];
+                type InlineShardSpec<'a> = (&'a Pipeline, [Binding; 6], usize, usize);
+                let mut inline_specs: [Option<InlineShardSpec<'_>>; INLINE_SHARDS] =
+                    [const { None }; INLINE_SHARDS];
                 for (slot, &(topology, key)) in inline_specs.iter_mut().zip(self.touched.iter()) {
                     let bucket = self.buckets.get(topology).and_then(Option::as_ref);
                     let shard = bucket.and_then(|bucket| bucket.shards.get(key));

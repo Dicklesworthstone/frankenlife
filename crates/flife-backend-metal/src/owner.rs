@@ -886,6 +886,10 @@ const DUMMY_USE: (Binding, bool) = (
 
 /// Stack-backed deduplicated buffer-use list with transparent heap fallback for
 /// commands touching more than [`INLINE_BOUND`] distinct buffers.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "inline stack storage avoids per-submission heap allocation on the common <=64-buffer path"
+)]
 enum UsesBuf {
     Inline {
         data: [(Binding, bool); INLINE_BOUND],
@@ -993,6 +997,10 @@ impl<const N: usize> IndexBuf<N> {
 
 /// Stack-backed bound-buffer storage held by [`CommandGuard`] until verified
 /// completion or unwind.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "inline stack storage avoids per-submission heap allocation on the common <=64-buffer path"
+)]
 enum BoundList {
     Inline {
         data: [Option<Bound>; INLINE_BOUND],
@@ -1073,6 +1081,10 @@ impl BoundList {
 }
 
 /// Stack-backed `RwLock` guard list held across a command's submission.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "inline stack storage avoids per-submission heap allocation on the common <=64-buffer path"
+)]
 enum HeldBuf<'a> {
     Inline {
         data: [Option<(usize, Held<'a>)>; INLINE_BOUND],

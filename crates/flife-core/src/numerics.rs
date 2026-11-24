@@ -424,6 +424,183 @@ pub fn tanh_f32(z: f32) -> Option<f32> {
     Some(if z.is_sign_negative() { -value } else { value })
 }
 
+/// Four-lane batch [`tanh_f32`], bit-identical to
+/// `[tanh_f32(xs[0])?, tanh_f32(xs[1])?, tanh_f32(xs[2])?, tanh_f32(xs[3])?]`.
+///
+/// Runs the exact same Estrin polynomial evaluation and Cody–Waite range
+/// reduction as [`tanh_f32`] in lockstep 4-lane arrays so LLVM auto-vectorizes
+/// across lanes (`fmul.2d` / `fadd.2d` / `fdiv.2d`) while preserving every F32
+/// bit across all finite inputs (including `±0.0`, subnormals, branch boundary
+/// `±1/32`, and saturation `|z| ≥ 20`). Returns `None` if any lane is nonfinite
+/// (`NaN` or `±Inf`), matching [`tanh_f32`].
+#[must_use]
+pub fn tanh_f32_4(xs: [f32; 4]) -> Option<[f32; 4]> {
+    let xf = [
+        f64::from(xs[0]),
+        f64::from(xs[1]),
+        f64::from(xs[2]),
+        f64::from(xs[3]),
+    ];
+    if !xf[0].is_finite() || !xf[1].is_finite() || !xf[2].is_finite() || !xf[3].is_finite() {
+        return None;
+    }
+    let mags = [xf[0].abs(), xf[1].abs(), xf[2].abs(), xf[3].abs()];
+    let s = [2.0 * mags[0], 2.0 * mags[1], 2.0 * mags[2], 2.0 * mags[3]];
+
+    let is_small = [
+        mags[0] > 0.0 && s[0] < TANH_SERIES_BELOW,
+        mags[1] > 0.0 && s[1] < TANH_SERIES_BELOW,
+        mags[2] > 0.0 && s[2] < TANH_SERIES_BELOW,
+        mags[3] > 0.0 && s[3] < TANH_SERIES_BELOW,
+    ];
+    let any_small = is_small[0] | is_small[1] | is_small[2] | is_small[3];
+    let any_mid = (s[0] >= TANH_SERIES_BELOW && mags[0] < TANH_SATURATES)
+        | (s[1] >= TANH_SERIES_BELOW && mags[1] < TANH_SATURATES)
+        | (s[2] >= TANH_SERIES_BELOW && mags[2] < TANH_SATURATES)
+        | (s[3] >= TANH_SERIES_BELOW && mags[3] < TANH_SATURATES);
+
+    if !any_mid {
+        if !any_small {
+            // Every lane is either `±0.0` or saturated (`|z| ≥ 20`).
+            return Some([
+                if mags[0] == 0.0 {
+                    xs[0]
+                } else if xs[0].is_sign_negative() {
+                    -1.0
+                } else {
+                    1.0
+                },
+                if mags[1] == 0.0 {
+                    xs[1]
+                } else if xs[1].is_sign_negative() {
+                    -1.0
+                } else {
+                    1.0
+                },
+                if mags[2] == 0.0 {
+                    xs[2]
+                } else if xs[2].is_sign_negative() {
+                    -1.0
+                } else {
+                    1.0
+                },
+                if mags[3] == 0.0 {
+                    xs[3]
+                } else if xs[3].is_sign_negative() {
+                    -1.0
+                } else {
+                    1.0
+                },
+            ]);
+        }
+        let s_safe = [
+            if is_small[0] { s[0] } else { 0.0 },
+            if is_small[1] { s[1] } else { 0.0 },
+            if is_small[2] { s[2] } else { 0.0 },
+            if is_small[3] { s[3] } else { 0.0 },
+        ];
+        let poly = estrin8_4(
+            [-s_safe[0], -s_safe[1], -s_safe[2], -s_safe[3]],
+            &EXPM1_COEFFICIENTS,
+        );
+        let m = [
+            s_safe[0] * poly[0],
+            s_safe[1] * poly[1],
+            s_safe[2] * poly[2],
+            s_safe[3] * poly[3],
+        ];
+        let approx = [
+            m[0] / (2.0 - m[0]),
+            m[1] / (2.0 - m[1]),
+            m[2] / (2.0 - m[2]),
+            m[3] / (2.0 - m[3]),
+        ];
+        return Some(finalize_tanh_f32_4(xs, mags, approx));
+    }
+
+    let s_safe = [
+        if s[0] >= TANH_SERIES_BELOW && mags[0] < TANH_SATURATES {
+            s[0]
+        } else {
+            0.0
+        },
+        if s[1] >= TANH_SERIES_BELOW && mags[1] < TANH_SATURATES {
+            s[1]
+        } else {
+            0.0
+        },
+        if s[2] >= TANH_SERIES_BELOW && mags[2] < TANH_SATURATES {
+            s[2]
+        } else {
+            0.0
+        },
+        if s[3] >= TANH_SERIES_BELOW && mags[3] < TANH_SATURATES {
+            s[3]
+        } else {
+            0.0
+        },
+    ];
+    let n = [
+        (s_safe[0] * core::f64::consts::LOG2_E).round(),
+        (s_safe[1] * core::f64::consts::LOG2_E).round(),
+        (s_safe[2] * core::f64::consts::LOG2_E).round(),
+        (s_safe[3] * core::f64::consts::LOG2_E).round(),
+    ];
+    let neg_r = [
+        -((s_safe[0] - n[0] * LN2_HI) - n[0] * LN2_LO),
+        -((s_safe[1] - n[1] * LN2_HI) - n[1] * LN2_LO),
+        -((s_safe[2] - n[2] * LN2_HI) - n[2] * LN2_LO),
+        -((s_safe[3] - n[3] * LN2_HI) - n[3] * LN2_LO),
+    ];
+    let poly = estrin12_4(neg_r, &EXP_COEFFICIENTS);
+    let d = [
+        poly[0] * power_of_two_neg_small(n[0]),
+        poly[1] * power_of_two_neg_small(n[1]),
+        poly[2] * power_of_two_neg_small(n[2]),
+        poly[3] * power_of_two_neg_small(n[3]),
+    ];
+    let mut approx = [
+        (1.0 - d[0]) / (1.0 + d[0]),
+        (1.0 - d[1]) / (1.0 + d[1]),
+        (1.0 - d[2]) / (1.0 + d[2]),
+        (1.0 - d[3]) / (1.0 + d[3]),
+    ];
+    if any_small {
+        for ((ap, &small), &si) in approx.iter_mut().zip(&is_small).zip(&s) {
+            if small {
+                let m = si * estrin8(-si, &EXPM1_COEFFICIENTS);
+                *ap = m / (2.0 - m);
+            }
+        }
+    }
+    Some(finalize_tanh_f32_4(xs, mags, approx))
+}
+
+/// Branchless `2^(−n)` for integer `n ∈ [0, 58]` (exact bits of `power_of_two(-(n as i32))`).
+#[inline]
+fn power_of_two_neg_small(nf: f64) -> f64 {
+    let ni = nf as u32;
+    f64::from_bits(u64::from(1023_u32.wrapping_sub(ni)) << 52)
+}
+
+#[inline]
+fn finalize_tanh_f32_4(xs: [f32; 4], mags: [f64; 4], approx: [f64; 4]) -> [f32; 4] {
+    let mut out = [0.0_f32; 4];
+    for ((dst, &z), (&mag, &ap)) in out.iter_mut().zip(&xs).zip(mags.iter().zip(&approx)) {
+        *dst = if mag == 0.0 {
+            z
+        } else {
+            let value = if mag >= TANH_SATURATES {
+                1.0
+            } else {
+                ap as f32
+            };
+            if z.is_sign_negative() { -value } else { value }
+        };
+    }
+    out
+}
+
 /// [`tanh`] of an F64 argument, rounded once to F32: for every `f64` `x`,
 /// `tanh_f64_as_f32(x)` is `tanh(x).map(|t| t as f32)`, bit for bit.
 ///
@@ -1177,5 +1354,135 @@ mod batch_tests {
         assert_eq!(tanh_f64_as_f32_4([0.0, f64::INFINITY, 1.0, -1.0]), None);
         assert_eq!(tanh_f64_as_f32_4([0.0, 1.0, f64::NEG_INFINITY, -1.0]), None);
         assert_eq!(tanh_f64_as_f32_4([0.0, 1.0, -1.0, f64::NAN]), None);
+    }
+
+    #[test]
+    fn tanh_f32_4_matches_scalar_tanh_f32_bit_for_bit() {
+        let cutoff = (0.5 * TANH_SERIES_BELOW) as f32;
+        let sat = TANH_SATURATES as f32;
+        let smallest_sub = f32::from_bits(1);
+        let largest_sub = f32::from_bits(0x007f_ffff);
+        let mut samples = vec![
+            0.0_f32,
+            -0.0_f32,
+            smallest_sub,
+            -smallest_sub,
+            f32::from_bits(42),
+            -f32::from_bits(42),
+            largest_sub,
+            -largest_sub,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            1e-9_f32,
+            -1e-9_f32,
+            cutoff.next_down(),
+            cutoff,
+            cutoff.next_up(),
+            -cutoff.next_down(),
+            -cutoff,
+            -cutoff.next_up(),
+            0.25_f32,
+            -0.25_f32,
+            0.5_f32,
+            -0.5_f32,
+            1.0_f32,
+            -1.0_f32,
+            sat.next_down(),
+            sat,
+            sat.next_up(),
+            -sat.next_down(),
+            -sat,
+            -sat.next_up(),
+            1e6_f32,
+            -1e6_f32,
+            f32::MAX,
+            f32::MIN,
+        ];
+        // Dense sweeps across small `(0, 1/32)`, mid `[1/32, 20)`, and saturated `[20, 40]`.
+        for k in 1..=3000_u32 {
+            let small = (f64::from(k) * (f64::from(cutoff) / 3000.0)) as f32;
+            let mid =
+                (f64::from(cutoff) + f64::from(k) * ((20.0 - f64::from(cutoff)) / 3000.0)) as f32;
+            samples.push(small);
+            samples.push(-small);
+            samples.push(mid);
+            samples.push(-mid);
+        }
+        // Dense ULP walk across the `1/32` branch boundary and `20.0` saturation boundary.
+        let mut u = cutoff;
+        for _ in 0..128 {
+            samples.push(u);
+            samples.push(-u);
+            u = u.next_down();
+        }
+        let mut u = cutoff;
+        for _ in 0..128 {
+            samples.push(u);
+            samples.push(-u);
+            u = u.next_up();
+        }
+        let mut u = sat;
+        for _ in 0..64 {
+            samples.push(u);
+            samples.push(-u);
+            u = u.next_down();
+        }
+        // Deterministic pseudo-random F32 values spanning subnormals through saturation.
+        let mut state: u64 = 0xd1b5_4a32_d192_ed03;
+        for _ in 0..6000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let raw = (state as u32) & 0x7fff_ffff;
+            let z = f32::from_bits(raw);
+            if z.is_finite() {
+                samples.push(z);
+                samples.push(-z);
+            }
+        }
+
+        for &xs in samples.as_chunks::<4>().0 {
+            let got = tanh_f32_4(xs).expect("valid tanh_f32_4");
+            for (lane, &z) in xs.iter().enumerate() {
+                let expected = tanh_f32(z).expect("valid scalar tanh_f32");
+                assert_eq!(
+                    got[lane].to_bits(),
+                    expected.to_bits(),
+                    "tanh_f32_4 mismatch at lane {lane} for z={z:e} (bits=0x{:08x})",
+                    z.to_bits()
+                );
+            }
+        }
+
+        // Explicit regime combos: all zero/saturated, all small, all mid, and every mixed pattern.
+        let special = [
+            [0.0_f32, -0.0, 20.0, -25.0],
+            [0.0, -0.0, smallest_sub, -largest_sub],
+            [1e-6, -1e-4, 0.01, -cutoff.next_down()],
+            [cutoff, -0.5, 3.5, -19.999],
+            [1e-4, 0.5, -1e-4, -0.5],
+            [0.5, 1e-4, -0.0, -25.0],
+            [-0.0, 25.0, 1e-5, -0.75],
+            [0.75, -0.75, 1.5, smallest_sub],
+        ];
+        for xs in special {
+            let got = tanh_f32_4(xs).expect("special tanh_f32_4");
+            for (lane, &z) in xs.iter().enumerate() {
+                let expected = tanh_f32(z).expect("scalar tanh_f32");
+                assert_eq!(
+                    got[lane].to_bits(),
+                    expected.to_bits(),
+                    "special tanh_f32_4 mismatch for {xs:?} lane {lane}"
+                );
+            }
+        }
+
+        // Nonfinite refusal in every lane position (matching tanh_f32 -> None).
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(tanh_f32_4([bad, 0.0, 1.0, -1.0]), None);
+            assert_eq!(tanh_f32_4([0.0, bad, 1.0, -1.0]), None);
+            assert_eq!(tanh_f32_4([0.0, 1.0, bad, -1.0]), None);
+            assert_eq!(tanh_f32_4([0.0, 1.0, -1.0, bad]), None);
+        }
     }
 }

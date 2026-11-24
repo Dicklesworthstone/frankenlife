@@ -372,10 +372,22 @@ pub fn reduce_field_on(
 ) -> Result<[DepositSummary; 2], CoreError> {
     apply_grants_on(field, grants, workers)?;
     let [first, second] = deposits;
-    Ok([
-        apply_deposits_on(field, first, workers)?,
-        apply_deposits_on(field, second, workers)?,
-    ])
+    let carrier = field.carrier0();
+    let mut out = [None; 2];
+    crate::deposit::apply_deposit_streams_to_carrier_on(
+        field,
+        &mut [first, second],
+        carrier,
+        workers,
+        &mut out,
+    )?;
+    match out {
+        [Some(a), Some(b)] => Ok([a, b]),
+        _ => Err(CoreError::StateConflict {
+            operation: "reduce field deposits",
+            detail: "missing deposit reduction summaries".to_owned(),
+        }),
+    }
 }
 
 /// Phase 9 for a 34-plane dual-carrier field (`V2-15`): debits `grants`

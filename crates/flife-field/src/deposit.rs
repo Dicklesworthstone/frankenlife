@@ -128,6 +128,10 @@ pub struct Deposits {
     identities: Vec<(OrganismId, usize)>,
     /// Packet indices in organism identity order, before grouping by cell.
     sequence: Vec<u32>,
+    /// True when the last `prepare_for_carrier` proved `packets` is already in
+    /// strictly ascending identity order (`0..packets.len()`), allowing
+    /// grouping and reduction to skip `sequence` indirection completely.
+    identity_sequence: bool,
     bins: Bins,
     /// The most deposits one reduction admits.
     organisms: usize,
@@ -170,6 +174,7 @@ impl Deposits {
             received: Vec::new(),
             identities: Vec::new(),
             sequence: Vec::new(),
+            identity_sequence: false,
             bins: Bins::new(DEPOSIT_PACKETS),
             organisms: usize::try_from(u32::MAX).unwrap_or(usize::MAX) / 4,
             applied: false,
@@ -254,6 +259,7 @@ impl Deposits {
         self.received.clear();
         self.identities.clear();
         self.sequence.clear();
+        self.identity_sequence = false;
         self.bins.clear();
         self.applied = false;
     }
@@ -418,6 +424,76 @@ impl Deposits {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Stage `organism`'s deposit using a precomputed `grid-cic-v1`
+    /// [`ExchangeStencil`], avoiding redundant stencil computation when
+    /// multiple deposit streams share the exact same position.
+    ///
+    /// # Errors
+    /// As [`Deposits::push`]. Nothing is staged on error.
+    pub fn push_stencil(
+        &mut self,
+        grid: &FieldGrid,
+        organism: OrganismId,
+        paid: f64,
+        offered: f64,
+        direction: &[f64; CHANNELS],
+        stencil: &ExchangeStencil,
+    ) -> Result<(), CoreError> {
+        self.check_entry(grid, paid, offered, direction)?;
+        let shares = split(stencil, offered);
+        self.stage(
+            grid,
+            organism,
+            paid,
+            offered,
+            direction,
+            stencil.cells().iter().copied().zip(shares),
+        );
+        Ok(())
+    }
+
+    /// Stage `organism`'s deposit using a precomputed [`ExchangeKernel`]
+    /// footprint (`(cell_index, weight)` pairs from
+    /// [`ExchangeKernel::footprint_into`] in ascending cell order), avoiding
+    /// redundant Gaussian evaluations when multiple streams share a position.
+    ///
+    /// # Errors
+    /// As [`Deposits::push`]. Nothing is staged on error.
+    pub fn push_footprint(
+        &mut self,
+        grid: &FieldGrid,
+        organism: OrganismId,
+        paid: f64,
+        offered: f64,
+        direction: &[f64; CHANNELS],
+        footprint: &[(usize, f64)],
+    ) -> Result<(), CoreError> {
+        self.check_entry(grid, paid, offered, direction)?;
+        split_slice(footprint, offered, &mut self.shares);
+        let entry = self.entries.len();
+        self.grid = Some(*grid);
+        let first = self.packets.len();
+        for (&(cell, _), &amount) in footprint.iter().zip(&self.shares) {
+            if amount > 0.0 {
+                self.packets.push(Packet {
+                    cell,
+                    organism,
+                    entry,
+                    amount,
+                });
+            }
+        }
+        self.entries.push(Entry {
+            organism,
+            paid: paid + 0.0,
+            offered: offered + 0.0,
+            direction: *direction,
+            first,
+            count: self.packets.len() - first,
+        });
         Ok(())
     }
 
@@ -926,6 +1002,326 @@ pub fn apply_deposits_on(
     apply_deposits_to_carrier_on(field, deposits, carrier, workers)
 }
 
+/// Reduce multiple [`Deposits`] streams sequentially into `carrier` of `field`
+/// in fixed slice order (`streams[0]`, `streams[1]`, ...) inside a single
+/// worker-pool dispatch so each worker processes every active stream over its
+/// cell partition while those cells stay hot in L1/L2 cache.
+///
+/// Bit-identical to calling [`apply_deposits_to_carrier_on`] on each stream in
+/// slice order.
+///
+/// # Errors
+/// [`CoreError::LayoutMismatch`] if `streams.len() != out.len()`, or as
+/// [`apply_deposits_to_carrier_on`]. On validation error nothing is written to
+/// `field`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-dispatch multi-stream carrier deposit reduction preserving bit-exact per-stream F32 rounding and compensated sums"
+)]
+pub fn apply_deposit_streams_to_carrier_on(
+    field: &mut FieldState,
+    streams: &mut [&mut Deposits],
+    carrier: CarrierLayout,
+    workers: usize,
+    out: &mut [Option<DepositSummary>],
+) -> Result<(), CoreError> {
+    if streams.len() != out.len() {
+        return Err(CoreError::LayoutMismatch {
+            buffer: "deposit summaries",
+            detail: format!(
+                "{} deposit streams for {} summary slots",
+                streams.len(),
+                out.len()
+            ),
+        });
+    }
+    if streams.is_empty() {
+        return Ok(());
+    }
+    if streams.len() == 1 {
+        out[0] = Some(apply_deposits_to_carrier_on(
+            field, streams[0], carrier, workers,
+        )?);
+        return Ok(());
+    }
+
+    // Validate and group every stream before mutating `field`.
+    let mut prepared: Vec<(DepositSummary, usize)> = Vec::with_capacity(streams.len());
+    let mut active_indices: Vec<usize> = Vec::with_capacity(streams.len());
+    let mut total_items = 0_usize;
+    let mut heaviest_stream = 0_usize;
+    let mut heaviest_items = 0_usize;
+    for (idx, stream) in streams.iter_mut().enumerate() {
+        let (summary, buckets) = stream.prepare_for_carrier(field, carrier)?;
+        let items = stream.bins.order().len();
+        let occ = stream.bins.occupied_buckets().len();
+        if items > 0 && occ > 0 {
+            active_indices.push(idx);
+            total_items = total_items.saturating_add(items);
+            if items > heaviest_items {
+                heaviest_items = items;
+                heaviest_stream = idx;
+            }
+        }
+        prepared.push((summary, buckets));
+    }
+    if active_indices.is_empty() {
+        for ((stream, (summary, _)), slot) in streams.iter_mut().zip(prepared).zip(out.iter_mut()) {
+            stream.received.clear();
+            stream.applied = true;
+            *slot = Some(summary);
+        }
+        return Ok(());
+    }
+    let buckets = prepared[0].1;
+    let values = field.as_mut_slice();
+    let energy_start = (carrier.energy_plane as usize) * buckets;
+    let moments_start = (carrier.first_moment_plane as usize) * buckets;
+    let moment_count = carrier.moment_count as usize;
+    let moments_len = moment_count * buckets;
+    let (mut energy, moments): (&mut [f32], &mut [f32]) = if energy_start < moments_start {
+        let (_, tail) = cut(values, energy_start)?;
+        let (e_slice, after_e) = cut(tail, buckets)?;
+        let gap = moments_start - (energy_start + buckets);
+        let (_, m_tail) = cut(after_e, gap)?;
+        let (m_slice, _) = cut(m_tail, moments_len)?;
+        (e_slice, m_slice)
+    } else {
+        let (_, tail) = cut(values, moments_start)?;
+        let (m_slice, after_m) = cut(tail, moments_len)?;
+        let gap = energy_start - (moments_start + moments_len);
+        let (_, e_tail) = cut(after_m, gap)?;
+        let (e_slice, _) = cut(e_tail, buckets)?;
+        (e_slice, m_slice)
+    };
+
+    let runs = workers.min(total_items / PACKETS_PER_RUN).max(1);
+    if runs == 1 {
+        let mut field_moments: [&mut [f32]; CHANNELS] =
+            std::array::from_fn(|_| <&mut [f32]>::default());
+        if moment_count > 0 {
+            for (channel, plane) in moments.chunks_exact_mut(buckets.max(1)).enumerate() {
+                if let Some(slot) = field_moments.get_mut(channel) {
+                    *slot = plane;
+                }
+            }
+        }
+        for ((stream, (mut summary, _)), slot) in
+            streams.iter_mut().zip(prepared).zip(out.iter_mut())
+        {
+            let occ = stream.bins.occupied_buckets();
+            stream.received.clear();
+            if stream.bins.order().is_empty() || occ.is_empty() {
+                stream.applied = true;
+                *slot = Some(summary);
+                continue;
+            }
+            stream.received.resize(occ.len(), 0.0);
+            let seq = (!stream.identity_sequence).then_some(stream.sequence.as_slice());
+            let mut run = Run {
+                cell_base: 0,
+                occupied_cells: occ,
+                energy,
+                moment_count,
+                moments: field_moments,
+                received: stream.received.as_mut_slice(),
+            };
+            let count = reduce_run(
+                &mut run,
+                stream.bins.offsets(),
+                stream.bins.order(),
+                seq,
+                &stream.packets,
+                &stream.entries,
+            );
+            energy = run.energy;
+            field_moments = run.moments;
+            let mut applied = CompensatedSum::ZERO;
+            for &value in stream.received.get(..count).unwrap_or(&[]) {
+                applied.add(value);
+            }
+            summary.cells = count;
+            summary.applied = applied.value();
+            stream.applied = true;
+            *slot = Some(summary);
+        }
+        return Ok(());
+    }
+
+    // Partition cells into `runs` ranges balanced by the heaviest active stream.
+    let heavy_offsets = streams[heaviest_stream].bins.offsets();
+    let heavy_items = streams[heaviest_stream].bins.order().len();
+    let bounds: Vec<usize> = (0..=runs)
+        .map(|run| {
+            if run == runs {
+                buckets
+            } else {
+                let target = heavy_items / runs * run + heavy_items % runs * run / runs;
+                heavy_offsets
+                    .partition_point(|&at| (at as usize) < target)
+                    .min(buckets)
+            }
+        })
+        .collect();
+
+    struct FieldSlice<'a> {
+        cell_base: usize,
+        energy: &'a mut [f32],
+        moments: [&'a mut [f32]; CHANNELS],
+    }
+    let mut field_lanes = Vec::with_capacity(runs);
+    for pair in bounds.windows(2) {
+        let cell_start = pair[0];
+        let cell_end = pair[1];
+        let (head, tail) = cut(std::mem::take(&mut energy), cell_end - cell_start)?;
+        energy = tail;
+        field_lanes.push(FieldSlice {
+            cell_base: cell_start,
+            energy: head,
+            moments: std::array::from_fn(|_| <&mut [f32]>::default()),
+        });
+    }
+    if moment_count > 0 {
+        for (channel, plane) in moments.chunks_exact_mut(buckets.max(1)).enumerate() {
+            let mut plane = plane;
+            for lane in &mut field_lanes {
+                let (head, tail) = cut(std::mem::take(&mut plane), lane.energy.len())?;
+                plane = tail;
+                if let Some(slot) = lane.moments.get_mut(channel) {
+                    *slot = head;
+                }
+            }
+        }
+    }
+
+    // Prepare per-stream read-only views and per-lane mutable `received` slices.
+    struct StreamRead<'a> {
+        offsets: &'a [u32],
+        order: &'a [u32],
+        sequence: Option<&'a [u32]>,
+        packets: &'a [Packet],
+        entries: &'a [Entry],
+    }
+    struct StreamLane<'a> {
+        occupied_cells: &'a [u32],
+        received: &'a mut [f64],
+        count: usize,
+    }
+    let stream_count = streams.len();
+    let mut stream_reads: Vec<StreamRead<'_>> = Vec::with_capacity(stream_count);
+    let mut lane_streams: Vec<Vec<StreamLane<'_>>> = (0..runs)
+        .map(|_| Vec::with_capacity(stream_count))
+        .collect();
+    for stream in streams.iter_mut() {
+        let occ_len = stream.bins.occupied_buckets().len();
+        stream.received.clear();
+        stream.received.resize(occ_len, 0.0);
+        let Deposits {
+            entries,
+            packets,
+            received,
+            sequence,
+            identity_sequence,
+            bins,
+            ..
+        } = &mut **stream;
+        let occupied_buckets = bins.occupied_buckets();
+        stream_reads.push(StreamRead {
+            offsets: bins.offsets(),
+            order: bins.order(),
+            sequence: (!*identity_sequence).then_some(sequence.as_slice()),
+            packets: packets.as_slice(),
+            entries: entries.as_slice(),
+        });
+        let mut rem_received = received.as_mut_slice();
+        let mut occ_cursor = 0_usize;
+        for (run_idx, pair) in bounds.windows(2).enumerate() {
+            let cell_end = pair[1];
+            let occ_end = if run_idx + 1 == runs {
+                occupied_buckets.len()
+            } else {
+                occ_cursor
+                    + occupied_buckets[occ_cursor..].partition_point(|&c| (c as usize) < cell_end)
+            };
+            let lane_occ = &occupied_buckets[occ_cursor..occ_end];
+            occ_cursor = occ_end;
+            let (owned, rest) = cut(std::mem::take(&mut rem_received), lane_occ.len())?;
+            rem_received = rest;
+            lane_streams[run_idx].push(StreamLane {
+                occupied_cells: lane_occ,
+                received: owned,
+                count: 0,
+            });
+        }
+    }
+
+    let reads: &[StreamRead<'_>] = &stream_reads;
+    let process_lane = |field_lane: &mut FieldSlice<'_>, lane_work: &mut [StreamLane<'_>]| {
+        let mut lane_energy = std::mem::take(&mut field_lane.energy);
+        let mut lane_moments = std::mem::replace(
+            &mut field_lane.moments,
+            std::array::from_fn(|_| <&mut [f32]>::default()),
+        );
+        for (s_read, s_lane) in reads.iter().zip(lane_work.iter_mut()) {
+            if s_lane.occupied_cells.is_empty() {
+                s_lane.count = 0;
+                continue;
+            }
+            let mut run = Run {
+                cell_base: field_lane.cell_base,
+                occupied_cells: s_lane.occupied_cells,
+                energy: lane_energy,
+                moment_count,
+                moments: lane_moments,
+                received: s_lane.received,
+            };
+            let count = reduce_run(
+                &mut run,
+                s_read.offsets,
+                s_read.order,
+                s_read.sequence,
+                s_read.packets,
+                s_read.entries,
+            );
+            s_lane.count = count;
+            lane_energy = run.energy;
+            lane_moments = run.moments;
+        }
+        field_lane.energy = lane_energy;
+        field_lane.moments = lane_moments;
+    };
+    let process_lane = &process_lane;
+    flife_core::pool::scope_workers(workers, "apply deposits", |scope| {
+        let mut pairs = field_lanes.iter_mut().zip(lane_streams.iter_mut());
+        let first = pairs.next();
+        for (f_lane, s_lanes) in pairs {
+            scope.spawn(move || process_lane(f_lane, s_lanes));
+        }
+        if let Some((f_lane, s_lanes)) = first {
+            process_lane(f_lane, s_lanes);
+        }
+    })?;
+
+    for (s_idx, (mut summary, _)) in prepared.into_iter().enumerate() {
+        let mut applied = CompensatedSum::ZERO;
+        for lane in &lane_streams {
+            let s_lane = &lane[s_idx];
+            for &value in s_lane.received.get(..s_lane.count).unwrap_or(&[]) {
+                applied.add(value);
+            }
+            summary.cells += s_lane.count;
+        }
+        summary.applied = applied.value();
+        out[s_idx] = Some(summary);
+    }
+    drop(lane_streams);
+    drop(stream_reads);
+    for stream in streams.iter_mut() {
+        stream.applied = true;
+    }
+    Ok(())
+}
+
 /// [`apply_deposits_on`] targeting a specific [`CarrierLayout`] (`V2-15`):
 /// `(0, 1, 32)` on 33-plane single-carrier fields, `(0, 1, 24)` for Carrier 0
 /// or `(25, 26, 8)` for Carrier 1 on 34-plane dual-carrier fields. Leaves all
@@ -947,6 +1343,7 @@ pub fn apply_deposits_to_carrier_on(
         packets,
         received,
         sequence,
+        identity_sequence,
         bins,
         ..
     } = deposits;
@@ -983,7 +1380,8 @@ pub fn apply_deposits_to_carrier_on(
 
     let runs = workers.min(items / PACKETS_PER_RUN).max(1);
     received.resize(occupied_buckets.len(), 0.0);
-    let (sequence, packets, entries) = (&**sequence, &**packets, &**entries);
+    let seq = (!*identity_sequence).then_some(sequence.as_slice());
+    let (packets, entries) = (&**packets, &**entries);
 
     if runs == 1 {
         let mut run = Run {
@@ -1001,7 +1399,7 @@ pub fn apply_deposits_to_carrier_on(
                 }
             }
         }
-        let count = reduce_run(&mut run, offsets, order, sequence, packets, entries);
+        let count = reduce_run(&mut run, offsets, order, seq, packets, entries);
         let mut applied = CompensatedSum::ZERO;
         for &value in run.received.get(..count).unwrap_or(&[]) {
             applied.add(value);
@@ -1065,7 +1463,7 @@ pub fn apply_deposits_to_carrier_on(
         }
     }
 
-    let reduce = |run: &mut Run<'_>| reduce_run(run, offsets, order, sequence, packets, entries);
+    let reduce = |run: &mut Run<'_>| reduce_run(run, offsets, order, seq, packets, entries);
     let reduce = &reduce;
     let mut occupied = vec![0_usize; lanes.len()];
     flife_core::pool::scope_workers(workers, "apply deposits", |scope| {
@@ -1191,6 +1589,7 @@ impl Deposits {
             packets,
             identities,
             sequence,
+            identity_sequence,
             bins,
             ..
         } = self;
@@ -1199,28 +1598,36 @@ impl Deposits {
                 quantity: DEPOSIT_PACKETS,
             });
         }
-        sequence.clear();
-        if strictly_ascending {
-            for entry in entries.iter() {
-                sequence.extend((entry.first..entry.first + entry.count).map(|at| at as u32));
-            }
-        } else {
-            for &(_, index) in identities.iter() {
-                if let Some(entry) = entries.get(index) {
-                    sequence.extend((entry.first..entry.first + entry.count).map(|at| at as u32));
-                }
-            }
-        }
         let buckets =
             usize::try_from(field.grid().cell_count()).map_err(|_| CoreError::Overflow {
                 quantity: DEPOSIT_PACKETS,
             })?;
-        bins.group(buckets, sequence.len(), |at| {
-            sequence
-                .get(at)
-                .and_then(|&packet| packets.get(packet as usize))
-                .map_or(usize::MAX, |packet| packet.cell)
-        })?;
+        let contiguous = strictly_ascending && entries_are_contiguous(entries, packets.len());
+        sequence.clear();
+        if contiguous {
+            *identity_sequence = true;
+            bins.group(buckets, packets.len(), |at| packets[at].cell)?;
+        } else {
+            *identity_sequence = false;
+            if strictly_ascending {
+                for entry in entries.iter() {
+                    sequence.extend((entry.first..entry.first + entry.count).map(|at| at as u32));
+                }
+            } else {
+                for &(_, index) in identities.iter() {
+                    if let Some(entry) = entries.get(index) {
+                        sequence
+                            .extend((entry.first..entry.first + entry.count).map(|at| at as u32));
+                    }
+                }
+            }
+            bins.group(buckets, sequence.len(), |at| {
+                sequence
+                    .get(at)
+                    .and_then(|&packet| packets.get(packet as usize))
+                    .map_or(usize::MAX, |packet| packet.cell)
+            })?;
+        }
 
         let values = field.as_slice().len();
         let planes_usize = usize::try_from(total_planes).map_err(|_| CoreError::Overflow {
@@ -1290,8 +1697,12 @@ impl DepositReduction<'_> {
     pub fn packet(&self, at: usize) -> Option<(f64, usize)> {
         let deposits = &*self.deposits;
         let &index = deposits.bins.order().get(at)?;
-        let &packet = deposits.sequence.get(index as usize)?;
-        let packet = deposits.packets.get(packet as usize)?;
+        let packet_idx = if deposits.identity_sequence {
+            index as usize
+        } else {
+            *deposits.sequence.get(index as usize)? as usize
+        };
+        let packet = deposits.packets.get(packet_idx)?;
         Some((packet.amount, packet.entry))
     }
 
@@ -1378,13 +1789,25 @@ fn flush_moment_batch_const<const M: usize>(
     for (channel, plane) in moments.iter_mut().take(M).enumerate() {
         for b in 0..count {
             let added = accum[b][channel] * factors[b];
-            if added != 0.0
-                && let Some(value) = plane.get_mut(cell_at[b])
-            {
-                *value = (f64::from(*value) + added) as f32;
+            if added != 0.0 {
+                let slot = &mut plane[cell_at[b]];
+                *slot = (f64::from(*slot) + added) as f32;
             }
         }
     }
+}
+
+/// True when `entries` cover `0..packet_len` contiguously in order, allowing
+/// `prepare_for_carrier` to bypass the `sequence` indirection array.
+fn entries_are_contiguous(entries: &[Entry], packet_len: usize) -> bool {
+    let mut cursor = 0_usize;
+    for entry in entries {
+        if entry.first != cursor {
+            return false;
+        }
+        cursor = cursor.saturating_add(entry.count);
+    }
+    cursor == packet_len
 }
 
 /// Fixed-channel specialization of [`reduce_run`] iterating only occupied cells
@@ -1395,7 +1818,7 @@ fn reduce_run_const<const M: usize>(
     run: &mut Run<'_>,
     offsets: &[u32],
     order: &[u32],
-    sequence: &[u32],
+    sequence: Option<&[u32]>,
     packets: &[Packet],
     entries: &[Entry],
 ) -> usize {
@@ -1405,39 +1828,47 @@ fn reduce_run_const<const M: usize>(
     let mut factors = [0.0_f64; REDUCE_BATCH];
     let mut accum = [[0.0_f64; M]; REDUCE_BATCH];
     let cell_base = run.cell_base;
+    let energy_len = run.energy.len();
 
     for &cell_u32 in run.occupied_cells {
         let cell = cell_u32 as usize;
-        let Some(at) = cell.checked_sub(cell_base) else {
+        let at = cell.wrapping_sub(cell_base);
+        if at >= energy_len {
             continue;
-        };
-        let (Some(&first), Some(&end)) = (offsets.get(cell), offsets.get(cell + 1)) else {
-            continue;
-        };
+        }
+        let first = offsets[cell] as usize;
+        let end = offsets[cell + 1] as usize;
         if first >= end {
             continue;
         }
-        let Some(energy) = run.energy.get_mut(at) else {
-            continue;
-        };
-        let slice = order.get(first as usize..end as usize).unwrap_or(&[]);
-        let before = *energy;
+        let slice = &order[first..end];
+        let before = run.energy[at];
         let mut total = 0.0_f64;
         let mut moment = [0.0_f64; M];
-        for &ord in slice {
-            let Some(&seq) = sequence.get(ord as usize) else {
-                continue;
-            };
-            let Some(packet) = packets.get(seq as usize) else {
-                continue;
-            };
-            total = add_down(total, packet.amount);
-            if let Some(entry) = entries.get(packet.entry)
-                && let Some(dir) = entry.direction.first_chunk::<M>()
-            {
-                let amount = packet.amount;
-                for (slot, &component) in moment.iter_mut().zip(dir) {
-                    *slot += amount * component;
+        match sequence {
+            None => {
+                for &ord in slice {
+                    let packet = &packets[ord as usize];
+                    total = add_down(total, packet.amount);
+                    if let Some(dir) = entries[packet.entry].direction.first_chunk::<M>() {
+                        let amount = packet.amount;
+                        for (slot, &component) in moment.iter_mut().zip(dir) {
+                            *slot += amount * component;
+                        }
+                    }
+                }
+            }
+            Some(sequence) => {
+                for &ord in slice {
+                    let seq = sequence[ord as usize];
+                    let packet = &packets[seq as usize];
+                    total = add_down(total, packet.amount);
+                    if let Some(dir) = entries[packet.entry].direction.first_chunk::<M>() {
+                        let amount = packet.amount;
+                        for (slot, &component) in moment.iter_mut().zip(dir) {
+                            *slot += amount * component;
+                        }
+                    }
                 }
             }
         }
@@ -1448,10 +1879,8 @@ fn reduce_run_const<const M: usize>(
         } else {
             0.0
         };
-        *energy = after;
-        if let Some(slot) = run.received.get_mut(occupied) {
-            *slot = received;
-        }
+        run.energy[at] = after;
+        run.received[occupied] = received;
         occupied += 1;
 
         if factor != 0.0 {
@@ -1484,7 +1913,7 @@ fn reduce_run(
     run: &mut Run<'_>,
     offsets: &[u32],
     order: &[u32],
-    sequence: &[u32],
+    sequence: Option<&[u32]>,
     packets: &[Packet],
     entries: &[Entry],
 ) -> usize {
@@ -1520,10 +1949,14 @@ fn reduce_run(
                 let mut total = 0.0_f64;
                 let mut moment = [0.0_f64; CHANNELS];
                 for &ord in slice {
-                    let Some(&seq) = sequence.get(ord as usize) else {
-                        continue;
+                    let pkt_idx = match sequence {
+                        None => ord as usize,
+                        Some(seq_slice) => match seq_slice.get(ord as usize) {
+                            Some(&seq) => seq as usize,
+                            None => continue,
+                        },
                     };
-                    let Some(packet) = packets.get(seq as usize) else {
+                    let Some(packet) = packets.get(pkt_idx) else {
                         continue;
                     };
                     total = add_down(total, packet.amount);

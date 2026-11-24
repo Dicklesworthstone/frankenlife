@@ -25,8 +25,8 @@
 use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_core::{CoreError, TimeStep, ValidatedConfig};
 
-use crate::grid::FieldGrid;
-use crate::numerics::exp_neg;
+use crate::grid::{FieldGrid, minimum_image};
+use crate::numerics::{exp_neg, exp_neg_4};
 use crate::state::FieldState;
 
 /// The baseline bilinear cloud-in-cell exchange kernel.
@@ -275,35 +275,123 @@ impl ExchangeKernel {
                 }
                 let radius_squared = radius * radius;
                 let two_sigma_squared = 2.0 * sigma * sigma;
+                let width = grid.world_width();
+                let height = grid.world_height();
                 let hx = grid.cell_width();
                 let hy = grid.cell_height();
+                let cells_x = grid.cells_x();
+                let cells_y = grid.cells_y();
+                let stride = cells_x as usize;
                 let mut weight_sum = 0.0;
-                for &row in &scratch.rows {
-                    let cy = (f64::from(row) + 0.5) * hy;
-                    for &column in &scratch.columns {
-                        let cx = (f64::from(column) + 0.5) * hx;
-                        let [dx, dy] = grid.displacement(center, [cx, cy])?;
-                        let d2 = dx * dx + dy * dy;
-                        if d2 > radius_squared {
-                            continue;
-                        }
-                        let raw = exp_neg(d2 / two_sigma_squared).ok_or_else(|| {
-                            CoreError::NumericalInvalid {
-                                quantity: "exchange weight",
-                                detail: format!("|d|² = {d2:?} has no Gaussian weight"),
-                            }
-                        })?;
-                        if raw <= 0.0 {
-                            continue;
-                        }
-                        let cell = grid.cell_index(column, row).ok_or_else(|| {
-                            CoreError::NumericalInvalid {
+                const STACK_COLS: usize = 64;
+                if scratch.columns.len() <= STACK_COLS
+                    && usize::try_from(grid.cell_count()).is_ok()
+                {
+                    let mut col_dx_sq = [0.0_f64; STACK_COLS];
+                    let col_len = scratch.columns.len();
+                    for (slot, &column) in col_dx_sq.iter_mut().zip(&scratch.columns) {
+                        if column >= cells_x {
+                            return Err(CoreError::NumericalInvalid {
                                 quantity: "exchange footprint",
-                                detail: format!("cell ({column}, {row}) is outside the grid"),
+                                detail: format!("column {column} is outside the grid"),
+                            });
+                        }
+                        let cx = (f64::from(column) + 0.5) * hx;
+                        let dx = minimum_image(center[0], cx, width)?;
+                        *slot = dx * dx;
+                    }
+                    let mut pending_cells = [0_usize; 4];
+                    let mut pending_args = [0.0_f64; 4];
+                    for &row in &scratch.rows {
+                        if row >= cells_y {
+                            return Err(CoreError::NumericalInvalid {
+                                quantity: "exchange footprint",
+                                detail: format!("row {row} is outside the grid"),
+                            });
+                        }
+                        let cy = (f64::from(row) + 0.5) * hy;
+                        let dy = minimum_image(center[1], cy, height)?;
+                        let dy_sq = dy * dy;
+                        if dy_sq > radius_squared {
+                            continue;
+                        }
+                        let row_base = (row as usize) * stride;
+                        let mut pending = 0_usize;
+                        for (&column, &dx_sq) in scratch.columns.iter().zip(&col_dx_sq[..col_len]) {
+                            let d2 = dx_sq + dy_sq;
+                            if d2 > radius_squared {
+                                continue;
                             }
-                        })?;
-                        scratch.cells.push((cell, raw));
-                        weight_sum += raw;
+                            pending_cells[pending] = row_base + (column as usize);
+                            pending_args[pending] = d2 / two_sigma_squared;
+                            pending += 1;
+                            if pending == 4 {
+                                let weights = exp_neg_4(pending_args).ok_or_else(|| {
+                                    CoreError::NumericalInvalid {
+                                        quantity: "exchange weight",
+                                        detail: format!(
+                                            "Gaussian args {pending_args:?} have no weight"
+                                        ),
+                                    }
+                                })?;
+                                for (&cell, &raw) in pending_cells.iter().zip(&weights) {
+                                    if raw > 0.0 {
+                                        scratch.cells.push((cell, raw));
+                                        weight_sum += raw;
+                                    }
+                                }
+                                pending = 0;
+                            }
+                        }
+                        for idx in 0..pending {
+                            let raw = exp_neg(pending_args[idx]).ok_or_else(|| {
+                                CoreError::NumericalInvalid {
+                                    quantity: "exchange weight",
+                                    detail: format!(
+                                        "Gaussian arg {:?} has no weight",
+                                        pending_args[idx]
+                                    ),
+                                }
+                            })?;
+                            if raw > 0.0 {
+                                scratch.cells.push((pending_cells[idx], raw));
+                                weight_sum += raw;
+                            }
+                        }
+                    }
+                } else {
+                    for &row in &scratch.rows {
+                        let cy = (f64::from(row) + 0.5) * hy;
+                        let dy = minimum_image(center[1], cy, height)?;
+                        let dy_sq = dy * dy;
+                        if dy_sq > radius_squared {
+                            continue;
+                        }
+                        for &column in &scratch.columns {
+                            let cx = (f64::from(column) + 0.5) * hx;
+                            let dx = minimum_image(center[0], cx, width)?;
+                            let d2 = dx * dx + dy_sq;
+                            if d2 > radius_squared {
+                                continue;
+                            }
+                            let raw = exp_neg(d2 / two_sigma_squared).ok_or_else(|| {
+                                CoreError::NumericalInvalid {
+                                    quantity: "exchange weight",
+                                    detail: format!("|d|² = {d2:?} has no Gaussian weight"),
+                                }
+                            })?;
+                            if raw <= 0.0 {
+                                continue;
+                            }
+                            let cell = grid.cell_index(column, row).ok_or_else(|| {
+                                CoreError::NumericalInvalid {
+                                    quantity: "exchange footprint",
+                                    detail: format!("cell ({column}, {row}) is outside the grid"),
+                                }
+                            })?;
+                            scratch.cells.push((cell, raw));
+                            weight_sum += raw;
+                        }
                     }
                 }
                 if scratch.cells.is_empty() || !weight_sum.is_finite() || weight_sum <= 0.0 {
@@ -421,6 +509,15 @@ fn axis_candidates(
     }
     let (low, high) = (low as i64, high as i64);
     let modulus = i64::from(cells);
+    if low >= 0 && high < modulus {
+        #[expect(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "low >= 0 and high < cells <= u32::MAX checked above"
+        )]
+        out.extend((low as u32)..=(high as u32));
+        return true;
+    }
     out.extend((low..=high).filter_map(|index| u32::try_from(index.rem_euclid(modulus)).ok()));
     out.sort_unstable();
     out.dedup();

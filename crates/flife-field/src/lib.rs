@@ -61,9 +61,9 @@ pub mod uptake;
 
 pub use bins::Bins;
 pub use deposit::{
-    DepositReduction, DepositSummary, Deposits, DualCarrierEmissionSplit, apply_deposits,
-    apply_deposits_on, apply_deposits_to_carrier, apply_deposits_to_carrier_on,
-    split_dual_carrier_emission,
+    DepositReduction, DepositSummary, Deposits, DualCarrierEmissionSplit,
+    apply_deposit_streams_to_carrier_on, apply_deposits, apply_deposits_on,
+    apply_deposits_to_carrier, apply_deposits_to_carrier_on, split_dual_carrier_emission,
 };
 pub use exchange::{
     ExchangeKernel, ExchangeScratch, ExchangeStencil, FIXED_WORLD_GAUSSIAN_CUTOFF_SIGMA,

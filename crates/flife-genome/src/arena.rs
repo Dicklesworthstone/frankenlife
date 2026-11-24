@@ -115,6 +115,34 @@ impl GenomeArena {
         Ok(())
     }
 
+    /// Make room for one genome of `topology` without allocating temporary
+    /// count storage, so inserting it (and later freeing it) does not allocate.
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] when the host refuses the room.
+    pub fn reserve_one(&mut self, topology: TopologyId) -> Result<(), CoreError> {
+        let index = topology.index();
+        if self.buckets.len() <= index {
+            let more = index + 1 - self.buckets.len();
+            grow(&mut self.buckets, more)?;
+            self.buckets.resize_with(index + 1, Bucket::default);
+        }
+        let bucket = &mut self.buckets[index];
+        if bucket.free.is_empty() {
+            grow(&mut bucket.slots, 1)?;
+            let total = bucket.slots.len().saturating_add(1);
+            bucket
+                .free
+                .try_reserve(total)
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "genome arena",
+                    bytes: u64::try_from(total.saturating_mul(size_of::<u64>()))
+                        .unwrap_or(u64::MAX),
+                })?;
+        }
+        Ok(())
+    }
+
     /// Give a genome of `topology` the lowest free slot of its bucket, or a
     /// new one. It allocates only beyond what [`GenomeArena::reserve`] made
     /// room for.

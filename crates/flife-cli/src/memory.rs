@@ -29,13 +29,15 @@ pub fn admit(
     checkpoint: Option<&CheckpointAdmission>,
     render: u64,
 ) -> Result<MemoryAdmission, CoreError> {
-    let batched = match choice {
-        ControllerChoice::Cpu => false,
-        ControllerChoice::Auto | ControllerChoice::Torch | ControllerChoice::Metal => true,
-    };
-    world.admit_memory(
-        batched,
-        checkpoint.map_or(0, |admission| admission.peak_bytes),
-        render,
-    )
+    let ckpt = checkpoint.map_or(0, |admission| admission.peak_bytes);
+    match choice {
+        ControllerChoice::Cpu => world.admit_memory(false, ckpt, render),
+        // Every built-in accelerated backend (`CpuBackend`, `MetalBackend`)
+        // implements `supports_flat_f32() == true`, reserving only the compact
+        // flat-F32 buffers (`flat_f32_batched_bytes`) rather than legacy
+        // `RawOutputs` / per-lane `Observation` buffers.
+        ControllerChoice::Auto | ControllerChoice::Torch | ControllerChoice::Metal => {
+            world.admit_memory_flat_f32(ckpt, render)
+        }
+    }
 }

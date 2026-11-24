@@ -1040,6 +1040,19 @@ impl Population {
         Ok(())
     }
 
+    /// Admit a single organism outside a tick without staging a temporary
+    /// `Vec<Entrant>` (used by streaming checkpoint restore to avoid holding
+    /// every entrant beside the population; FL-043).
+    ///
+    /// # Errors
+    /// As [`Population::admit`]. Nothing changes on error.
+    pub fn admit_one(&mut self, entrant: Entrant) -> Result<(), CoreError> {
+        self.check_entrants(std::slice::from_ref(&entrant), self.len())?;
+        self.arena.reserve_one(entrant.genome.topology())?;
+        self.insert(entrant);
+        Ok(())
+    }
+
     /// Replace a live organism's changing state: position, velocity, energy,
     /// energy change rate, held output and cooldown deadline.
     ///

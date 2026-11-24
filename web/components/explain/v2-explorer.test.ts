@@ -197,34 +197,22 @@ describe("minimal CLI override synthesis & exact round-trip", () => {
     );
   });
 
-  test("keeps content.ts v2BuildStatus synced with the 15/18 closed V2 beads + FL-043 and supports radiogroup arrow navigation", () => {
-    const landed = v2BuildStatus.find((row) => row.tone === "built")?.detail ?? "";
-    const inFlight = v2BuildStatus.find((row) => row.tone === "partial")?.detail ?? "";
-    const open = v2BuildStatus.find((row) => row.tone === "open")?.detail ?? "";
+  test("keeps content.ts v2BuildStatus synced with the 18/18 closed V2 beads and supports radiogroup arrow navigation", () => {
+    const builtRows = v2BuildStatus.filter((row) => row.tone === "built");
+    const landed = builtRows[0]?.detail ?? "";
+    const observed = builtRows[1]?.detail ?? "";
+    const residuals = v2BuildStatus.find((row) => row.tone === "partial")?.detail ?? "";
 
-    for (const closed of [
-      "V2-01",
-      "V2-02",
-      "V2-03",
-      "V2-04",
-      "V2-05",
-      "V2-06",
-      "V2-07",
-      "V2-08",
-      "V2-09",
-      "V2-11",
-      "V2-12",
-      "V2-13",
-      "V2-14",
-      "V2-15",
-      "V2-16",
-      "FL-043",
-    ]) {
-      expect(landed).toContain(closed);
-    }
-    expect(inFlight).toContain("V2-10");
-    expect(inFlight).toContain("V2-17");
-    expect(open).toContain("V2-17");
+    expect(builtRows).toHaveLength(2);
+    expect(landed).toContain("18 of 18 V2 beads");
+    expect(landed).toContain("V2-01 through V2-17");
+    expect(landed).toContain("104/104 Stage-2");
+    expect(observed).toContain("Gate G5");
+    expect(observed).toContain("104-run Stage-2");
+    expect(observed).toContain("429×");
+    expect(observed).toContain("Sarle b = 0.608");
+    expect(residuals).toContain("8,192t+");
+    expect(residuals).toContain("+3.1%");
 
     // WAI-ARIA radiogroup keyboard wrapping (ArrowRight/Left/Up/Down, Home, End).
     expect(nextRadioIndex(0, 4, "ArrowRight")).toBe(1);

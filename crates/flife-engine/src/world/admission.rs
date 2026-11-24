@@ -76,6 +76,21 @@ impl World {
         self.admit_memory_beside(batched, checkpoint, render, 0)
     }
 
+    /// [`World::admit_memory`] for a flat-F32 controller backend
+    /// (`ControllerBackend::supports_flat_f32() == true`, such as `CpuBackend`
+    /// or `MetalBackend`), charging [`World::flat_f32_batched_bytes`] instead
+    /// of the larger legacy [`World::batched_bytes`].
+    ///
+    /// # Errors
+    /// As [`World::admit_memory`].
+    pub fn admit_memory_flat_f32(
+        &self,
+        checkpoint: u64,
+        render: u64,
+    ) -> Result<MemoryAdmission, CoreError> {
+        self.admit_memory_with_batched(Some(self.flat_f32_batched_bytes()), checkpoint, render, 0)
+    }
+
     /// [`World::admit_memory`] with `package` bytes held beside this world
     /// as a term of their own: a transplant's package (FL-042), which its
     /// host holds until it has grafted it: the package's world
@@ -91,12 +106,27 @@ impl World {
         render: u64,
         package: u64,
     ) -> Result<MemoryAdmission, CoreError> {
+        self.admit_memory_with_batched(
+            batched.then(|| self.batched_bytes()),
+            checkpoint,
+            render,
+            package,
+        )
+    }
+
+    fn admit_memory_with_batched(
+        &self,
+        batched_scratch: Option<u64>,
+        checkpoint: u64,
+        render: u64,
+        package: u64,
+    ) -> Result<MemoryAdmission, CoreError> {
         let execution = &self.config().config().execution;
         let footprint = self.footprint();
-        let scratch = if batched {
-            footprint.scratch.saturating_add(self.batched_bytes())
-        } else {
-            footprint.scratch
+        let batched = batched_scratch.is_some();
+        let scratch = match batched_scratch {
+            Some(extra) => footprint.scratch.saturating_add(extra),
+            None => footprint.scratch,
         };
         let mut admission = MemoryAdmission {
             budget_bytes: execution.maximum_total_bytes,

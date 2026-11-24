@@ -196,7 +196,12 @@ fn the_preset_is_admitted_term_by_term() {
     let execution = &config.config().execution;
     let mut world = found(&config).expect("the preset founds");
     let footprint = world.footprint();
-    let batched = world.batched_bytes();
+    let batched = world.flat_f32_batched_bytes();
+    assert!(
+        batched < world.batched_bytes(),
+        "flat-F32 staging ({batched}) must be strictly smaller than legacy ({})",
+        world.batched_bytes()
+    );
     let reference = admit(&world, ControllerChoice::Cpu, None, 0).expect("admitted");
     print(&reference);
     assert_eq!(reference.budget_bytes, execution.maximum_total_bytes);

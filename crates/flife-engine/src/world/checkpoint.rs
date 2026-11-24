@@ -706,9 +706,11 @@ impl World {
             field.current().as_slice().len(),
         )?;
 
-        // Genomes, rebuilt through the run's own quota and seal, a record
-        // at a time from a window over the chunk: a streamed chunk is never
-        // held whole (FL-043), and is verified when the stream finishes.
+        // Genomes, particles and held state decoded in lockstep directly into
+        // `Population`, one organism at a time from a window over the genome
+        // chunk: neither the genome chunk nor intermediate `Vec<Genome>` /
+        // `Vec<Entrant>` lists are held whole beside the population (FL-043).
+        // The genome stream's digest is verified as soon as all records finish.
         let maximum = usize::try_from(rules.maximum_population).unwrap_or(usize::MAX);
         let parameters_max = usize::try_from(catalog.maximum_parameters()).unwrap_or(usize::MAX);
         let mut quota = GenomeQuota::from_config(&config)?;
@@ -716,7 +718,31 @@ impl World {
         let mut stream = reader.stream(ChunkFamily::Genomes, version)?;
         let live = stream.count(maximum, 8)?;
         let header_bytes = genome_header_bytes(&rules);
-        let mut genomes = Vec::with_capacity(live);
+
+        let chunk = reader.versioned(ChunkFamily::Particles, version)?;
+        counted(chunk.items, ChunkFamily::Particles, live)?;
+        let mut particles = ByteReader::new(chunk.bytes, "particles chunk");
+        let state_width = rules.recurrent_state_width;
+        let expected_action_width = rules.v2.actions().action_width();
+        let held_version = if is_v2_chunk {
+            WORLD_V2_CHUNK_VERSION
+        } else if state_width > 0 {
+            WORLD_RECURRENT_HELD_VERSION
+        } else {
+            version
+        };
+        let chunk = reader.versioned(ChunkFamily::Held, held_version)?;
+        counted(chunk.items, ChunkFamily::Held, live)?;
+        let mut held = ByteReader::new(chunk.bytes, "held chunk");
+        if particles.count(maximum, 8)? != live || held.count(maximum, 8)? != live {
+            return Err(refuse("the particle, held and genome counts differ"));
+        }
+
+        let mut population = Population::from_config(arrangement, &config)?;
+        let past = |next: Option<u64>, id: u64| next.is_some_and(|next| next > id);
+        let mut last_organism_id: Option<u64> = None;
+        let mut all_genomes_past = true;
+
         for _ in 0..live {
             stream.fill(header_bytes)?;
             let mut input = ByteReader::new(stream.window(), "genomes chunk");
@@ -771,39 +797,7 @@ impl World {
                     Err(refuse(format!("{id}'s parameters: {}", unsealed.error)))
                 },
             )?;
-            genomes.push(genome);
-        }
-        let (window, genome_items) = (stream.held_bytes(), stream.items());
-        stream.finish()?;
-        counted(genome_items, ChunkFamily::Genomes, live)?;
-        if [quota.logical_bytes(), quota.allocated_bytes(), quota.live()] != quota_recorded {
-            return Err(refuse(format!(
-                "the genomes' quota is {:?}; the checkpoint records {quota_recorded:?}",
-                [quota.logical_bytes(), quota.allocated_bytes(), quota.live()]
-            )));
-        }
 
-        // Organisms: particles and held state, row by row.
-        let chunk = reader.versioned(ChunkFamily::Particles, version)?;
-        counted(chunk.items, ChunkFamily::Particles, live)?;
-        let mut particles = ByteReader::new(chunk.bytes, "particles chunk");
-        let state_width = rules.recurrent_state_width;
-        let expected_action_width = rules.v2.actions().action_width();
-        let held_version = if is_v2_chunk {
-            WORLD_V2_CHUNK_VERSION
-        } else if state_width > 0 {
-            WORLD_RECURRENT_HELD_VERSION
-        } else {
-            version
-        };
-        let chunk = reader.versioned(ChunkFamily::Held, held_version)?;
-        counted(chunk.items, ChunkFamily::Held, live)?;
-        let mut held = ByteReader::new(chunk.bytes, "held chunk");
-        if particles.count(maximum, 8)? != live || held.count(maximum, 8)? != live {
-            return Err(refuse("the particle, held and genome counts differ"));
-        }
-        let mut entrants = Vec::with_capacity(live);
-        for genome in genomes {
             let id = OrganismId::new(particles.u64()?);
             let genome_id = GenomeId::new(particles.u64()?);
             if genome_id != genome.id() {
@@ -1000,7 +994,9 @@ impl World {
             } else {
                 (INITIAL_SECRETORY_READINESS, Tick::new(0), 0.0_f32)
             };
-            entrants.push(Entrant {
+            all_genomes_past &= past(identities.genomes.next_raw(), genome.id().get());
+            last_organism_id = Some(id.get());
+            let entrant = Entrant {
                 organism: Organism {
                     id,
                     genome: genome_id,
@@ -1029,26 +1025,29 @@ impl World {
                     last_neighbor_h0,
                 },
                 genome,
-            });
+            };
+            population
+                .admit_one(entrant)
+                .map_err(|error| refuse(format!("the organisms are not admissible: {error}")))?;
+        }
+        let (window, genome_items) = (stream.held_bytes(), stream.items());
+        stream.finish()?;
+        counted(genome_items, ChunkFamily::Genomes, live)?;
+        if [quota.logical_bytes(), quota.allocated_bytes(), quota.live()] != quota_recorded {
+            return Err(refuse(format!(
+                "the genomes' quota is {:?}; the checkpoint records {quota_recorded:?}",
+                [quota.logical_bytes(), quota.allocated_bytes(), quota.live()]
+            )));
         }
         particles.finish()?;
         held.finish()?;
-        if let Some(last) = entrants.last() {
-            let past = |next: Option<u64>, id: u64| next.is_some_and(|next| next > id);
-            if !past(identities.organisms.next_raw(), last.organism.id.get())
-                || !entrants
-                    .iter()
-                    .all(|entrant| past(identities.genomes.next_raw(), entrant.genome.id().get()))
-            {
-                return Err(refuse(
-                    "an identity allocator would reissue a live identity",
-                ));
-            }
+        if let Some(last_id) = last_organism_id
+            && (!past(identities.organisms.next_raw(), last_id) || !all_genomes_past)
+        {
+            return Err(refuse(
+                "an identity allocator would reissue a live identity",
+            ));
         }
-        let mut population = Population::from_config(arrangement, &config)?;
-        population
-            .admit(&mut entrants)
-            .map_err(|error| refuse(format!("the organisms are not admissible: {error}")))?;
 
         // The ledger, which must close at exactly the restored energy.
         let chunk = reader.versioned(ChunkFamily::Ledger, version)?;

@@ -1399,12 +1399,24 @@ where
         }
         if g_start < topo_end {
             let sparse_pending = &pending[g_start..topo_end];
+            let mut visited_sparse = 0_usize;
             for (&key, shard) in sparse.iter_mut() {
                 let rel_start = sparse_pending.partition_point(|p| p.shard_key < key);
                 let rel_end = sparse_pending.partition_point(|p| p.shard_key <= key);
                 if rel_start < rel_end {
                     visit(layers, shard, g_start + rel_start, g_start + rel_end)?;
+                    visited_sparse += rel_end - rel_start;
                 }
+            }
+            if visited_sparse != sparse_pending.len() {
+                return Err(CoreError::StateConflict {
+                    operation: "cpu controller pack",
+                    detail: format!(
+                        "sparse shards missing for {} of {} pending pack jobs",
+                        sparse_pending.len().saturating_sub(visited_sparse),
+                        sparse_pending.len()
+                    ),
+                });
             }
         }
     }

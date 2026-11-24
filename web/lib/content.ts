@@ -611,21 +611,21 @@ export const v2BuildStatus: {
     claim: "Rules & Implementation",
     tone: "built",
     detail:
-      "15 of 18 V2 beads verified and closed across all 21 feature slugs: V2-01 (21-slug config/registry, --list-features, --disable/--enable/--v1-compat, INV-14 resume refusal), V2-02 (oases), V2-03 (senescence), V2-04 (surplus-emission, excitable-relay, wake-offset), V2-05 (so2-motor), V2-06 (so2-budding), V2-07 (hippo-crowding), V2-08 (pcp-polarity, emt-gate), V2-09 (tight-junctions), V2-11 (lysis-recycling, symplectic-waste), V2-12 (epigenetic-recurrence, notch-delta), V2-13 (trophallaxis, cadherin-4d, velocity-alignment), V2-14 (vascular-field), V2-15 (dual-carrier-trails), and V2-16 (v2-visual-mappings), alongside FL-043 peak-memory admission and FL-050 Cinema export.",
+      "All 18 of 18 V2 beads verified and closed across all 21 feature slugs (V2-01 through V2-17 + V2-EPIC): 104/104 Stage-2 320² × 2,048-tick runs across Discovery [42, 43] and Held-Out [101, 102] seeds reached target horizon with 0 extinct, 0 paused, 0 failed, 0 refused births (INV-12), and max |INV-03| = 7.17e-9. Automated E2E suites verify all 21 features composed simultaneously (112/44/48/34, 0 Metal F16 deferrals) and leave-one-out sweeps across every slug.",
   },
   {
-    stage: "In flight",
-    claim: "Empirical calibration & verification",
+    stage: "Observed (G5 & G9 Stage-2)",
+    claim: "Visual & Ecological",
+    tone: "built",
+    detail:
+      "Human Gate G5 inspection (raw + aesthetic + V2-16 overlays on Discovery 42 & Held-Out 101) and 104-run Stage-2 ablations establish 429× (Bundle A) and 67× (Bundle B) heritable survival over fresh-offspring, 4.0× anti-jamming + +0.135..+0.144 coherence + 79,910 E kin trophallaxis (4/4 seeds) on Bundle A, and INV-08 pure-field bimodal Murray vascular networks (Sarle b = 0.608, +50–58% organism alignment, 4/4) with decoupled Carrier-1 pheromone wakes (MaxZ = 10.24, decoupling = 0.948) and +10.0% held-out neural evolution lift over fixed-controller on Bundle B.",
+  },
+  {
+    stage: "Honest residuals",
+    claim: "Open tradeoffs & follow-ups",
     tone: "partial",
     detail:
-      "V2-10 128² quickies completed (Arm 2 treatment self-regulated at ~51% of cap with 1.98× wound-rim proliferation vs 0.989× v1-compat and 0.888× no-tight-junctions, while Arm 1 stayed null and exposed a real F32 INV-02 cone-drift bug); Plan §11.5 cone contraction, Rust v2_diagnostics, and V2-17 Bundle A/B calibration are in flight.",
-  },
-  {
-    stage: "Not yet established",
-    claim: "Visual & Ecological",
-    tone: "open",
-    detail:
-      "V2-17 calibrated Stage-2 Bundle A & B multi-seed runs, G9 ecological claims, and human G5 visual review remain open. No unearned visual or ecological claims are made for field-ecology-v2 presets.",
+      "Bundle A within-clone radial h_0 vs crowding correlation remains modest at 2,048 ticks (+0.069 despite +0.038 clonal W/T lift), kin trophallaxis and Carrier-1 trails carry real metabolic costs against ablated live counts, and Bundle A lesion-assay H4 follow-up + longer-horizon (8,192t+) runs remain open. Performance: Bundle B adds +3.1% per organism-tick vs --v1-compat (within the <8% pure-field target), while Round 1–2b optimizations delivered 1.35×–1.79× simulation speedups and 3.4×–10× checkpoint speedups with bit-exact parity.",
   },
 ];
 
@@ -810,8 +810,8 @@ export const inheritance = {
 
 // The presets (presets/*.toml; README "Planned command surface"). `kind` says how each was chosen:
 // a profile's world is declared by its experiment; the search worlds were picked by an outer search whose
-// procedure experiments/showcase/README.md states; the two v2 presets are authored Stage-2 candidates
-// awaiting V2-10/V2-17 multi-seed verification and are never presented as verified ecological results.
+// procedure experiments/showcase/README.md states; the two v2 presets are authored Stage-2 presets verified
+// across 104 runs in V2-17 (experiments/v2-emergence/README.md), with observed gains and honest residuals stated.
 export const presets: {
   file: string;
   model: string;
@@ -929,8 +929,8 @@ export const presets: {
     torus: 80,
     dt: "1/32",
     kind: "v2",
-    chosen: "Authored V2 preset · awaiting verify",
-    body: "Bundle A (tissue, 14 active features, [contact]): 108 inputs, 40 actions, 44 raw outputs on a 320² × 33 field, drawn in cell-state-v1. Authored Stage-2 candidate awaiting V2-10/V2-17 multi-seed verification — not yet a verified ecological result.",
+    chosen: "V2-17 verified · 52 Stage-2 runs",
+    body: "Bundle A (tissue, 14 active features, [contact]): 108 inputs, 40 actions, 44 raw outputs on a 320² × 33 field, drawn in cell-state-v1. Stage-2 verified (4/4 seeds): 4.0× fewer jammed overlaps vs v1-compat, +0.135..+0.144 coherence lift, 79,910 E active kin trophallaxis, and 429× heritable survival over fresh-offspring.",
   },
   {
     file: "supercolony-v2",
@@ -941,8 +941,8 @@ export const presets: {
     torus: 80,
     dt: "1/32",
     kind: "v2",
-    chosen: "Authored V2 preset · awaiting verify",
-    body: "Bundle B (supercolony, 11 active features, no [contact]): 108 inputs, 40 actions on a 320² × 34 dual-carrier field with Murray vascular conductances. Authored Stage-2 candidate awaiting V2-10/V2-17 verification — not yet a verified ecological result.",
+    chosen: "V2-17 verified · 52 Stage-2 runs",
+    body: "Bundle B (supercolony, 11 active features, no [contact]): 108 inputs, 40 actions on a 320² × 34 dual-carrier field with Murray vascular conductances. Stage-2 verified (4/4 seeds): bimodal vascular networks (Sarle b = 0.608, +50–58% organism alignment), decoupled Carrier-1 trails (MaxZ = 10.24), +10.0% held-out neural lift vs fixed-controller, and +3.1% per organism-tick vs v1-compat.",
   },
 ];
 
@@ -954,7 +954,7 @@ export const milestones = [
   { id: "M3", name: "Qualified acceleration", deliverable: "CPU/Metal parity, persistent buffers, fused population inference, variable topology", gates: ["G4"] },
   { id: "M4", name: "Screenshot-scale world", deliverable: "400k independent networks near 10k parameters on a 1024² field, interactive, honest clocks", gates: ["G7", "G8"] },
   { id: "M5", name: "Scientific and visual release", deliverable: "A seed gallery, ablations, experiment reports, reliable Cinema export", gates: ["G9", "G10"] },
-  { id: "M6", name: "Additional model families", deliverable: "Modular field-ecology-v2 (21 toggleable mechanisms, Bundles A & B): all 21 engine & visual modules verified (15/18 V2 beads closed); V2-10 & V2-17 empirical calibration and multi-seed verification in flight", gates: [] },
+  { id: "M6", name: "Additional model families", deliverable: "Modular field-ecology-v2 (21 toggleable mechanisms, Bundles A & B): all 18/18 V2 beads closed with 104-run Stage-2 G5/G9 verification and honest residuals recorded in experiments/v2-emergence/README.md", gates: [] },
 ];
 
 export const stack = [

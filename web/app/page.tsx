@@ -589,9 +589,9 @@ export default function Home() {
               <>
                 Every <code className="text-green-300">field-ecology-v1*</code> run omits <code className="text-slate-200">[v2]</code>{" "}
                 and stays byte-identical. On <code className="text-green-300">field-ecology-v2</code>, 21 mechanisms are registered as
-                individually toggleable slugs grouped into two default bundles: Bundle A (<code className="text-slate-200">tissue</code>,
-                14 defaults, <code className="text-slate-200">[contact]</code>) and Bundle B (<code className="text-slate-200">supercolony</code>,
-                13 defaults, strictly <code className="text-slate-200">INV-08</code> pure-field). Every override materializes before
+                individually toggleable slugs grouped into two Stage-2 verified bundles: Bundle A (<code className="text-slate-200">tissue</code>,
+                14 active features, <code className="text-slate-200">[contact]</code>) and Bundle B (<code className="text-slate-200">supercolony</code>,
+                11 active features, strictly <code className="text-slate-200">INV-08</code> pure-field). Every override materializes before
                 hashing and is locked at founding time (<code className="text-slate-200">INV-14</code>).
               </>
             }
@@ -629,8 +629,7 @@ export default function Home() {
                     <a className={link} href="#status">
                       Honest status
                     </a>{" "}
-                    for which V2 modules are verified versus in flight — no ecological claims are made until V2-10 and
-                    V2-17 multi-seed campaigns run.
+                    for the 104-run Stage-2 V2-17 empirical results and explicit residual tradeoffs.
                   </p>
                 </div>
               </Reveal>
@@ -983,8 +982,8 @@ export default function Home() {
                 <a className={link} href={siteConfig.showcase}>
                   the search states how
                 </a>
-                . Two are authored <code className="text-slate-200">field-ecology-v2</code> presets (Bundles A and B)
-                awaiting Stage-2 V2-10/V2-17 verification — never presented as verified ecological results.
+                . Two are Stage-2 verified <code className="text-slate-200">field-ecology-v2</code> presets (Bundles A and B,
+                104 runs across discovery and held-out seeds with explicit residual tradeoffs).
               </>
             }
           >

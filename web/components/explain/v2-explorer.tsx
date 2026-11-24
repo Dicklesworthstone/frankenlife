@@ -154,9 +154,10 @@ export function V2Explorer() {
           (<code className="text-slate-300">V2Feature::ALL</code>,{" "}
           <code className="text-slate-300">V2Config::abi</code>, <code className="text-slate-300">validate_v2</code>)
           and <code className="text-slate-300">flife --list-features</code>. Configuration and ABI calculator only —
-          not simulation output. Verified &amp; closed (15/18 V2 beads — all 21 slugs + FL-043): V2-01..V2-09,
-          V2-11..V2-16. Empirical multi-seed campaigns (V2-10, V2-17) are in flight; no ecological claims are made
-          here.
+          not simulation output. Verified &amp; closed (18/18 V2 beads — all 21 slugs + V2-10/V2-17 Stage-2):
+          V2-01..V2-17 + V2-EPIC. Stage-2 G5/G9 outcomes and honest residuals are recorded in{" "}
+          <code className="text-slate-300">experiments/v2-emergence/README.md</code>; this widget makes no ecological
+          claims.
         </>
       }
     >
@@ -397,9 +398,9 @@ export function V2Explorer() {
         <div className="flex flex-wrap items-center gap-3 font-mono text-[10px]">
           <span className="inline-flex items-center gap-1.5 text-green-300">
             <span aria-hidden="true" className="h-2 w-2 rounded-full bg-green-400" />
-            Verified &amp; closed (all 21 slugs: V2-01..09, 11..16)
+            Verified &amp; closed (all 21 slugs, 18/18 V2 beads: V2-01..V2-17 + V2-EPIC)
           </span>
-          <span className="text-slate-400">Empirical campaigns in flight (V2-10, V2-17)</span>
+          <span className="text-slate-400">104-run Stage-2 G5/G9 recorded</span>
         </div>
       </div>
 

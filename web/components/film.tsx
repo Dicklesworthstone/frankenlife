@@ -156,6 +156,7 @@ export function Film({ className, feather = false }: { className?: string; feath
   const seekRef = useRef<HTMLInputElement>(null);
   const seekAt = useRef(0);
   const pausedOffScreen = useRef(false);
+  const visibleRef = useRef(true);
 
   /** Bring the seek control up to the frame on screen: late while the film plays, at once before it is used. */
   const syncSeek = useCallback(() => {
@@ -221,7 +222,16 @@ export function Film({ className, feather = false }: { className?: string; feath
     const seekAndPlay = () => {
       if (slotGenRef.current[slot] !== gen) return;
       if (Math.abs(el.currentTime - localTime) > 1e-3 || el.ended) el.currentTime = localTime;
-      if (playWhenReady && activeSlotRef.current === slot) el.play().catch(() => {});
+      if (playWhenReady && activeSlotRef.current === slot) {
+        if (!visibleRef.current) {
+          pausedOffScreen.current = true;
+          setPlaying(false);
+          return;
+        }
+        el.play().catch(() => {
+          if (activeSlotRef.current === slot) setPlaying(false);
+        });
+      }
     };
     if (el.readyState >= 1) {
       seekAndPlay();
@@ -316,6 +326,7 @@ export function Film({ className, feather = false }: { className?: string; feath
     if (!container || typeof IntersectionObserver === "undefined") return;
     const observer = new IntersectionObserver(([entry]) => {
       if (!entry) return;
+      visibleRef.current = entry.isIntersecting;
       const active = slotRefs.current[activeSlotRef.current];
       if (!active) return;
       if (!entry.isIntersecting) {
@@ -414,8 +425,8 @@ export function Film({ className, feather = false }: { className?: string; feath
         onPlay={() => {
           if (activeSlotRef.current === slot) setPlaying(true);
         }}
-        onPause={() => {
-          if (activeSlotRef.current === slot) {
+        onPause={(event) => {
+          if (activeSlotRef.current === slot && !(MULTI_SEGMENT && event.currentTarget.ended)) {
             setPlaying(false);
             syncSeek();
             if (dotRef.current) dotRef.current.style.opacity = "";

@@ -2200,3 +2200,59 @@ fn command_journal_refuses_nonfinite_applied_outcome_and_closes_on_schema_mismat
         Some("design")
     );
 }
+
+/// Regression: the read-only fast path in `CommandJournal::open` must verify
+/// that both required unique indexes (`commands_identity`, `outcomes_command`)
+/// exist before returning early, recreating any dropped index on reopen.
+#[test]
+fn command_journal_open_restores_dropped_unique_indexes() {
+    let dir = fresh("dropped-index");
+    let path = dir.join("catalog.db");
+    {
+        let _journal = CommandJournal::open(&path).expect("creates catalog");
+    }
+    block_on_inline(async {
+        let mut conn = fsqlite::Connection::open(path.display().to_string())
+            .await
+            .expect("raw open");
+        conn.execute("DROP INDEX commands_identity")
+            .await
+            .expect("drops commands_identity");
+        conn.execute("DROP INDEX outcomes_command")
+            .await
+            .expect("drops outcomes_command");
+        let _ = conn.close_in_place().await;
+    });
+
+    {
+        let _reopened = CommandJournal::open(&path).expect("reopens and restores indexes");
+    }
+
+    let indexes: Vec<String> = block_on_inline(async {
+        let mut conn = fsqlite::Connection::open(path.display().to_string())
+            .await
+            .expect("raw open");
+        let rows = conn
+            .query("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .await
+            .expect("reads indexes");
+        let names = rows
+            .into_iter()
+            .filter_map(|row| {
+                row.get(0)
+                    .and_then(fsqlite::SqliteValue::as_text)
+                    .map(str::to_owned)
+            })
+            .collect();
+        let _ = conn.close_in_place().await;
+        names
+    });
+    assert!(
+        indexes.iter().any(|n| n == "commands_identity"),
+        "commands_identity missing after reopen: {indexes:?}"
+    );
+    assert!(
+        indexes.iter().any(|n| n == "outcomes_command"),
+        "outcomes_command missing after reopen: {indexes:?}"
+    );
+}

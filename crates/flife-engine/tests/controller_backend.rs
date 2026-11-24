@@ -293,7 +293,12 @@ fn flat_f32_batched_world_matches_reference_bit_for_bit_and_never_grows() {
         batched.set_cpu_workers(w).expect("workers");
 
         let before = batched.allocated();
-        let batched_bytes = batched.batched_bytes();
+        let flat_batched_bytes = batched.flat_f32_batched_bytes();
+        assert!(
+            flat_batched_bytes > 0 && flat_batched_bytes < batched.batched_bytes(),
+            "flat-F32 staging ({flat_batched_bytes}) must be strictly smaller than legacy ({})",
+            batched.batched_bytes()
+        );
         batched.set_controller_backend(Some(Box::new(FlatReferenceBatch {
             defer_every: 5,
             ..FlatReferenceBatch::default()
@@ -302,8 +307,16 @@ fn flat_f32_batched_world_matches_reference_bit_for_bit_and_never_grows() {
         let installed = batched.allocated();
         assert_eq!(
             installed.scratch,
-            before.scratch + batched_bytes,
+            before.scratch + flat_batched_bytes,
             "workers={workers}"
+        );
+        // Resizing workers while a flat-F32 backend is installed must not
+        // allocate unused legacy per-lane Observation buffers.
+        batched.set_cpu_workers(w).expect("re-set workers");
+        assert_eq!(
+            batched.allocated().scratch,
+            installed.scratch,
+            "workers={workers}: set_cpu_workers must preserve flat-F32 scratch"
         );
 
         let (difference, evaluated, births) = race(&mut reference, &mut batched, 200);

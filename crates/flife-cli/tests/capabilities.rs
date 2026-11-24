@@ -74,7 +74,7 @@ fn fixed_terms() -> (u64, u64) {
     let config = ValidatedConfig::from_toml(PRESET).expect("the preset validates");
     let world = found(&config).expect("founds");
     let reference = world.admit_memory(false, 0, 0).expect("admitted");
-    let batched = world.admit_memory(true, 0, 0).expect("admitted");
+    let batched = world.admit_memory_flat_f32(0, 0).expect("admitted");
     (reference.fixed_bytes(), batched.fixed_bytes())
 }
 

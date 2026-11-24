@@ -1461,9 +1461,19 @@ impl World {
         lanes.extend(added);
         lanes.truncate(workers);
         lanes.shrink_to(workers);
-        // A lane's share of the rows follows the count (FL-043).
-        let batched = self.controllers.backend.is_some();
-        fit_lanes(lanes, &self.rules, capacity_of(&self.rules)?, batched)
+        // A lane's share of the rows follows the count (FL-043). Only legacy
+        // non-flat-F32 backends use per-lane `observed` / `controller_inputs`.
+        let legacy_batched = self
+            .controllers
+            .backend
+            .as_deref()
+            .is_some_and(|backend| !backend.supports_flat_f32());
+        fit_lanes(
+            lanes,
+            &self.rules,
+            capacity_of(&self.rules)?,
+            legacy_batched,
+        )
     }
 
     /// Evaluate due controllers in one batch on `backend` from the next
@@ -1473,16 +1483,22 @@ impl World {
     /// ([`flife_neural::backend`]). A backend that fails is dropped, and
     /// [`World::controller_report`] says why.
     ///
-    /// Installing a backend reserves the batched path's lists for the
-    /// population's capacity (FL-043): its outputs, a slot per row and each
-    /// lane's observations. If the host refuses them, the backend is not
-    /// installed, and the report says why.
+    /// Installing a backend reserves only the batched path's lists it actually
+    /// uses for the population's capacity (FL-043): compact flat-F32 buffers
+    /// ([`World::flat_f32_batched_bytes`]) when `backend.supports_flat_f32()`,
+    /// or legacy `RawOutputs` and per-lane `Observation` buffers
+    /// ([`World::batched_bytes`]) otherwise. If the host refuses them, the
+    /// backend is not installed, and the report says why.
     pub fn set_controller_backend(&mut self, backend: Option<Box<dyn ControllerBackend>>) {
-        let reserved = if backend.is_some() {
-            capacity_of(&self.rules).and_then(|rows| self.reserve_batched(rows))
-        } else {
-            self.release_batched();
-            Ok(())
+        let reserved = match backend.as_deref() {
+            Some(device) => {
+                let flat_f32 = device.supports_flat_f32();
+                capacity_of(&self.rules).and_then(|rows| self.reserve_batched(rows, flat_f32))
+            }
+            None => {
+                self.release_batched();
+                Ok(())
+            }
         };
         let controllers = &mut self.controllers;
         controllers.report.backend = backend.as_ref().map(|backend| backend.describe());
@@ -1499,43 +1515,55 @@ impl World {
         });
     }
 
-    /// Reserve the batched path's lists for `rows` rows: legacy outputs, flat
-    /// F32 staging/outputs, and each lane's observations.
-    fn reserve_batched(&mut self, rows: usize) -> Result<(), CoreError> {
-        let input_width = self.rules.v2.sensors().input_width();
-        let raw_output_width = self.rules.v2.actions().raw_output_width();
-        let flat_in = rows.checked_mul(input_width).ok_or(CoreError::Overflow {
-            quantity: "flat controller inputs",
-        })?;
-        let flat_out = rows
-            .checked_mul(raw_output_width)
-            .ok_or(CoreError::Overflow {
-                quantity: "flat controller outputs",
+    /// Reserve the batched path's lists for `rows` rows: either compact
+    /// flat-F32 staging/output buffers (`flat_f32 == true`, freeing legacy
+    /// `outputs` and per-lane `observed` / `controller_inputs`) or legacy
+    /// `RawOutputs` + per-lane observations (`flat_f32 == false`, freeing
+    /// flat-F32 buffers).
+    fn reserve_batched(&mut self, rows: usize, flat_f32: bool) -> Result<(), CoreError> {
+        if flat_f32 {
+            let input_width = self.rules.v2.sensors().input_width();
+            let raw_output_width = self.rules.v2.actions().raw_output_width();
+            let flat_in = rows.checked_mul(input_width).ok_or(CoreError::Overflow {
+                quantity: "flat controller inputs",
             })?;
-        let controllers = &mut self.controllers;
-        fit(&mut controllers.outputs, rows, "controller outputs")?;
-        fit(
-            &mut controllers.flat_inputs_f32,
-            flat_in,
-            "flat controller inputs",
-        )?;
-        fit(
-            &mut controllers.flat_inputs_finite,
-            rows,
-            "flat controller input flags",
-        )?;
-        fit(
-            &mut controllers.flat_outputs.values,
-            flat_out,
-            "flat controller outputs",
-        )?;
-        fit(
-            &mut controllers.flat_outputs.valid,
-            rows,
-            "flat controller valid flags",
-        )?;
-        controllers.flat_outputs.output_width = 0;
-        fit_lanes(&mut self.scratch.lanes, &self.rules, rows, true)
+            let flat_out = rows
+                .checked_mul(raw_output_width)
+                .ok_or(CoreError::Overflow {
+                    quantity: "flat controller outputs",
+                })?;
+            let controllers = &mut self.controllers;
+            controllers.outputs = Vec::new();
+            fit(
+                &mut controllers.flat_inputs_f32,
+                flat_in,
+                "flat controller inputs",
+            )?;
+            fit(
+                &mut controllers.flat_inputs_finite,
+                rows,
+                "flat controller input flags",
+            )?;
+            fit(
+                &mut controllers.flat_outputs.values,
+                flat_out,
+                "flat controller outputs",
+            )?;
+            fit(
+                &mut controllers.flat_outputs.valid,
+                rows,
+                "flat controller valid flags",
+            )?;
+            controllers.flat_outputs.output_width = 0;
+            fit_lanes(&mut self.scratch.lanes, &self.rules, rows, false)
+        } else {
+            let controllers = &mut self.controllers;
+            controllers.flat_inputs_f32 = Vec::new();
+            controllers.flat_inputs_finite = Vec::new();
+            controllers.flat_outputs = FlatOutputs::default();
+            fit(&mut controllers.outputs, rows, "controller outputs")?;
+            fit_lanes(&mut self.scratch.lanes, &self.rules, rows, true)
+        }
     }
 
     /// Release the batched path's lists.
@@ -1925,9 +1953,9 @@ impl World {
         }
     }
 
-    /// What installing a controller backend reserves on top of
-    /// [`World::footprint`] (FL-043): its outputs and a slot per row for the
-    /// population's capacity, and each lane's observations (plus expanded
+    /// What installing a legacy (non-flat-F32) controller backend reserves on
+    /// top of [`World::footprint`] (FL-043): its `RawOutputs` list for the
+    /// population's capacity, and each lane's `Observation` (plus expanded
     /// input vectors when the controller layout exceeds `SENSOR_WIDTH`) for
     /// the most rows it can take.
     #[must_use]
@@ -1936,7 +1964,6 @@ impl World {
         let lanes = self.scratch.lanes.len();
         let rows = lane_rows(organisms, lanes);
         let input_width = self.rules.v2.sensors().input_width();
-        let raw_output_width = self.rules.v2.actions().raw_output_width();
         let expanded = if input_width > SENSOR_WIDTH {
             bytes_for::<[f64; MAX_SENSOR_WIDTH]>(rows).saturating_mul(lanes as u64)
         } else {
@@ -1944,12 +1971,27 @@ impl World {
         };
         total([
             bytes_for::<Option<RawOutputs>>(organisms),
+            bytes_for::<Observation>(rows).saturating_mul(lanes as u64),
+            expanded,
+        ])
+    }
+
+    /// What installing a flat-F32 controller backend
+    /// (`ControllerBackend::supports_flat_f32() == true`, such as `CpuBackend`
+    /// or `MetalBackend`) reserves on top of [`World::footprint`] (FL-043):
+    /// contiguous F32 inputs, input-finiteness flags, and `FlatOutputs` for
+    /// the population's capacity (omitting the unused legacy `RawOutputs` and
+    /// per-lane `Observation` buffers).
+    #[must_use]
+    pub fn flat_f32_batched_bytes(&self) -> u64 {
+        let organisms = self.population.capacity();
+        let input_width = self.rules.v2.sensors().input_width();
+        let raw_output_width = self.rules.v2.actions().raw_output_width();
+        total([
             bytes_for::<f32>(organisms.saturating_mul(input_width)),
             bytes_for::<u8>(organisms),
             bytes_for::<f32>(organisms.saturating_mul(raw_output_width)),
             bytes_for::<u8>(organisms),
-            bytes_for::<Observation>(rows).saturating_mul(lanes as u64),
-            expanded,
         ])
     }
 
@@ -3476,7 +3518,7 @@ impl World {
         // sequential per-cell order).
         let (_, next) = field.stage();
         let workers = field_work.workers();
-        let mut byproducts_recorded = false;
+        let mut fused_byproducts: Option<DepositSummary> = None;
         if let Some(trail_deposits) = trail_emissions.as_mut().filter(|_| next.is_dual_carrier()) {
             let (emitted_c0, recycled_summary, emitted_c1) = if fields.backend.is_none() {
                 apply_grants_on(next, grants, workers)?;
@@ -3498,8 +3540,7 @@ impl World {
                                 .to_owned(),
                         });
                     };
-                    bp_summary.record(&mut tick_ledger, Transfer::MetabolicByproduct)?;
-                    byproducts_recorded = true;
+                    fused_byproducts = Some(bp_summary);
                     (em, rec)
                 } else {
                     let mut summaries = [None; 2];
@@ -3560,8 +3601,7 @@ impl World {
                         detail: "missing deposit summaries for fused reduction".to_owned(),
                     });
                 };
-                bp_summary.record(&mut tick_ledger, Transfer::MetabolicByproduct)?;
-                byproducts_recorded = true;
+                fused_byproducts = Some(bp_summary);
                 (em, rec)
             } else {
                 let mut summaries = [None; 2];
@@ -3605,8 +3645,10 @@ impl World {
             emitted_summary.record(&mut tick_ledger, Transfer::Emission)?;
             recycled_summary.record(&mut tick_ledger, Transfer::Recycling)?;
         }
-        if !byproducts_recorded && let Some(byproducts) = byproducts.as_mut() {
-            let byproduct_summary = if byproducts.is_empty() {
+        if let Some(byproducts) = byproducts.as_mut() {
+            let byproduct_summary = if let Some(summary) = fused_byproducts {
+                summary
+            } else if byproducts.is_empty() {
                 DepositSummary::default()
             } else {
                 apply_deposits_to_carrier_on(next, byproducts, next.carrier0(), workers)?

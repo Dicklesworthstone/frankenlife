@@ -338,7 +338,7 @@ pub fn transport_on(
     }
 
     let energy_before = sum(current.energy());
-    let used = scratches.len().min(planes);
+    let used = scratches.len().min(planes).min(64);
     let per = planes.div_ceil(used.max(1));
     let run = |first_plane: usize,
                source: &[f32],
@@ -474,7 +474,7 @@ pub fn transport_range_on(
         width,
         height,
     };
-    let used = scratches.len().min(planes);
+    let used = scratches.len().min(planes).min(64);
     let per = planes.div_ceil(used.max(1));
     let run = |first_plane: usize,
                source: &[f32],
@@ -1235,7 +1235,7 @@ pub fn transport_flux_range_on(
         width,
         height,
     };
-    let used = scratches.len().min(planes);
+    let used = scratches.len().min(planes).min(64);
     let per = planes.div_ceil(used.max(1));
     let run = |first_plane: usize,
                source: &[f32],

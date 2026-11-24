@@ -312,9 +312,10 @@ impl CommandJournal {
                 .map_err(|error| fail("set synchronous mode", &error))?;
 
             // Fast path for an already-initialized catalog: inspect existing
-            // tables read-only so reopening on every checkpoint avoids ten
-            // redundant DDL/write-transaction fsyncs while still refusing
-            // foreign catalogs without mutating them.
+            // tables and required unique indexes read-only so reopening on
+            // every checkpoint avoids ten redundant DDL/write-transaction
+            // fsyncs while still refusing foreign catalogs without mutating
+            // them and repairing any dropped table or index.
             const REQUIRED_TABLES: [&str; 6] = [
                 "runs",
                 "commands",
@@ -323,14 +324,31 @@ impl CommandJournal {
                 "lineage",
                 "branches",
             ];
-            let existing_tables: BTreeSet<String> = journal
+            const REQUIRED_INDEXES: [&str; 2] = ["commands_identity", "outcomes_command"];
+            let mut existing_tables: BTreeSet<String> = BTreeSet::new();
+            let mut existing_indexes: BTreeSet<String> = BTreeSet::new();
+            for row in journal
                 .connection
-                .query("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .query("SELECT type, name FROM sqlite_master WHERE type IN ('table', 'index')")
                 .await
                 .map_err(|error| fail("read catalog schema", &error))?
-                .into_iter()
-                .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
-                .collect();
+            {
+                let Some(kind) = row.get(0).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let Some(name) = row.get(1).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                match kind {
+                    "table" => {
+                        existing_tables.insert(name.to_owned());
+                    }
+                    "index" => {
+                        existing_indexes.insert(name.to_owned());
+                    }
+                    _ => {}
+                }
+            }
             if existing_tables.contains("catalog") {
                 let format = journal
                     .connection
@@ -347,6 +365,9 @@ impl CommandJournal {
                         if REQUIRED_TABLES
                             .iter()
                             .all(|table| existing_tables.contains(*table))
+                            && REQUIRED_INDEXES
+                                .iter()
+                                .all(|index| existing_indexes.contains(*index))
                         {
                             return Ok::<_, CoreError>(());
                         }

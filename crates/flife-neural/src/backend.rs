@@ -251,7 +251,13 @@ pub trait ControllerBackend: Debug + Send {
             outputs.clear();
             return Ok(());
         };
-        let output_width = first.controller.topology().raw_output_width();
+        let output_width = jobs
+            .iter()
+            .find_map(|job| {
+                let topo = job.controller.topology();
+                (topo.input_width() == input_width).then_some(topo.raw_output_width())
+            })
+            .unwrap_or_else(|| first.controller.topology().raw_output_width());
         outputs.prepare(jobs.len(), output_width)?;
 
         let mut wide_inputs = Vec::with_capacity(expected_inputs);
@@ -410,5 +416,30 @@ mod tests {
             backend.evaluate_flat_f32(&jobs, in_w, &inputs_f32[..in_w], &inputs_finite, &mut flat);
         assert!(matches!(mismatch, Err(CoreError::LayoutMismatch { .. })));
         assert!(flat.valid.is_empty());
+
+        // Leading job with mismatched input_width and different output_width
+        // must be deferred without suppressing valid subsequent jobs.
+        let other_topo = DenseTopology::with_io(in_w as u32 + 4, &[4], out_w as u32 + 4)
+            .expect("other topology");
+        let other_params = vec![0.02_f32; other_topo.parameter_count()];
+        let other_ctrl = ReferenceController::new(&other_topo, Weights::F32(&other_params), 4.0)
+            .expect("other controller");
+        let mixed_jobs = [
+            FlatControllerJob {
+                genome: GenomeId::new(99),
+                slot: ArenaSlot::new(1, 0, 1),
+                controller: other_ctrl,
+            },
+            jobs[0],
+        ];
+        let mixed_inputs = vec![0.25_f32; 2 * in_w];
+        let mixed_finite = [1_u8, 1];
+        backend
+            .evaluate_flat_f32(&mixed_jobs, in_w, &mixed_inputs, &mixed_finite, &mut flat)
+            .expect("mixed flat eval");
+        assert_eq!(flat.output_width, out_w);
+        assert_eq!(flat.valid, [0, 1]);
+        assert!(flat.row(0).is_none());
+        assert!(flat.row(1).is_some());
     }
 }

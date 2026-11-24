@@ -1633,12 +1633,15 @@ impl DeviceOwner {
             table.write_leases += 1;
             memory
         };
-        let _guard = ScopedWrite {
+        let mut scoped = ScopedWrite {
             shared: &self.shared,
             handle: buffer.handle,
+            committed: false,
         };
         let mut guard = memory.write().unwrap_or_else(PoisonError::into_inner);
-        T::write(&mut guard, offset, data).map_err(metal)
+        T::write(&mut guard, offset, data).map_err(metal)?;
+        scoped.committed = true;
+        Ok(())
     }
 
     /// The first `out.len()` elements of `buffer`, read under a readback
@@ -1688,10 +1691,13 @@ impl DeviceOwner {
 
 /// Stack-borrowed RAII guard releasing a transient host write lease on return
 /// or unwind while preserving the Level-1 (`table`) / Level-2 (`memory`) lock
-/// hierarchy.
+/// hierarchy. Marks the buffer defined and bumps its epoch only if the write
+/// succeeded (`committed == true`), so a rejected out-of-bounds `write_slice`
+/// never marks an undefined buffer defined or advances its epoch.
 struct ScopedWrite<'a> {
     shared: &'a Shared,
     handle: Handle,
+    committed: bool,
 }
 
 impl Drop for ScopedWrite<'_> {
@@ -1699,8 +1705,10 @@ impl Drop for ScopedWrite<'_> {
         let mut table = self.shared.table();
         if let Ok(resident) = table.resident(self.shared.id, self.handle) {
             resident.writer = None;
-            resident.contents = Contents::Defined;
-            resident.epoch = resident.epoch.saturating_add(1);
+            if self.committed {
+                resident.contents = Contents::Defined;
+                resident.epoch = resident.epoch.saturating_add(1);
+            }
         }
         table.write_leases = table.write_leases.saturating_sub(1);
         table.settle(self.handle);
@@ -1940,5 +1948,37 @@ mod tests {
             Some(2)
         );
         assert_eq!(owner.epoch(buffers[0]).ok().map(|e| e.get()), Some(1));
+    }
+
+    #[test]
+    fn failed_write_slice_leaves_undefined_buffer_undefined_and_epoch_unchanged() {
+        let Ok(owner) = DeviceOwner::open(Limits::UNBOUNDED) else {
+            return;
+        };
+        let output = owner.upload(&[2.0_f32; 4]).expect("uploads");
+        let failed = Err(MetalError::CommandBuffer(CommandBufferState::Error));
+        owner
+            .bind_and_release(&[output.writes()], &failed)
+            .expect("settles failed command");
+        assert_eq!(owner.state(output).ok(), Some(ResourceState::Available));
+        assert_eq!(owner.epoch(output).ok().map(|e| e.get()), Some(2));
+
+        // Out-of-bounds `write_slice` fails and must NOT mark the undefined
+        // buffer defined or bump its epoch.
+        assert!(owner.write_slice(output, 2, &[1.0_f32; 4]).is_err());
+        assert_eq!(owner.state(output).ok(), Some(ResourceState::Available));
+        assert_eq!(owner.epoch(output).ok().map(|e| e.get()), Some(2));
+        assert!(owner.read(output, super::Purpose::Readback).is_err());
+        assert_eq!(owner.usage().write_leases, 0);
+
+        // A valid `write_slice` commits and restores `Defined` at epoch 3.
+        owner
+            .write_slice(output, 0, &[9.0_f32; 4])
+            .expect("valid write_slice");
+        assert_eq!(owner.state(output).ok(), Some(ResourceState::Committed));
+        assert_eq!(owner.epoch(output).ok().map(|e| e.get()), Some(3));
+        let mut back = [0.0_f32; 4];
+        owner.read_back(output, &mut back).expect("reads back");
+        assert_eq!(back, [9.0_f32; 4]);
     }
 }

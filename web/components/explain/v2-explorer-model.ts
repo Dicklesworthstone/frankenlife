@@ -36,8 +36,8 @@ export type V2ExplorerFeature = {
  * (`crates/flife-core/src/v2.rs`, `V2Feature::ALL`).
  *
  * Verification status reflects the observed branch state (AGENTS.md):
- * - Verified & closed (15/18 V2 beads — all 21 feature slugs): V2-01..V2-09, V2-11..V2-16.
- * - Empirical campaigns in flight: V2-10 & V2-17.
+ * - Verified & closed (18/18 V2 beads — all 21 feature slugs + V2-10/V2-17 Stage-2): V2-01..V2-17 + V2-EPIC.
+ * - Stage-2 G5/G9 results and honest residuals are recorded in `experiments/v2-emergence/README.md`.
  */
 export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
   {

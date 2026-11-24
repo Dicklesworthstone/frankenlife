@@ -311,11 +311,12 @@ pub fn admit_kept(
     drawable: [u32; 2],
     checkpoint: u64,
 ) -> Result<MemoryAdmission, CoreError> {
-    world.admit_memory(
-        uses_batched_controllers(controllers),
-        checkpoint,
-        observer_bytes(world, founding, view, drawable),
-    )
+    let observers = observer_bytes(world, founding, view, drawable);
+    if uses_batched_controllers(controllers) {
+        world.admit_memory_flat_f32(checkpoint, observers)
+    } else {
+        world.admit_memory(false, checkpoint, observers)
+    }
 }
 
 /// [`admit_kept`] charging observers for the surface's opening `(drawable,
@@ -335,5 +336,9 @@ pub fn admit_kept_at(
     checkpoint: u64,
 ) -> Result<MemoryAdmission, CoreError> {
     let observers = observer_bytes_at(world, founding, view, drawable, pixels_per_point)?;
-    world.admit_memory(uses_batched_controllers(controllers), checkpoint, observers)
+    if uses_batched_controllers(controllers) {
+        world.admit_memory_flat_f32(checkpoint, observers)
+    } else {
+        world.admit_memory(false, checkpoint, observers)
+    }
 }

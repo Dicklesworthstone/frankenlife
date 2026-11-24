@@ -500,9 +500,10 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         fps: u32,
         /// What the organisms' colour means: `lineage`, `energy`,
-        /// `generation`, `motion`, `topology`, `affinity` or `lineage-energy`
-        /// (or a registered name such as `founder-lineage-v1`). The default
-        /// is the configuration's `[presentation] color_mapping`.
+        /// `generation`, `motion`, `topology`, `affinity`, `lineage-energy`,
+        /// `cell-state` or `polarity` (or a registered name such as
+        /// `founder-lineage-v1`, `cell-state-v1` or `polarity-v1`). The
+        /// default is the configuration's `[presentation] color_mapping`.
         #[arg(long)]
         color: Option<ColorMapping>,
         /// `glow` (the default), `raw`: no halos and a linear grey field, or `sphere`: raw with
@@ -517,9 +518,12 @@ enum Command {
         no_field: bool,
         /// What the field's colour means: `energy` (the default),
         /// `composition`, its mean chemical composition coloured as the
-        /// affinity mapping colours organisms, or `component-C`, moment
-        /// channel C (0 to 31) per unit energy from blue (-1) to red (+1);
-        /// the last two as bright as its energy.
+        /// affinity mapping colours organisms, `component-C`, moment
+        /// channel C (0 to 31) per unit energy from blue (-1) to red (+1)
+        /// (the previous two as bright as its energy), `trail-carrier`,
+        /// Carrier-1 slow trail energy density (`dual-carrier-trails`), or
+        /// `vascular-conductance`, mean vascular edge conductance
+        /// (`vascular-field`).
         #[arg(long, default_value = "energy")]
         field_mapping: FieldMapping,
         /// A camera path, as JSON: `{"keys": [{"tick", "center": [x, y],
@@ -1271,5 +1275,54 @@ mod tests {
                 FeatureOverride::V1Compat,
             ]
         );
+    }
+
+    #[test]
+    fn render_help_lists_v2_color_and_field_mappings() {
+        let mut command = Cli::command();
+        let render = command
+            .find_subcommand_mut("render")
+            .expect("render subcommand exists");
+        let help = render.render_long_help().to_string();
+        for token in [
+            "cell-state",
+            "polarity",
+            "trail-carrier",
+            "vascular-conductance",
+        ] {
+            assert!(
+                help.contains(token),
+                "flife render --help must document `{token}`:\n{help}"
+            );
+        }
+        for argv in [
+            &[
+                "flife",
+                "render",
+                "config.toml",
+                "--out",
+                "frames",
+                "--color",
+                "cell-state",
+                "--field-mapping",
+                "trail-carrier",
+            ][..],
+            &[
+                "flife",
+                "render",
+                "config.toml",
+                "--out",
+                "frames",
+                "--color",
+                "polarity",
+                "--field-mapping",
+                "vascular-conductance",
+            ][..],
+        ] {
+            assert!(
+                Cli::command().try_get_matches_from(argv).is_ok(),
+                "flife render must accept {argv:?}"
+            );
+        }
     }
 }

@@ -178,8 +178,9 @@ pub enum RenderRecord {
         particles: &'static str,
         /// Whether the field is drawn.
         field: bool,
-        /// What the field's colour means: `energy`, `composition` or
-        /// `component-C` for channel `C`.
+        /// What the field's colour means: `energy`, `composition`,
+        /// `trail-carrier`, `vascular-conductance` or `component-C` for
+        /// channel `C`.
         field_mapping: &'static str,
         /// The camera path the frames followed, if any.
         camera: Option<CameraPath>,

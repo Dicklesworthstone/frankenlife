@@ -566,6 +566,10 @@ pub struct Population {
     /// When `false`, `last_neighbor_h0` stays empty (0 bytes) and reads return `0.0`.
     tracks_notch_delta: bool,
     last_neighbor_h0: Vec<f32>,
+    /// Whether `V2-13` `cadherin-4d` traits are active and hashed into
+    /// [`Population::digest`] under tag byte `7`. Stored inside each organism's
+    /// [`Genome`] `Traits` (`0 B` extra SoA column allocation).
+    tracks_cadherin: bool,
     genomes: Vec<Option<Genome>>,
     /// Each slot's genome's arena slot, beside `genomes`.
     arena_slots: Vec<Option<ArenaSlot>>,
@@ -716,6 +720,32 @@ impl Population {
         tracks_polarity: bool,
         tracks_notch_delta: bool,
     ) -> Result<Self, CoreError> {
+        Self::new_with_v2_features(
+            arrangement,
+            capacity,
+            tracks_excitable,
+            tracks_polarity,
+            tracks_notch_delta,
+            false,
+        )
+    }
+
+    /// An empty population of at most `capacity` organisms, conditionally
+    /// allocating `V2-04` excitable-relay, `V2-08` polarity, and `V2-12`
+    /// Notch-Delta SoA columns up front (`INV-15`; `0 B` for any disabled
+    /// column) and optionally hashing `V2-13` `cadherin-4d` traits under
+    /// [`Population::digest`] tag byte `7`.
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] when the host refuses a column.
+    pub fn new_with_v2_features(
+        arrangement: Arrangement,
+        capacity: usize,
+        tracks_excitable: bool,
+        tracks_polarity: bool,
+        tracks_notch_delta: bool,
+        tracks_cadherin: bool,
+    ) -> Result<Self, CoreError> {
         let (secretory_readiness, emission_cooldown_deadlines) = if tracks_excitable {
             (reserve(capacity)?, reserve(capacity)?)
         } else {
@@ -754,6 +784,7 @@ impl Population {
             polarities,
             tracks_notch_delta,
             last_neighbor_h0,
+            tracks_cadherin,
             genomes: reserve(capacity)?,
             arena_slots: reserve(capacity)?,
             arena: GenomeArena::new(),
@@ -790,12 +821,18 @@ impl Population {
             .v2
             .as_ref()
             .is_some_and(|v2| v2.is_enabled(V2Feature::NotchDelta));
-        Self::new_with_v2_columns(
+        let tracks_cadherin = config
+            .config()
+            .v2
+            .as_ref()
+            .is_some_and(|v2| v2.is_enabled(V2Feature::Cadherin4d));
+        Self::new_with_v2_features(
             arrangement,
             capacity,
             tracks_excitable,
             tracks_polarity,
             tracks_notch_delta,
+            tracks_cadherin,
         )
     }
 
@@ -809,6 +846,13 @@ impl Population {
     #[must_use]
     pub const fn tracks_notch_delta(&self) -> bool {
         self.tracks_notch_delta
+    }
+
+    /// Whether this population hashes `V2-13` `cadherin-4d` traits in its
+    /// canonical digest.
+    #[must_use]
+    pub const fn tracks_cadherin(&self) -> bool {
+        self.tracks_cadherin
     }
 
     /// The arrangement.
@@ -1330,6 +1374,18 @@ impl Population {
             if self.tracks_notch_delta {
                 bytes.push(6);
                 bytes.extend_from_slice(&organism.last_neighbor_h0.to_bits().to_le_bytes());
+            }
+            if self.tracks_cadherin {
+                bytes.push(7);
+                if let Some(cad) = genome.and_then(|g| g.traits().cadherin_traits()) {
+                    bytes.push(1);
+                    for component in cad.tag() {
+                        bytes.extend_from_slice(&component.to_bits().to_le_bytes());
+                    }
+                    bytes.extend_from_slice(&cad.cohesiveness().to_bits().to_le_bytes());
+                } else {
+                    bytes.push(0);
+                }
             }
         }
         Sha256Digest::of(&bytes)

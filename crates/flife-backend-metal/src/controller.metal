@@ -241,7 +241,8 @@ constant uint HALF_TINY_INPUT_BITS = 0x18800000u;
 // exact value.
 //
 // F32 forward pass using coalesced float4 weight/activation loads when
-// 4-element aligned and branchless unsigned min-tracking for TINY_BITS.
+// 4-element aligned, vectorized uint4 min_z tracking off the FP addition chain,
+// and register-accumulated local_fault flushed once via simd_or at exit.
 static void forward_pass_f32(
     device const float *params,
     device const float *inputs,
@@ -252,13 +253,17 @@ static void forward_pass_f32(
     uint organism,
     uint lane,
     uint lanes,
+    uint simd_lane,
+    uint simd_width,
     threadgroup float4 *sensed4,
     threadgroup float4 *first4,
     threadgroup float4 *second4,
     threadgroup atomic_uint *fault)
 {
     uint fallbacks = 0u;
-    if (lane == 0u) {
+    uint local_fault = 0u;
+    bool single_simd = lanes <= simd_width;
+    if (!single_simd && lane == 0u) {
         atomic_store_explicit(fault, 0u, memory_order_relaxed);
     }
     uint input_width = dims[0];
@@ -274,7 +279,11 @@ static void forward_pass_f32(
     for (uint i = lane; i < input_width; i += lanes) {
         sensed[i] = inputs[slot * input_width + i];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (single_simd) {
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     uint offset = jobs[organism * 5u + 1u];
     uint hidden = jobs[organism * 5u + 2u];
@@ -299,6 +308,7 @@ static void forward_pass_f32(
             if (aligned4) {
                 device const float4 *row4 = reinterpret_cast<device const float4 *>(row);
                 uint4 tiny_p = uint4(0u);
+                uint4 min_z4 = uint4(0xFFFFFFFFu);
                 for (uint q = 0u; q < quads; ++q) {
                     float4 w = row4[q];
                     float4 x = source4[q];
@@ -307,15 +317,15 @@ static void forward_pass_f32(
                     uint4 xb = as_type<uint4>(x) & 0x7FFFFFFFu;
                     uint4 pb = as_type<uint4>(p) & 0x7FFFFFFFu;
                     tiny_p |= select(uint4(0u), uint4(1u), (pb < TINY_BITS) & (wb != 0u) & (xb != 0u));
-                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
-                    z = z + p.x;
-                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
-                    z = z + p.y;
-                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
-                    z = z + p.z;
-                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
-                    z = z + p.w;
+                    float z0 = z;
+                    float z1 = z0 + p.x;
+                    float z2 = z1 + p.y;
+                    float z3 = z2 + p.z;
+                    z = z3 + p.w;
+                    uint4 abs_z = (as_type<uint4>(float4(z0, z1, z2, z3)) & 0x7FFFFFFFu) - 1u;
+                    min_z4 = min(min_z4, abs_z);
                 }
+                min_z = min(min(min_z4.x, min_z4.y), min(min_z4.z, min_z4.w));
                 tiny_prod = any(tiny_p != 0u);
             } else {
                 for (uint i = 0u; i < fan_in; ++i) {
@@ -331,10 +341,10 @@ static void forward_pass_f32(
                 }
             }
             if (tiny_prod || min_z < TINY_BITS - 1u) {
-                atomic_fetch_or_explicit(fault, FAULT_TINY, memory_order_relaxed);
+                local_fault |= FAULT_TINY;
             }
             if (!isfinite(z)) {
-                atomic_fetch_or_explicit(fault, FAULT_NONFINITE, memory_order_relaxed);
+                local_fault |= FAULT_NONFINITE;
             }
             if (last) {
                 outputs[slot * output_width + o] = z;
@@ -344,18 +354,37 @@ static void forward_pass_f32(
         }
         offset += fan_in * fan_out + fan_out;
         fan_in = fan_out;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        source4 = target4;
+        if (!last) {
+            if (single_simd) {
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            } else {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            source4 = target4;
+        }
     }
-    if (lane == 0u) {
-        faults[slot] = atomic_load_explicit(fault, memory_order_relaxed);
+    uint sg_fault = simd_or(local_fault);
+    if (single_simd) {
+        if (lane == 0u) {
+            faults[slot] = sg_fault;
+        }
+    } else {
+        if (simd_lane == 0u && sg_fault != 0u) {
+            atomic_fetch_or_explicit(fault, sg_fault, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0u) {
+            faults[slot] = atomic_load_explicit(fault, memory_order_relaxed);
+        }
     }
 }
 
 // Binary16 forward pass (compact F16, FL-030): every parameter is widened
 // exactly to F32 and accumulated in the reference order. Layer inputs are
 // checked once against HALF_TINY_INPUT_BITS (2^-78), eliminating per-product
-// subnormal checks from the inner loop and allowing coalesced half4 loads.
+// subnormal checks from the inner loop, with 128-bit uint4 loads on 8-aligned
+// rows, 2x unrolled half4 loads on 4-aligned even-quad rows, vectorized uint4
+// min_z tracking off the FP chain, and register-accumulated local_fault.
 static void forward_pass_half(
     device const half *params,
     device const float *inputs,
@@ -366,13 +395,17 @@ static void forward_pass_half(
     uint organism,
     uint lane,
     uint lanes,
+    uint simd_lane,
+    uint simd_width,
     threadgroup float4 *sensed4,
     threadgroup float4 *first4,
     threadgroup float4 *second4,
     threadgroup atomic_uint *fault)
 {
     uint fallbacks = 0u;
-    if (lane == 0u) {
+    uint local_fault = 0u;
+    bool single_simd = lanes <= simd_width;
+    if (!single_simd && lane == 0u) {
         atomic_store_explicit(fault, 0u, memory_order_relaxed);
     }
     uint input_width = dims[0];
@@ -393,9 +426,13 @@ static void forward_pass_half(
         tiny_in |= uint(xb - 1u < HALF_TINY_INPUT_BITS - 1u);
     }
     if (tiny_in != 0u) {
-        atomic_fetch_or_explicit(fault, FAULT_TINY, memory_order_relaxed);
+        local_fault |= FAULT_TINY;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (single_simd) {
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     uint offset = jobs[organism * 5u + 1u];
     uint hidden = jobs[organism * 5u + 2u];
@@ -410,27 +447,77 @@ static void forward_pass_half(
         threadgroup const float *source = reinterpret_cast<threadgroup const float *>(source4);
         device const half *weights = params + offset;
         device const half *biases = weights + fan_in * fan_out;
+        bool aligned8 = ((offset | fan_in) & 7u) == 0u;
         bool aligned4 = ((offset | fan_in) & 3u) == 0u;
         uint quads = fan_in >> 2;
+        uint octets = fan_in >> 3;
         for (uint o = lane; o < fan_out; o += lanes) {
             device const half *row = weights + o * fan_in;
             float z = float(biases[o]);
             uint min_z = 0xFFFFFFFFu;
-            if (aligned4) {
+            if (aligned8) {
+                device const uint4 *row8 = reinterpret_cast<device const uint4 *>(row);
+                uint4 min_z4_a = uint4(0xFFFFFFFFu);
+                uint4 min_z4_b = uint4(0xFFFFFFFFu);
+                for (uint oct = 0u; oct < octets; ++oct) {
+                    uint4 raw = row8[oct];
+                    float4 w0 = float4(as_type<half4>(raw.xy));
+                    float4 w1 = float4(as_type<half4>(raw.zw));
+                    float4 x0 = source4[oct * 2u];
+                    float4 x1 = source4[oct * 2u + 1u];
+                    float4 p0 = w0 * x0;
+                    float4 p1 = w1 * x1;
+                    float z0 = z;
+                    float z1 = z0 + p0.x;
+                    float z2 = z1 + p0.y;
+                    float z3 = z2 + p0.z;
+                    float z4 = z3 + p0.w;
+                    float z5 = z4 + p1.x;
+                    float z6 = z5 + p1.y;
+                    float z7 = z6 + p1.z;
+                    z = z7 + p1.w;
+                    min_z4_a = min(min_z4_a, (as_type<uint4>(float4(z0, z1, z2, z3)) & 0x7FFFFFFFu) - 1u);
+                    min_z4_b = min(min_z4_b, (as_type<uint4>(float4(z4, z5, z6, z7)) & 0x7FFFFFFFu) - 1u);
+                }
+                uint4 min_z4 = min(min_z4_a, min_z4_b);
+                min_z = min(min(min_z4.x, min_z4.y), min(min_z4.z, min_z4.w));
+            } else if (aligned4) {
                 device const half4 *row4 = reinterpret_cast<device const half4 *>(row);
-                for (uint q = 0u; q < quads; ++q) {
+                uint4 min_z4_a = uint4(0xFFFFFFFFu);
+                uint4 min_z4_b = uint4(0xFFFFFFFFu);
+                uint q = 0u;
+                for (; q + 1u < quads; q += 2u) {
+                    float4 w0 = float4(row4[q]);
+                    float4 w1 = float4(row4[q + 1u]);
+                    float4 x0 = source4[q];
+                    float4 x1 = source4[q + 1u];
+                    float4 p0 = w0 * x0;
+                    float4 p1 = w1 * x1;
+                    float z0 = z;
+                    float z1 = z0 + p0.x;
+                    float z2 = z1 + p0.y;
+                    float z3 = z2 + p0.z;
+                    float z4 = z3 + p0.w;
+                    float z5 = z4 + p1.x;
+                    float z6 = z5 + p1.y;
+                    float z7 = z6 + p1.z;
+                    z = z7 + p1.w;
+                    min_z4_a = min(min_z4_a, (as_type<uint4>(float4(z0, z1, z2, z3)) & 0x7FFFFFFFu) - 1u);
+                    min_z4_b = min(min_z4_b, (as_type<uint4>(float4(z4, z5, z6, z7)) & 0x7FFFFFFFu) - 1u);
+                }
+                if (q < quads) {
                     float4 w = float4(row4[q]);
                     float4 x = source4[q];
                     float4 p = w * x;
-                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
-                    z = z + p.x;
-                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
-                    z = z + p.y;
-                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
-                    z = z + p.z;
-                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
-                    z = z + p.w;
+                    float z0 = z;
+                    float z1 = z0 + p.x;
+                    float z2 = z1 + p.y;
+                    float z3 = z2 + p.z;
+                    z = z3 + p.w;
+                    min_z4_a = min(min_z4_a, (as_type<uint4>(float4(z0, z1, z2, z3)) & 0x7FFFFFFFu) - 1u);
                 }
+                uint4 min_z4 = min(min_z4_a, min_z4_b);
+                min_z = min(min(min_z4.x, min_z4.y), min(min_z4.z, min_z4.w));
             } else {
                 for (uint i = 0u; i < fan_in; ++i) {
                     float product = float(row[i]) * source[i];
@@ -439,10 +526,10 @@ static void forward_pass_half(
                 }
             }
             if (min_z < TINY_BITS - 1u) {
-                atomic_fetch_or_explicit(fault, FAULT_TINY, memory_order_relaxed);
+                local_fault |= FAULT_TINY;
             }
             if (!isfinite(z)) {
-                atomic_fetch_or_explicit(fault, FAULT_NONFINITE, memory_order_relaxed);
+                local_fault |= FAULT_NONFINITE;
             }
             if (last) {
                 outputs[slot * output_width + o] = z;
@@ -451,17 +538,34 @@ static void forward_pass_half(
                 target[o] = a;
                 uint ab = as_type<uint>(a) & 0x7FFFFFFFu;
                 if (ab - 1u < HALF_TINY_INPUT_BITS - 1u) {
-                    atomic_fetch_or_explicit(fault, FAULT_TINY, memory_order_relaxed);
+                    local_fault |= FAULT_TINY;
                 }
             }
         }
         offset += fan_in * fan_out + fan_out;
         fan_in = fan_out;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        source4 = target4;
+        if (!last) {
+            if (single_simd) {
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            } else {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            source4 = target4;
+        }
     }
-    if (lane == 0u) {
-        faults[slot] = atomic_load_explicit(fault, memory_order_relaxed);
+    uint sg_fault = simd_or(local_fault);
+    if (single_simd) {
+        if (lane == 0u) {
+            faults[slot] = sg_fault;
+        }
+    } else {
+        if (simd_lane == 0u && sg_fault != 0u) {
+            atomic_fetch_or_explicit(fault, sg_fault, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0u) {
+            faults[slot] = atomic_load_explicit(fault, memory_order_relaxed);
+        }
     }
 }
 
@@ -475,14 +579,16 @@ kernel void controller_forward(
     device const uint *dims [[buffer(5)]],
     uint organism [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
-    uint lanes [[threads_per_threadgroup]])
+    uint lanes [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]])
 {
     threadgroup float4 sensed4[WIDEST / 4];
     threadgroup float4 first4[WIDEST / 4];
     threadgroup float4 second4[WIDEST / 4];
     threadgroup atomic_uint fault;
     forward_pass_f32(params, inputs, jobs, outputs, faults, dims, organism, lane, lanes,
-                     sensed4, first4, second4, &fault);
+                     simd_lane, simd_width, sensed4, first4, second4, &fault);
 }
 
 // The binary16 shards' forward pass (compact F16, FL-030): half the bytes a
@@ -496,14 +602,16 @@ kernel void controller_forward_half(
     device const uint *dims [[buffer(5)]],
     uint organism [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
-    uint lanes [[threads_per_threadgroup]])
+    uint lanes [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]])
 {
     threadgroup float4 sensed4[WIDEST / 4];
     threadgroup float4 first4[WIDEST / 4];
     threadgroup float4 second4[WIDEST / 4];
     threadgroup atomic_uint fault;
     forward_pass_half(params, inputs, jobs, outputs, faults, dims, organism, lane, lanes,
-                      sensed4, first4, second4, &fault);
+                      simd_lane, simd_width, sensed4, first4, second4, &fault);
 }
 
 // The activation alone: out[i] is the F32 bits of the activation of the F32

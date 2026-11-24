@@ -88,8 +88,25 @@ pub const CONTROLLER_MSL: &str = concat!(
 /// The widest hidden layer the kernel's threadgroup storage holds.
 pub const WIDEST_HIDDEN: usize = 128;
 
-/// Threads per organism in the forward dispatch.
+/// Threads per organism in the forward dispatch for wide topologies
+/// (`widest_hidden > 64`).
 pub const FORWARD_THREADS: usize = 64;
+
+/// Single-SIMD-group threads per organism for compact topologies
+/// (`widest_hidden <= 64`, including `[8]`, `[32]`, and the dominant `[64, 32]`):
+/// eliminates idle second SIMD groups on 32/36-wide layers and uses
+/// `simdgroup_barrier` + register `simd_or` without threadgroup atomics.
+const FORWARD_THREADS_COMPACT: usize = 32;
+
+/// Choose the adaptive threadgroup size for a topology whose widest hidden
+/// layer has `widest_hidden` neurons.
+const fn forward_threads(widest_hidden: usize) -> usize {
+    if widest_hidden <= 64 {
+        FORWARD_THREADS_COMPACT
+    } else {
+        FORWARD_THREADS
+    }
+}
 
 /// The jobs words per organism: its row, parameter offset, hidden-layer
 /// count and two hidden widths.
@@ -797,6 +814,9 @@ struct DeviceBucket {
     /// The weight dtype of its first genome, which its shards hold; a job of
     /// another dtype is deferred.
     dtype: WeightDtype,
+    /// Widest hidden layer of `topology`, selecting adaptive threadgroup size
+    /// (`32` for `<= 64`, `64` for `> 64`).
+    widest_hidden: usize,
     /// Validated `[hidden_layers, w0, w1]` words for the kernel's `jobs`
     /// buffer, cached once per topology; `None` for a shape the kernel refuses.
     shape_words: Option<[u32; 3]>,
@@ -837,6 +857,9 @@ pub struct MetalBackend {
     faults: Option<Owned<u32>>,
     /// Two-word `[input_width, raw_output_width]` uniform buffer.
     dims: Option<Owned<u32>>,
+    /// Last `[input_width, raw_output_width]` written to `dims`, avoiding a
+    /// redundant per-tick mutex/RwLock uniform upload when dimensions are steady.
+    cached_dims: Option<[u32; 2]>,
     /// Host staging, reused.
     staged_inputs: Vec<f32>,
     input_finite: Vec<u8>,
@@ -936,6 +959,7 @@ impl MetalBackend {
             raw: None,
             faults: None,
             dims: None,
+            cached_dims: None,
             staged_inputs: Vec::new(),
             input_finite: Vec::new(),
             dispatched: Vec::new(),
@@ -1002,7 +1026,7 @@ impl MetalBackend {
     fn bucket_in<'a>(
         buckets: &'a mut Vec<Option<DeviceBucket>>,
         owner: &DeviceOwner,
-        budget: BackendBudget,
+        budget_share: u64,
         shard_slots: u64,
         job: &ControllerJob<'_>,
     ) -> Result<Option<&'a mut DeviceBucket>, CoreError> {
@@ -1010,33 +1034,35 @@ impl MetalBackend {
             return Ok(None);
         };
         if buckets.len() <= index {
-            let more = index + 1 - buckets.len();
+            let needed = index.checked_add(1).ok_or(CoreError::Overflow {
+                quantity: "metal controller buckets",
+            })?;
+            let more = needed - buckets.len();
             reserve(buckets, more, "metal controller buckets")?;
-            buckets.resize_with(index + 1, || None);
+            buckets.resize_with(needed, || None);
         }
         let topology = job.controller.topology();
         let length = job.controller.parameters().len() as u64;
         let dtype = job.controller.parameters().dtype();
-        let share = match budget.bytes {
-            u64::MAX => u64::MAX,
-            bytes => bytes.saturating_sub(staging_bytes(budget.organisms, 0)) / SHARD_SHARE,
-        };
         let bucket = buckets[index].get_or_insert_with(|| {
             // A 32-bit job word offsets every element of a shard.
             let limit = (owner.max_buffer_bytes() as u64)
                 .min(SHARD_BYTES)
-                .min(share)
+                .min(budget_share)
                 / dtype.bytes();
             let shape_words = usize::try_from(length)
                 .ok()
                 .and_then(|len| job_words(topology, len, 0, 0).ok())
                 .map(|words| [words[2], words[3], words[4]]);
+            let widest_hidden =
+                topology.hidden_widths().iter().copied().max().unwrap_or(0) as usize;
             // Trap A defense-in-depth: `fitting_for_dtype` pads F16 slot stride
             // to a multiple of 4 elements, guaranteeing zero F16 alignment
             // deferrals even for odd-parameter topologies.
             DeviceBucket {
                 topology: topology.clone(),
                 dtype,
+                widest_hidden,
                 shape_words,
                 geometry: shape_words.and_then(|_| {
                     ShardGeometry::fitting_for_dtype(
@@ -1102,6 +1128,15 @@ impl MetalBackend {
         let mut touched = Vec::new();
         let mut overwrote_existing = false;
         let mut all_dispatched = true;
+        let budget_share = match budget.bytes {
+            u64::MAX => u64::MAX,
+            bytes => bytes.saturating_sub(staging_bytes(budget.organisms, 0)) / SHARD_SHARE,
+        };
+        // Safe intra-batch topology cache: every `&'a DenseTopology` borrowed
+        // inside `jobs` stays alive and immutable for the whole call, so an
+        // equal pointer with matching bucket index, dtype, and parameter count
+        // skips repeating `DenseTopology`'s `Vec` equality comparisons.
+        let mut cached_topo: Option<(usize, *const DenseTopology, WeightDtype, u64)> = None;
         for (index, job) in jobs.iter().enumerate() {
             if input_finite.get(index).copied().unwrap_or(0) == 0 {
                 all_dispatched = false;
@@ -1116,7 +1151,23 @@ impl MetalBackend {
                 all_dispatched = false;
                 continue;
             };
-            let Some(bucket) = Self::bucket_in(buckets, owner, budget, shard_slots, job)? else {
+            let job_dtype = job.controller.parameters().dtype();
+            let job_len = job.controller.parameters().len() as u64;
+            let job_ptr = std::ptr::from_ref(job_topo);
+            let hit_cache = matches!(
+                cached_topo,
+                Some((idx, ptr, dt, len))
+                    if idx == topology && std::ptr::eq(ptr, job_ptr) && dt == job_dtype && len == job_len
+            );
+            let Some(bucket) = (if hit_cache {
+                buckets.get_mut(topology).and_then(Option::as_mut)
+            } else {
+                let found = Self::bucket_in(buckets, owner, budget_share, shard_slots, job)?;
+                if found.is_some() {
+                    cached_topo = Some((topology, job_ptr, job_dtype, job_len));
+                }
+                found
+            }) else {
                 all_dispatched = false;
                 continue;
             };
@@ -1259,7 +1310,9 @@ impl MetalBackend {
                     reserve(&mut touched, 1, "metal controller shards")?;
                     touched.push((topology, at.shard));
                 }
-                reserve(&mut shard.staged, JOB_WORDS, "metal jobs")?;
+                if shard.staged.capacity() - shard.staged.len() < JOB_WORDS {
+                    reserve(&mut shard.staged, JOB_WORDS, "metal jobs")?;
+                }
                 shard.staged.extend_from_slice(&[
                     row_word,
                     offset_word,
@@ -1325,7 +1378,9 @@ impl MetalBackend {
                     reserve(&mut touched, 1, "metal controller shards")?;
                     touched.push((topology, at.shard));
                 }
-                reserve(&mut shard.staged, JOB_WORDS, "metal jobs")?;
+                if shard.staged.capacity() - shard.staged.len() < JOB_WORDS {
+                    reserve(&mut shard.staged, JOB_WORDS, "metal jobs")?;
+                }
                 shard.staged.extend_from_slice(&[
                     row_word,
                     offset_word,
@@ -1361,6 +1416,7 @@ impl MetalBackend {
         }
         if self.dims.is_none() {
             self.dims = Some(self.controllers.owner.zeroed_owned::<u32>(2)?);
+            self.cached_dims = None;
         }
         if count <= self.fault_capacity
             && need_inputs <= self.input_capacity
@@ -1462,22 +1518,133 @@ fn narrow_inputs(
             .clamp(1, PARALLEL_INPUT_MAX_THREADS)
             .min(jobs.len().div_ceil(1024));
         let chunk = jobs.len().div_ceil(threads);
+        let input_chunk = chunk.checked_mul(input_width).ok_or(CoreError::Overflow {
+            quantity: "metal input chunk",
+        })?;
+        let mut spawn_error: Option<std::io::Error> = None;
         std::thread::scope(|scope| {
             let mut job_chunks = jobs.chunks(chunk);
-            let mut out_chunks = out.chunks_mut(chunk * input_width);
+            let mut out_chunks = out.chunks_mut(input_chunk);
             let mut flag_chunks = flags.chunks_mut(chunk);
             let head = (job_chunks.next(), out_chunks.next(), flag_chunks.next());
             let mut handles = Vec::with_capacity(threads.saturating_sub(1));
             for ((jc, oc), fc) in job_chunks.zip(out_chunks).zip(flag_chunks) {
-                handles.push(scope.spawn(move || narrow_chunk(jc, oc, fc)));
+                match std::thread::Builder::new()
+                    .name("flife-metal-in".to_owned())
+                    .spawn_scoped(scope, move || narrow_chunk(jc, oc, fc))
+                {
+                    Ok(handle) => handles.push(handle),
+                    Err(error) => {
+                        spawn_error = Some(error);
+                        break;
+                    }
+                }
             }
-            if let (Some(jc), Some(oc), Some(fc)) = head {
+            if spawn_error.is_none()
+                && let (Some(jc), Some(oc), Some(fc)) = head
+            {
                 narrow_chunk(jc, oc, fc);
             }
             for handle in handles {
                 let _ = handle.join();
             }
         });
+        if let Some(error) = spawn_error {
+            return Err(CoreError::StateConflict {
+                operation: "metal controller input staging",
+                detail: format!("failed to spawn input staging worker: {error}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Unpack dense device output rows and fault flags into `outputs` (parallelized
+/// across bounded scoped threads for large batches).
+fn unpack_outputs(
+    values: &[f32],
+    flags: &[u32],
+    output_width: usize,
+    outputs: &mut Vec<Option<RawOutputs>>,
+) -> Result<(), CoreError> {
+    let count = flags.len();
+    let expected_values = count.checked_mul(output_width).ok_or(CoreError::Overflow {
+        quantity: "metal controller outputs",
+    })?;
+    if values.len() != expected_values {
+        return Err(CoreError::LayoutMismatch {
+            buffer: "metal controller outputs",
+            detail: format!(
+                "expected {expected_values} output values, got {}",
+                values.len()
+            ),
+        });
+    }
+    let template = RawOutputs::zeroed(output_width)?;
+    outputs.clear();
+    if outputs.capacity() < count {
+        reserve(
+            outputs,
+            count - outputs.capacity(),
+            "metal controller outputs",
+        )?;
+    }
+    outputs.resize(count, None);
+    let unpack_chunk = |rows: &[f32], flag_slice: &[u32], dst: &mut [Option<RawOutputs>]| {
+        for ((row, &flag), slot) in rows.chunks_exact(output_width).zip(flag_slice).zip(dst) {
+            if flag == 0 {
+                let mut out = template;
+                out.as_mut_slice().copy_from_slice(row);
+                *slot = Some(out);
+            }
+        }
+    };
+    if count < PARALLEL_INPUT_MIN_JOBS {
+        unpack_chunk(values, flags, outputs.as_mut_slice());
+    } else {
+        let threads = std::thread::available_parallelism()
+            .map_or(4, usize::from)
+            .clamp(1, PARALLEL_INPUT_MAX_THREADS)
+            .min(count.div_ceil(1024));
+        let chunk = count.div_ceil(threads);
+        let row_chunk = chunk.checked_mul(output_width).ok_or(CoreError::Overflow {
+            quantity: "metal output chunk",
+        })?;
+        let mut spawn_error: Option<std::io::Error> = None;
+        std::thread::scope(|scope| {
+            let mut row_chunks = values.chunks(row_chunk);
+            let mut flag_chunks = flags.chunks(chunk);
+            let mut dst_chunks = outputs.chunks_mut(chunk);
+            let head = (row_chunks.next(), flag_chunks.next(), dst_chunks.next());
+            let mut handles = Vec::with_capacity(threads.saturating_sub(1));
+            for ((rc, fc), dc) in row_chunks.zip(flag_chunks).zip(dst_chunks) {
+                match std::thread::Builder::new()
+                    .name("flife-metal-out".to_owned())
+                    .spawn_scoped(scope, move || unpack_chunk(rc, fc, dc))
+                {
+                    Ok(handle) => handles.push(handle),
+                    Err(error) => {
+                        spawn_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            if spawn_error.is_none()
+                && let (Some(rc), Some(fc), Some(dc)) = head
+            {
+                unpack_chunk(rc, fc, dc);
+            }
+            for handle in handles {
+                let _ = handle.join();
+            }
+        });
+        if let Some(error) = spawn_error {
+            outputs.clear();
+            return Err(CoreError::StateConflict {
+                operation: "metal controller output unpack",
+                detail: format!("failed to spawn output unpack worker: {error}"),
+            });
+        }
     }
     Ok(())
 }
@@ -1642,7 +1809,10 @@ impl ControllerBackend for MetalBackend {
                     quantity: "metal controller output width",
                 })?,
             ];
-            owner.write(dims)?.write(0, &dims_words)?;
+            if self.cached_dims != Some(dims_words) {
+                owner.write(dims)?.write(0, &dims_words)?;
+                self.cached_dims = Some(dims_words);
+            }
             owner
                 .write(inputs)?
                 .write(0, &self.staged_inputs[..count * input_width])?;
@@ -1651,10 +1821,11 @@ impl ControllerBackend for MetalBackend {
             for &(topology, key) in &touched {
                 let bucket = self.buckets.get(topology).and_then(Option::as_ref);
                 let shard = bucket.and_then(|bucket| bucket.shards.get(key));
-                let Some((dtype, parameters, words, staged)) =
+                let Some((dtype, threads, parameters, words, staged)) =
                     bucket.zip(shard).and_then(|(bucket, shard)| {
                         Some((
                             bucket.dtype,
+                            forward_threads(bucket.widest_hidden),
                             shard.parameters.reads(),
                             shard.jobs.as_ref()?.buffer(),
                             shard.staged.len() / JOB_WORDS,
@@ -1681,14 +1852,15 @@ impl ControllerBackend for MetalBackend {
                         dims.reads(),
                     ],
                     staged,
+                    threads,
                 ));
             }
             let kernels: Vec<Kernel<'_>> = bindings
                 .iter()
-                .map(|(pipeline, bound, staged)| Kernel {
+                .map(|(pipeline, bound, staged, threads)| Kernel {
                     pipeline,
                     bindings: bound,
-                    grid: Grid::linear(*staged, FORWARD_THREADS),
+                    grid: Grid::linear(*staged, *threads),
                 })
                 .collect();
             let receipt = owner.submit_batch(&kernels)?;
@@ -1708,17 +1880,14 @@ impl ControllerBackend for MetalBackend {
             owner.read_back(faults, &mut self.flags[..count])?;
         }
         if count == jobs.len() {
-            for (row, &flag) in self.values[..count * output_width]
-                .chunks_exact(output_width)
-                .zip(&self.flags[..count])
-            {
-                outputs.push(if flag == 0 {
-                    Some(RawOutputs::from_slice(row)?)
-                } else {
-                    None
-                });
-            }
+            unpack_outputs(
+                &self.values[..count * output_width],
+                &self.flags[..count],
+                output_width,
+                outputs,
+            )?;
         } else {
+            let template = RawOutputs::zeroed(output_width)?;
             let mut dispatched = self.dispatched.iter().zip(
                 self.values[..count * output_width]
                     .chunks_exact(output_width)
@@ -1729,7 +1898,9 @@ impl ControllerBackend for MetalBackend {
                 match next {
                     Some((&at, (row, &flag))) if at == index => {
                         outputs.push(if flag == 0 {
-                            Some(RawOutputs::from_slice(row)?)
+                            let mut out = template;
+                            out.as_mut_slice().copy_from_slice(row);
+                            Some(out)
                         } else {
                             None
                         });

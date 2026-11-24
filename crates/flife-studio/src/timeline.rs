@@ -1240,11 +1240,11 @@ pub(crate) fn replay_with<S>(
         drop(restored);
         publish_at(&mut world, opened, &at, &mut publisher, &viewer)?
     };
-    view.show(&opening)?;
-    let font = HudFont::bundled()?;
     if let Some((drawable, scale)) = options.target_resolution {
         view.refit_surface(drawable, scale)?;
     }
+    view.show(&opening)?;
+    let font = HudFont::bundled()?;
 
     let mut frames = 0_u64;
     if let Some((every_ticks, fps)) = options.sample_every_ticks {

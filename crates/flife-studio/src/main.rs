@@ -1432,6 +1432,9 @@ fn main() -> ExitCode {
             }
         }
         noted.clear();
+        if studio.should_close() || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
         slot = next_slot(slot, period, Instant::now());
         let next = slot;
         if cli.offscreen_zooms && studio.tally().frames.is_multiple_of(3) {

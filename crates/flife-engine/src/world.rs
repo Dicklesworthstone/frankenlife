@@ -105,9 +105,9 @@ use flife_field::{
     resolve_uptake_with_on_workers, state::CHANNELS,
 };
 use flife_genome::{
-    CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters,
-    MutationRecord, Mutator, ParameterBuffer, TopologyCatalog, TopologyId, TraitLimits, Traits,
-    founder_topology, founder_traits_v2, grow_founder, initial_scale,
+    CadherinTraits, CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES,
+    MutationParameters, MutationRecord, Mutator, ParameterBuffer, TopologyCatalog, TopologyId,
+    TraitLimits, Traits, founder_topology, founder_traits_v2, grow_founder, initial_scale,
 };
 use flife_neural::actions::EMISSION_SPEND;
 use flife_neural::{
@@ -122,7 +122,10 @@ use crate::chemistry::{
     Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition, corpse_affinity_direction,
     effective_affinity, symplectic_waste_direction,
 };
-use crate::contact::{ContactRules, ContactWork, CrowdingWork, PcpSweepParams, unit_affinity};
+use crate::contact::{
+    ContactRules, ContactV2Buffers, ContactV2Sweep, ContactWork, CrowdingWork, PcpSweepParams,
+    TROPHALLAXIS_QUANTUM, TrophallaxisSweepParams, VelocityAlignmentSweepParams, unit_affinity,
+};
 use crate::costs::{MaintenanceCosts, MaintenanceSettlement};
 use crate::emission::{
     EmissionContext, EmissionPolicy, EmissionSettlement, INITIAL_SECRETORY_READINESS,
@@ -159,9 +162,10 @@ pub use checkpoint::{
 pub use graft::Graft;
 use settle::{Settle, settle_with};
 pub use v2::{
-    BuddingRules, CarrierSpec, CorpseDirection, CrowdingMode, CrowdingRules, DifferentiationRules,
-    LysisRules, NotchDeltaMode, NotchDeltaRules, PolarityRules, SenescenceRules,
-    StateInheritanceMode, V2Rules, WasteRules,
+    BuddingRules, CadherinRules, CarrierSpec, CorpseDirection, CrowdingMode, CrowdingRules,
+    DifferentiationRules, LysisRules, NotchDeltaMode, NotchDeltaRules, PolarityRules,
+    SenescenceRules, StateInheritanceMode, TrophallaxisRules, V2Rules, VelocityAlignmentRules,
+    WasteRules,
 };
 
 /// The backend this module implements: the scalar CPU reference.
@@ -1702,6 +1706,25 @@ impl World {
         self.rules.v2.polarity().is_some()
     }
 
+    /// Whether `V2-13` (`cadherin-4d`) is active on this world.
+    #[must_use]
+    pub const fn tracks_cadherin(&self) -> bool {
+        self.rules.v2.cadherin().is_some()
+    }
+
+    /// One live organism's decoupled 4-D cadherin traits (`V2-13`), or `None`
+    /// when `cadherin-4d` is disabled or `id` is not alive (`INV-09` pure
+    /// read-only seam for `flife inspect`).
+    #[must_use]
+    pub fn cadherin_traits(&self, id: OrganismId) -> Option<CadherinTraits> {
+        if !self.tracks_cadherin() {
+            return None;
+        }
+        self.population
+            .genome(id)
+            .and_then(|genome| genome.traits().cadherin_traits())
+    }
+
     /// Live unit apical-basal polarity vectors `p_i ∈ S^1` in ascending
     /// identity order when `V2-08` (`pcp-polarity`) is active; `None` when
     /// disabled (`INV-09` pure read-only seam for `V2-16` / `Epoch::polarities`).
@@ -2938,6 +2961,15 @@ impl World {
         // positions, before any moves (crate::contact).
         let contacted = if let Some(bodies) = &rules.contact {
             contact_displacements(rules, bodies, population, working, contact, lanes.len())?;
+            if rules.v2.trophallaxis().is_some()
+                && contact.trophallaxis_summary.total_out_quanta > 0
+            {
+                tick_ledger.transfer(
+                    Transfer::Trophallaxis,
+                    contact.trophallaxis_summary.debited(),
+                    contact.trophallaxis_summary.credited(),
+                )?;
+            }
             Some(&contact.displacements)
         } else {
             None
@@ -2955,11 +2987,52 @@ impl World {
         } else {
             &[]
         };
+        let trophallaxis_deltas = if rules.v2.trophallaxis().is_some() && rules.contact.is_some() {
+            contact.trophallaxis_delta_quanta.as_slice()
+        } else {
+            &[]
+        };
+        let next_velocities = if rules.v2.velocity_alignment().is_some() && rules.contact.is_some()
+        {
+            contact.next_velocities.as_slice()
+        } else {
+            &[]
+        };
         for (index, organism) in working.iter().enumerate() {
             emitted += usize::from(organism.emitted);
             match organism.vitality.fate()? {
                 Fate::Survives => {
-                    let energy = organism.budget.remaining();
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "signed per-organism quantum delta is exact in f64 for |delta_k| <= 2^53"
+                    )]
+                    let trophallaxis_delta = trophallaxis_deltas
+                        .get(index)
+                        .copied()
+                        .map_or(0.0, |k| (k as f64) * TROPHALLAXIS_QUANTUM);
+                    let energy = if trophallaxis_delta != 0.0 {
+                        let updated = organism.budget.remaining() + trophallaxis_delta;
+                        if !updated.is_finite() || updated <= 0.0 {
+                            return Err(CoreError::NumericalInvalid {
+                                quantity: "trophallaxis survivor energy",
+                                detail: format!(
+                                    "{} post-trophallaxis energy {updated:?} is not finite and positive",
+                                    organism.committed.id
+                                ),
+                            });
+                        }
+                        updated
+                    } else {
+                        organism.budget.remaining()
+                    };
+                    if trophallaxis_delta != 0.0
+                        && let Some(record) = transactions
+                            .as_mut()
+                            .filter(|_| watch.organism == Some(organism.committed.id))
+                    {
+                        record.trophallaxis_delta = trophallaxis_delta;
+                        record.closing = energy;
+                    }
                     organisms.add(energy);
                     let position = match contacted.and_then(|moves| moves.get(index)) {
                         Some(&[dx, dy]) if dx != 0.0 || dy != 0.0 => rules.grid.wrap_position([
@@ -2968,11 +3041,15 @@ impl World {
                         ])?,
                         _ => organism.position,
                     };
+                    let base_velocity = next_velocities
+                        .get(index)
+                        .copied()
+                        .unwrap_or(organism.velocity);
                     let velocity = match (pressed.get(index), &rules.contact) {
                         (Some(&push), Some(bodies)) => {
-                            inhibited(organism.velocity, push, bodies.inhibition)
+                            inhibited(base_velocity, push, bodies.inhibition)
                         }
-                        _ => organism.velocity,
+                        _ => base_velocity,
                     };
                     let polarity = next_polarities
                         .get(index)
@@ -3440,13 +3517,18 @@ impl Scratch {
             survivors: reserved(rows, "survivors")?,
             deaths: reserved(rows, "deaths")?,
             contact: match &rules.contact {
-                Some(bodies) => ContactWork::with_capacity_v2(
+                Some(bodies) => ContactWork::with_capacity_v2_features(
                     &rules.grid,
                     bodies,
                     rows,
-                    rules.v2.polarity().is_some(),
-                    rules.v2.emt_gate() || rules.v2.emt_h1_adhesion_enabled(),
-                    rules.v2.notch_delta().is_some(),
+                    ContactV2Buffers {
+                        pcp_polarity: rules.v2.polarity().is_some(),
+                        emt_gate: rules.v2.emt_gate() || rules.v2.emt_h1_adhesion_enabled(),
+                        notch_delta: rules.v2.notch_delta().is_some(),
+                        cadherin: rules.v2.cadherin().is_some(),
+                        trophallaxis: rules.v2.trophallaxis().is_some(),
+                        velocity_alignment: rules.v2.velocity_alignment().is_some(),
+                    },
                 )?,
                 None => ContactWork::default(),
             },
@@ -6194,9 +6276,10 @@ fn effective_emt_factor(rules: &Rules, organism: &Working) -> f64 {
 }
 
 /// Every working organism's contact displacement into `work`, from the
-/// settled positions of those that survive the tick, with their genetic
-/// affinity directions when bodies adhere (or `pcp-polarity` / `notch-delta`
-/// is enabled).
+/// settled positions of those that survive the tick, together with any active
+/// `field-ecology-v2` Sweep-1 channels (`V2-08` PCP/EMT, `V2-12` Notch-Delta,
+/// `V2-13` cadherin-4d, passive exact-quantum trophallaxis, and dissipative
+/// velocity alignment).
 fn contact_displacements(
     rules: &Rules,
     bodies: &ContactRules,
@@ -6217,24 +6300,40 @@ fn contact_displacements(
     work.emt_factors.clear();
     work.cell_states_h0.clear();
     work.neighbor_h0.clear();
+    work.cadherin_tags.clear();
+    work.cadherin_cohesiveness.clear();
+    work.energies.clear();
+    work.trophallaxis_delta_quanta.clear();
+    work.velocities.clear();
+    work.next_velocities.clear();
     let pcp = rules.v2.polarity();
     let needs_emt_factors = rules.v2.emt_gate() || rules.v2.emt_h1_adhesion_enabled();
     let notch_delta = rules.v2.notch_delta().is_some();
-    let needs_affinities = bodies.adheres() || pcp.is_some() || notch_delta;
+    let cadherin = rules.v2.cadherin().is_some();
+    let trophallaxis = rules.v2.trophallaxis();
+    let velocity_alignment = rules.v2.velocity_alignment();
+    let needs_affinities = (bodies.adheres() && !cadherin)
+        || (pcp.is_some() && !cadherin)
+        || notch_delta
+        || trophallaxis.is_some()
+        || (velocity_alignment.is_some() && !cadherin);
+    let needs_genome = needs_affinities || pcp.is_some() || cadherin;
     for organism in working {
         work.positions.push(organism.position);
         work.ids.push(organism.committed.id.get());
         work.alive
             .push(matches!(organism.vitality.fate()?, Fate::Survives));
-        let genome = if needs_affinities || pcp.is_some() {
+        let genome = if needs_genome {
             Some(genome_of(population, organism.committed.id)?)
         } else {
             None
         };
         if needs_affinities && let Some(genome) = genome {
-            // CRITICAL V2-12 clonal kin rule: contact kin weighting MUST use
-            // GENETIC `traits.affinity()`, NEVER rotated `a_eff(h_0)`, so
-            // differentiated clonal sisters retain kin adhesion & Notch-Delta.
+            // CRITICAL V2-12 / V2-13 clonal kin rule: contact kin weighting
+            // (and ALWAYS trophallaxis & Notch-Delta) MUST use GENETIC
+            // `traits.affinity()`, NEVER rotated `a_eff(h_0)`, so
+            // differentiated clonal sisters retain kin signaling and freely
+            // pipe metabolic energy inward.
             work.affinities
                 .push(unit_affinity(genome.traits().affinity()));
         }
@@ -6254,18 +6353,55 @@ fn contact_displacements(
             work.cell_states_h0
                 .push(organism.held.recurrent_state_array()[0]);
         }
+        if cadherin {
+            let cad = genome
+                .and_then(|g| g.traits().cadherin_traits())
+                .ok_or_else(|| CoreError::StateConflict {
+                    operation: "contact",
+                    detail: format!(
+                        "{} is missing cadherin traits while cadherin-4d is enabled",
+                        organism.committed.id
+                    ),
+                })?;
+            work.cadherin_tags.push(*cad.tag());
+            work.cadherin_cohesiveness.push(cad.cohesiveness());
+        }
+        if trophallaxis.is_some() {
+            work.energies.push(organism.budget.remaining());
+        }
+        if velocity_alignment.is_some() {
+            work.velocities.push(organism.velocity);
+        }
     }
+    let dt = rules.step.seconds_per_tick();
     let pcp_params = pcp.map(|pol| PcpSweepParams {
-        dt: rules.step.seconds_per_tick(),
+        dt,
         torque_mobility: pol.torque_mobility,
         gradient_cue_strength: pol.gradient_cue_strength,
     });
-    work.relax_v2(
+    let trophallaxis_params = trophallaxis.map(|tr| TrophallaxisSweepParams {
+        dt,
+        conductance_per_second: tr.conductance_per_second,
+        transfer_efficiency: tr.transfer_efficiency,
+        reserve_energy: tr.reserve_energy,
+        maximum_export_fraction: tr.maximum_export_fraction,
+        kin_cosine_exponent: tr.kin_cosine_exponent,
+        kin_threshold: tr.kin_threshold,
+    });
+    let velocity_alignment_params = velocity_alignment.map(|va| VelocityAlignmentSweepParams {
+        strength: va.strength,
+    });
+    work.relax_v2_features(
         &rules.grid,
         bodies,
-        pcp_params,
-        needs_emt_factors,
-        notch_delta,
+        ContactV2Sweep {
+            pcp: pcp_params,
+            emt_gate: needs_emt_factors,
+            notch_delta,
+            cadherin,
+            trophallaxis: trophallaxis_params,
+            velocity_alignment: velocity_alignment_params,
+        },
         workers,
     )
 }
@@ -6345,6 +6481,7 @@ fn settle_stages(
             emission: None,
             reproduction: None,
             tiny: 0.0,
+            trophallaxis_delta: 0.0,
             closing: 0.0,
         })
     });

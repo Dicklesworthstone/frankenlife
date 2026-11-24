@@ -265,6 +265,8 @@ fn inspection_reports_the_committed_world_as_a_direct_world_holds_it() {
                 }
                 _ => assert!(record["held"].is_null(), "{}", record["held"]),
             }
+            assert!(record.get("cadherin_tag").is_none());
+            assert!(record.get("cohesiveness").is_none());
             energy += organism.energy;
         }
         assert_eq!(
@@ -549,4 +551,122 @@ fn recurrent_run_inspects_carried_state_and_runs_batched_backends() {
         ),
         "metal recurrent route must be verified (on Metal) or unavailable: {routes:?}"
     );
+}
+
+/// V2-13 CLI inspect check: `cadherin-4d` exposes `cadherin_tag` and
+/// `cohesiveness` matching `World::organism_snapshot` bit-for-bit when
+/// enabled, and omits both fields when `cadherin-4d` is disabled.
+#[test]
+fn v2_cadherin_inspect_reports_tag_and_cohesiveness_when_enabled() {
+    let mut cfg = ecology_text().replace(
+        "model = \"field-ecology-v1\"",
+        "model = \"field-ecology-v2\"",
+    );
+    cfg.push_str(
+        "\n[contact]\ndiameter = 0.25\nstiffness = 0.25\nadhesion = 0.1\nadhesion_range = 1.5\n\
+         \n[v2]\nprofile = \"minimal\"\n\n[v2.contact.cadherin]\nenabled = true\n",
+    );
+    let config = scratch().join("v2-cadherin-ecology.toml");
+    fs::write(&config, &cfg).expect("writes v2 cadherin config");
+
+    let run_on = fresh("v2-cadherin-on");
+    let (status, _, err) = flife(&[
+        "run",
+        text(&config),
+        "--ticks",
+        "4",
+        "--every",
+        "0",
+        "--controllers",
+        "cpu",
+        "--run-dir",
+        text(&run_on),
+        "--checkpoint-every",
+        "4",
+        "--checkpoint-durability",
+        "process-crash",
+    ]);
+    assert_eq!(status, Some(0), "{err:?}");
+
+    let (status, records, err) = flife(&["inspect", text(&run_on)]);
+    assert_eq!(status, Some(0), "{err:?}");
+    let header = &records[0];
+    assert_eq!(header["inv08_pure_field"], false);
+    assert!(
+        header["v2_features"]
+            .as_array()
+            .expect("v2_features")
+            .iter()
+            .any(|slug| slug == "cadherin-4d"),
+        "{header}"
+    );
+
+    let validated = ValidatedConfig::from_toml(&cfg).expect("valid v2 cadherin config");
+    let mut world = flife_cli::found(&validated).expect("founds v2 cadherin world");
+    while world.tick().get() < 4 {
+        match world.step().expect("steps") {
+            Stepped::Published(_) => {}
+            Stepped::Paused(shortfall) => panic!("paused: {shortfall:?}"),
+        }
+    }
+    let organisms: Vec<&Value> = records
+        .iter()
+        .filter(|record| record["record"] == "organism")
+        .collect();
+    assert_eq!(organisms.len(), world.population().len());
+    for (record, organism) in organisms.iter().zip(world.population().iter()) {
+        let snap = world
+            .organism_snapshot(organism.id)
+            .expect("snapshot")
+            .expect("live organism");
+        let expected_tag = snap.cadherin_tag().expect("cadherin tag enabled");
+        let expected_cohesiveness = snap.cohesiveness().expect("cohesiveness enabled");
+        let got_tag: Vec<u64> = record["cadherin_tag"]
+            .as_array()
+            .expect("cadherin_tag array")
+            .iter()
+            .map(|value| value.as_f64().expect("f64").to_bits())
+            .collect();
+        let expected_bits: Vec<u64> = expected_tag.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(got_tag, expected_bits, "organism {}", organism.id.get());
+        assert_eq!(
+            record["cohesiveness"].as_f64().expect("f64").to_bits(),
+            expected_cohesiveness.to_bits(),
+            "organism {}",
+            organism.id.get()
+        );
+    }
+
+    let run_off = fresh("v2-cadherin-off");
+    let (status, _, err) = flife(&[
+        "run",
+        text(&config),
+        "--disable",
+        "cadherin-4d",
+        "--ticks",
+        "4",
+        "--every",
+        "0",
+        "--controllers",
+        "cpu",
+        "--run-dir",
+        text(&run_off),
+        "--checkpoint-every",
+        "4",
+        "--checkpoint-durability",
+        "process-crash",
+    ]);
+    assert_eq!(status, Some(0), "{err:?}");
+
+    let (status, records_off, err) = flife(&["inspect", text(&run_off)]);
+    assert_eq!(status, Some(0), "{err:?}");
+    let organisms_off: Vec<&Value> = records_off
+        .iter()
+        .filter(|record| record["record"] == "organism")
+        .collect();
+    assert!(!organisms_off.is_empty());
+    for record in organisms_off {
+        assert!(record.get("cadherin_tag").is_none(), "{record}");
+        assert!(record.get("cohesiveness").is_none(), "{record}");
+    }
 }

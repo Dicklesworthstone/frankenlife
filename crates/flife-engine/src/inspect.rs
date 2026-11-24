@@ -47,7 +47,7 @@
 use flife_core::clock::Tick;
 use flife_core::ids::{GenomeId, OrganismId};
 use flife_field::pyramid::RawSample;
-use flife_genome::Traits;
+use flife_genome::{CADHERIN_TERMS, CadherinTraits, Traits};
 use flife_neural::{DecodedActions, LayerShape, Observation, WeightDtype};
 
 use crate::{
@@ -100,6 +100,32 @@ pub struct OrganismSnapshot {
     /// world traces its ancestry ([`crate::World::trace_ancestry`]); `None`
     /// otherwise.
     pub descendants: Option<Descendants>,
+}
+
+impl OrganismSnapshot {
+    /// Decoupled 4-D cadherin traits (`V2-13` `cadherin-4d`), or `None` when
+    /// disabled.
+    #[must_use]
+    pub const fn cadherin_traits(&self) -> Option<CadherinTraits> {
+        self.traits.cadherin_traits()
+    }
+
+    /// Decoupled 4-D unit cadherin adhesion tag `c_i` (`V2-13`), or `None`
+    /// when `cadherin-4d` is disabled.
+    #[must_use]
+    pub const fn cadherin_tag(&self) -> Option<[f64; CADHERIN_TERMS]> {
+        match self.traits.cadherin() {
+            Some(tag) => Some(*tag),
+            None => None,
+        }
+    }
+
+    /// Heritable cadherin cohesiveness scalar `s_i ∈ [0, 1]` (`V2-13`), or
+    /// `None` when `cadherin-4d` is disabled.
+    #[must_use]
+    pub const fn cohesiveness(&self) -> Option<f64> {
+        self.traits.cohesiveness()
+    }
 }
 
 /// What the committed field offers one organism where it stands (plan
@@ -171,6 +197,10 @@ pub struct Transactions {
     pub reproduction: Option<ReproductionOutcome>,
     /// What the tiny reservoir took (§8.2's last stage); zero if nothing.
     pub tiny: f64,
+    /// Signed net energy change from passive exact-quantum kin trophallaxis
+    /// (`V2-13`, `C013`); zero when `trophallaxis` is disabled or no quanta
+    /// moved.
+    pub trophallaxis_delta: f64,
     /// Its energy when the step ended; zero if the step exhausted it.
     pub closing: f64,
 }

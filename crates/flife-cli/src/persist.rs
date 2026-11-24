@@ -1097,9 +1097,10 @@ fn write_background(
     stream: Stream,
     queue: &Queue,
 ) -> (ChunkStore, Result<Committed, CoreError>) {
+    let mut guard = queue.writer_guard();
     let outcome = store_streamed(&mut store, stream, queue);
-    if outcome.is_err() {
-        queue.stop();
+    if outcome.is_ok() {
+        guard.disarm();
     }
     (store, outcome)
 }

@@ -32,6 +32,7 @@ use flife_core::checkpoint::ChunkFamily;
 use flife_core::ids::OrganismId;
 use flife_core::{CoreError, V2Feature};
 use flife_engine::{ControllerWeights, NumericalProfile, World};
+use flife_genome::CADHERIN_TERMS;
 use flife_store::{ChunkStore, Durability};
 use serde::Serialize;
 
@@ -174,6 +175,14 @@ pub struct InspectedOrganism {
     /// `notch-delta` is enabled; omitted when disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_neighbor_h0: Option<f64>,
+    /// Decoupled 4-D unit cadherin adhesion tag `c_i ∈ S^3` when `V2-13`
+    /// `cadherin-4d` is enabled; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cadherin_tag: Option<[f64; CADHERIN_TERMS]>,
+    /// Heritable cadherin cohesiveness scalar `s_i ∈ [0, 1]` when `V2-13`
+    /// `cadherin-4d` is enabled; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cohesiveness: Option<f64>,
 }
 
 /// An organism's held controller outputs.
@@ -387,6 +396,12 @@ fn of(
         .v2
         .as_ref()
         .is_some_and(|v2| v2.is_enabled(V2Feature::PcpPolarity));
+    let cadherin_active = world
+        .config()
+        .config()
+        .v2
+        .as_ref()
+        .is_some_and(|v2| v2.is_enabled(V2Feature::Cadherin4d));
     let differentiation = world.v2_rules().differentiation();
     let affinity_rotation_active = world.v2_rules().affinity_rotation_enabled();
     let notch_delta_active = world.v2_rules().notch_delta().is_some();
@@ -453,6 +468,12 @@ fn of(
             epigenetic_state,
             effective_affinity,
             last_neighbor_h0: notch_delta_active.then(|| f64::from(organism.last_neighbor_h0)),
+            cadherin_tag: cadherin_active
+                .then(|| genome.traits().cadherin().copied())
+                .flatten(),
+            cohesiveness: cadherin_active
+                .then(|| genome.traits().cohesiveness())
+                .flatten(),
         });
     }
     let state = world.field();

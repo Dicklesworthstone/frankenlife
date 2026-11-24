@@ -172,6 +172,38 @@ pub struct NotchDeltaRules {
     pub inhibition_gain: f64,
 }
 
+/// Resolved passive exact-quantum kin trophallaxis rules (`V2-13`, `C013`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrophallaxisRules {
+    /// Gap-junction conductance `G_gap >= 0` in `s^-1`.
+    pub conductance_per_second: f64,
+    /// Transfer efficiency `ρ_tr ∈ (0, 0.99]`.
+    pub transfer_efficiency: f64,
+    /// Donor energy reserve floor `E_reserve` (`> tiny_energy_threshold` and
+    /// `> E_viable` when `lysis-recycling` is active).
+    pub reserve_energy: f64,
+    /// Maximum fraction `f_max ∈ (0, 1]` of `(E_i - E_reserve).max(0)` exported per tick.
+    pub maximum_export_fraction: f64,
+    /// Exponent `p` applied to `max(0, cos(a_i, a_j))` (default `4`).
+    pub kin_cosine_exponent: u32,
+    /// Minimum genetic affinity cosine required for transfer (`∈ [0, 1]`, default `0.5`).
+    pub kin_threshold: f64,
+}
+
+/// Resolved decoupled 4-D cadherin adhesion rules (`V2-13`, `C023`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CadherinRules {
+    /// Per-birth Gaussian mutation standard deviation (`>= 0`).
+    pub mutation_std: f64,
+}
+
+/// Resolved dissipative kin velocity alignment rules (`V2-13`, `C019`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VelocityAlignmentRules {
+    /// Alignment blend weight `μ_align ∈ [0, 0.4]`.
+    pub strength: f64,
+}
+
 /// Run-constant `field-ecology-v2` rules resolved from a [`ValidatedConfig`].
 ///
 /// For `field-ecology-v1*` worlds, `config` is `None`, `feature_bitmask` is
@@ -202,6 +234,9 @@ pub struct V2Rules {
     emt_gate: bool,
     differentiation: Option<DifferentiationRules>,
     notch_delta: Option<NotchDeltaRules>,
+    trophallaxis: Option<TrophallaxisRules>,
+    cadherin: Option<CadherinRules>,
+    velocity_alignment: Option<VelocityAlignmentRules>,
     config: Option<V2Config>,
 }
 
@@ -531,6 +566,130 @@ impl V2Rules {
         } else {
             None
         };
+        let has_contact = config.config().contact.is_some();
+        let trophallaxis = if let Some(v2) = v2_config
+            .as_ref()
+            .filter(|v2| v2.is_enabled(V2Feature::Trophallaxis))
+        {
+            if !has_contact {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.trophallaxis.enabled",
+                    detail: "trophallaxis requires a [contact] table".to_owned(),
+                });
+            }
+            let tr = &v2.trophallaxis;
+            if !tr.conductance_per_second.is_finite() || tr.conductance_per_second < 0.0 {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.trophallaxis.conductance_per_second",
+                    detail: format!(
+                        "{} must be finite and nonnegative",
+                        tr.conductance_per_second
+                    ),
+                });
+            }
+            if !tr.transfer_efficiency.is_finite()
+                || !(tr.transfer_efficiency > 0.0 && tr.transfer_efficiency <= 0.99)
+            {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.trophallaxis.transfer_efficiency",
+                    detail: format!("{} must lie in (0.0, 0.99]", tr.transfer_efficiency),
+                });
+            }
+            if !tr.maximum_export_fraction.is_finite()
+                || !(tr.maximum_export_fraction > 0.0 && tr.maximum_export_fraction <= 1.0)
+            {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.trophallaxis.maximum_export_fraction",
+                    detail: format!("{} must lie in (0.0, 1.0]", tr.maximum_export_fraction),
+                });
+            }
+            if !tr.kin_threshold.is_finite() || !(0.0..=1.0).contains(&tr.kin_threshold) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.trophallaxis.kin_threshold",
+                    detail: format!("{} must lie in [0.0, 1.0]", tr.kin_threshold),
+                });
+            }
+            let tiny = config.config().world.tiny_energy_threshold;
+            let lysis_floor = lysis.map_or(0.0, |rule| rule.viability_energy_floor);
+            let reserve_energy = tr
+                .reserve_energy
+                .unwrap_or_else(|| 0.25_f64.max(tiny * 2.0).max(lysis_floor * 2.0));
+            if !reserve_energy.is_finite() || reserve_energy <= tiny {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.trophallaxis.reserve_energy",
+                    detail: format!(
+                        "{reserve_energy:?} must be finite and > tiny_energy_threshold ({tiny:?})"
+                    ),
+                });
+            }
+            if let Some(rule) = lysis
+                && reserve_energy <= rule.viability_energy_floor
+            {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.trophallaxis.reserve_energy",
+                    detail: format!(
+                        "{reserve_energy:?} must be > v2.metabolism.lysis.viability_energy_floor ({:?})",
+                        rule.viability_energy_floor
+                    ),
+                });
+            }
+            Some(TrophallaxisRules {
+                conductance_per_second: tr.conductance_per_second + 0.0,
+                transfer_efficiency: tr.transfer_efficiency + 0.0,
+                reserve_energy: reserve_energy + 0.0,
+                maximum_export_fraction: tr.maximum_export_fraction + 0.0,
+                kin_cosine_exponent: tr.kin_cosine_exponent,
+                kin_threshold: tr.kin_threshold + 0.0,
+            })
+        } else {
+            None
+        };
+        let cadherin = if let Some(v2) = v2_config
+            .as_ref()
+            .filter(|v2| v2.is_enabled(V2Feature::Cadherin4d))
+        {
+            if !has_contact {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.contact.cadherin.enabled",
+                    detail: "cadherin-4d requires a [contact] table".to_owned(),
+                });
+            }
+            let mutation_std = v2.contact.cadherin.mutation_std;
+            if !mutation_std.is_finite() || mutation_std < 0.0 {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.contact.cadherin.mutation_std",
+                    detail: format!("{mutation_std:?} must be finite and nonnegative"),
+                });
+            }
+            Some(CadherinRules {
+                mutation_std: mutation_std + 0.0,
+            })
+        } else {
+            None
+        };
+        let velocity_alignment = if let Some(v2) = v2_config
+            .as_ref()
+            .filter(|v2| v2.is_enabled(V2Feature::VelocityAlignment))
+        {
+            if !has_contact {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.contact.velocity_alignment.enabled",
+                    detail: "velocity-alignment requires a [contact] table".to_owned(),
+                });
+            }
+            let strength = v2.contact.velocity_alignment.strength;
+            if !strength.is_finite() || !(0.0..=0.4).contains(&strength) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.contact.velocity_alignment.strength",
+                    detail: format!("{strength:?} must lie in [0.0, 0.4]"),
+                });
+            }
+            Some(VelocityAlignmentRules {
+                strength: strength + 0.0,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             abi,
             sensors,
@@ -555,6 +714,9 @@ impl V2Rules {
             emt_gate,
             differentiation,
             notch_delta,
+            trophallaxis,
+            cadherin,
+            velocity_alignment,
             config: v2_config,
         })
     }
@@ -739,6 +901,27 @@ impl V2Rules {
     #[must_use]
     pub const fn notch_delta(&self) -> Option<NotchDeltaRules> {
         self.notch_delta
+    }
+
+    /// Resolved passive exact-quantum kin trophallaxis rules (`V2-13`,
+    /// `trophallaxis`), if enabled.
+    #[must_use]
+    pub const fn trophallaxis(&self) -> Option<TrophallaxisRules> {
+        self.trophallaxis
+    }
+
+    /// Resolved decoupled 4-D cadherin adhesion rules (`V2-13`,
+    /// `cadherin-4d`), if enabled.
+    #[must_use]
+    pub const fn cadherin(&self) -> Option<CadherinRules> {
+        self.cadherin
+    }
+
+    /// Resolved dissipative kin velocity alignment rules (`V2-13`,
+    /// `velocity-alignment`), if enabled.
+    #[must_use]
+    pub const fn velocity_alignment(&self) -> Option<VelocityAlignmentRules> {
+        self.velocity_alignment
     }
 
     /// Whether `h_0` rotates effective metabolic affinity `a_eff(h_0)` (`V2-12`).

@@ -37,6 +37,19 @@
 //!    `World::polarities()`, `DeathCause::Lysed`, `Transfer::MetabolicByproduct`,
 //!    `Transfer::Recycling`, zero `Flow::TinyReservoir`, active GPU service on
 //!    all 5 backends, and clean `DeviceOwner::usage()` in BOTH `f32` and `f16`.
+//! 5. **Full `V2-12` (`epigenetic-recurrence` `S = 2` + `notch-delta` +
+//!    `a_eff(h_0)` / `Q_met == J a_eff(h_0)` + `m(h_1)` EMT) + `V2-08`
+//!    (`pcp-polarity` + `emt-gate`) + `V2-11` (`lysis-recycling` +
+//!    `symplectic-waste`)** on ONE shared Metal `DeviceOwner` vs pure CPU
+//!    Reference in BOTH `f32` and `f16` across BOTH Notch-Delta modes:
+//!    - Bundle-A 4-aligned `108/44` (`sensor-neighbor-mean-v1`, 33-plane);
+//!    - Full 17-feature `111/47` (`direct-lateral-inhibition-v1` + `supercolony`
+//!      + `emt-gate`, 34-plane dual-carrier).
+//!
+//!    Verifies 0 controller deferrals, bit-exact `World::digest()`,
+//!    `World::cell_states()`, `World::effective_affinity()`, `last_neighbor_h0`,
+//!    `World::polarities()`, `Transfer::MetabolicByproduct`, live state
+//!    differentiation, active 5/5 GPU service, and idle `DeviceOwner`.
 
 #![allow(
     clippy::expect_used,
@@ -1060,5 +1073,462 @@ enabled = true
         assert_eq!(s_gpu.settle_report().failure, None);
         assert_eq!(s_gpu.settle_report().reference_ticks, 0);
         assert_owner_idle(&s_owner, &format!("Part B starved lysis+pcp {dtype}"));
+    }
+}
+
+fn cell_state_bits(world: &World) -> Vec<u32> {
+    world
+        .cell_states()
+        .expect("epigenetic-recurrence world exposes cell_states")
+        .into_iter()
+        .map(f32::to_bits)
+        .collect()
+}
+
+/// Full `V2-12` (`epigenetic-recurrence` `S = 2`, `epigenetic_gate_bias = 2.5`,
+/// `asymmetric-stem-v1` inheritance, `a_eff(h_0)` rotation, `Q_met == J
+/// a_eff(h_0)` symplectic waste, `m(h_1)` EMT, and BOTH `notch-delta` modes)
+/// combined with `V2-08` (`pcp-polarity` + `emt-gate`) and `V2-11`
+/// (`lysis-recycling` + `symplectic-waste`) on ONE shared Metal `DeviceOwner`
+/// (`MetalField` + `MetalSensors` + `MetalUptake` + `MetalBackend` +
+/// `MetalSettle`) vs pure CPU Reference in BOTH `f32` and `f16`.
+#[test]
+fn v2_epigenetic_differentiation_notch_delta_pcp_and_trophic_on_metal_matches_reference_f32_and_f16()
+ {
+    if open_owner().is_none() {
+        return;
+    }
+    let profile = NumericalProfile::reference_f32().expect("profile");
+
+    struct EpiCase<'a> {
+        label: &'a str,
+        tail: &'a str,
+        expected_planes: u32,
+        expected_in: u32,
+        expected_action: u32,
+        expected_raw_out: u32,
+        expect_emt_gate: bool,
+    }
+
+    let cases = [
+        // Case 1: Bundle-A exact 4-aligned 108/44 ABI (`sensor-neighbor-mean-v1`, 33-plane)
+        // with V2-12 + V2-08 polarity + V2-11 lysis/waste + V2-05 motor + V2-07 crowding + V2-09.
+        EpiCase {
+            label: "V2-12 Bundle-A 108/44 (sensor-neighbor-mean-v1, 33-plane)",
+            tail: r#"
+[contact]
+diameter = 0.5
+stiffness = 0.75
+adhesion = 0.35
+adhesion_range = 1.8
+sweeps = 2
+
+[v2]
+profile = "minimal"
+
+[v2.senescence]
+enabled = true
+
+[v2.emission.surplus_floor]
+enabled = true
+
+[v2.emission.offset]
+enabled = true
+
+[v2.motor]
+enabled = true
+
+[v2.crowding]
+enabled = true
+mode = "local-neighbors-v1"
+arrest_threshold = 6.0
+expose_sensor = true
+
+[v2.polarity]
+enabled = true
+torque_mobility = 2.0
+gradient_cue_strength = 0.25
+initial_polarity_strength_max = 0.8
+maximum_wedge_curvature = 0.25
+polarity_mutation_std = 0.05
+oriented_lateral_mitosis = true
+emt_gate_enabled = false
+
+[v2.barrier]
+enabled = true
+
+[v2.metabolism.lysis]
+enabled = true
+
+[v2.metabolism.waste]
+enabled = true
+byproduct_recycle_fraction = 0.45
+
+[v2.differentiation]
+enabled = true
+state_width = 2
+epigenetic_gate_bias = 2.5
+state_inheritance = "asymmetric-stem-v1"
+inheritance_retention = 0.8
+inheritance_jitter = 0.05
+stem_asymmetry = -0.8
+affinity_rotation_enabled = true
+emt_adhesion_enabled = true
+
+[v2.differentiation.notch_delta]
+enabled = true
+mode = "sensor-neighbor-mean-v1"
+inhibition_gain = 0.25
+"#,
+            expected_planes: 33,
+            expected_in: 108,
+            expected_action: 40,
+            expected_raw_out: 44,
+            expect_emt_gate: false,
+        },
+        // Case 2: All 17 closed V2 features simultaneously (`direct-lateral-inhibition-v1` +
+        // `supercolony` 34-plane dual-carrier + V2-08 `pcp-polarity` & `emt-gate` + V2-11 + V2-12),
+        // odd unaligned `111/47` ABI exercising Metal F16 padded slot stride with 0 deferrals.
+        EpiCase {
+            label: "V2-12 17-feature 111/47 (direct-lateral-inhibition-v1 + supercolony + emt-gate, 34-plane)",
+            tail: r#"
+[contact]
+diameter = 0.5
+stiffness = 0.75
+adhesion = 0.35
+adhesion_range = 1.8
+sweeps = 2
+
+[v2]
+profile = "supercolony"
+
+[v2.crowding]
+enabled = true
+mode = "local-neighbors-v1"
+arrest_threshold = 6.0
+expose_sensor = true
+
+[v2.polarity]
+enabled = true
+torque_mobility = 2.0
+gradient_cue_strength = 0.25
+initial_polarity_strength_max = 0.8
+maximum_wedge_curvature = 0.25
+polarity_mutation_std = 0.05
+oriented_lateral_mitosis = true
+emt_gate_enabled = true
+
+[v2.metabolism.waste]
+enabled = true
+byproduct_recycle_fraction = 0.45
+
+[v2.differentiation]
+enabled = true
+state_width = 2
+epigenetic_gate_bias = 2.5
+state_inheritance = "asymmetric-stem-v1"
+inheritance_retention = 0.8
+inheritance_jitter = 0.05
+stem_asymmetry = -0.8
+affinity_rotation_enabled = true
+emt_adhesion_enabled = true
+
+[v2.differentiation.notch_delta]
+enabled = true
+mode = "direct-lateral-inhibition-v1"
+inhibition_gain = 0.25
+"#,
+            expected_planes: DUAL_CARRIER_PLANES,
+            expected_in: 111,
+            expected_action: 43,
+            expected_raw_out: 47,
+            expect_emt_gate: true,
+        },
+    ];
+
+    for case in &cases {
+        for dtype in ["f32", "f16"] {
+            let dtype_toml = format!("\"{dtype}\"");
+            let overrides = [
+                ("world", "width", "16.0"),
+                ("world", "height", "16.0"),
+                ("world", "grid_width", "32"),
+                ("world", "grid_height", "32"),
+                ("world", "tick_numerator", "1"),
+                ("world", "tick_denominator", "32"),
+                ("population", "initial_count", "96"),
+                ("population", "maximum_count", "384"),
+                ("population", "initial_energy", "3.5"),
+                ("sources", "count", "4"),
+                ("sources", "power_per_source", "220.0"),
+                ("sources", "sigma_world_units", "2.0"),
+                ("sources", "path_direction_interval_seconds", "2.0"),
+                ("controller", "hidden_widths", "[64, 32]"),
+                ("controller", "canonical_weight_dtype", dtype_toml.as_str()),
+                ("reproduction", "cooldown_seconds", "0.05"),
+                (
+                    "reproduction",
+                    "minimum_parent_energy_before_attempt",
+                    "1.5",
+                ),
+                ("architecture_mutation", "probability_per_birth", "0.25"),
+                ("execution", "command_durability", "\"volatile-in-memory\""),
+            ];
+            let toml = ecology_toml("field-ecology-v2", &overrides, case.tail);
+            let config = ValidatedConfig::from_toml(&toml).expect("V2-12 config validates");
+
+            for feature in [
+                V2Feature::Senescence,
+                V2Feature::SurplusEmission,
+                V2Feature::WakeOffset,
+                V2Feature::So2Motor,
+                V2Feature::HippoCrowding,
+                V2Feature::PcpPolarity,
+                V2Feature::TightJunctions,
+                V2Feature::LysisRecycling,
+                V2Feature::SymplecticWaste,
+                V2Feature::EpigeneticRecurrence,
+                V2Feature::NotchDelta,
+            ] {
+                assert!(
+                    config.is_v2_feature_enabled(feature),
+                    "{} dtype={dtype}: expected {feature:?} enabled",
+                    case.label
+                );
+            }
+            assert_eq!(
+                config.is_v2_feature_enabled(V2Feature::EmtGate),
+                case.expect_emt_gate,
+                "{} dtype={dtype}: EmtGate mismatch",
+                case.label
+            );
+
+            let abi = config.v2_abi();
+            assert_eq!(abi.field_planes, case.expected_planes, "{}", case.label);
+            assert_eq!(abi.input_width, case.expected_in, "{}", case.label);
+            assert_eq!(abi.action_width, case.expected_action, "{}", case.label);
+            assert_eq!(
+                abi.raw_output_width, case.expected_raw_out,
+                "{}",
+                case.label
+            );
+
+            let mut reference = found_world(&config);
+            let mut gpu = found_world(&config);
+            let owner = install_all_metal_on_one_owner(&mut gpu).expect("metal owner");
+
+            let watched = reference.population().ids().next();
+            reference.watch(watched);
+            gpu.watch(watched);
+
+            let ticks = 64_u64;
+            let mut max_rel = 0.0_f64;
+            let mut total_births = 0_usize;
+            let mut total_byproducts = 0.0_f64;
+            for step in 1..=ticks {
+                let Stepped::Published(expected) = reference.step().expect("ref step") else {
+                    panic!("{} dtype={dtype} tick={step}: ref paused", case.label);
+                };
+                let Stepped::Published(got) = gpu.step().expect("metal step") else {
+                    panic!("{} dtype={dtype} tick={step}: gpu paused", case.label);
+                };
+                assert_eq!(
+                    reference.digest(),
+                    gpu.digest(),
+                    "{} dtype={dtype} tick={step}: World::digest diverged",
+                    case.label
+                );
+                assert_eq!(
+                    cell_state_bits(&reference),
+                    cell_state_bits(&gpu),
+                    "{} dtype={dtype} tick={step}: World::cell_states diverged",
+                    case.label
+                );
+                assert_eq!(
+                    polarity_bits(&reference),
+                    polarity_bits(&gpu),
+                    "{} dtype={dtype} tick={step}: World::polarities diverged",
+                    case.label
+                );
+                assert_eq!(
+                    summary_bits(&expected.field),
+                    summary_bits(&got.field),
+                    "{} dtype={dtype} tick={step}: FieldSummary diverged",
+                    case.label
+                );
+                assert_eq!(
+                    (
+                        expected.closure.closing().field().to_bits(),
+                        expected.closure.closing().organisms().to_bits(),
+                        expected.closure.residual().to_bits(),
+                        expected
+                            .closure
+                            .credited(Transfer::MetabolicByproduct)
+                            .to_bits(),
+                    ),
+                    (
+                        got.closure.closing().field().to_bits(),
+                        got.closure.closing().organisms().to_bits(),
+                        got.closure.residual().to_bits(),
+                        got.closure.credited(Transfer::MetabolicByproduct).to_bits(),
+                    ),
+                    "{} dtype={dtype} tick={step}: INV-03 closure or MetabolicByproduct diverged",
+                    case.label
+                );
+                assert_eq!(expected.births, got.births);
+                assert_eq!(expected.deaths, got.deaths);
+                for birth in &got.births {
+                    let a = reference
+                        .population()
+                        .genome(birth.child)
+                        .expect("ref child");
+                    let b = gpu.population().genome(birth.child).expect("gpu child");
+                    assert!(
+                        same_genome(a, b),
+                        "{} dtype={dtype} tick={step}: newborn genome {:?} diverged",
+                        case.label,
+                        birth.child
+                    );
+                }
+                assert!(
+                    reference
+                        .watched_transactions()
+                        .eq(gpu.watched_transactions()),
+                    "{} dtype={dtype} tick={step}: watched transactions diverged",
+                    case.label
+                );
+
+                let rel = got.closure.residual().abs() / got.closure.scale().max(1.0);
+                max_rel = max_rel.max(rel);
+                total_births += got.births.len();
+                total_byproducts += got.closure.credited(Transfer::MetabolicByproduct);
+            }
+
+            // Verify bit-exact `World::effective_affinity` (a_eff(h_0)) and Trap F
+            // `last_neighbor_h0` across EVERY live organism after 64 ticks, plus
+            // genuine epigenetic rotation away from genetic affinity and live state spread.
+            let mut saw_rotated_affinity = false;
+            for org in gpu.population().iter() {
+                let ref_org = reference
+                    .population()
+                    .get(org.id)
+                    .expect("ref live organism");
+                assert_eq!(
+                    org.last_neighbor_h0.to_bits(),
+                    ref_org.last_neighbor_h0.to_bits(),
+                    "{} dtype={dtype}: last_neighbor_h0 diverged for {:?}",
+                    case.label,
+                    org.id
+                );
+                let ref_eff = reference
+                    .effective_affinity(org.id)
+                    .expect("ref effective_affinity")
+                    .expect("ref org present");
+                let gpu_eff = gpu
+                    .effective_affinity(org.id)
+                    .expect("gpu effective_affinity")
+                    .expect("gpu org present");
+                assert_eq!(
+                    ref_eff.map(f64::to_bits),
+                    gpu_eff.map(f64::to_bits),
+                    "{} dtype={dtype}: effective_affinity diverged for {:?}",
+                    case.label,
+                    org.id
+                );
+                let genetic = gpu
+                    .population()
+                    .genome(org.id)
+                    .expect("gpu genome")
+                    .traits()
+                    .affinity();
+                if org.held.recurrent_state_array()[0].abs() > 1e-3 && gpu_eff != *genetic {
+                    saw_rotated_affinity = true;
+                }
+            }
+
+            let states = gpu.cell_states().expect("final cell_states");
+            let min_h = states.iter().copied().fold(f32::INFINITY, f32::min);
+            let max_h = states.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                max_h - min_h > 1e-3,
+                "{} dtype={dtype}: expected differentiated cell_states h_0 (min={min_h}, max={max_h})",
+                case.label
+            );
+            assert!(
+                saw_rotated_affinity,
+                "{} dtype={dtype}: expected nonzero h_0 to rotate effective_affinity away from genetic affinity",
+                case.label
+            );
+            assert!(
+                total_byproducts > 0.0,
+                "{} dtype={dtype}: expected positive Q_met == J a_eff(h_0) Transfer::MetabolicByproduct flux",
+                case.label
+            );
+            assert!(
+                total_births > 0,
+                "{} dtype={dtype}: expected live asymmetric-stem-v1 births over 64 ticks",
+                case.label
+            );
+
+            // INV-03 closure bounds (§21.4).
+            assert!(
+                max_rel <= 1e-6,
+                "{} dtype={dtype}: per-tick INV-03 residual {max_rel:e} > 1e-6",
+                case.label
+            );
+            let cum_norm = gpu.ledger().report().normalized.unwrap_or(0.0);
+            assert!(
+                cum_norm <= profile.residual.cumulative(),
+                "{} dtype={dtype}: cumulative INV-03 residual {cum_norm:e} > {}",
+                case.label,
+                profile.residual.cumulative()
+            );
+
+            // ALL FIVE Metal backends served all 64 ticks with 0 failures & 0 deferrals!
+            let f_rep = gpu.field_report();
+            let s_rep = gpu.sensor_report();
+            let u_rep = gpu.uptake_report();
+            let c_rep = gpu.controller_report();
+            let t_rep = gpu.settle_report();
+            assert_eq!(
+                f_rep.failure, None,
+                "{} {dtype} field: {f_rep:?}",
+                case.label
+            );
+            assert_eq!(
+                s_rep.failure, None,
+                "{} {dtype} sensors: {s_rep:?}",
+                case.label
+            );
+            assert_eq!(
+                u_rep.failure, None,
+                "{} {dtype} uptake: {u_rep:?}",
+                case.label
+            );
+            assert_eq!(
+                c_rep.failure, None,
+                "{} {dtype} ctrl: {c_rep:?}",
+                case.label
+            );
+            assert_eq!(
+                t_rep.failure, None,
+                "{} {dtype} settle: {t_rep:?}",
+                case.label
+            );
+            assert_eq!((f_rep.steps, f_rep.reference_steps), (ticks, 0));
+            assert_eq!((f_rep.reductions, f_rep.reference_reductions), (ticks, 0));
+            assert_eq!((f_rep.checks, f_rep.reference_checks), (ticks, 0));
+            assert_eq!((s_rep.ticks, s_rep.reference_ticks), (ticks, 0));
+            assert_eq!((u_rep.ticks, u_rep.reference_ticks), (ticks, 0));
+            assert_eq!((t_rep.ticks, t_rep.reference_ticks), (ticks, 0));
+            assert_eq!(c_rep.reference_ticks, 0);
+            assert_eq!(
+                c_rep.deferred, 0,
+                "{} dtype={dtype}: expected 0 controller deferrals on Metal GPU",
+                case.label
+            );
+            assert!(c_rep.batched > 0);
+            assert_owner_idle(&owner, &format!("{} {dtype}", case.label));
+        }
     }
 }

@@ -863,6 +863,23 @@ fn check_model(config: &RunConfig, issues: &mut Issues) -> Option<ValidationRepo
             ),
         );
     }
+    if let Some(v2) = config.v2.as_ref()
+        && v2.is_enabled(V2Feature::Oases)
+        && let Some(sigma_min) = v2.oases.sigma_min_world_units
+        && sigma_min.is_finite()
+        && sigma_min > 0.0
+    {
+        let min_radius = config.sources.kernel_cutoff_sigma * sigma_min;
+        if min_radius < farthest_from_center {
+            issues.add(
+                "v2.oases.sigma_min_world_units",
+                format!(
+                    "minimum oasis support radius {min_radius:?} can miss every cell center \
+                     (needs >= {farthest_from_center:?})"
+                ),
+            );
+        }
+    }
 
     // Tick alignment (A.3 item 8, §7.4).
     let ticks = |seconds: f64, path: &str, exact: bool, issues: &mut Issues| {

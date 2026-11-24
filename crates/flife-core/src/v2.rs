@@ -1481,7 +1481,14 @@ pub fn apply_feature_overrides(
                 }
             }
             FeatureOverride::Disable(raw) => {
-                for token in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                for token in raw.split(',').map(str::trim) {
+                    if token.is_empty() {
+                        issues.push(ConfigIssue {
+                            path: "v2.disabled_features".into(),
+                            problem: "empty v2 feature slug or alias in override list".into(),
+                        });
+                        continue;
+                    }
                     let Some(expanded) = V2Feature::expand_slug_or_alias(token) else {
                         issues.push(ConfigIssue {
                             path: "v2.disabled_features".into(),
@@ -1495,7 +1502,14 @@ pub fn apply_feature_overrides(
                 }
             }
             FeatureOverride::Enable(raw) => {
-                for token in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                for token in raw.split(',').map(str::trim) {
+                    if token.is_empty() {
+                        issues.push(ConfigIssue {
+                            path: "v2.enabled_features".into(),
+                            problem: "empty v2 feature slug or alias in override list".into(),
+                        });
+                        continue;
+                    }
                     let Some(expanded) = V2Feature::expand_slug_or_alias(token) else {
                         issues.push(ConfigIssue {
                             path: "v2.enabled_features".into(),

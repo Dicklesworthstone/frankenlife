@@ -1238,6 +1238,10 @@ fn spatial_statistics_guard_zero_bins_overflow_and_non_finite_inputs() {
     assert_eq!(morans_i(&[1.0, f64::INFINITY, 3.0, 4.0], [2, 2]), None);
     assert_eq!(gini(&[1.0, f64::NAN, 2.0]), None);
     assert_eq!(gini(&[1.0, f64::INFINITY, 2.0]), None);
+    assert_eq!(gini(&[-1.0, 2.0, 3.0]), None);
+    assert!(gini(&[-0.0, 1.0]).is_some());
     assert_eq!(top_decile_share(&[1.0, f64::NAN, 2.0]), None);
     assert_eq!(top_decile_share(&[1.0, f64::INFINITY, 2.0]), None);
+    assert_eq!(top_decile_share(&[-1.0, 2.0, 3.0]), None);
+    assert_eq!(top_decile_share(&[-0.0, 1.0]), Some(1.0));
 }

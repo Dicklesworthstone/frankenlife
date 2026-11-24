@@ -5,7 +5,9 @@
 //! against exact integer arithmetic: each test value is a dyadic rational
 //! whose bits fit an `i128` scaled by `2^100`.
 
-use flife_core::ledger::{CompensatedSum, FLOW_KINDS, TRANSFER_KINDS, add_down, sub_down};
+use flife_core::ledger::{
+    CompensatedSum, FLOW_KINDS, LedgerState, TRANSFER_KINDS, add_down, sub_down,
+};
 use flife_core::{
     CoreError, EnergyBudget, EnergyLedger, Flow, FlowClass, Holdings, Ledger, LedgerLog,
     ResidualBudget, Tick, TickClosure, TickLedger, Transfer,
@@ -608,4 +610,128 @@ fn a_replayed_log_sums_the_same_bits_as_recording_directly() {
         expected,
         "these entries' sums depend on their order, so the test can tell"
     );
+}
+
+#[test]
+fn ledger_rejects_nonfinite_scale_allowance_and_corrupt_restore_states() {
+    // TickLedger::close must reject overflowing scale under both exact (0 * Inf = NaN)
+    // and relative (Inf allowance) budgets rather than passing INV-03 silently.
+    for tick_budget in [ResidualBudget::EXACT, budget(0.0, 1.0e-9, 1.0e-9)] {
+        let mut tick = TickLedger::open(Tick::new(0), holdings(1.0e308, 0.0), tick_budget);
+        tick.record(Flow::SourcePower, 1.0e308).expect("source");
+        tick.record(Flow::Decay, 1.0e308).expect("decay");
+        let err = tick
+            .close(holdings(1.0e308, 0.0))
+            .expect_err("overflowing scale must not bypass INV-03");
+        assert!(
+            matches!(
+                err,
+                CoreError::NumericalInvalid {
+                    quantity: "energy ledger residual (INV-03)",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    // Valid baseline state restores cleanly.
+    let mut ledger = EnergyLedger::new(holdings(4.0, 2.0), budget(0.0, 1.0e-9, 1.0e-9));
+    let closure = ledger
+        .open(Tick::new(0), holdings(4.0, 2.0))
+        .expect("opens")
+        .close(holdings(4.0, 2.0))
+        .expect("closes");
+    ledger.commit(&closure).expect("commits");
+    let valid_state = ledger.state();
+    let restored =
+        EnergyLedger::restore(valid_state, budget(0.0, 1.0e-9, 1.0e-9)).expect("valid restores");
+    assert_eq!(restored.state(), valid_state);
+
+    let overflow_sum = CompensatedSum::from_parts([f64::MAX, f64::MAX]);
+    let negative_sum = CompensatedSum::from_parts([-1.0, 0.0]);
+    let bad_states: [(&str, LedgerState, ResidualBudget); 9] = [
+        (
+            "overflow residual sum with finite parts",
+            LedgerState {
+                residual: overflow_sum,
+                ..valid_state
+            },
+            budget(0.0, 1.0e-9, 1.0e-9),
+        ),
+        (
+            "overflow turnover with exact budget (0 * Inf = NaN allowance)",
+            LedgerState {
+                turnover: overflow_sum,
+                ..valid_state
+            },
+            ResidualBudget::EXACT,
+        ),
+        (
+            "overflow turnover with relative budget (Inf allowance)",
+            LedgerState {
+                turnover: overflow_sum,
+                residual: CompensatedSum::from_parts([1.0e100, 0.0]),
+                ..valid_state
+            },
+            budget(0.0, 1.0e-9, 1.0e-9),
+        ),
+        (
+            "overflow initial + turnover scale",
+            LedgerState {
+                initial: holdings(1.0e308, 0.0),
+                turnover: CompensatedSum::from_parts([1.0e308, 0.0]),
+                residual: CompensatedSum::from_parts([1.0e50, 0.0]),
+                ..valid_state
+            },
+            budget(0.0, 1.0e-9, 1.0e-9),
+        ),
+        (
+            "overflow initial holdings total",
+            LedgerState {
+                initial: holdings(1.0e308, 1.0e308),
+                ..valid_state
+            },
+            budget(0.0, 1.0e-9, 1.0e-9),
+        ),
+        (
+            "negative largest_tick_residual",
+            LedgerState {
+                largest_tick_residual: -1.0,
+                ..valid_state
+            },
+            budget(0.0, 1.0e-9, 1.0e-9),
+        ),
+        (
+            "negative turnover",
+            LedgerState {
+                turnover: negative_sum,
+                ..valid_state
+            },
+            budget(0.0, 1.0e-9, 1.0e-9),
+        ),
+        (
+            "negative drift count",
+            LedgerState {
+                drift: [-1.0, 0.0, 0.0, 0.0, 0.0],
+                ..valid_state
+            },
+            budget(0.0, 1.0e-9, 1.0e-9),
+        ),
+        (
+            "negative drift x_moment",
+            LedgerState {
+                drift: [1.0, 0.0, 0.0, 0.0, -1.0],
+                ..valid_state
+            },
+            budget(0.0, 1.0e-9, 1.0e-9),
+        ),
+    ];
+    for (label, state, restore_budget) in bad_states {
+        let result = EnergyLedger::restore(state, restore_budget);
+        assert!(
+            matches!(result, Err(CoreError::IncompatibleCheckpoint { .. })),
+            "{label}: expected IncompatibleCheckpoint, got {result:?}"
+        );
+    }
 }

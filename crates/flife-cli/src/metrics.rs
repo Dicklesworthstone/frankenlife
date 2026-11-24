@@ -1010,10 +1010,10 @@ pub fn morans_i(values: &[f64], size: [usize; 2]) -> Option<f64> {
 
 /// The Gini coefficient of nonnegative `values`:
 /// `Σ_i (2i − n − 1) x_(i) / (n Σ x)` over the ascending order, `i` from 1.
-/// `None` when they sum to zero.
+/// `None` when empty, negative, nonfinite, or summing to zero.
 #[must_use]
 pub fn gini(values: &[f64]) -> Option<f64> {
-    if values.is_empty() || values.iter().any(|v| !v.is_finite()) {
+    if values.is_empty() || values.iter().any(|v| !v.is_finite() || *v < 0.0) {
         return None;
     }
     let mut sorted = values.to_vec();
@@ -1032,10 +1032,11 @@ pub fn gini(values: &[f64]) -> Option<f64> {
 }
 
 /// The share of the sum of nonnegative `values` held by the largest tenth
-/// of them (rounded up). `None` when they sum to zero.
+/// of them (rounded up). `None` when empty, negative, nonfinite, or summing
+/// to zero.
 #[must_use]
 pub fn top_decile_share(values: &[f64]) -> Option<f64> {
-    if values.is_empty() || values.iter().any(|v| !v.is_finite()) {
+    if values.is_empty() || values.iter().any(|v| !v.is_finite() || *v < 0.0) {
         return None;
     }
     let mut sorted = values.to_vec();

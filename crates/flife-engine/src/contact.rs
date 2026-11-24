@@ -66,6 +66,7 @@
 //! workers and a world's contact displacement is the same at any worker
 //! count.
 
+use flife_core::ledger::CompensatedSum;
 use flife_core::model::{
     FIELD_ECOLOGY_V1_CONTACT_INHIBITION, FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
     FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, MAXIMUM_CONTACT_SWEEPS, is_v2_model,
@@ -73,10 +74,17 @@ use flife_core::model::{
 use flife_core::numerics::{normalize_turns, sin_cos_turns};
 use flife_core::{CoreError, ValidatedConfig};
 use flife_field::FieldGrid;
-use flife_genome::AFFINITY_TERMS;
+use flife_genome::{AFFINITY_TERMS, CADHERIN_TERMS};
 
 /// Maximum per-tick angular polarity rotation in radians (`V2-08`, `C003`).
 pub const MAX_POLARITY_DTHETA_RAD: f64 = 0.25;
+
+/// Exact binary energy quantum `Q_tr = 2^-30` for passive kin trophallaxis
+/// (`V2-13`, `C013`). Because `2^-30` is an exact power of two, converting
+/// signed `i64` quantum totals to `f64` (`k as f64 * TROPHALLAXIS_QUANTUM`) is
+/// bit-exact for every `|k| <= 2^53`, guaranteeing 0-bit integer ledger
+/// conservation (`INV-03`) and bit-exact worker-count determinism (`INV-11`).
+pub const TROPHALLAXIS_QUANTUM: f64 = 1.0 / ((1_u64 << 30) as f64);
 
 /// `V2-08` (`pcp-polarity`) Sweep-1 physics parameters.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -89,12 +97,85 @@ pub struct PcpSweepParams {
     pub gradient_cue_strength: f64,
 }
 
+/// `V2-13` (`trophallaxis`, `C013`) passive exact-quantum Sweep-1 parameters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrophallaxisSweepParams {
+    /// Timestep `Δt` in simulation seconds.
+    pub dt: f64,
+    /// Gap-junction conductance `G_gap >= 0` in `s^-1`.
+    pub conductance_per_second: f64,
+    /// Transfer efficiency `ρ_tr ∈ (0, 0.99]`.
+    pub transfer_efficiency: f64,
+    /// Donor energy reserve floor `E_reserve` (`> 0`).
+    pub reserve_energy: f64,
+    /// Maximum fraction `f_max ∈ (0, 1]` of `(E_i - E_reserve).max(0)` exported per tick.
+    pub maximum_export_fraction: f64,
+    /// Exponent `p` applied to `max(0, cos(a_i, a_j))` (default `4`).
+    pub kin_cosine_exponent: u32,
+    /// Minimum genetic affinity cosine required for transfer (`∈ [0, 1]`, default `0.5`).
+    pub kin_threshold: f64,
+}
+
+/// Exact integer quantum totals produced by one tick's passive kin trophallaxis
+/// (`V2-13`, `C013`), satisfying `total_out_quanta == total_in_quanta + total_tax_quanta`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrophallaxisSummary {
+    /// Total quanta debited from donors across the population.
+    pub total_out_quanta: u64,
+    /// Total quanta credited to recipients across the population.
+    pub total_in_quanta: u64,
+    /// Total quanta dissipated as `Flow::TrophallaxisLoss`.
+    pub total_tax_quanta: u64,
+}
+
+impl TrophallaxisSummary {
+    /// Total energy debited from donors (`total_out_quanta * 2^-30`).
+    #[must_use]
+    pub fn debited(self) -> f64 {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "exact power-of-two binary quantum scaling for ecological energy totals"
+        )]
+        let value = (self.total_out_quanta as f64) * TROPHALLAXIS_QUANTUM;
+        value
+    }
+
+    /// Total energy credited to recipients (`total_in_quanta * 2^-30`).
+    #[must_use]
+    pub fn credited(self) -> f64 {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "exact power-of-two binary quantum scaling for ecological energy totals"
+        )]
+        let value = (self.total_in_quanta as f64) * TROPHALLAXIS_QUANTUM;
+        value
+    }
+
+    /// Total energy dissipated as trophallaxis tax (`total_tax_quanta * 2^-30`).
+    #[must_use]
+    pub fn tax(self) -> f64 {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "exact power-of-two binary quantum scaling for ecological energy totals"
+        )]
+        let value = (self.total_tax_quanta as f64) * TROPHALLAXIS_QUANTUM;
+        value
+    }
+}
+
+/// `V2-13` (`velocity-alignment`, `C019`) dissipative Sweep-1 parameters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VelocityAlignmentSweepParams {
+    /// Alignment blend weight `μ_align ∈ [0, 0.4]`.
+    pub strength: f64,
+}
+
 /// Optional `field-ecology-v2` Sweep-1 context (`V2-08` PCP polarity + EMT
-/// adhesion gate, `V2-12` Notch-Delta neighbor averaging, clean extension seam
-/// for `V2-13`).
+/// adhesion gate, `V2-12` Notch-Delta neighbor averaging, `V2-13` cadherin-4d,
+/// passive exact-quantum trophallaxis, and dissipative velocity alignment).
 ///
-/// When `pcp`, `emt_factors`, and `cell_states_h0` are all `None`, Sweep 1
-/// dispatches directly to the baseline isotropic [`relax`] kernel bit-for-bit.
+/// When all optional fields are `None`, Sweep 1 dispatches directly to the
+/// baseline isotropic [`relax`] kernel bit-for-bit.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Sweep1Context<'a> {
     /// Active `V2-08` PCP polarity parameters, if `pcp-polarity` is enabled.
@@ -113,6 +194,18 @@ pub struct Sweep1Context<'a> {
     /// Post-Phase-4 primary recurrent cell states `h_0 ∈ [-1, 1]` (length `N`),
     /// if `V2-12` (`notch-delta`) is enabled.
     pub cell_states_h0: Option<&'a [f32]>,
+    /// Decoupled 4-D unit cadherin tags `c_i` (`V2-13` `cadherin-4d`, length `N`).
+    pub cadherin_tags: Option<&'a [[f64; CADHERIN_TERMS]]>,
+    /// Heritable cadherin cohesiveness scalars `s_i ∈ [0, 1]` (`V2-13`, length `N`).
+    pub cadherin_cohesiveness: Option<&'a [f64]>,
+    /// Active `V2-13` (`trophallaxis`) parameters, if enabled.
+    pub trophallaxis: Option<TrophallaxisSweepParams>,
+    /// Pre-trophallaxis survivor budgets `E_i` (`V2-13` `trophallaxis`, length `N`).
+    pub energies: Option<&'a [f64]>,
+    /// Active `V2-13` (`velocity-alignment`) parameters, if enabled.
+    pub velocity_alignment: Option<VelocityAlignmentSweepParams>,
+    /// Committed post-motion velocities `v_i` (`V2-13` `velocity-alignment`, length `N`).
+    pub velocities: Option<&'a [[f64; 2]]>,
 }
 
 /// Mutable Sweep-1 outputs written by [`relax_sweep1_with_context`].
@@ -126,6 +219,210 @@ pub struct Sweep1Output<'a> {
     /// Kin-weighted mean neighbor cell state `h̄_i ∈ [-1, 1]` when `V2-12`
     /// (`notch-delta`) is active (length `N`); `None` when disabled.
     pub neighbor_h0: Option<&'a mut Vec<f32>>,
+    /// Signed per-body exact binary-quantum trophallaxis deltas `Δk_i` in units
+    /// of [`TROPHALLAXIS_QUANTUM`] (`V2-13`, length `N`); `None` when disabled.
+    pub trophallaxis_delta_quanta: Option<&'a mut Vec<i64>>,
+    /// Population-wide exact integer quantum totals (`V2-13`); `None` when
+    /// disabled.
+    pub trophallaxis_summary: Option<&'a mut TrophallaxisSummary>,
+    /// Updated speed-non-increasing aligned velocities `v'_i` (`V2-13`, length
+    /// `N`); `None` when disabled.
+    pub next_velocities: Option<&'a mut Vec<[f64; 2]>>,
+}
+
+/// Deterministic integer power `base^exp` in F64 via binary exponentiation
+/// (avoids host libm `powi` variance).
+#[must_use]
+fn pow_u32(mut base: f64, mut exp: u32) -> f64 {
+    let mut acc = 1.0_f64;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            acc *= base;
+        }
+        exp >>= 1;
+        if exp > 0 {
+            base *= base;
+        }
+    }
+    acc
+}
+
+/// Pure `V2-13` (`cadherin-4d`, `C023`) decoupled pair adhesion weight
+/// `min(s_i, s_j) * max(0, cos(c_i, c_j))^2` (`∈ [0, 1]`), strictly symmetric
+/// under `i <-> j`.
+#[must_use]
+pub fn cadherin_pair_weight(
+    c_i: &[f64; CADHERIN_TERMS],
+    s_i: f64,
+    c_j: &[f64; CADHERIN_TERMS],
+    s_j: f64,
+) -> f64 {
+    let dot = c_i[0] * c_j[0] + c_i[1] * c_j[1] + c_i[2] * c_j[2] + c_i[3] * c_j[3];
+    let alike = dot.clamp(0.0, 1.0);
+    s_i.min(s_j) * (alike * alike)
+}
+
+/// Cadherin adhesion weight with optional cell-sorting repulsion `r >= 0`.
+/// At `r == 0.0` this equals [`cadherin_pair_weight`] identically; at `s_i == 0`
+/// or `s_j == 0` non-cohesive bodies exert neither pull nor sorting repulsion.
+#[must_use]
+fn cadherin_sorting_weight(
+    c_i: &[f64; CADHERIN_TERMS],
+    s_i: f64,
+    c_j: &[f64; CADHERIN_TERMS],
+    s_j: f64,
+    repulsion: f64,
+) -> f64 {
+    let dot = c_i[0] * c_j[0] + c_i[1] * c_j[1] + c_i[2] * c_j[2] + c_i[3] * c_j[3];
+    let alike = dot.clamp(0.0, 1.0);
+    let alike_sq = alike * alike;
+    let cohesion = s_i.min(s_j);
+    if repulsion > 0.0 {
+        cohesion * ((1.0 + repulsion) * alike_sq - repulsion)
+    } else {
+        cohesion * alike_sq
+    }
+}
+
+/// Pure `V2-13` (`trophallaxis`, `C013`) raw directional energy demand
+/// `Δt · G_gap · alike^p · (1 − d / (R D)) · (E_donor − E_recipient)` for a
+/// directed pair with `donor_e > recipient_e` and genetic affinity cosine
+/// `alike = max(0, cos(a_i, a_j))`.
+#[must_use]
+pub fn pair_trophallaxis_raw(
+    donor_e: f64,
+    recipient_e: f64,
+    dist: f64,
+    reach_distance: f64,
+    alike: f64,
+    cfg: &TrophallaxisSweepParams,
+) -> f64 {
+    if donor_e <= recipient_e
+        || dist >= reach_distance
+        || reach_distance <= 0.0
+        || alike < cfg.kin_threshold
+        || cfg.conductance_per_second <= 0.0
+        || cfg.dt <= 0.0
+    {
+        return 0.0;
+    }
+    let spatial = (1.0 - dist / reach_distance).max(0.0);
+    if spatial <= 0.0 {
+        return 0.0;
+    }
+    let kin = pow_u32(alike, cfg.kin_cosine_exponent);
+    let raw = cfg.dt * cfg.conductance_per_second * kin * spatial * (donor_e - recipient_e);
+    if raw.is_finite() && raw > 0.0 {
+        raw
+    } else {
+        0.0
+    }
+}
+
+/// Canonical symmetric binary-quantum trophallaxis kernel (`V2-13`, `C013`).
+///
+/// Called identically on both the donor and recipient sides with the same
+/// `(donor_e, donor_scale, recipient_e, dist, reach_distance, alike, cfg)`
+/// (where `dist = dx.abs().hypot(dy.abs())` and `alike = max(0, cos(a_i, a_j))`
+/// from genetic `traits.affinity()`). Returns `(q_out, q_in, q_tax)` in units
+/// of [`TROPHALLAXIS_QUANTUM`] (`2^-30`) satisfying `q_out == q_in + q_tax` and
+/// `0 <= q_in <= q_out` to zero bits.
+#[must_use]
+pub fn pair_trophallaxis_quanta(
+    donor_e: f64,
+    donor_scale: f64,
+    recipient_e: f64,
+    dist: f64,
+    reach_distance: f64,
+    alike: f64,
+    cfg: &TrophallaxisSweepParams,
+) -> (i64, i64, i64) {
+    if donor_scale <= 0.0 {
+        return (0, 0, 0);
+    }
+    let raw = pair_trophallaxis_raw(donor_e, recipient_e, dist, reach_distance, alike, cfg);
+    if raw <= 0.0 {
+        return (0, 0, 0);
+    }
+    let scaled = donor_scale * raw;
+    let quanta_f = (scaled / TROPHALLAXIS_QUANTUM).floor();
+    if !quanta_f.is_finite() || quanta_f < 1.0 {
+        return (0, 0, 0);
+    }
+    const MAX_QUANTA: f64 = (1_i64 << 52) as f64;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "quanta_f is a finite nonnegative integer clamped to [1, 2^52]"
+    )]
+    let q_out = quanta_f.min(MAX_QUANTA) as i64;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "q_out <= 2^52 is exact in f64 and transfer_efficiency <= 0.99 keeps q_in <= q_out"
+    )]
+    let q_in = ((cfg.transfer_efficiency * (q_out as f64)).floor() as i64).clamp(0, q_out);
+    let q_tax = q_out - q_in;
+    (q_out, q_in, q_tax)
+}
+
+/// Pure `V2-13` (`velocity-alignment`, `C019`) dissipative kin velocity blend.
+///
+/// Computes `v_blend = (1 - μ) v_i + μ (sum_v / sum_w)` when `sum_w > 0` and
+/// `μ > 0`, and clamps `v'_i` radially to `‖v_i‖₂` using `motion.rs`'s 1-ulp
+/// shrink loop so `v'_i · v'_i <= v_i · v_i` strictly holds in F64 (`TK-04`:
+/// zero unpaid kinetic work).
+#[must_use]
+pub fn align_velocity_dissipative(
+    v_i: [f64; 2],
+    sum_v: [f64; 2],
+    sum_w: f64,
+    strength: f64,
+) -> [f64; 2] {
+    let bound_sq = v_i[0] * v_i[0] + v_i[1] * v_i[1];
+    if strength <= 0.0 || sum_w <= 0.0 || !bound_sq.is_finite() || bound_sq <= 0.0 {
+        return v_i;
+    }
+    let mean_x = sum_v[0] / sum_w;
+    let mean_y = sum_v[1] / sum_w;
+    let keep = 1.0 - strength;
+    let blend = [
+        keep * v_i[0] + strength * mean_x,
+        keep * v_i[1] + strength * mean_y,
+    ];
+    let blend_sq = blend[0] * blend[0] + blend[1] * blend[1];
+    if !blend_sq.is_finite() || blend_sq <= 0.0 {
+        return [0.0, 0.0];
+    }
+    if blend_sq <= bound_sq {
+        return blend;
+    }
+    let scale = bound_sq.sqrt() / blend_sq.sqrt();
+    let mut clamped = [blend[0] * scale, blend[1] * scale];
+    let shrink = 1.0 - f64::EPSILON / 2.0;
+    while clamped[0] * clamped[0] + clamped[1] * clamped[1] > bound_sq {
+        let next = [clamped[0] * shrink, clamped[1] * shrink];
+        if next == clamped {
+            clamped = [
+                if clamped[0] > 0.0 {
+                    clamped[0].next_down()
+                } else if clamped[0] < 0.0 {
+                    clamped[0].next_up()
+                } else {
+                    0.0
+                },
+                if clamped[1] > 0.0 {
+                    clamped[1].next_down()
+                } else if clamped[1] < 0.0 {
+                    clamped[1].next_up()
+                } else {
+                    0.0
+                },
+            ];
+        } else {
+            clamped = next;
+        }
+    }
+    clamped
 }
 
 /// Pure `V2-08` PCP lateral + wedge adhesion modulation factor
@@ -339,6 +636,44 @@ pub struct ContactScratch {
     /// Each body's push from the bodies it overlaps, unclamped, when the
     /// rules inhibit; empty otherwise.
     pressed: Vec<[f64; 2]>,
+    /// Pass-1 donor export scale factors (`V2-13` `trophallaxis`; `0 B` when disabled).
+    trophallaxis_scales: Vec<f64>,
+}
+
+/// Which `field-ecology-v2` Sweep-1 buffers [`ContactWork::with_capacity_v2_features`]
+/// reserves up front (`0 B` for every `false` flag, `INV-15`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContactV2Buffers {
+    /// `V2-08` (`pcp-polarity`).
+    pub pcp_polarity: bool,
+    /// `V2-08` (`emt-gate`) or `V2-12` (`h_1` EMT adhesion modulation).
+    pub emt_gate: bool,
+    /// `V2-12` (`notch-delta`).
+    pub notch_delta: bool,
+    /// `V2-13` (`cadherin-4d`).
+    pub cadherin: bool,
+    /// `V2-13` (`trophallaxis`).
+    pub trophallaxis: bool,
+    /// `V2-13` (`velocity-alignment`).
+    pub velocity_alignment: bool,
+}
+
+/// Optional per-tick `field-ecology-v2` parameters passed into
+/// [`ContactWork::relax_v2_features`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ContactV2Sweep {
+    /// `V2-08` (`pcp-polarity`).
+    pub pcp: Option<PcpSweepParams>,
+    /// `V2-08` (`emt-gate`) or `V2-12` (`h_1` EMT adhesion modulation).
+    pub emt_gate: bool,
+    /// `V2-12` (`notch-delta`).
+    pub notch_delta: bool,
+    /// `V2-13` (`cadherin-4d`).
+    pub cadherin: bool,
+    /// `V2-13` (`trophallaxis`).
+    pub trophallaxis: Option<TrophallaxisSweepParams>,
+    /// `V2-13` (`velocity-alignment`).
+    pub velocity_alignment: Option<VelocityAlignmentSweepParams>,
 }
 
 /// A world's contact buffers: the survivors' gathered state, the
@@ -351,8 +686,9 @@ pub struct ContactWork {
     pub ids: Vec<u64>,
     /// Whether each survives the tick.
     pub alive: Vec<bool>,
-    /// Each one's unit affinity direction, when bodies adhere (or `pcp-polarity`
-    /// torque is enabled).
+    /// Each one's unit affinity direction, when genetic affinity is needed
+    /// (baseline adhesion without cadherin, PCP without cadherin, Notch-Delta,
+    /// trophallaxis, or velocity alignment without cadherin).
     pub affinities: Vec<[f32; AFFINITY_TERMS]>,
     /// Committed unit polarity vectors `p_i` (`V2-08`; empty / `0 B` when off).
     pub polarities: Vec<[f64; 2]>,
@@ -372,6 +708,20 @@ pub struct ContactWork {
     /// Kin-weighted mean neighbor cell states `h̄_0` computed on Sweep 1 (`V2-12`
     /// `notch-delta`; empty / `0 B` when off).
     pub neighbor_h0: Vec<f32>,
+    /// Decoupled 4-D unit cadherin tags `c_i` (`V2-13` `cadherin-4d`; `0 B` when off).
+    pub cadherin_tags: Vec<[f64; CADHERIN_TERMS]>,
+    /// Heritable cadherin cohesiveness scalars `s_i` (`V2-13` `cadherin-4d`; `0 B` when off).
+    pub cadherin_cohesiveness: Vec<f64>,
+    /// Pre-trophallaxis survivor budgets `E_i` (`V2-13` `trophallaxis`; `0 B` when off).
+    pub energies: Vec<f64>,
+    /// Signed per-body exact binary-quantum deltas `Δk_i` (`V2-13` `trophallaxis`; `0 B` when off).
+    pub trophallaxis_delta_quanta: Vec<i64>,
+    /// Population-wide exact integer quantum totals (`V2-13` `trophallaxis`).
+    pub trophallaxis_summary: TrophallaxisSummary,
+    /// Committed post-motion velocities `v_i` (`V2-13` `velocity-alignment`; `0 B` when off).
+    pub velocities: Vec<[f64; 2]>,
+    /// Updated speed-non-increasing aligned velocities `v'_i` (`V2-13`; `0 B` when off).
+    pub next_velocities: Vec<[f64; 2]>,
     /// Each one's displacement, zero for those that die: the sum of its
     /// sweeps'.
     pub displacements: Vec<[f64; 2]>,
@@ -409,7 +759,7 @@ impl ContactWork {
         rules: &ContactRules,
         rows: usize,
     ) -> Result<Self, CoreError> {
-        Self::with_capacity_v2(grid, rules, rows, false, false, false)
+        Self::with_capacity_v2_features(grid, rules, rows, ContactV2Buffers::default())
     }
 
     /// Buffers for `rows` organisms on `grid` under `rules`, additionally
@@ -427,10 +777,39 @@ impl ContactWork {
         emt_gate: bool,
         notch_delta: bool,
     ) -> Result<Self, CoreError> {
+        Self::with_capacity_v2_features(
+            grid,
+            rules,
+            rows,
+            ContactV2Buffers {
+                pcp_polarity,
+                emt_gate,
+                notch_delta,
+                ..ContactV2Buffers::default()
+            },
+        )
+    }
+
+    /// Buffers for `rows` organisms on `grid` under `rules`, reserving only
+    /// those `field-ecology-v2` Sweep-1 scratch arrays whose feature flag in
+    /// `buffers` is `true` (`0 B` when disabled, `INV-15`).
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] when a reservation fails.
+    pub fn with_capacity_v2_features(
+        grid: &FieldGrid,
+        rules: &ContactRules,
+        rows: usize,
+        buffers: ContactV2Buffers,
+    ) -> Result<Self, CoreError> {
         // Later sweeps push only, binned at the diameter: never fewer bins.
         let reach = if rules.sweeps > 1 {
             rules.diameter
-        } else if pcp_polarity || notch_delta {
+        } else if buffers.pcp_polarity
+            || buffers.notch_delta
+            || buffers.trophallaxis
+            || buffers.velocity_alignment
+        {
             rules.diameter * rules.range
         } else {
             rules.reach()
@@ -440,10 +819,15 @@ impl ContactWork {
         reserve(&mut work.positions, rows, "contact positions")?;
         reserve(&mut work.ids, rows, "contact identities")?;
         reserve(&mut work.alive, rows, "contact fates")?;
-        if rules.adheres() || pcp_polarity || notch_delta {
+        let needs_affinities = (rules.adheres() && !buffers.cadherin)
+            || (buffers.pcp_polarity && !buffers.cadherin)
+            || buffers.notch_delta
+            || buffers.trophallaxis
+            || (buffers.velocity_alignment && !buffers.cadherin);
+        if needs_affinities {
             reserve(&mut work.affinities, rows, "contact affinities")?;
         }
-        if pcp_polarity {
+        if buffers.pcp_polarity {
             reserve(&mut work.polarities, rows, "contact polarities")?;
             reserve(&mut work.next_polarities, rows, "contact next polarities")?;
             reserve(
@@ -454,12 +838,37 @@ impl ContactWork {
             reserve(&mut work.wedge_curvatures, rows, "contact wedge curvatures")?;
             reserve(&mut work.energy_gradients, rows, "contact energy gradients")?;
         }
-        if emt_gate {
+        if buffers.emt_gate {
             reserve(&mut work.emt_factors, rows, "contact emt factors")?;
         }
-        if notch_delta {
+        if buffers.notch_delta {
             reserve(&mut work.cell_states_h0, rows, "contact cell states h0")?;
             reserve(&mut work.neighbor_h0, rows, "contact neighbor h0")?;
+        }
+        if buffers.cadherin {
+            reserve(&mut work.cadherin_tags, rows, "contact cadherin tags")?;
+            reserve(
+                &mut work.cadherin_cohesiveness,
+                rows,
+                "contact cadherin cohesiveness",
+            )?;
+        }
+        if buffers.trophallaxis {
+            reserve(&mut work.energies, rows, "contact trophallaxis energies")?;
+            reserve(
+                &mut work.trophallaxis_delta_quanta,
+                rows,
+                "contact trophallaxis deltas",
+            )?;
+            reserve(
+                &mut work.scratch.trophallaxis_scales,
+                rows,
+                "contact trophallaxis scales",
+            )?;
+        }
+        if buffers.velocity_alignment {
+            reserve(&mut work.velocities, rows, "contact velocities")?;
+            reserve(&mut work.next_velocities, rows, "contact next velocities")?;
         }
         reserve(&mut work.displacements, rows, "contact displacements")?;
         if rules.sweeps > 1 {
@@ -492,6 +901,12 @@ impl ContactWork {
             bytes(&self.emt_factors),
             bytes(&self.cell_states_h0),
             bytes(&self.neighbor_h0),
+            bytes(&self.cadherin_tags),
+            bytes(&self.cadherin_cohesiveness),
+            bytes(&self.energies),
+            bytes(&self.trophallaxis_delta_quanta),
+            bytes(&self.velocities),
+            bytes(&self.next_velocities),
             bytes(&self.displacements),
             bytes(&self.pressed),
             bytes(&self.settled),
@@ -500,6 +915,7 @@ impl ContactWork {
             bytes(&self.scratch.bins),
             bytes(&self.scratch.starts),
             bytes(&self.scratch.pressed),
+            bytes(&self.scratch.trophallaxis_scales),
         ]
         .into_iter()
         .fold(0_u64, u64::saturating_add)
@@ -519,7 +935,7 @@ impl ContactWork {
         rules: &ContactRules,
         workers: usize,
     ) -> Result<(), CoreError> {
-        self.relax_v2(grid, rules, None, false, false, workers)
+        self.relax_v2_features(grid, rules, ContactV2Sweep::default(), workers)
     }
 
     /// [`Self::relax`] extended with optional `V2-08` PCP polarity (`pcp`),
@@ -539,6 +955,34 @@ impl ContactWork {
         notch_delta: bool,
         workers: usize,
     ) -> Result<(), CoreError> {
+        self.relax_v2_features(
+            grid,
+            rules,
+            ContactV2Sweep {
+                pcp,
+                emt_gate,
+                notch_delta,
+                ..ContactV2Sweep::default()
+            },
+            workers,
+        )
+    }
+
+    /// [`Self::relax`] extended with all optional `field-ecology-v2` Sweep-1
+    /// hooks (`V2-08` PCP/EMT, `V2-12` Notch-Delta, `V2-13` cadherin-4d,
+    /// passive exact-quantum trophallaxis, and dissipative velocity alignment).
+    /// When all options are disabled, runs the exact baseline isotropic
+    /// [`relax`] path bit-for-bit. Sweeps `2..S` remain strictly push-only.
+    ///
+    /// # Errors
+    /// As [`relax_sweep1_with_context`] and [`FieldGrid::wrap_position`].
+    pub fn relax_v2_features(
+        &mut self,
+        grid: &FieldGrid,
+        rules: &ContactRules,
+        sweep_v2: ContactV2Sweep,
+        workers: usize,
+    ) -> Result<(), CoreError> {
         let Self {
             positions,
             ids,
@@ -552,15 +996,40 @@ impl ContactWork {
             emt_factors,
             cell_states_h0,
             neighbor_h0,
+            cadherin_tags,
+            cadherin_cohesiveness,
+            energies,
+            trophallaxis_delta_quanta,
+            trophallaxis_summary,
+            velocities,
+            next_velocities,
             displacements,
             pressed,
             settled,
             sweep,
             scratch,
         } = self;
-        let has_v2 = pcp.is_some() || emt_gate || notch_delta;
-        let sweep1_affinities =
-            (rules.adheres() || pcp.is_some() || notch_delta).then_some(affinities.as_slice());
+        *trophallaxis_summary = TrophallaxisSummary::default();
+        let ContactV2Sweep {
+            pcp,
+            emt_gate,
+            notch_delta,
+            cadherin,
+            trophallaxis,
+            velocity_alignment,
+        } = sweep_v2;
+        let has_v2 = pcp.is_some()
+            || emt_gate
+            || notch_delta
+            || cadherin
+            || trophallaxis.is_some()
+            || velocity_alignment.is_some();
+        let needs_affinities = (rules.adheres() && !cadherin)
+            || (pcp.is_some() && !cadherin)
+            || notch_delta
+            || trophallaxis.is_some()
+            || (velocity_alignment.is_some() && !cadherin);
+        let sweep1_affinities = needs_affinities.then_some(affinities.as_slice());
         let ctx = Sweep1Context {
             pcp,
             polarities: pcp.map(|_| polarities.as_slice()),
@@ -569,6 +1038,12 @@ impl ContactWork {
             energy_gradients: pcp.map(|_| energy_gradients.as_slice()),
             emt_factors: emt_gate.then_some(emt_factors.as_slice()),
             cell_states_h0: notch_delta.then_some(cell_states_h0.as_slice()),
+            cadherin_tags: cadherin.then_some(cadherin_tags.as_slice()),
+            cadherin_cohesiveness: cadherin.then_some(cadherin_cohesiveness.as_slice()),
+            trophallaxis,
+            energies: trophallaxis.map(|_| energies.as_slice()),
+            velocity_alignment,
+            velocities: velocity_alignment.map(|_| velocities.as_slice()),
         };
         if rules.sweeps <= 1 {
             if has_v2 {
@@ -586,6 +1061,9 @@ impl ContactWork {
                         displacements,
                         next_polarities: pcp.map(|_| next_polarities),
                         neighbor_h0: notch_delta.then_some(neighbor_h0),
+                        trophallaxis_delta_quanta: trophallaxis.map(|_| trophallaxis_delta_quanta),
+                        trophallaxis_summary: trophallaxis.map(|_| trophallaxis_summary),
+                        next_velocities: velocity_alignment.map(|_| next_velocities),
                     },
                     scratch,
                     workers,
@@ -640,6 +1118,10 @@ impl ContactWork {
                         displacements: sweep,
                         next_polarities: pcp.map(|_| &mut *next_polarities),
                         neighbor_h0: notch_delta.then_some(&mut *neighbor_h0),
+                        trophallaxis_delta_quanta: trophallaxis
+                            .map(|_| &mut *trophallaxis_delta_quanta),
+                        trophallaxis_summary: trophallaxis.map(|_| &mut *trophallaxis_summary),
+                        next_velocities: velocity_alignment.map(|_| &mut *next_velocities),
                     },
                     scratch,
                     workers,
@@ -840,6 +1322,7 @@ pub fn relax(
         members,
         bins,
         pressed,
+        trophallaxis_scales: _,
     } = scratch;
     starts.clear();
     starts.resize(bins_x * bins_y + 1, 0);
@@ -1020,18 +1503,21 @@ pub fn relax(
 }
 
 /// Sweep 1 with optional `V2-08` PCP lateral/wedge adhesion, non-vanishing
-/// equilibrium polarity torque, and/or neural EMT adhesion gate (`emt-gate`).
+/// equilibrium polarity torque, neural/epigenetic EMT adhesion gate, `V2-12`
+/// Notch-Delta neighbor averaging, and `V2-13` decoupled 4-D cadherin,
+/// passive exact-quantum (`2^-30`) kin trophallaxis, and dissipative velocity
+/// alignment.
 ///
-/// When both `context.pcp` and `context.emt_factors` are `None`, delegates
-/// directly to [`relax`] bit-for-bit.
+/// When all optional `context` fields are `None`, delegates directly to
+/// [`relax`] bit-for-bit.
 ///
 /// # Errors
-/// [`CoreError::StateConflict`] for misaligned inputs or missing required
-/// buffers; [`CoreError::NumericalInvalid`] for unwrapped positions or
-/// nonfinite polarity / EMT values.
+/// [`CoreError::StateConflict`] for misaligned inputs, missing required
+/// buffers, or quantum-conservation mismatch; [`CoreError::NumericalInvalid`]
+/// for unwrapped positions, zero-norm cadherin tags, or nonfinite inputs.
 #[expect(
     clippy::too_many_lines,
-    reason = "Sweep 1 spatial bin pass combining soft-core overlap, PCP/EMT adhesion, and equilibrium torque in one deterministic traversal"
+    reason = "Sweep 1 spatial bin pass combining soft-core overlap, V2-08 PCP/EMT, V2-12 Notch-Delta, and V2-13 cadherin/trophallaxis/velocity-alignment in one deterministic traversal"
 )]
 pub fn relax_sweep1_with_context(
     grid: &FieldGrid,
@@ -1042,7 +1528,14 @@ pub fn relax_sweep1_with_context(
     scratch: &mut ContactScratch,
     workers: usize,
 ) -> Result<(), CoreError> {
-    if context.pcp.is_none() && context.emt_factors.is_none() && context.cell_states_h0.is_none() {
+    if context.pcp.is_none()
+        && context.emt_factors.is_none()
+        && context.cell_states_h0.is_none()
+        && context.cadherin_tags.is_none()
+        && context.cadherin_cohesiveness.is_none()
+        && context.trophallaxis.is_none()
+        && context.velocity_alignment.is_none()
+    {
         return relax(grid, rules, bodies, output.displacements, scratch, workers);
     }
     rules.check()?;
@@ -1063,17 +1556,53 @@ pub fn relax_sweep1_with_context(
             ),
         });
     }
-    let needs_affinities =
-        rules.adheres() || context.pcp.is_some() || context.cell_states_h0.is_some();
-    let affinities = match (needs_affinities, affinities) {
-        (true, Some(affinities)) if affinities.len() == count => Some(affinities),
-        (true, _) => {
+    let cadherin_inputs = match (context.cadherin_tags, context.cadherin_cohesiveness) {
+        (Some(tags), Some(cohesions)) => {
+            if tags.len() != count || cohesions.len() != count {
+                return Err(CoreError::StateConflict {
+                    operation: "contact",
+                    detail: format!(
+                        "cadherin-4d buffers misaligned for {count} bodies: tags={}, cohesions={}",
+                        tags.len(),
+                        cohesions.len()
+                    ),
+                });
+            }
+            for (index, (tag, &cohesion)) in tags.iter().zip(cohesions).enumerate() {
+                if tag.iter().any(|c| !c.is_finite()) {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "cadherin tag",
+                        detail: format!("body {index} has nonfinite cadherin tag {tag:?}"),
+                    });
+                }
+                let norm_sq = tag[0] * tag[0] + tag[1] * tag[1] + tag[2] * tag[2] + tag[3] * tag[3];
+                if !norm_sq.is_finite() || norm_sq <= 0.0 || norm_sq > 1.0 + 1.0e-12 {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "cadherin tag",
+                        detail: format!(
+                            "body {index} has invalid cadherin tag norm^2 {norm_sq:?} (must lie in (0, 1])"
+                        ),
+                    });
+                }
+                if !cohesion.is_finite() || !(0.0..=1.0).contains(&cohesion) {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "cadherin cohesiveness",
+                        detail: format!(
+                            "body {index} has invalid cohesiveness {cohesion:?} (must lie in [0, 1])"
+                        ),
+                    });
+                }
+            }
+            Some((tags, cohesions))
+        }
+        (None, None) => None,
+        _ => {
             return Err(CoreError::StateConflict {
                 operation: "contact",
-                detail: format!("adhesion/pcp/notch-delta needs one affinity per body, of {count}"),
+                detail: "cadherin-4d Sweep1Context requires both cadherin_tags and cadherin_cohesiveness"
+                    .to_owned(),
             });
         }
-        (false, _) => None,
     };
     let pcp_inputs = if let Some(pcp) = context.pcp {
         if !(pcp.dt.is_finite()
@@ -1172,6 +1701,115 @@ pub fn relax_sweep1_with_context(
         }
         None => None,
     };
+    let trophallaxis_inputs = if let Some(tr) = context.trophallaxis {
+        if !(tr.dt.is_finite()
+            && tr.dt >= 0.0
+            && tr.conductance_per_second.is_finite()
+            && tr.conductance_per_second >= 0.0
+            && tr.transfer_efficiency.is_finite()
+            && tr.transfer_efficiency > 0.0
+            && tr.transfer_efficiency <= 0.99
+            && tr.reserve_energy.is_finite()
+            && tr.reserve_energy >= 0.0
+            && tr.maximum_export_fraction.is_finite()
+            && tr.maximum_export_fraction > 0.0
+            && tr.maximum_export_fraction <= 1.0
+            && tr.kin_threshold.is_finite()
+            && (0.0..=1.0).contains(&tr.kin_threshold))
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.trophallaxis",
+                detail: format!("invalid trophallaxis sweep params {tr:?}"),
+            });
+        }
+        let Some(energies) = context.energies else {
+            return Err(CoreError::StateConflict {
+                operation: "contact",
+                detail: "trophallaxis Sweep1Context requires energies buffer".to_owned(),
+            });
+        };
+        if energies.len() != count {
+            return Err(CoreError::StateConflict {
+                operation: "contact",
+                detail: format!("{} energies for {count} bodies", energies.len()),
+            });
+        }
+        for (index, &energy) in energies.iter().enumerate() {
+            if !energy.is_finite() || energy < 0.0 {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "trophallaxis energy",
+                    detail: format!("body {index} has invalid energy {energy:?}"),
+                });
+            }
+        }
+        if output.trophallaxis_delta_quanta.is_none() || output.trophallaxis_summary.is_none() {
+            return Err(CoreError::StateConflict {
+                operation: "contact",
+                detail: "trophallaxis Sweep1Output requires trophallaxis_delta_quanta and trophallaxis_summary"
+                    .to_owned(),
+            });
+        }
+        Some((tr, energies))
+    } else {
+        None
+    };
+    let velocity_inputs = if let Some(va) = context.velocity_alignment {
+        if !va.strength.is_finite() || !(0.0..=0.4).contains(&va.strength) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.contact.velocity_alignment.strength",
+                detail: format!("invalid velocity alignment strength {:?}", va.strength),
+            });
+        }
+        let Some(velocities) = context.velocities else {
+            return Err(CoreError::StateConflict {
+                operation: "contact",
+                detail: "velocity-alignment Sweep1Context requires velocities buffer".to_owned(),
+            });
+        };
+        if velocities.len() != count {
+            return Err(CoreError::StateConflict {
+                operation: "contact",
+                detail: format!("{} velocities for {count} bodies", velocities.len()),
+            });
+        }
+        for (index, &vel) in velocities.iter().enumerate() {
+            if !(vel[0].is_finite() && vel[1].is_finite()) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "velocity alignment input",
+                    detail: format!("body {index} has nonfinite velocity {vel:?}"),
+                });
+            }
+        }
+        if output.next_velocities.is_none() {
+            return Err(CoreError::StateConflict {
+                operation: "contact",
+                detail: "velocity-alignment Sweep1Output requires next_velocities buffer"
+                    .to_owned(),
+            });
+        }
+        Some((va, velocities))
+    } else {
+        None
+    };
+
+    let has_cadherin = cadherin_inputs.is_some();
+    let needs_affinities = (rules.adheres() && !has_cadherin)
+        || (pcp_inputs.is_some() && !has_cadherin)
+        || notch_h0.is_some()
+        || trophallaxis_inputs.is_some()
+        || (velocity_inputs.is_some() && !has_cadherin);
+    let affinities = match (needs_affinities, affinities) {
+        (true, Some(affinities)) if affinities.len() == count => Some(affinities),
+        (true, _) => {
+            return Err(CoreError::StateConflict {
+                operation: "contact",
+                detail: format!(
+                    "adhesion/pcp/notch-delta/trophallaxis/velocity-alignment needs one affinity per body, of {count}"
+                ),
+            });
+        }
+        (false, _) => None,
+    };
 
     let ContactRules {
         diameter,
@@ -1183,7 +1821,12 @@ pub fn relax_sweep1_with_context(
         ..
     } = *rules;
     let adheres = rules.adheres();
-    let reach = if adheres || pcp_inputs.is_some() || notch_h0.is_some() {
+    let reach = if adheres
+        || pcp_inputs.is_some()
+        || notch_h0.is_some()
+        || trophallaxis_inputs.is_some()
+        || velocity_inputs.is_some()
+    {
         diameter * range
     } else {
         diameter
@@ -1198,6 +1841,7 @@ pub fn relax_sweep1_with_context(
         members,
         bins,
         pressed,
+        trophallaxis_scales,
     } = scratch;
     starts.clear();
     starts.resize(bins_x * bins_y + 1, 0);
@@ -1237,6 +1881,9 @@ pub fn relax_sweep1_with_context(
         displacements,
         mut next_polarities,
         mut neighbor_h0,
+        mut trophallaxis_delta_quanta,
+        mut trophallaxis_summary,
+        mut next_velocities,
     } = output;
     displacements.clear();
     displacements.resize(count, [0.0, 0.0]);
@@ -1256,6 +1903,21 @@ pub fn relax_sweep1_with_context(
         notch_out.clear();
         notch_out.resize(count, 0.0_f32);
     }
+    if let Some(delta_out) = trophallaxis_delta_quanta.as_deref_mut() {
+        delta_out.clear();
+        delta_out.resize(count, 0_i64);
+    }
+    if let Some(summary_out) = trophallaxis_summary.as_mut() {
+        **summary_out = TrophallaxisSummary::default();
+    }
+    if let Some(vel_out) = next_velocities.as_deref_mut() {
+        vel_out.clear();
+        if let Some((_, vels)) = velocity_inputs {
+            vel_out.extend_from_slice(vels);
+        } else {
+            vel_out.resize(count, [0.0, 0.0]);
+        }
+    }
 
     let push_factor = 0.5 * stiffness;
     let pull_factor = if adheres {
@@ -1267,14 +1929,140 @@ pub fn relax_sweep1_with_context(
     let beyond = reach_distance * reach_distance * (1.0 + 1e-9);
     let (half_width, half_height) = (0.5 * width, 0.5 * height);
     let (starts, members, bins) = (&*starts, &*members, &*bins);
+    let used = workers
+        .max(1)
+        .min(count.div_ceil(MINIMUM_BODIES_PER_WORKER))
+        .max(1);
 
-    type BodyEval = ([f64; 2], [f64; 2], [f64; 2], f32);
+    // Trophallaxis Pass 1 (donor export cap, INV-01 / INV-05): compute each
+    // donor's scale factor `scale_i in [0, 1]` over the immutable Sweep-1 bins.
+    trophallaxis_scales.clear();
+    if let Some((tr_cfg, energies)) = trophallaxis_inputs {
+        let aff = affinities.ok_or_else(|| CoreError::StateConflict {
+            operation: "contact",
+            detail: "trophallaxis requires genetic affinities".to_owned(),
+        })?;
+        trophallaxis_scales.resize(count, 0.0_f64);
+        let compute_scale = |index: usize| -> f64 {
+            let bin = bins[index];
+            if bin == usize::MAX {
+                return 0.0;
+            }
+            let e_i = energies[index];
+            let cap = tr_cfg.maximum_export_fraction * (e_i - tr_cfg.reserve_energy).max(0.0);
+            if cap <= 0.0 {
+                return 0.0;
+            }
+            let here = positions[index];
+            let (bx, by) = (bin % bins_x, bin / bins_x);
+            let (rows, row_count) = neighbours(by, bins_y);
+            let (columns, column_count) = neighbours(bx, bins_x);
+            let mut out_sum = CompensatedSum::ZERO;
+            for &row in &rows[..row_count] {
+                for &column in &columns[..column_count] {
+                    let neighbour = row * bins_x + column;
+                    for &other in &members[starts[neighbour]..starts[neighbour + 1]] {
+                        if other == index {
+                            continue;
+                        }
+                        let e_j = energies[other];
+                        if e_j >= e_i {
+                            continue;
+                        }
+                        let there = positions[other];
+                        let dx = image(there[0], here[0], width, half_width);
+                        let dy = image(there[1], here[1], height, half_height);
+                        if dx * dx + dy * dy > beyond {
+                            continue;
+                        }
+                        let distance = dx.abs().hypot(dy.abs());
+                        if distance >= reach_distance {
+                            continue;
+                        }
+                        let alike = cosine(&aff[index], &aff[other]).max(0.0);
+                        let raw = pair_trophallaxis_raw(
+                            e_i,
+                            e_j,
+                            distance,
+                            reach_distance,
+                            alike,
+                            &tr_cfg,
+                        );
+                        if raw > 0.0 {
+                            out_sum.add(raw);
+                        }
+                    }
+                }
+            }
+            let total_out = out_sum.value();
+            if total_out <= 0.0 {
+                return 0.0;
+            }
+            let mut scale = (cap / total_out).min(1.0);
+            while scale > 0.0 && scale * total_out > cap {
+                scale = scale.next_down();
+            }
+            scale
+        };
+        let fill_scales = |first: usize, out: &mut [f64]| {
+            for (offset, slot) in out.iter_mut().enumerate() {
+                *slot = compute_scale(first + offset);
+            }
+        };
+        if used == 1 {
+            fill_scales(0, trophallaxis_scales);
+        } else {
+            let length = count.div_ceil(used);
+            let mut chunks = trophallaxis_scales.chunks_mut(length);
+            let head = chunks.next().unwrap_or_default();
+            let fill_scales = &fill_scales;
+            std::thread::scope(|scope| {
+                let others: Vec<_> = chunks
+                    .enumerate()
+                    .map(|(index, chunk)| {
+                        scope.spawn(move || fill_scales((index + 1) * length, chunk))
+                    })
+                    .collect();
+                fill_scales(0, head);
+                let mut result = Ok(());
+                for other in others {
+                    if other.join().is_err() && result.is_ok() {
+                        result = Err(CoreError::StateConflict {
+                            operation: "contact",
+                            detail: "a trophallaxis pass-1 worker panicked".to_owned(),
+                        });
+                    }
+                }
+                result
+            })?;
+        }
+    }
+    let tr_scales = trophallaxis_scales.as_slice();
+
+    type BodyEval = (
+        [f64; 2],
+        [f64; 2],
+        [f64; 2],
+        f32,
+        i64,
+        TrophallaxisSummary,
+        [f64; 2],
+    );
     let eval_body = |index: usize| -> Result<BodyEval, CoreError> {
         let current_pol =
             pcp_inputs.map_or([1.0, 0.0], |(_, polarities, _, _, _)| polarities[index]);
+        let current_vel = velocity_inputs.map_or([0.0, 0.0], |(_, vels)| vels[index]);
         let bin = bins[index];
         if bin == usize::MAX {
-            return Ok(([0.0, 0.0], [0.0, 0.0], current_pol, 0.0_f32));
+            return Ok((
+                [0.0, 0.0],
+                [0.0, 0.0],
+                current_pol,
+                0.0_f32,
+                0_i64,
+                TrophallaxisSummary::default(),
+                current_vel,
+            ));
         }
         let here = positions[index];
         let (bx, by) = (bin % bins_x, bin / bins_x);
@@ -1285,6 +2073,12 @@ pub fn relax_sweep1_with_context(
         let mut tau_neighbors = 0.0_f64;
         let mut notch_num = 0.0_f64;
         let mut notch_den = 0.0_f64;
+        let mut delta_k = 0_i64;
+        let mut body_out = 0_u64;
+        let mut body_in = 0_u64;
+        let mut body_tax = 0_u64;
+        let mut align_v = [0.0_f64, 0.0_f64];
+        let mut align_w = 0.0_f64;
         for &row in &rows[..row_count] {
             for &column in &columns[..column_count] {
                 let neighbour = row * bins_x + column;
@@ -1299,7 +2093,9 @@ pub fn relax_sweep1_with_context(
                     if dx * dx + dy * dy > beyond {
                         continue;
                     }
-                    let distance = dx.hypot(dy);
+                    // Commutative distance `|dx|.hypot(|dy|)` guarantees bit-identical
+                    // `distance` on both sides of pair `(i, j)`.
+                    let distance = dx.abs().hypot(dy.abs());
                     let overlaps = distance < diameter;
                     let in_reach = distance < reach_distance;
                     if !overlaps && !in_reach {
@@ -1314,14 +2110,26 @@ pub fn relax_sweep1_with_context(
                     };
                     // `r_hat = (x_j - x_i) / d = -u_ij` for `d > 0`.
                     let r_hat = [-ux, -uy];
-                    let kin_weight = affinities.map(|aff| {
-                        let alike = cosine(&aff[index], &aff[other]).max(0.0);
+                    let genetic_alike =
+                        affinities.map(|aff| cosine(&aff[index], &aff[other]).max(0.0));
+                    let genetic_kin_weight = genetic_alike.map(|alike| {
                         if repulsion > 0.0 {
                             (1.0 + repulsion) * (alike * alike) - repulsion
                         } else {
                             alike * alike
                         }
                     });
+                    let adhesion_weight = match cadherin_inputs {
+                        Some((tags, cohesions)) => cadherin_sorting_weight(
+                            &tags[index],
+                            cohesions[index],
+                            &tags[other],
+                            cohesions[other],
+                            repulsion,
+                        ),
+                        None => genetic_kin_weight.unwrap_or(0.0),
+                    };
+                    let adhesion_kin_pos = adhesion_weight.max(0.0);
                     if overlaps {
                         let push = push_factor * (diameter - distance);
                         sum[0] += push * ux;
@@ -1329,8 +2137,7 @@ pub fn relax_sweep1_with_context(
                         overlapping[0] += push * ux;
                         overlapping[1] += push * uy;
                     } else if adheres && in_reach {
-                        let base_kin = kin_weight.unwrap_or(0.0);
-                        let eff_weight = if base_kin > 0.0 {
+                        let eff_weight = if adhesion_weight > 0.0 {
                             let emt_pair = emt_factors
                                 .map_or(1.0, |factors| (factors[index] * factors[other]).sqrt());
                             let pcp_factor = match pcp_inputs {
@@ -1347,9 +2154,9 @@ pub fn relax_sweep1_with_context(
                                 }
                                 None => 1.0,
                             };
-                            emt_pair * base_kin * pcp_factor
+                            emt_pair * adhesion_weight * pcp_factor
                         } else {
-                            base_kin
+                            adhesion_weight
                         };
                         let push = -pull_factor
                             * eff_weight
@@ -1361,29 +2168,98 @@ pub fn relax_sweep1_with_context(
                     if let Some((_, polarities, strengths, curvatures, _)) = pcp_inputs
                         && distance > 0.0
                         && in_reach
+                        && adhesion_kin_pos > 0.0
                     {
-                        let kin_pos = kin_weight.unwrap_or(0.0).max(0.0);
-                        if kin_pos > 0.0 {
-                            let w_torque = kin_pos * (1.0 - distance / reach_distance);
-                            let alpha_ij = (strengths[index] * strengths[other]).sqrt();
-                            let beta_bar = 0.5 * (curvatures[index] + curvatures[other]);
-                            let pair_term = pcp_pair_torque_term(
-                                polarities[index],
-                                polarities[other],
-                                r_hat,
-                                beta_bar,
-                            );
-                            tau_neighbors += alpha_ij * w_torque * pair_term;
-                        }
+                        let w_torque = adhesion_kin_pos * (1.0 - distance / reach_distance);
+                        let alpha_ij = (strengths[index] * strengths[other]).sqrt();
+                        let beta_bar = 0.5 * (curvatures[index] + curvatures[other]);
+                        let pair_term = pcp_pair_torque_term(
+                            polarities[index],
+                            polarities[other],
+                            r_hat,
+                            beta_bar,
+                        );
+                        tau_neighbors += alpha_ij * w_torque * pair_term;
                     }
                     if let Some(states_h0) = notch_h0
                         && in_reach
                     {
-                        let kin_pos = kin_weight.unwrap_or(0.0).max(0.0);
+                        let kin_pos = genetic_kin_weight.unwrap_or(0.0).max(0.0);
                         if kin_pos > 0.0 {
                             notch_num += kin_pos * f64::from(states_h0[other]);
                             notch_den += kin_pos;
                         }
+                    }
+                    if let Some((tr_cfg, energies)) = trophallaxis_inputs
+                        && in_reach
+                    {
+                        let e_i = energies[index];
+                        let e_j = energies[other];
+                        let alike = genetic_alike.unwrap_or(0.0);
+                        if e_i > e_j {
+                            let (q_out, _q_in, q_tax) = pair_trophallaxis_quanta(
+                                e_i,
+                                tr_scales[index],
+                                e_j,
+                                distance,
+                                reach_distance,
+                                alike,
+                                &tr_cfg,
+                            );
+                            if q_out > 0 {
+                                delta_k =
+                                    delta_k.checked_sub(q_out).ok_or(CoreError::Overflow {
+                                        quantity: "trophallaxis organism delta quanta",
+                                    })?;
+                                let q_out_u =
+                                    u64::try_from(q_out).map_err(|_| CoreError::Overflow {
+                                        quantity: "trophallaxis outgoing quanta",
+                                    })?;
+                                let q_tax_u =
+                                    u64::try_from(q_tax).map_err(|_| CoreError::Overflow {
+                                        quantity: "trophallaxis tax quanta",
+                                    })?;
+                                body_out =
+                                    body_out.checked_add(q_out_u).ok_or(CoreError::Overflow {
+                                        quantity: "trophallaxis outgoing quanta",
+                                    })?;
+                                body_tax =
+                                    body_tax.checked_add(q_tax_u).ok_or(CoreError::Overflow {
+                                        quantity: "trophallaxis tax quanta",
+                                    })?;
+                            }
+                        } else if e_j > e_i {
+                            let (_q_out, q_in, _q_tax) = pair_trophallaxis_quanta(
+                                e_j,
+                                tr_scales[other],
+                                e_i,
+                                distance,
+                                reach_distance,
+                                alike,
+                                &tr_cfg,
+                            );
+                            if q_in > 0 {
+                                delta_k = delta_k.checked_add(q_in).ok_or(CoreError::Overflow {
+                                    quantity: "trophallaxis organism delta quanta",
+                                })?;
+                                let q_in_u =
+                                    u64::try_from(q_in).map_err(|_| CoreError::Overflow {
+                                        quantity: "trophallaxis incoming quanta",
+                                    })?;
+                                body_in =
+                                    body_in.checked_add(q_in_u).ok_or(CoreError::Overflow {
+                                        quantity: "trophallaxis incoming quanta",
+                                    })?;
+                            }
+                        }
+                    }
+                    if let Some((_, vels)) = velocity_inputs
+                        && in_reach
+                        && adhesion_kin_pos > 0.0
+                    {
+                        align_v[0] += adhesion_kin_pos * vels[other][0];
+                        align_v[1] += adhesion_kin_pos * vels[other][1];
+                        align_w += adhesion_kin_pos;
                     }
                 }
             }
@@ -1406,22 +2282,69 @@ pub fn relax_sweep1_with_context(
             current_pol
         };
         let next_notch = if notch_h0.is_some() {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "kin-weighted neighbor average in [-1, 1] stored as f32 cell state"
+            )]
             let value = ((notch_num / notch_den.max(1.0e-6)) as f32).clamp(-1.0_f32, 1.0_f32);
             if value == 0.0 { 0.0 } else { value }
         } else {
             0.0_f32
         };
-        Ok((sum, overlapping, next_pol, next_notch))
+        let next_vel = if let Some((va_cfg, _)) = velocity_inputs {
+            align_velocity_dissipative(current_vel, align_v, align_w, va_cfg.strength)
+        } else {
+            current_vel
+        };
+        Ok((
+            sum,
+            overlapping,
+            next_pol,
+            next_notch,
+            delta_k,
+            TrophallaxisSummary {
+                total_out_quanta: body_out,
+                total_in_quanta: body_in,
+                total_tax_quanta: body_tax,
+            },
+            next_vel,
+        ))
     };
+
+    let accumulate_summary =
+        |acc: &mut TrophallaxisSummary, add: TrophallaxisSummary| -> Result<(), CoreError> {
+            acc.total_out_quanta = acc
+                .total_out_quanta
+                .checked_add(add.total_out_quanta)
+                .ok_or(CoreError::Overflow {
+                    quantity: "trophallaxis total outgoing quanta",
+                })?;
+            acc.total_in_quanta = acc.total_in_quanta.checked_add(add.total_in_quanta).ok_or(
+                CoreError::Overflow {
+                    quantity: "trophallaxis total incoming quanta",
+                },
+            )?;
+            acc.total_tax_quanta = acc
+                .total_tax_quanta
+                .checked_add(add.total_tax_quanta)
+                .ok_or(CoreError::Overflow {
+                    quantity: "trophallaxis total tax quanta",
+                })?;
+            Ok(())
+        };
 
     let fill = |first: usize,
                 out: &mut [[f64; 2]],
                 pushes: &mut [[f64; 2]],
                 pols: &mut [[f64; 2]],
-                notches: &mut [f32]|
-     -> Result<(), CoreError> {
+                notches: &mut [f32],
+                deltas: &mut [i64],
+                vels: &mut [[f64; 2]]|
+     -> Result<TrophallaxisSummary, CoreError> {
+        let mut chunk_summary = TrophallaxisSummary::default();
         for (offset, slot) in out.iter_mut().enumerate() {
-            let (displacement, push, next_pol, next_notch) = eval_body(first + offset)?;
+            let (displacement, push, next_pol, next_notch, delta_k, body_tr, next_vel) =
+                eval_body(first + offset)?;
             *slot = displacement;
             if let Some(push_slot) = pushes.get_mut(offset) {
                 *push_slot = push;
@@ -1432,59 +2355,122 @@ pub fn relax_sweep1_with_context(
             if let Some(notch_slot) = notches.get_mut(offset) {
                 *notch_slot = next_notch;
             }
+            if let Some(delta_slot) = deltas.get_mut(offset) {
+                *delta_slot = delta_k;
+            }
+            if let Some(vel_slot) = vels.get_mut(offset) {
+                *vel_slot = next_vel;
+            }
+            accumulate_summary(&mut chunk_summary, body_tr)?;
         }
-        Ok(())
+        Ok(chunk_summary)
     };
 
-    let used = workers
-        .max(1)
-        .min(count.div_ceil(MINIMUM_BODIES_PER_WORKER))
-        .max(1);
     let pol_slice: &mut [[f64; 2]] = next_polarities.map_or(&mut [], Vec::as_mut_slice);
     let notch_slice: &mut [f32] = neighbor_h0.map_or(&mut [], Vec::as_mut_slice);
-    if used == 1 {
-        return fill(0, displacements, pressed, pol_slice, notch_slice);
-    }
-    let length = count.div_ceil(used);
-    let mut chunks = displacements.chunks_mut(length);
-    let mut push_chunks = pressed
-        .chunks_mut(length)
-        .chain(std::iter::repeat_with(|| -> &mut [[f64; 2]] { &mut [] }));
-    let mut pol_chunks = pol_slice
-        .chunks_mut(length)
-        .chain(std::iter::repeat_with(|| -> &mut [[f64; 2]] { &mut [] }));
-    let mut notch_chunks = notch_slice
-        .chunks_mut(length)
-        .chain(std::iter::repeat_with(|| -> &mut [f32] { &mut [] }));
-    let head = chunks.next().unwrap_or_default();
-    let push_head = push_chunks.next().unwrap_or_default();
-    let pol_head = pol_chunks.next().unwrap_or_default();
-    let notch_head = notch_chunks.next().unwrap_or_default();
-    let fill = &fill;
-    std::thread::scope(|scope| {
-        let others: Vec<_> = chunks
-            .zip(push_chunks)
-            .zip(pol_chunks)
-            .zip(notch_chunks)
-            .enumerate()
-            .map(|(index, (((chunk, pushes), pols), notches))| {
-                scope.spawn(move || fill((index + 1) * length, chunk, pushes, pols, notches))
-            })
-            .collect();
-        let mut result = fill(0, head, push_head, pol_head, notch_head);
-        for other in others {
-            let joined = other.join().unwrap_or_else(|_| {
-                Err(CoreError::StateConflict {
-                    operation: "contact",
-                    detail: "a contact worker panicked".to_owned(),
-                })
-            });
-            if result.is_ok() {
-                result = joined;
+    let delta_slice: &mut [i64] = trophallaxis_delta_quanta.map_or(&mut [], Vec::as_mut_slice);
+    let vel_slice: &mut [[f64; 2]] = next_velocities.map_or(&mut [], Vec::as_mut_slice);
+    let total_summary = if used == 1 {
+        fill(
+            0,
+            displacements,
+            pressed,
+            pol_slice,
+            notch_slice,
+            delta_slice,
+            vel_slice,
+        )?
+    } else {
+        let length = count.div_ceil(used);
+        let mut chunks = displacements.chunks_mut(length);
+        let mut push_chunks = pressed
+            .chunks_mut(length)
+            .chain(std::iter::repeat_with(|| -> &mut [[f64; 2]] { &mut [] }));
+        let mut pol_chunks = pol_slice
+            .chunks_mut(length)
+            .chain(std::iter::repeat_with(|| -> &mut [[f64; 2]] { &mut [] }));
+        let mut notch_chunks = notch_slice
+            .chunks_mut(length)
+            .chain(std::iter::repeat_with(|| -> &mut [f32] { &mut [] }));
+        let mut delta_chunks = delta_slice
+            .chunks_mut(length)
+            .chain(std::iter::repeat_with(|| -> &mut [i64] { &mut [] }));
+        let mut vel_chunks = vel_slice
+            .chunks_mut(length)
+            .chain(std::iter::repeat_with(|| -> &mut [[f64; 2]] { &mut [] }));
+        let head = chunks.next().unwrap_or_default();
+        let push_head = push_chunks.next().unwrap_or_default();
+        let pol_head = pol_chunks.next().unwrap_or_default();
+        let notch_head = notch_chunks.next().unwrap_or_default();
+        let delta_head = delta_chunks.next().unwrap_or_default();
+        let vel_head = vel_chunks.next().unwrap_or_default();
+        let fill = &fill;
+        std::thread::scope(|scope| {
+            let others: Vec<_> = chunks
+                .zip(push_chunks)
+                .zip(pol_chunks)
+                .zip(notch_chunks)
+                .zip(delta_chunks)
+                .zip(vel_chunks)
+                .enumerate()
+                .map(
+                    |(index, (((((chunk, pushes), pols), notches), deltas), vels))| {
+                        scope.spawn(move || {
+                            fill(
+                                (index + 1) * length,
+                                chunk,
+                                pushes,
+                                pols,
+                                notches,
+                                deltas,
+                                vels,
+                            )
+                        })
+                    },
+                )
+                .collect();
+            let mut result = fill(
+                0, head, push_head, pol_head, notch_head, delta_head, vel_head,
+            );
+            for other in others {
+                let joined = other.join().unwrap_or_else(|_| {
+                    Err(CoreError::StateConflict {
+                        operation: "contact",
+                        detail: "a contact worker panicked".to_owned(),
+                    })
+                });
+                match (&mut result, joined) {
+                    (Ok(acc), Ok(chunk)) => {
+                        if let Err(err) = accumulate_summary(acc, chunk) {
+                            result = Err(err);
+                        }
+                    }
+                    (Ok(_), Err(err)) => result = Err(err),
+                    (Err(_), _) => {}
+                }
             }
+            result
+        })?
+    };
+
+    if let Some(summary_out) = trophallaxis_summary {
+        let conserved = total_summary
+            .total_in_quanta
+            .checked_add(total_summary.total_tax_quanta);
+        if conserved != Some(total_summary.total_out_quanta) {
+            return Err(CoreError::StateConflict {
+                operation: "trophallaxis",
+                detail: format!(
+                    "exact quantum conservation violated: out={} != in={} + tax={}",
+                    total_summary.total_out_quanta,
+                    total_summary.total_in_quanta,
+                    total_summary.total_tax_quanta
+                ),
+            });
         }
-        result
-    })
+        *summary_out = total_summary;
+    }
+    Ok(())
 }
 
 /// Reusable post-Phase-1 crowding buffers for `V2-07` (`hippo-crowding`).

@@ -66,9 +66,12 @@ pub use chemistry::{
     effective_affinity, settle_efficiencies, symplectic_waste_direction,
 };
 pub use contact::{
-    ContactRules, ContactScratch, ContactWork, CrowdingWork, MAX_POLARITY_DTHETA_RAD,
-    PcpSweepParams, Sweep1Context, Sweep1Output, pcp_lateral_wedge_weight, pcp_pair_torque_term,
-    relax, relax_sweep1_with_context, rotate_unit_polarity, unit_affinity,
+    ContactRules, ContactScratch, ContactV2Buffers, ContactV2Sweep, ContactWork, CrowdingWork,
+    MAX_POLARITY_DTHETA_RAD, PcpSweepParams, Sweep1Context, Sweep1Output, TROPHALLAXIS_QUANTUM,
+    TrophallaxisSummary, TrophallaxisSweepParams, VelocityAlignmentSweepParams,
+    align_velocity_dissipative, cadherin_pair_weight, pair_trophallaxis_quanta,
+    pair_trophallaxis_raw, pcp_lateral_wedge_weight, pcp_pair_torque_term, relax,
+    relax_sweep1_with_context, rotate_unit_polarity, unit_affinity,
 };
 pub use costs::{MaintenanceBill, MaintenanceCosts, MaintenanceSettlement, senescence_multiplier};
 pub use emission::{
@@ -104,12 +107,13 @@ pub use reproduction::{
     resolve_births_with, resolve_births_with_workers,
 };
 pub use world::{
-    Advance, BirthEvent, BuddingRules, CPU_REFERENCE, Candidate, CarrierSpec, ControllerReport,
-    CorpseDirection, CrowdingMode, CrowdingRules, DifferentiationRules, FieldReport, Footprint,
-    Graft, IntroductionEvent, LysisRules, ModelVariant, NotchDeltaMode, NotchDeltaRules,
-    NumericalFault, NumericalProfile, PAUSE_BEFORE_COMMIT, PolarityRules, QUALIFIED_REFERENCE,
-    STOP_AND_PRESERVE, SenescenceRules, SensorReport, SettleReport, StateInheritanceMode, Stepped,
-    TickReport, UNIFORM_POSITIONS, UptakeReport, V2Rules, WORLD_CHECKPOINT_CHUNKS,
-    WORLD_CHUNK_VERSION, WORLD_DIGEST_SCHEMA, WORLD_RECURRENT_HELD_VERSION, WORLD_V2_CHUNK_VERSION,
-    WasteRules, World, ZERO_VELOCITY, founder_polarity, founder_position,
+    Advance, BirthEvent, BuddingRules, CPU_REFERENCE, CadherinRules, Candidate, CarrierSpec,
+    ControllerReport, CorpseDirection, CrowdingMode, CrowdingRules, DifferentiationRules,
+    FieldReport, Footprint, Graft, IntroductionEvent, LysisRules, ModelVariant, NotchDeltaMode,
+    NotchDeltaRules, NumericalFault, NumericalProfile, PAUSE_BEFORE_COMMIT, PolarityRules,
+    QUALIFIED_REFERENCE, STOP_AND_PRESERVE, SenescenceRules, SensorReport, SettleReport,
+    StateInheritanceMode, Stepped, TickReport, TrophallaxisRules, UNIFORM_POSITIONS, UptakeReport,
+    V2Rules, VelocityAlignmentRules, WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION,
+    WORLD_DIGEST_SCHEMA, WORLD_RECURRENT_HELD_VERSION, WORLD_V2_CHUNK_VERSION, WasteRules, World,
+    ZERO_VELOCITY, founder_polarity, founder_position,
 };

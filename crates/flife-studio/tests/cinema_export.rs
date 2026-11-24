@@ -26,8 +26,8 @@ use flife_studio::memory::{admit_export, export_scratch_bytes, video_scratch_byt
 use flife_studio::{
     CINEMA_4K, CINEMA_4K_SQUARE, CINEMA_1080P, CameraKey, CameraPath, CinemaOptions, ColorMapping,
     ControllerChoice, EXPORT_SCHEMA, Exact, ExportManifest, ExportMode, FieldMapping, KEY_8, KEY_9,
-    KEY_C, KEY_E, KEY_PERIOD, Look, MANIFEST_FILE, OverlayState, REPLAY_SLOTS, Status, Studio,
-    StudioOptions, Style, Surface, TimelineCheckpoint, TimelineRecord, TimelineStart,
+    KEY_C, KEY_E, KEY_PERIOD, Look, MANIFEST_FILE, OverlayState, Particles, REPLAY_SLOTS, Status,
+    Studio, StudioOptions, Style, Surface, TimelineCheckpoint, TimelineRecord, TimelineStart,
     TimelineStyle, VIDEO_FILE, export_cinema, field_key, legends, overlay_text,
     parse_cinema_resolution, peak_observer_bytes_for, plan_simulation_samples, read_timeline,
     validate_timeline, validate_v2_style, write_timeline_record,
@@ -1328,5 +1328,71 @@ fn g10_cinema_60fps_square_4k_and_live_v2_overlay_cycling() {
     assert_ne!(
         moved_png, nocam_png,
         "LiveCapture --export-camera must actually re-place the rendered view"
+    );
+
+    // 3. Target Cinema resolution refit before opening `view.show`: a paused
+    //    `Particles::Density` timeline drawing frame 0 with no prior `Show`
+    //    record must bin density at the target resolution (matching
+    //    `SimulationTime` frame 0 bit-for-bit, never stale header bins).
+    let density_world = World::found(
+        &config,
+        Arrangement::FreeList,
+        NumericalProfile::reference_f32().expect("profile"),
+    )
+    .expect("density world");
+    let density_style = Style {
+        particles: Particles::Density,
+        field: false,
+        ..Style::default()
+    };
+    let density_records = [
+        TimelineRecord::header(&config, [160, 100], density_style),
+        TimelineRecord::Draw {
+            frame: 0,
+            tick: 0,
+            wall_seconds: Exact(0.0),
+        },
+        TimelineRecord::End {
+            tick: 0,
+            digest: density_world.digest().to_hex(),
+            applied: Vec::new(),
+        },
+    ];
+    let mut density_bytes = Vec::new();
+    for record in &density_records {
+        write_timeline_record(&mut density_bytes, record).expect("write density record");
+    }
+    let density_text = String::from_utf8(density_bytes).expect("utf-8 density timeline");
+    let out_density_live = fresh("cinema-density-live-refit");
+    let out_density_sim = fresh("cinema-density-sim-refit");
+    let opts_density_live = CinemaOptions {
+        frames_per_second: NonZeroU32::new(60).expect("60fps"),
+        cpu_workers: NonZeroUsize::new(2),
+        mp4: false,
+        mode: ExportMode::LiveCapture,
+        resolution: Some([640, 400]),
+        pixels_per_point: Some(1.0),
+        camera: None,
+    };
+    let opts_density_sim = CinemaOptions {
+        mode: ExportMode::SimulationTime {
+            every_ticks: NonZeroU64::new(1).expect("1"),
+        },
+        ..opts_density_live.clone()
+    };
+    let live_density = export_cinema(
+        &config,
+        &density_text,
+        &opts_density_live,
+        &out_density_live,
+    )
+    .expect("live density export");
+    let sim_density = export_cinema(&config, &density_text, &opts_density_sim, &out_density_sim)
+        .expect("sim density export");
+    assert_eq!(live_density.frames.len(), 1);
+    assert_eq!(sim_density.frames.len(), 1);
+    assert_eq!(
+        live_density.frames[0].sha256, sim_density.frames[0].sha256,
+        "LiveCapture frame 0 must bin density at the target Cinema resolution, matching SimulationTime"
     );
 }

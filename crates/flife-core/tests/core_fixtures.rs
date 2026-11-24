@@ -1304,3 +1304,46 @@ fn v2_model_descriptor_differs_when_feature_toggled() {
     assert_ne!(no_vis.config_hash(), base.config_hash());
     assert_eq!(ModelDescriptor::of(&no_vis).digest(), base_desc.digest());
 }
+
+#[test]
+fn v2_rejects_empty_override_tokens_and_tiny_oasis_sigma_min() {
+    // Empty or blank comma-separated tokens must be rejected, matching TOML toggle lists.
+    for override_item in [
+        FeatureOverride::Disable(String::new()),
+        FeatureOverride::Disable(",,,".into()),
+        FeatureOverride::Disable("oases,".into()),
+        FeatureOverride::Enable(" , ".into()),
+        FeatureOverride::Enable(",oases".into()),
+    ] {
+        let mut cfg = starter();
+        cfg.model = FIELD_ECOLOGY_V2.to_owned();
+        let err = apply_feature_overrides(&mut cfg, &[override_item])
+            .expect_err("empty override token must be rejected");
+        assert!(
+            matches!(err, CoreError::InvalidConfig(_)),
+            "expected InvalidConfig, got {err:?}"
+        );
+    }
+
+    // When oases are enabled, sigma_min_world_units must still reach at least one cell center.
+    let mut tiny_oasis = starter();
+    tiny_oasis.model = FIELD_ECOLOGY_V2.to_owned();
+    let mut v2 = V2Config::default();
+    v2.oases.enabled = Some(true);
+    v2.oases.sigma_min_world_units = Some(0.01);
+    tiny_oasis.v2 = Some(v2);
+    let err = validate(tiny_oasis).expect_err("tiny oasis sigma_min can miss every cell center");
+    assert!(
+        err.to_string().contains("v2.oases.sigma_min_world_units"),
+        "{err}"
+    );
+
+    // Disabling oases allows the unused sigma_min_world_units parameter.
+    let mut disabled_oasis = starter();
+    disabled_oasis.model = FIELD_ECOLOGY_V2.to_owned();
+    let mut v2_off = V2Config::default();
+    v2_off.oases.enabled = Some(false);
+    v2_off.oases.sigma_min_world_units = Some(0.01);
+    disabled_oasis.v2 = Some(v2_off);
+    assert!(validate(disabled_oasis).is_ok());
+}

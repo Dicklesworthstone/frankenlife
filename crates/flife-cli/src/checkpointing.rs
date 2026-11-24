@@ -308,6 +308,37 @@ impl Queue {
         state.retained = state.retained.saturating_sub(queued);
         self.changed.notify_all();
     }
+
+    /// Guard a writer task so any early return or panic stops the queue and
+    /// wakes an encoder blocked in [`Producer::page`].
+    pub(crate) const fn writer_guard(&self) -> WriterGuard<'_> {
+        WriterGuard {
+            queue: self,
+            disarmed: false,
+        }
+    }
+}
+
+/// Stops a [`Queue`] when dropped unless explicitly disarmed after a clean
+/// commit, preventing an encoder blocked on a full queue from hanging forever
+/// if the background writer returns an error or panics while unwinding.
+pub(crate) struct WriterGuard<'a> {
+    queue: &'a Queue,
+    disarmed: bool,
+}
+
+impl WriterGuard<'_> {
+    pub(crate) const fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            self.queue.stop();
+        }
+    }
 }
 
 /// The encoder's refusal once the writer has stopped.
@@ -484,6 +515,57 @@ mod tests {
             }
         }
         assert!(!sealed);
+        assert_eq!(queue.retained(), 0);
+    }
+
+    /// If the background writer panics while the encoder is blocked waiting
+    /// for room on a full queue, [`WriterGuard`] stops the queue during unwind
+    /// so the encoder wakes with [`WRITER_STOPPED`] instead of deadlocking.
+    #[test]
+    #[allow(
+        clippy::panic,
+        reason = "intentional panic to verify WriterGuard unwind wakes a blocked encoder"
+    )]
+    fn a_panicking_writer_wakes_a_blocked_encoder_and_releases_pages() {
+        let budget = 2 * PAGE as u64;
+        let queue = Queue::new(budget);
+        let writer_queue = Arc::clone(&queue);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (panic_tx, panic_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _guard = writer_queue.writer_guard();
+            let first = writer_queue.next();
+            assert!(matches!(first, Some(Message::Begin(..))));
+            entered_tx.send(()).expect("signals producer");
+            panic_rx.recv().expect("waits to panic");
+            panic!("simulated background writer panic");
+        });
+
+        let producer_queue = Arc::clone(&queue);
+        let producer = std::thread::spawn(move || {
+            let mut producer = Producer::new(producer_queue);
+            producer.begin(0, ChunkFamily::Field)?;
+            entered_rx.recv().expect("writer consumed begin");
+            // Two pages fill the budget; the third blocks inside Queue::reserve.
+            producer.page(&[1; PAGE])?;
+            producer.page(&[2; PAGE])?;
+            producer.page(&[3; PAGE])
+        });
+
+        // Wait until the producer has filled the full budget and entered the
+        // blocking third page reserve, then trigger the writer panic.
+        while queue.retained() < budget {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        panic_tx.send(()).expect("triggers writer panic");
+
+        let refused = producer.join().expect("producer thread does not panic");
+        assert!(
+            matches!(&refused, Err(CoreError::Cancelled { reason }) if reason == WRITER_STOPPED),
+            "{refused:?}"
+        );
+        assert!(writer.join().is_err(), "writer panicked as expected");
         assert_eq!(queue.retained(), 0);
     }
 }

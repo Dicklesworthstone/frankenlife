@@ -489,7 +489,11 @@ impl TickLedger {
             (closing.total() - self.opening.total()) - ((injected - removed) - dissipated);
         let scale = self.opening.total() + turnover;
         let allowance = self.budget.tick_allowance(scale);
-        if residual.abs() > allowance || !residual.is_finite() {
+        if !residual.is_finite()
+            || !allowance.is_finite()
+            || !scale.is_finite()
+            || residual.abs() > allowance
+        {
             return Err(CoreError::NumericalInvalid {
                 quantity: "energy ledger residual (INV-03)",
                 detail: format!(
@@ -902,12 +906,34 @@ impl EnergyLedger {
         let finite = sums
             .iter()
             .flat_map(CompensatedSum::parts)
+            .chain(sums.iter().map(CompensatedSum::value))
             .chain(state.drift)
-            .chain([state.largest_tick_residual])
+            .chain([
+                state.initial.total(),
+                state.last.total(),
+                state.largest_tick_residual,
+            ])
             .all(f64::is_finite);
         if !finite {
             return Err(CoreError::IncompatibleCheckpoint {
                 reason: "ledger state holds a nonfinite value".into(),
+            });
+        }
+        let [count, mean_x, mean_y, co_moment, x_moment] = state.drift;
+        let nonnegative = [
+            state.injected.value(),
+            state.removed.value(),
+            state.dissipated.value(),
+            state.turnover.value(),
+            state.largest_tick_residual,
+            count,
+            x_moment,
+        ]
+        .into_iter()
+        .all(|value| value >= 0.0);
+        if !nonnegative {
+            return Err(CoreError::IncompatibleCheckpoint {
+                reason: "ledger state holds a negative magnitude".into(),
             });
         }
         if (state.ticks == 0) != state.next_tick.is_none() {
@@ -918,7 +944,6 @@ impl EnergyLedger {
                 ),
             });
         }
-        let [count, mean_x, mean_y, co_moment, x_moment] = state.drift;
         let ledger = Self {
             budget,
             initial: state.initial,
@@ -940,7 +965,12 @@ impl EnergyLedger {
             },
         };
         let report = ledger.report();
-        if report.residual.abs() > report.allowance {
+        let scale = report.initial + report.turnover;
+        if !report.residual.is_finite()
+            || !report.allowance.is_finite()
+            || !scale.is_finite()
+            || report.residual.abs() > report.allowance
+        {
             return Err(CoreError::IncompatibleCheckpoint {
                 reason: format!(
                     "ledger residual {:e} exceeds the allowance {:e} (INV-03)",
@@ -1003,7 +1033,12 @@ impl EnergyLedger {
         next.last = closure.closing;
         next.next_tick = Some(closure.tick.next()?);
         let report = next.report();
-        if report.residual.abs() > report.allowance || !report.residual.is_finite() {
+        let scale = report.initial + report.turnover;
+        if !report.residual.is_finite()
+            || !report.allowance.is_finite()
+            || !scale.is_finite()
+            || report.residual.abs() > report.allowance
+        {
             return Err(CoreError::NumericalInvalid {
                 quantity: "cumulative energy ledger residual (INV-03)",
                 detail: format!(

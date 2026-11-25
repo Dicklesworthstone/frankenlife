@@ -1469,3 +1469,55 @@ fn deposits_append_interleaved_empty_and_nonempty_lanes_bit_exact() {
     assert_eq!(summary_bits(&got), summary_bits(&expected));
     assert!(planes(&merged_field) == planes(&direct_field));
 }
+
+#[test]
+fn sample_batch_detects_nonfinite_across_all_packed_buckets() {
+    let g = FieldGrid::new(32, 32, 32.0, 32.0).expect("grid");
+    for bad_val in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut snap = field(g, 4242);
+        // Inject one nonfinite cell into moment plane 17.
+        snap.moment_mut(16).expect("m16")[123] = bad_val;
+        let mut pyr = SensorPyramid::new(g, 3, &BufferLimits::host()).expect("pyr");
+        let view = pyr.build_on(&snap, 2).expect("build");
+
+        // Query directly over cell 123 = (27, 3) across all 3 buckets:
+        // level-0 only (`scale=1.0`), level-0/1 blend (`scale=1.35`), and coarse (`scale=2.7`).
+        for &(scale, label) in &[
+            (1.0, "l0"),
+            (1.35, "l01_blend"),
+            (2.7, "coarse_blend"),
+            (4.0, "coarse_exact"),
+        ] {
+            let mut queries = vec![
+                SensorQuery {
+                    position: [1.25, 1.25],
+                    scale,
+                };
+                40 // > SUB_BATCH=32 so packed tile-sorted path runs
+            ];
+            queries[37] = SensorQuery {
+                position: [27.5, 3.5],
+                scale,
+            };
+            let zero = RawSample {
+                values: [0.0; PLANES],
+                dx: [0.0; PLANES],
+                dy: [0.0; PLANES],
+            };
+            let mut out = vec![zero; queries.len()];
+            let err = view
+                .sample_batch(&queries, &mut out)
+                .expect_err(&format!("{label} with {bad_val:?} must refuse"));
+            assert!(
+                matches!(
+                    err,
+                    CoreError::NumericalInvalid {
+                        quantity: "sensor sample",
+                        ..
+                    }
+                ),
+                "{label} ({bad_val:?}): unexpected error {err:?}"
+            );
+        }
+    }
+}

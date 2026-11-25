@@ -2508,30 +2508,43 @@ impl World {
     /// the epoch and the event cursor are excluded.
     #[must_use]
     pub fn digest(&self) -> Sha256Digest {
-        let field = self.field.current().as_slice();
-        let mut bytes = Vec::with_capacity(256 + field.len() * 4);
-        bytes.extend_from_slice(WORLD_DIGEST_SCHEMA.as_bytes());
-        bytes.push(b'\n');
-        bytes.extend_from_slice(&self.tick.get().to_le_bytes());
-        for value in field {
-            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+        let mut stream = flife_core::canonical::Sha256Stream::new();
+        let mut buf = Vec::with_capacity(4096);
+        let flush = |stream: &mut flife_core::canonical::Sha256Stream, buf: &mut Vec<u8>| {
+            if !buf.is_empty() {
+                stream.update(buf);
+                buf.clear();
+            }
+        };
+        buf.extend_from_slice(WORLD_DIGEST_SCHEMA.as_bytes());
+        buf.push(b'\n');
+        buf.extend_from_slice(&self.tick.get().to_le_bytes());
+        for &value in self.field.current().as_slice() {
+            buf.extend_from_slice(&value.to_bits().to_le_bytes());
+            if buf.len() >= 4096 {
+                flush(&mut stream, &mut buf);
+            }
         }
         if let Some((gx, gy)) = self.field.current().vascular_edges() {
             for &value in gx.iter().chain(gy.iter()) {
-                bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+                buf.extend_from_slice(&value.to_bits().to_le_bytes());
+                if buf.len() >= 4096 {
+                    flush(&mut stream, &mut buf);
+                }
             }
         }
-        bytes.extend_from_slice(self.population.digest().as_bytes());
+        flush(&mut stream, &mut buf);
+        buf.extend_from_slice(self.population.digest().as_bytes());
         for next in [
             self.identities.organisms.next_raw(),
             self.identities.genomes.next_raw(),
         ] {
             match next {
                 Some(raw) => {
-                    bytes.push(1);
-                    bytes.extend_from_slice(&raw.to_le_bytes());
+                    buf.push(1);
+                    buf.extend_from_slice(&raw.to_le_bytes());
                 }
-                None => bytes.push(0),
+                None => buf.push(0),
             }
         }
         for value in [
@@ -2539,23 +2552,30 @@ impl World {
             self.quota.allocated_bytes(),
             self.quota.live(),
         ] {
-            bytes.extend_from_slice(&value.to_le_bytes());
+            buf.extend_from_slice(&value.to_le_bytes());
         }
         for path in &self.paths {
-            bytes.extend_from_slice(&path.source().get().to_le_bytes());
-            bytes.extend_from_slice(&path.ordinal().to_le_bytes());
+            buf.extend_from_slice(&path.source().get().to_le_bytes());
+            buf.extend_from_slice(&path.ordinal().to_le_bytes());
+            if buf.len() >= 4096 {
+                flush(&mut stream, &mut buf);
+            }
         }
         if !self.source_kernels.is_empty() {
-            bytes.extend_from_slice(&(self.source_kernels.len() as u64).to_le_bytes());
+            buf.extend_from_slice(&(self.source_kernels.len() as u64).to_le_bytes());
             for kernel in &self.source_kernels {
-                bytes.extend_from_slice(&kernel.sigma().to_bits().to_le_bytes());
+                buf.extend_from_slice(&kernel.sigma().to_bits().to_le_bytes());
+                if buf.len() >= 4096 {
+                    flush(&mut stream, &mut buf);
+                }
             }
         }
         let holdings = self.ledger.holdings();
         for value in [holdings.field(), holdings.organisms()] {
-            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+            buf.extend_from_slice(&value.to_bits().to_le_bytes());
         }
-        Sha256Digest::of(&bytes)
+        flush(&mut stream, &mut buf);
+        stream.finish()
     }
 
     /// Prepare the candidate for the next tick (see the [module

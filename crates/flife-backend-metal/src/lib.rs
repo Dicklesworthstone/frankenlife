@@ -726,9 +726,13 @@ fn allocate_shard_parameters(
 }
 
 /// Highest `local` slot index in `&jobs[start_index..]` belonging to
-/// `(topology_u32, shard_key)` for a shard covering `slots_per_shard` slots.
-/// Invoked only when a shard is created or grown, so steady-state ticks pay
-/// zero scan overhead.
+/// `(topology_u32, shard_key)` whose shape, dtype, and parameter count match
+/// the bucket and batch dimensions. Invoked only when a shard is created or
+/// grown, so steady-state ticks pay zero scan overhead.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "filters lookahead by exact bucket geometry, dtype, and batch dimensions"
+)]
 fn batch_max_local_for_shard<J: JobView>(
     jobs: &[J],
     finite_flags: &[u8],
@@ -736,6 +740,9 @@ fn batch_max_local_for_shard<J: JobView>(
     topology_u32: u32,
     shard_key: u64,
     slots_per_shard: u64,
+    expected_dtype: WeightDtype,
+    expected_len: u64,
+    batch_dims: (usize, usize),
     initial_local: usize,
 ) -> usize {
     let Ok(max_possible) = usize::try_from(slots_per_shard) else {
@@ -758,9 +765,18 @@ fn batch_max_local_for_shard<J: JobView>(
             continue;
         }
         let raw = s.slot();
-        if raw >= shard_base
-            && shard_end.is_none_or(|end| raw < end)
-            && let Ok(local) = usize::try_from(raw - shard_base)
+        if raw < shard_base || shard_end.is_some_and(|end| raw >= end) {
+            continue;
+        }
+        let controller = job.controller();
+        let topo = controller.topology();
+        if (topo.input_width(), topo.raw_output_width()) != batch_dims
+            || controller.parameters().dtype() != expected_dtype
+            || controller.parameters().len() as u64 != expected_len
+        {
+            continue;
+        }
+        if let Ok(local) = usize::try_from(raw - shard_base)
             && local > max_local
         {
             max_local = local;
@@ -770,6 +786,85 @@ fn batch_max_local_for_shard<J: JobView>(
         }
     }
     max_local
+}
+
+/// Current device staging buffer occupancy, used by
+/// [`pending_device_staging_bytes`] to reserve headroom before creating or
+/// growing a parameter shard.
+#[derive(Clone, Copy)]
+struct StagingState {
+    input_capacity: usize,
+    output_capacity: usize,
+    fault_capacity: usize,
+    has_io_buffers: bool,
+    has_dims: bool,
+}
+
+/// Additional device bytes `MetalBackend::hold` and `dispatch_staged` will
+/// allocate for a batch of at most `batch_jobs` jobs of `batch_dims` beyond
+/// what the backend's staging buffers currently hold. Reserving this delta in
+/// `choose_fitting_capacity` ensures a parameter shard never consumes the last
+/// bytes of a tight `DeviceOwner` limit and causes `hold()` to fail later.
+fn pending_device_staging_bytes(
+    batch_jobs: usize,
+    batch_dims: (usize, usize),
+    state: StagingState,
+    cur_shard_job_cap: usize,
+) -> u64 {
+    let (input_width, output_width) = batch_dims;
+    let dims_delta = if state.has_dims {
+        0
+    } else {
+        2 * size_of::<u32>() as u64
+    };
+    let need_inputs = batch_jobs.saturating_mul(input_width);
+    let need_outputs = batch_jobs.saturating_mul(output_width);
+    let io_delta = if state.has_io_buffers
+        && batch_jobs <= state.fault_capacity
+        && need_inputs <= state.input_capacity
+        && need_outputs <= state.output_capacity
+    {
+        0
+    } else {
+        let organisms = batch_jobs
+            .checked_next_power_of_two()
+            .unwrap_or(batch_jobs)
+            .max(256);
+        let new_elems = organisms
+            .saturating_mul(input_width)
+            .max(need_inputs)
+            .saturating_add(organisms.saturating_mul(output_width).max(need_outputs))
+            .saturating_add(organisms);
+        let new_bytes = (new_elems as u64).saturating_mul(size_of::<f32>() as u64);
+        let old_elems = if state.has_io_buffers {
+            state
+                .input_capacity
+                .saturating_add(state.output_capacity)
+                .saturating_add(state.fault_capacity)
+        } else {
+            0
+        };
+        let old_bytes = (old_elems as u64).saturating_mul(size_of::<f32>() as u64);
+        new_bytes.saturating_sub(old_bytes)
+    };
+    let shard_jobs_delta = if cur_shard_job_cap > 0 && batch_jobs <= cur_shard_job_cap {
+        0
+    } else {
+        let cap = batch_jobs
+            .checked_next_power_of_two()
+            .unwrap_or(batch_jobs)
+            .max(64);
+        let new_bytes = (cap as u64)
+            .saturating_mul(JOB_WORDS as u64)
+            .saturating_mul(size_of::<u32>() as u64);
+        let old_bytes = (cur_shard_job_cap as u64)
+            .saturating_mul(JOB_WORDS as u64)
+            .saturating_mul(size_of::<u32>() as u64);
+        new_bytes.saturating_sub(old_bytes)
+    };
+    dims_delta
+        .saturating_add(io_delta)
+        .saturating_add(shard_jobs_delta)
 }
 
 /// Pick the largest power-of-two (or full-shard) slot capacity between
@@ -1426,6 +1521,13 @@ impl MetalBackend {
             shard_count,
             held,
             buckets,
+            input_capacity,
+            output_capacity,
+            fault_capacity,
+            inputs,
+            raw,
+            faults,
+            dims,
             input_finite,
             dispatched,
             touched,
@@ -1433,6 +1535,13 @@ impl MetalBackend {
             uploads,
             ..
         } = self;
+        let staging_state = StagingState {
+            input_capacity: *input_capacity,
+            output_capacity: *output_capacity,
+            fault_capacity: *fault_capacity,
+            has_io_buffers: inputs.is_some() && raw.is_some() && faults.is_some(),
+            has_dims: dims.is_some(),
+        };
         let finite_flags = external_finite.unwrap_or(input_finite.as_slice());
         if finite_flags.len() < jobs.len() {
             return Err(CoreError::LayoutMismatch {
@@ -1595,24 +1704,42 @@ impl MetalBackend {
                     slot.topology(),
                     shard_key,
                     slots_per_shard,
+                    dtype,
+                    geometry.parameters(),
+                    batch_dims,
                     local,
                 );
                 let owner_limit = owner.limits().bytes;
                 if let Some(old_cap) = existing_cap {
                     // Grow an existing shard by powers of two, preserving all
                     // `0..old_cap` resident weights bit-for-bit.
-                    let (old_elements, old_bytes, old_device_bytes) =
+                    let (old_elements, old_bytes, old_device_bytes, cur_shard_job_cap) =
                         match bucket.shards.get(shard_key) {
                             Some(shard) => {
                                 let (old_elems, _, old_dev) =
                                     shard_accounting(old_cap, stride, dtype)?;
-                                (old_elems, shard.bytes, old_dev)
+                                (
+                                    old_elems,
+                                    shard.bytes,
+                                    old_dev,
+                                    if shard.jobs.is_some() {
+                                        shard.job_capacity
+                                    } else {
+                                        0
+                                    },
+                                )
                             }
                             None => {
                                 all_dispatched = false;
                                 continue;
                             }
                         };
+                    let pending_staging = pending_device_staging_bytes(
+                        jobs.len(),
+                        batch_dims,
+                        staging_state,
+                        cur_shard_job_cap,
+                    );
                     let staging = staging_bytes(budget.organisms, *shard_count);
                     let Some((new_cap, new_elements, new_bytes, new_device_bytes)) =
                         choose_fitting_capacity(
@@ -1624,7 +1751,11 @@ impl MetalBackend {
                             held.saturating_sub(old_bytes),
                             staging,
                             budget.bytes,
-                            owner.usage().bytes.saturating_sub(old_device_bytes),
+                            owner
+                                .usage()
+                                .bytes
+                                .saturating_sub(old_device_bytes)
+                                .saturating_add(pending_staging),
                             owner_limit,
                         )?
                     else {
@@ -1687,7 +1818,7 @@ impl MetalBackend {
                             match allocate_shard_parameters(owner, dtype, new_elements) {
                                 Ok(parameters) => parameters,
                                 Err(CoreError::BudgetExhausted { .. }) => {
-                                    if live_count > 0 {
+                                    if live_count > 0 || !staged.is_empty() {
                                         overwrote_existing = true;
                                     }
                                     all_dispatched = false;
@@ -1713,6 +1844,8 @@ impl MetalBackend {
                         );
                     }
                 } else {
+                    let pending_staging =
+                        pending_device_staging_bytes(jobs.len(), batch_dims, staging_state, 0);
                     let staging = staging_bytes(budget.organisms, shard_count.saturating_add(1));
                     let Some((cap, elements, bytes, _device_bytes)) = choose_fitting_capacity(
                         local,
@@ -1723,7 +1856,7 @@ impl MetalBackend {
                         *held,
                         staging,
                         budget.bytes,
-                        owner.usage().bytes,
+                        owner.usage().bytes.saturating_add(pending_staging),
                         owner_limit,
                     )?
                     else {

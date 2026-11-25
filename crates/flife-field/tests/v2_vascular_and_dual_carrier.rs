@@ -22,15 +22,16 @@ use flife_core::ids::{OrganismId, SourceId};
 use flife_core::{CoreError, TimeStep, ValidatedConfig};
 use flife_field::state::CHANNELS;
 use flife_field::{
-    Arrangement, BarrierMode, BufferLimits, CARRIER1_ENERGY_PLANE, CARRIER1_FIRST_MOMENT_PLANE,
-    CarrierLayout, Cell, ConeTolerance, DUAL_CARRIER_PLANES, Demand, DepositSummary, Deposits,
-    DualCarrierRules, DualRawSample, FIELD_PLANES, FieldBackend, FieldFootprint, FieldGrid,
-    FieldLayout, FieldPair, FieldScan, FieldState, FieldStepPhase2, FieldStepReport, FieldWork,
-    FluxEdges, Grants, MAX_PLANES, OasisSchedule, RawSample, SensorBackend, SensorPyramid,
-    SensorQuery, Source, SourceKernel, TightJunctions, TransportPlan, TransportScratch,
-    VASCULAR_INITIAL_CONDUCTANCE, VascularField, advance_field_on, advance_field_wave2_on,
-    apply_deposits_to_carrier_on, field_planes_for_config, reduce_dual_carrier_field_on, relayout,
-    resolve_uptake, split_dual_carrier_emission, transport_flux,
+    Arrangement, BarrierMode, BufferLimits, CARRIER0_MOMENT_CHANNELS, CARRIER1_ENERGY_PLANE,
+    CARRIER1_FIRST_MOMENT_PLANE, CARRIER1_MOMENT_CHANNELS, CarrierLayout, Cell, ConeTolerance,
+    DUAL_CARRIER_PLANES, Demand, DepositSummary, Deposits, DualCarrierRules, DualRawSample,
+    FIELD_PLANES, FieldBackend, FieldFootprint, FieldGrid, FieldLayout, FieldPair, FieldScan,
+    FieldState, FieldStepPhase2, FieldStepReport, FieldWork, FluxEdges, Grants, MAX_PLANES,
+    OasisSchedule, RawSample, SensorBackend, SensorPyramid, SensorQuery, Source, SourceKernel,
+    TightJunctions, TransportPlan, TransportScratch, VASCULAR_INITIAL_CONDUCTANCE, VascularField,
+    advance_field_on, advance_field_wave2_on, apply_deposits_to_carrier_on,
+    field_planes_for_config, reduce_dual_carrier_field_on, relayout, resolve_uptake,
+    split_dual_carrier_emission, transport_flux,
 };
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -1140,4 +1141,135 @@ fn dual_carrier_disabled_matches_33_plane_bit_exact_and_full_wave2_composition()
         backend.sample_dual(&pyr1, &f34, &queries, &mut dual_samples),
         Err(CoreError::MissingCapability { .. })
     ));
+}
+
+#[test]
+fn dual_carrier_check_invariants_blocked_matches_scalar_and_catches_every_fault() {
+    // 16 x 12 = 192 cells spans three 64-cell CHECK_BLOCKs cleanly, and
+    // 17 x 11 = 187 cells spans two full 64-cell blocks plus a 59-cell tail.
+    let tol = ConeTolerance::new(1.0e-6, 1.0e-6).expect("tol");
+    let trigger = ConeTolerance::new(1.0e-7, 1.0e-7).expect("trigger");
+
+    let build_clean = |cx: u32, cy: u32| -> FieldState {
+        let grid = FieldGrid::new(cx, cy, f64::from(cx), f64::from(cy)).expect("grid");
+        let mut state =
+            FieldState::zeroed_dual_carrier(grid, &BufferLimits::host()).expect("dual field");
+        let cells = grid.cell_count() as usize;
+        for c in 0..cells {
+            if c % 7 == 0 {
+                continue; // empty Carrier 0 cell
+            }
+            let e0 = 1.0 + (c % 13) as f32 * 0.25;
+            state.energy_mut()[c] = e0;
+            for ch in 0..CARRIER0_MOMENT_CHANNELS {
+                let sign = if (c + ch as usize).is_multiple_of(2) {
+                    1.0
+                } else {
+                    -1.0
+                };
+                state.moment_mut(ch).expect("c0 m")[c] = sign * (e0 / 6.0);
+            }
+            let e1 = 0.5 + (c % 5) as f32 * 0.1;
+            state.plane_mut(CARRIER1_ENERGY_PLANE).expect("e1")[c] = e1;
+            for ch in 0..CARRIER1_MOMENT_CHANNELS {
+                let plane = CARRIER1_FIRST_MOMENT_PLANE + ch;
+                state.plane_mut(plane).expect("c1 m")[c] = e1 / 4.0;
+            }
+        }
+        state
+    };
+
+    for (cx, cy) in [(16, 12), (17, 11)] {
+        let state = build_clean(cx, cy);
+        let s1 = state
+            .check_invariants_with_trigger_on(tol, trigger, 1)
+            .expect("1w clean");
+        let s4 = state
+            .check_invariants_with_trigger_on(tol, trigger, 4)
+            .expect("4w clean");
+        assert_eq!(s1, s4, "worker parity on {cx}x{cy}");
+        let scan = state.scan_invariants(tol);
+        assert!(scan.offending.is_none());
+        let from_scan = state
+            .summarize_scan(tol, &scan)
+            .expect("summarize")
+            .expect("passing");
+        assert_eq!(s1.0, from_scan, "blocked dual check matches scalar scan");
+    }
+
+    // Inject every fault class across block boundaries (cell 73 is inside block 2)
+    // and verify blocked check returns the exact same error string as scalar scan/check.
+    let base = build_clean(17, 11);
+    let idx = 73_usize;
+
+    // 1. Single NaN moment on Carrier 0.
+    let mut f_nan0 = base.clone();
+    f_nan0.moment_mut(19).expect("m19")[idx] = f32::NAN;
+    let err = f_nan0.check_invariants_on(tol, 4).unwrap_err();
+    assert!(
+        format!("{err}").contains("channel 19"),
+        "expected channel 19 NaN, got {err}"
+    );
+    assert_eq!(f_nan0.scan_invariants(tol).offending, Some(idx));
+
+    // 2. Single -Inf moment on Carrier 1 (squares to +Inf, must not cancel).
+    let mut f_inf1 = base.clone();
+    f_inf1
+        .plane_mut(CARRIER1_FIRST_MOMENT_PLANE + 5)
+        .expect("c1 m5")[idx] = f32::NEG_INFINITY;
+    let err = f_inf1.check_invariants_on(tol, 4).unwrap_err();
+    assert!(
+        format!("{err}").contains("channel 5"),
+        "expected Carrier 1 channel 5 -Inf, got {err}"
+    );
+    assert_eq!(f_inf1.scan_invariants(tol).offending, Some(idx));
+
+    // 3. Negative energy on Carrier 1.
+    let mut f_neg1 = base.clone();
+    f_neg1.plane_mut(CARRIER1_ENERGY_PLANE).expect("e1")[idx] = -0.01;
+    let err = f_neg1.check_invariants_on(tol, 4).unwrap_err();
+    assert!(
+        format!("{err}").contains("INV-01"),
+        "expected Carrier 1 negative energy INV-01, got {err}"
+    );
+    assert_eq!(f_neg1.scan_invariants(tol).offending, Some(idx));
+
+    // 4. Error priority: cell 71 (non-empty) has Carrier 0 cone violation, cell 73 has Carrier 1 NaN ->
+    // cell 71 (earlier in cell-index order) must be reported first.
+    let mut f_order = base.clone();
+    assert!(f_order.energy()[71] > 0.0, "cell 71 must be non-empty");
+    f_order.moment_mut(0).expect("m0")[71] = f_order.energy()[71] * 2.0;
+    f_order
+        .plane_mut(CARRIER1_FIRST_MOMENT_PLANE)
+        .expect("c1 m0")[73] = f32::NAN;
+    let err = f_order.check_invariants_on(tol, 4).unwrap_err();
+    assert!(
+        format!("{err}").contains("INV-02"),
+        "expected earlier cell 71 INV-02 before cell 73 NaN, got {err}"
+    );
+    assert_eq!(f_order.scan_invariants(tol).offending, Some(71));
+
+    // 5. Same-cell Carrier 0 before Carrier 1 priority, and Carrier 1 cone violation alone.
+    let mut f_same = base.clone();
+    f_same.moment_mut(0).expect("m0")[idx] = f_same.energy()[idx] * 2.0;
+    f_same
+        .plane_mut(CARRIER1_FIRST_MOMENT_PLANE)
+        .expect("c1 m0")[idx] = f32::NAN;
+    let err = f_same.check_invariants_on(tol, 4).unwrap_err();
+    assert!(
+        format!("{err}").contains("INV-02"),
+        "expected same-cell Carrier 0 INV-02 before Carrier 1 NaN, got {err}"
+    );
+
+    let mut f_cone1 = base.clone();
+    let e1_73 = f_cone1.plane(CARRIER1_ENERGY_PLANE).expect("e1")[idx];
+    f_cone1
+        .plane_mut(CARRIER1_FIRST_MOMENT_PLANE)
+        .expect("c1 m0")[idx] = e1_73 * 2.0;
+    let err = f_cone1.check_invariants_on(tol, 4).unwrap_err();
+    assert!(
+        format!("{err}").contains("INV-02"),
+        "expected Carrier 1 INV-02, got {err}"
+    );
+    assert_eq!(f_cone1.scan_invariants(tol).offending, Some(idx));
 }

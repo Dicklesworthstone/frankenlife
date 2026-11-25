@@ -1675,7 +1675,8 @@ impl Population {
     /// The canonical scientific state, in identity order, without slots.
     #[must_use]
     pub fn digest(&self) -> Sha256Digest {
-        let mut bytes = Vec::with_capacity(64 + self.len() * 256);
+        let mut stream = flife_core::canonical::Sha256Stream::new();
+        let mut bytes = Vec::with_capacity(4096);
         bytes.extend_from_slice(POPULATION_DIGEST_SCHEMA.as_bytes());
         bytes.push(b'\n');
         bytes.extend_from_slice(&(self.len() as u64).to_le_bytes());
@@ -1766,8 +1767,15 @@ impl Population {
                     bytes.push(0);
                 }
             }
+            if bytes.len() >= 3072 {
+                stream.update(&bytes);
+                bytes.clear();
+            }
         }
-        Sha256Digest::of(&bytes)
+        if !bytes.is_empty() {
+            stream.update(&bytes);
+        }
+        stream.finish()
     }
 
     /// Check `entrants` against the population as it will be with

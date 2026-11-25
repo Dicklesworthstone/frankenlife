@@ -600,10 +600,11 @@ fn check_cell_dual(
     Ok(r0.max(r1))
 }
 
-/// Check cells `range` on a 34-plane dual-carrier field in cell-index order,
-/// stopping at the first offending cell across either carrier and recording
-/// whether either carrier's residual strictly exceeded `bounds.trigger`.
-fn check_range_dual(
+/// Exact scalar fallback over `base..base + len` on a 34-plane dual-carrier
+/// field, preserving strict cell-index and Carrier-0-before-Carrier-1 error
+/// ordering when a block encounters an invalid energy or truncated plane.
+#[allow(clippy::too_many_arguments)]
+fn check_range_dual_scalar(
     e0: &[f32],
     m0: &[&[f32]],
     e1: &[f32],
@@ -611,10 +612,9 @@ fn check_range_dual(
     range: Range<usize>,
     bounds: CheckBounds,
     width: u64,
-) -> Result<RangeSummary, CoreError> {
-    let mut summary = RangeSummary::default();
-    let end = range.end.min(e0.len());
-    for index in range.start..end {
+    summary: &mut RangeSummary,
+) -> Result<(), CoreError> {
+    for index in range {
         let r0 = check_cell(e0, m0, index, bounds.tolerance, width)?;
         let r1 = check_cell(e1, m1, index, bounds.tolerance, width)?;
         let e0_val = e0.get(index).copied().map_or(0.0, f64::from);
@@ -631,14 +631,187 @@ fn check_range_dual(
             summary.empty_cells += 1;
         }
     }
+    Ok(())
+}
+
+/// Check cells `range` on a 34-plane dual-carrier field in cell-index order,
+/// using 64-cell plane-major blocks for both Carrier 0 and Carrier 1 to avoid
+/// 34-way cross-plane cache thrashing while preserving exact channel-order sums,
+/// error reporting, and `bounds.trigger` detection.
+fn check_range_dual(
+    e0: &[f32],
+    m0: &[&[f32]],
+    e1: &[f32],
+    m1: &[&[f32]],
+    range: Range<usize>,
+    bounds: CheckBounds,
+    width: u64,
+) -> Result<RangeSummary, CoreError> {
+    let mut summary = RangeSummary::default();
+    let end = range.end.min(e0.len());
+    let mut base = range.start;
+    while base < end {
+        let len = (end - base).min(CHECK_BLOCK);
+        let e0_block = e0.get(base..base + len).unwrap_or(&[]);
+        let e1_block = e1.get(base..base + len).unwrap_or(&[]);
+        let mut bad_energy = e0_block.len() != len || e1_block.len() != len;
+        let mut e0_vals = [0.0_f64; CHECK_BLOCK];
+        let mut e1_vals = [0.0_f64; CHECK_BLOCK];
+        if !bad_energy {
+            for (slot, &cell_energy) in e0_vals[..len].iter_mut().zip(e0_block) {
+                let e = f64::from(cell_energy);
+                if !e.is_finite() || e < 0.0 {
+                    bad_energy = true;
+                    break;
+                }
+                *slot = e;
+            }
+        }
+        if !bad_energy {
+            for (slot, &cell_energy) in e1_vals[..len].iter_mut().zip(e1_block) {
+                let e = f64::from(cell_energy);
+                if !e.is_finite() || e < 0.0 {
+                    bad_energy = true;
+                    break;
+                }
+                *slot = e;
+            }
+        }
+        if bad_energy {
+            check_range_dual_scalar(
+                e0,
+                m0,
+                e1,
+                m1,
+                base..base + len,
+                bounds,
+                width,
+                &mut summary,
+            )?;
+            base += len;
+            continue;
+        }
+
+        let mut sq0 = [0.0_f64; CHECK_BLOCK];
+        let mut sq1 = [0.0_f64; CHECK_BLOCK];
+        let mut short_plane = false;
+        for plane in m0 {
+            let Some(slice) = plane.get(base..base + len) else {
+                short_plane = true;
+                break;
+            };
+            for (square, &m_raw) in sq0[..len].iter_mut().zip(slice) {
+                let m = f64::from(m_raw);
+                *square += m * m;
+            }
+        }
+        if !short_plane {
+            for plane in m1 {
+                let Some(slice) = plane.get(base..base + len) else {
+                    short_plane = true;
+                    break;
+                };
+                for (square, &m_raw) in sq1[..len].iter_mut().zip(slice) {
+                    let m = f64::from(m_raw);
+                    *square += m * m;
+                }
+            }
+        }
+        if short_plane {
+            check_range_dual_scalar(
+                e0,
+                m0,
+                e1,
+                m1,
+                base..base + len,
+                bounds,
+                width,
+                &mut summary,
+            )?;
+            base += len;
+            continue;
+        }
+
+        for offset in 0..len {
+            let e0_val = e0_vals[offset];
+            let s0 = sq0[offset];
+            // Every finite `m_raw` has `0 ≤ m² ≤ 1.2e77`, so across ≤32 planes
+            // `s0` is non-finite iff at least one moment plane held NaN/±Inf.
+            if !s0.is_finite() {
+                let _ = check_cell(e0, m0, base + offset, bounds.tolerance, width)?;
+            }
+            let r0 = if s0 == 0.0 {
+                0.0
+            } else {
+                (s0.sqrt() - e0_val).max(0.0)
+            };
+            if !bounds.tolerance.allows(r0, e0_val) {
+                let _ = check_cell(e0, m0, base + offset, bounds.tolerance, width)?;
+            }
+
+            let e1_val = e1_vals[offset];
+            let s1 = sq1[offset];
+            if !s1.is_finite() {
+                let _ = check_cell(e1, m1, base + offset, bounds.tolerance, width)?;
+            }
+            let r1 = if s1 == 0.0 {
+                0.0
+            } else {
+                (s1.sqrt() - e1_val).max(0.0)
+            };
+            if !bounds.tolerance.allows(r1, e1_val) {
+                let _ = check_cell(e1, m1, base + offset, bounds.tolerance, width)?;
+            }
+
+            if !bounds.trigger.allows(r0, e0_val) || !bounds.trigger.allows(r1, e1_val) {
+                summary.any_exceeds_trigger = true;
+            }
+            let residual = r0.max(r1);
+            if residual > summary.max_cone_residual {
+                summary.max_cone_residual = residual;
+                summary.max_cone_residual_cell = Some(locate(base + offset, width));
+            }
+            if e0_val == 0.0 {
+                summary.empty_cells += 1;
+            }
+        }
+        base += len;
+    }
     Ok(summary)
 }
 
-/// Cells checked per cache-friendly plane-major block in [`check_range`].
-/// Accumulating squares plane by plane over 64 consecutive cells eliminates
-/// 33-way L1D cache-set conflict misses on power-of-two grids (e.g., 512²
-/// where each plane is 1 MiB) while preserving exact channel-order sums.
+/// Cells checked per cache-friendly plane-major block in [`check_range`] and
+/// [`check_range_dual`]. Accumulating squares plane by plane over 64
+/// consecutive cells eliminates 33/34-way L1D cache-set conflict misses on
+/// power-of-two grids (e.g., 512² where each plane is 1 MiB) while preserving
+/// exact channel-order sums.
 const CHECK_BLOCK: usize = 64;
+
+/// Exact scalar fallback over `range` for [`check_range`].
+fn check_range_scalar(
+    energy: &[f32],
+    moments: &[&[f32]],
+    range: Range<usize>,
+    bounds: CheckBounds,
+    width: u64,
+    summary: &mut RangeSummary,
+) -> Result<(), CoreError> {
+    for index in range {
+        let residual = check_cell(energy, moments, index, bounds.tolerance, width)?;
+        let e = energy.get(index).copied().map_or(0.0, f64::from);
+        if !bounds.trigger.allows(residual, e) {
+            summary.any_exceeds_trigger = true;
+        }
+        if residual > summary.max_cone_residual {
+            summary.max_cone_residual = residual;
+            summary.max_cone_residual_cell = Some(locate(index, width));
+        }
+        if e == 0.0 {
+            summary.empty_cells += 1;
+        }
+    }
+    Ok(())
+}
 
 /// Check cells `range` in cell-index order, stopping at the first offending
 /// cell, and measure them (including whether any cell strictly exceeded
@@ -658,7 +831,7 @@ fn check_range(
         let energy_block = energy.get(base..base + len).unwrap_or(&[]);
         let mut bad_energy = energy_block.len() != len;
         let mut energies = [0.0_f64; CHECK_BLOCK];
-        for (slot, &cell_energy) in energies.iter_mut().zip(energy_block) {
+        for (slot, &cell_energy) in energies[..len].iter_mut().zip(energy_block) {
             let e = f64::from(cell_energy);
             if !e.is_finite() || e < 0.0 {
                 bad_energy = true;
@@ -667,60 +840,47 @@ fn check_range(
             *slot = e;
         }
         if bad_energy {
-            for offset in 0..len {
-                let index = base + offset;
-                let residual = check_cell(energy, moments, index, bounds.tolerance, width)?;
-                let e = energy.get(index).copied().map_or(0.0, f64::from);
-                if !bounds.trigger.allows(residual, e) {
-                    summary.any_exceeds_trigger = true;
-                }
-                if residual > summary.max_cone_residual {
-                    summary.max_cone_residual = residual;
-                    summary.max_cone_residual_cell = Some(locate(index, width));
-                }
-                if e == 0.0 {
-                    summary.empty_cells += 1;
-                }
-            }
+            check_range_scalar(
+                energy,
+                moments,
+                base..base + len,
+                bounds,
+                width,
+                &mut summary,
+            )?;
             base += len;
             continue;
         }
 
         let mut squares = [0.0_f64; CHECK_BLOCK];
-        let mut bad_moment = false;
+        let mut short_plane = false;
         for plane in moments {
             let Some(slice) = plane.get(base..base + len) else {
-                bad_moment = true;
+                short_plane = true;
                 break;
             };
-            for (square, &m_raw) in squares.iter_mut().zip(slice) {
-                if !m_raw.is_finite() {
-                    bad_moment = true;
-                }
+            for (square, &m_raw) in squares[..len].iter_mut().zip(slice) {
                 let m = f64::from(m_raw);
                 *square += m * m;
             }
         }
-        if bad_moment {
-            for (offset, &e) in energies.iter().enumerate().take(len) {
-                let index = base + offset;
-                let residual = check_cell(energy, moments, index, bounds.tolerance, width)?;
-                if !bounds.trigger.allows(residual, e) {
-                    summary.any_exceeds_trigger = true;
-                }
-                if residual > summary.max_cone_residual {
-                    summary.max_cone_residual = residual;
-                    summary.max_cone_residual_cell = Some(locate(index, width));
-                }
-                if e == 0.0 {
-                    summary.empty_cells += 1;
-                }
-            }
+        if short_plane {
+            check_range_scalar(
+                energy,
+                moments,
+                base..base + len,
+                bounds,
+                width,
+                &mut summary,
+            )?;
             base += len;
             continue;
         }
 
         for (offset, (&e, &sq)) in energies.iter().zip(&squares).enumerate().take(len) {
+            if !sq.is_finite() {
+                let _ = check_cell(energy, moments, base + offset, bounds.tolerance, width)?;
+            }
             let residual = if sq == 0.0 {
                 0.0
             } else {

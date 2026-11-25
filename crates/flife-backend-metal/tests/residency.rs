@@ -479,6 +479,53 @@ fn growable_shards_start_small_and_grow_bit_identically_within_budget() -> Resul
     assert_eq!(refuse.uploads(), 64, "earlier 64 slots stay resident");
     assert_eq!(refuse.shards(), 1);
     assert!(refuse.owner().usage().bytes <= refuse_grow_limit);
+
+    // 5. Fresh device limit that fits 128-slot parameter bytes alone, but NOT
+    //    128 slots plus hold()'s first-time per-organism staging buffers: shard
+    //    creation must step down to 64 slots and defer 64..100 cleanly instead
+    //    of starving dispatch_staged -> hold() into BudgetExhausted.
+    let starve_limit = 2 * one_tier_bytes + 4_096;
+    let starve_owner = flife_backend_metal::DeviceOwner::open(flife_backend_metal::Limits {
+        bytes: starve_limit,
+        leases_per_purpose: u32::MAX,
+    })?;
+    let mut starve = MetalBackend::with_owner(starve_owner, u64::MAX, BackendBudget::UNBOUNDED)?;
+    starve.evaluate(&all_jobs[..100], &mut outputs)?;
+    assert_eq!(bits(&outputs[..64]), &want[..64]);
+    assert!(
+        outputs[64..].iter().all(Option::is_none),
+        "allocation that would starve hold() staging must step down and defer cleanly"
+    );
+    assert!(starve.owner().usage().bytes <= starve_limit);
+
+    // 6. A deferred mismatched-dtype job at a high slot in the same batch must
+    //    not inflate the newly created shard past INITIAL_SHARD_SLOTS.
+    let Some(mut filtered) = backend(u64::MAX) else {
+        return Ok(());
+    };
+    let f16_params: Vec<F16> = cases[0]
+        .parameters
+        .iter()
+        .map(|&v| F16::from_f64(f64::from(v)))
+        .collect();
+    let f16_ctrl = ReferenceController::new(&topologies[0], &f16_params, BOUND)?;
+    let mixed = [
+        all_jobs[0],
+        ControllerJob {
+            genome: GenomeId::new(9_999),
+            slot: ArenaSlot::new(0, 500, 1),
+            controller: f16_ctrl,
+            inputs: all_jobs[0].inputs,
+        },
+    ];
+    filtered.evaluate(&mixed, &mut outputs)?;
+    assert_eq!(bits(&outputs[..1]), &want[..1]);
+    assert!(outputs[1].is_none());
+    assert!(
+        filtered.owner().usage().bytes < (2 << 20),
+        "deferred mismatched-dtype job at slot 500 must not inflate shard, held {} B",
+        filtered.owner().usage().bytes
+    );
     Ok(())
 }
 

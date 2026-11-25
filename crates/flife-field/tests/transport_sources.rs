@@ -1205,3 +1205,82 @@ fn deposit_energy_fused_refuses_mismatched_source_and_support_lengths() {
     let after: Vec<u32> = state.as_slice().iter().map(|v| v.to_bits()).collect();
     assert_eq!(after, before, "refused call must not mutate field");
 }
+
+#[test]
+fn support_into_matches_scalar_weight_bit_for_bit_across_seams_and_wide_grids() {
+    let assert_exact = |grid: &FieldGrid, kernel: &SourceKernel, center: [f64; 2], label: &str| {
+        let mut fast = SourceSupport::new();
+        kernel
+            .support_into(grid, center, &mut fast)
+            .unwrap_or_else(|e| panic!("{label}: fast support_into failed: {e}"));
+
+        let mut oracle = SourceSupport::new();
+        kernel
+            .candidates_into(grid, center, &mut oracle)
+            .unwrap_or_else(|e| panic!("{label}: oracle candidates_into failed: {e}"));
+        kernel
+            .weigh_into(grid, center, &mut oracle, |col, row| {
+                kernel.weight(grid, center, col, row)
+            })
+            .unwrap_or_else(|e| panic!("{label}: oracle weigh_into failed: {e}"));
+
+        assert_eq!(
+            fast.weight_sum().to_bits(),
+            oracle.weight_sum().to_bits(),
+            "{label}: weight_sum bits differ"
+        );
+        assert_eq!(fast.len(), oracle.len(), "{label}: cell count differs");
+        let fast_cells: Vec<(usize, u64)> = fast
+            .normalized()
+            .map(|(idx, w)| (idx, w.to_bits()))
+            .collect();
+        let oracle_cells: Vec<(usize, u64)> = oracle
+            .normalized()
+            .map(|(idx, w)| (idx, w.to_bits()))
+            .collect();
+        assert_eq!(
+            fast_cells, oracle_cells,
+            "{label}: normalized weights differ"
+        );
+        assert_eq!(fast, oracle, "{label}: raw SourceSupport differs");
+    };
+
+    // Standard torus seams, corners, and fractional positions.
+    let g64 = FieldGrid::new(64, 64, 16.0, 16.0).expect("g64");
+    let k_large = SourceKernel::new(2.25, 4.0).expect("k_large");
+    for &(center, label) in &[
+        ([0.0, 0.0], "origin seam"),
+        ([0.125, 0.125], "cell center (x=0 hits exact exp_neg(0)=1)"),
+        ([15.999, 15.999], "upper-right wrap seam"),
+        ([7.37, 12.83], "interior off-grid"),
+        ([0.05, 8.0], "x wrap only"),
+        ([8.0, 15.95], "y wrap only"),
+    ] {
+        assert_exact(&g64, &k_large, center, label);
+    }
+
+    // Wide grid (> 512 candidate columns) exercises the heap fallback for `dx_sq`.
+    let g_wide = FieldGrid::new(600, 16, 600.0, 16.0).expect("g_wide");
+    let k_wide = SourceKernel::new(100.0, 4.0).expect("k_wide");
+    assert_exact(&g_wide, &k_wide, [12.3, 4.7], "wide >512 cols");
+
+    // Unwrapped coordinates must refuse identically to `weigh_into`.
+    let mut scratch = SourceSupport::new();
+    for bad in [[-0.1, 4.0], [16.0, 4.0], [4.0, -0.1], [4.0, 16.0]] {
+        let fast_err = k_large.support_into(&g64, bad, &mut scratch).unwrap_err();
+        let mut oracle = SourceSupport::new();
+        k_large
+            .candidates_into(&g64, bad, &mut oracle)
+            .expect("finite bad center still has candidates");
+        let oracle_err = k_large
+            .weigh_into(&g64, bad, &mut oracle, |col, row| {
+                k_large.weight(&g64, bad, col, row)
+            })
+            .unwrap_err();
+        assert_eq!(
+            format!("{fast_err}"),
+            format!("{oracle_err}"),
+            "unwrapped center {bad:?} refusal mismatch"
+        );
+    }
+}

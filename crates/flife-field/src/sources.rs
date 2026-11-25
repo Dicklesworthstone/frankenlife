@@ -25,9 +25,9 @@ use flife_core::numerics::{normalize_turns, sin_cos_turns};
 use flife_core::rng::SemanticRng;
 use flife_core::{CoreError, Tick, TickSpan, TimeStep, V2Feature, ValidatedConfig};
 
-use crate::grid::{FieldGrid, wrap_coordinate};
+use crate::grid::{FieldGrid, minimum_image, wrap_coordinate};
 use crate::layout::overflow;
-use crate::numerics::exp_neg;
+use crate::numerics::{exp_neg, exp_neg_4};
 use crate::seeding::source_sigma;
 use crate::state::{CHANNELS, FieldState};
 
@@ -193,9 +193,126 @@ impl SourceKernel {
         support: &mut SourceSupport,
     ) -> Result<(), CoreError> {
         self.candidates_into(grid, center, support)?;
-        self.weigh_into(grid, center, support, |column, row| {
-            self.weight(grid, center, column, row)
-        })
+        let SourceSupport {
+            cells,
+            weight_sum,
+            columns,
+            rows,
+            ..
+        } = support;
+        cells.clear();
+        *weight_sum = 0.0;
+        if let (Some(&first_col), Some(&first_row)) = (columns.first(), rows.first()) {
+            let (radius_squared, two_sigma_squared) = self.weight_constants();
+            let cell_w = grid.cell_width();
+            let cell_h = grid.cell_height();
+            let lx = grid.world_width();
+            let ly = grid.world_height();
+
+            // Validate `center[0]` then `center[1]` in the exact order of
+            // `FieldGrid::displacement(center, cell_center)`.
+            let dx0 = minimum_image(center[0], (f64::from(first_col) + 0.5) * cell_w, lx)?;
+            let _ = minimum_image(center[1], (f64::from(first_row) + 0.5) * cell_h, ly)?;
+
+            // Hoist per-column `dx²` once so 2D support evaluation pays O(W + H)
+            // minimum-image calls instead of O(W × H), with zero heap traffic for
+            // grids up to 512 candidate columns wide.
+            const STACK_COLS: usize = 512;
+            let mut dx_sq_stack = [0.0_f64; STACK_COLS];
+            let mut dx_sq_heap = Vec::new();
+            let dx_sq: &mut [f64] = if columns.len() <= STACK_COLS {
+                &mut dx_sq_stack[..columns.len()]
+            } else {
+                dx_sq_heap.resize(columns.len(), 0.0);
+                &mut dx_sq_heap
+            };
+            dx_sq[0] = dx0 * dx0;
+            for (slot, &column) in dx_sq[1..].iter_mut().zip(&columns[1..]) {
+                let dx = minimum_image(center[0], (f64::from(column) + 0.5) * cell_w, lx)?;
+                *slot = dx * dx;
+            }
+
+            let max_col = *columns.last().unwrap_or(&0) as usize;
+            let mut batch_idx = [0_usize; 4];
+            let mut batch_dist_sq = [0.0_f64; 4];
+            let mut batch_len = 0_usize;
+
+            for &row in rows.iter() {
+                let dy = minimum_image(center[1], (f64::from(row) + 0.5) * cell_h, ly)?;
+                let dy_sq = dy * dy;
+                if dy_sq > radius_squared {
+                    continue;
+                }
+                let row_base = grid
+                    .cell_index(0, row)
+                    .filter(|base| base.checked_add(max_col).is_some());
+                for (&column, &dx2) in columns.iter().zip(dx_sq.iter()) {
+                    let distance_squared = dx2 + dy_sq;
+                    if distance_squared > radius_squared {
+                        continue;
+                    }
+                    let index = match row_base {
+                        Some(base) => base + column as usize,
+                        None => grid.cell_index(column, row).ok_or_else(overflow)?,
+                    };
+                    batch_idx[batch_len] = index;
+                    batch_dist_sq[batch_len] = distance_squared;
+                    batch_len += 1;
+                    if batch_len == 4 {
+                        let args = [
+                            batch_dist_sq[0] / two_sigma_squared,
+                            batch_dist_sq[1] / two_sigma_squared,
+                            batch_dist_sq[2] / two_sigma_squared,
+                            batch_dist_sq[3] / two_sigma_squared,
+                        ];
+                        let weights = if let Some(weights) = exp_neg_4(args) {
+                            weights
+                        } else {
+                            let mut fallback = [0.0_f64; 4];
+                            for lane in 0..4 {
+                                fallback[lane] = exp_neg(args[lane]).ok_or_else(|| {
+                                    CoreError::NumericalInvalid {
+                                        quantity: "source weight",
+                                        detail: format!(
+                                            "|d|² = {:?} has no weight",
+                                            batch_dist_sq[lane]
+                                        ),
+                                    }
+                                })?;
+                            }
+                            fallback
+                        };
+                        for lane in 0..4 {
+                            let weight = weights[lane];
+                            cells.push((batch_idx[lane], weight));
+                            *weight_sum += weight;
+                        }
+                        batch_len = 0;
+                    }
+                }
+            }
+            for lane in 0..batch_len {
+                let distance_squared = batch_dist_sq[lane];
+                let weight = exp_neg(distance_squared / two_sigma_squared).ok_or_else(|| {
+                    CoreError::NumericalInvalid {
+                        quantity: "source weight",
+                        detail: format!("|d|² = {distance_squared:?} has no weight"),
+                    }
+                })?;
+                cells.push((batch_idx[lane], weight));
+                *weight_sum += weight;
+            }
+        }
+        if cells.is_empty() || *weight_sum <= 0.0 || !weight_sum.is_finite() {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "source support",
+                detail: format!(
+                    "no cell center lies within {:?} of {center:?} with positive weight",
+                    self.radius
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// The most candidate columns and rows one support on `grid` takes

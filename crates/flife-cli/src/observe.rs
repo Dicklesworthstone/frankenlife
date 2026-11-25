@@ -205,6 +205,7 @@ enum HeredityTask<'a> {
     },
 }
 
+#[derive(Clone, Copy)]
 enum HeredityOutcome {
     FounderPair {
         compared: u64,
@@ -239,14 +240,12 @@ impl Survey {
         let mut founders_alive = 0;
         let mut rows = Vec::with_capacity(live);
         let mut genomes: Vec<&Genome> = Vec::with_capacity(live);
-        let mut walk = population.ascending();
-        for organism in population.iter() {
+        for (organism, genome) in population.iter_with_genomes() {
             *generations.entry(organism.generation.get()).or_insert(0) += 1;
             lineages.insert(organism.lineage.get());
             if organism.parent.is_none() {
                 founders_alive += 1;
             }
-            let (genome, _) = walk.next(organism.id);
             if let Some(genome) = genome {
                 *topologies.entry(genome.topology().index()).or_insert(0) += 1;
                 genomes.push(genome);
@@ -300,20 +299,20 @@ fn compute_digests(genomes: &[&Genome], workers: usize) -> Vec<DigestKey> {
     if genomes.is_empty() {
         return Vec::new();
     }
-    let compute_chunk = |slice: &[&Genome], out: &mut Vec<DigestKey>| {
+    let zero_digest = Sha256Digest::from_bytes([0_u8; 32]);
+    let mut out = vec![((0_usize, zero_digest), zero_digest); genomes.len()];
+    let compute_chunk = |slice: &[&Genome], dst: &mut [DigestKey]| {
         let mut scratch = Vec::new();
-        out.reserve(slice.len());
-        for &genome in slice {
+        for (&genome, slot) in slice.iter().zip(dst.iter_mut()) {
             let params = (
                 genome.topology().index(),
                 parameter_digest_into(genome, &mut scratch),
             );
             let traits = trait_digest_into(genome, &mut scratch);
-            out.push((params, traits));
+            *slot = (params, traits);
         }
     };
     if workers <= 1 || genomes.len() < 128 {
-        let mut out = Vec::with_capacity(genomes.len());
         compute_chunk(genomes, &mut out);
         return out;
     }
@@ -323,25 +322,20 @@ fn compute_digests(genomes: &[&Genome], workers: usize) -> Vec<DigestKey> {
         .min(genomes.len().div_ceil(64))
         .max(1);
     let tile_len = genomes.len().div_ceil(tile_count);
-    let mut tiles: Vec<(&[&Genome], Vec<DigestKey>)> = genomes
+    let mut tiles: Vec<(&[&Genome], &mut [DigestKey])> = genomes
         .chunks(tile_len)
-        .map(|chunk| (chunk, Vec::new()))
+        .zip(out.chunks_mut(tile_len))
         .collect();
-    if pool::parallel_tasks(workers, "survey digests", &mut tiles, |_, (chunk, out)| {
-        compute_chunk(chunk, out);
+    if pool::parallel_tasks(workers, "survey digests", &mut tiles, |_, (chunk, dst)| {
+        compute_chunk(chunk, dst);
     })
     .is_err()
     {
-        for (chunk, out) in &mut tiles {
-            out.clear();
-            compute_chunk(chunk, out);
+        for (chunk, dst) in &mut tiles {
+            compute_chunk(chunk, dst);
         }
     }
-    let mut merged = Vec::with_capacity(genomes.len());
-    for (_, mut out) in tiles {
-        merged.append(&mut out);
-    }
-    merged
+    out
 }
 
 #[derive(Default)]
@@ -445,11 +439,18 @@ fn heredity(rows: &[SurveyRow<'_>], limits: &TraitLimits, workers: usize) -> Her
         });
     }
 
-    let outcomes: Vec<HeredityOutcome> = if workers <= 1 || tasks.len() < 64 {
-        tasks
-            .iter()
-            .map(|task| evaluate_heredity_task(task, limits))
-            .collect()
+    let mut outcomes = vec![
+        HeredityOutcome::FounderPair {
+            compared: 0,
+            identical: 0,
+            distance: 0.0,
+        };
+        tasks.len()
+    ];
+    if workers <= 1 || tasks.len() < 64 {
+        for (task, dst) in tasks.iter().zip(outcomes.iter_mut()) {
+            *dst = evaluate_heredity_task(task, limits);
+        }
     } else {
         let tile_count = workers
             .saturating_mul(4)
@@ -457,32 +458,24 @@ fn heredity(rows: &[SurveyRow<'_>], limits: &TraitLimits, workers: usize) -> Her
             .min(tasks.len().div_ceil(32))
             .max(1);
         let tile_len = tasks.len().div_ceil(tile_count);
-        let mut tiles: Vec<(&[HeredityTask<'_>], Vec<HeredityOutcome>)> = tasks
+        let mut tiles: Vec<(&[HeredityTask<'_>], &mut [HeredityOutcome])> = tasks
             .chunks(tile_len)
-            .map(|chunk| (chunk, Vec::new()))
+            .zip(outcomes.chunks_mut(tile_len))
             .collect();
-        if pool::parallel_tasks(workers, "survey heredity", &mut tiles, |_, (chunk, out)| {
-            out.reserve(chunk.len());
-            for task in *chunk {
-                out.push(evaluate_heredity_task(task, limits));
+        if pool::parallel_tasks(workers, "survey heredity", &mut tiles, |_, (chunk, dst)| {
+            for (task, slot) in chunk.iter().zip(dst.iter_mut()) {
+                *slot = evaluate_heredity_task(task, limits);
             }
         })
         .is_err()
         {
-            for (chunk, out) in &mut tiles {
-                out.clear();
-                out.reserve(chunk.len());
-                for task in *chunk {
-                    out.push(evaluate_heredity_task(task, limits));
+            for (chunk, dst) in &mut tiles {
+                for (task, slot) in chunk.iter().zip(dst.iter_mut()) {
+                    *slot = evaluate_heredity_task(task, limits);
                 }
             }
         }
-        let mut merged = Vec::with_capacity(tasks.len());
-        for (_, mut out) in tiles {
-            merged.append(&mut out);
-        }
-        merged
-    };
+    }
 
     // Fold every counter and floating-point mean in exact ascending identity
     // order so output bits never depend on `workers`.
@@ -695,124 +688,132 @@ mod tests {
 
     #[test]
     fn parallel_survey_matches_serial_bit_for_bit() {
-        let mut toml = STARTER.to_owned();
-        for (from, to) in [
-            ("width = 128.0\n", "width = 64.0\n"),
-            ("height = 128.0\n", "height = 64.0\n"),
-            ("grid_width = 128\n", "grid_width = 64\n"),
-            ("grid_height = 128\n", "grid_height = 64\n"),
-            ("initial_count = 4096\n", "initial_count = 256\n"),
-            ("maximum_count = 16384\n", "maximum_count = 2048\n"),
-            ("initial_energy = 2.0\n", "initial_energy = 4.0\n"),
-            (
-                "maximum_attempt_rate_per_second = 1.0\n",
-                "maximum_attempt_rate_per_second = 40.0\n",
-            ),
-            (
-                "minimum_parent_energy_before_attempt = 3.0\n",
-                "minimum_parent_energy_before_attempt = 1.2\n",
-            ),
-            ("cooldown_seconds = 0.5\n", "cooldown_seconds = 0.02\n"),
-        ] {
-            toml = toml.replace(from, to);
-        }
-        let validated = ValidatedConfig::from_toml(&toml).expect("valid config");
-        let mut world = World::found(
-            &validated,
-            Arrangement::Compact,
-            NumericalProfile::reference_f32().expect("profile"),
-        )
-        .expect("founded world");
-        for _ in 0..32 {
-            let stepped = world.step().expect("step");
-            assert!(matches!(stepped, Stepped::Published(_)));
-        }
-        let serial = Survey::of_with_workers(&world, 1);
-        assert!(
-            serial.heredity.founder_pairs > 0
-                && serial.heredity.pairs > 0
-                && serial.heredity.triples > 0,
-            "test world must exercise founder pairs, parent-child pairs, and grandparent triples: {:?}",
-            serial.heredity
-        );
-        for workers in [2_usize, 4, 8] {
-            let parallel = Survey::of_with_workers(&world, workers);
-            assert_eq!(parallel.tick, serial.tick);
-            assert_eq!(parallel.live, serial.live);
-            assert_eq!(parallel.founders_alive, serial.founders_alive);
-            assert_eq!(parallel.descendants_alive, serial.descendants_alive);
-            assert_eq!(parallel.max_generation, serial.max_generation);
-            assert_eq!(parallel.generations, serial.generations);
-            assert_eq!(parallel.lineages_alive, serial.lineages_alive);
-            assert_eq!(parallel.identities_issued, serial.identities_issued);
-            assert_eq!(parallel.distinct_genomes, serial.distinct_genomes);
-            assert_eq!(
-                parallel.distinct_parameter_sets,
-                serial.distinct_parameter_sets
+        for dtype in ["f32", "f16"] {
+            let mut toml = STARTER.to_owned();
+            for (from, to) in [
+                ("width = 128.0\n", "width = 64.0\n"),
+                ("height = 128.0\n", "height = 64.0\n"),
+                ("grid_width = 128\n", "grid_width = 64\n"),
+                ("grid_height = 128\n", "grid_height = 64\n"),
+                ("initial_count = 4096\n", "initial_count = 256\n"),
+                ("maximum_count = 16384\n", "maximum_count = 2048\n"),
+                ("initial_energy = 2.0\n", "initial_energy = 4.0\n"),
+                (
+                    "maximum_attempt_rate_per_second = 1.0\n",
+                    "maximum_attempt_rate_per_second = 40.0\n",
+                ),
+                (
+                    "minimum_parent_energy_before_attempt = 3.0\n",
+                    "minimum_parent_energy_before_attempt = 1.2\n",
+                ),
+                ("cooldown_seconds = 0.5\n", "cooldown_seconds = 0.02\n"),
+            ] {
+                toml = toml.replace(from, to);
+            }
+            if dtype == "f16" {
+                toml = toml.replace(
+                    "canonical_weight_dtype = \"f32\"",
+                    "canonical_weight_dtype = \"f16\"",
+                );
+            }
+            let validated = ValidatedConfig::from_toml(&toml).expect("valid config");
+            let mut world = World::found(
+                &validated,
+                Arrangement::Compact,
+                NumericalProfile::reference_f32().expect("profile"),
+            )
+            .expect("founded world");
+            for _ in 0..32 {
+                let stepped = world.step().expect("step");
+                assert!(matches!(stepped, Stepped::Published(_)));
+            }
+            let serial = Survey::of_with_workers(&world, 1);
+            assert!(
+                serial.heredity.founder_pairs > 0
+                    && serial.heredity.pairs > 0
+                    && serial.heredity.triples > 0,
+                "{dtype} test world must exercise founder pairs, parent-child pairs, and grandparent triples: {:?}",
+                serial.heredity
             );
-            assert_eq!(
-                parallel.distinct_trait_vectors,
-                serial.distinct_trait_vectors
-            );
-            assert_eq!(parallel.topologies, serial.topologies);
-            assert_eq!(parallel.heredity.pairs, serial.heredity.pairs);
-            assert_eq!(
-                parallel.heredity.pairs_across_topologies,
-                serial.heredity.pairs_across_topologies
-            );
-            assert_eq!(
-                parallel.heredity.pair_parameters,
-                serial.heredity.pair_parameters
-            );
-            assert_eq!(
-                parallel.heredity.pair_parameters_identical,
-                serial.heredity.pair_parameters_identical
-            );
-            assert_eq!(
-                parallel.heredity.pairs_differing,
-                serial.heredity.pairs_differing
-            );
-            assert_eq!(
-                parallel.heredity.most_parameter_differences,
-                serial.heredity.most_parameter_differences
-            );
-            assert_eq!(
-                opt_f64_bits(parallel.heredity.pair_trait_distance),
-                opt_f64_bits(serial.heredity.pair_trait_distance)
-            );
-            assert_eq!(
-                parallel.heredity.founder_pairs,
-                serial.heredity.founder_pairs
-            );
-            assert_eq!(
-                parallel.heredity.founder_parameters,
-                serial.heredity.founder_parameters
-            );
-            assert_eq!(
-                parallel.heredity.founder_parameters_identical,
-                serial.heredity.founder_parameters_identical
-            );
-            assert_eq!(
-                opt_f64_bits(parallel.heredity.founder_trait_distance),
-                opt_f64_bits(serial.heredity.founder_trait_distance)
-            );
-            assert_eq!(parallel.heredity.triples, serial.heredity.triples);
-            assert_eq!(
-                parallel.heredity.parental_parameter_variants,
-                serial.heredity.parental_parameter_variants
-            );
-            assert_eq!(
-                parallel.heredity.carried_parameter_variants,
-                serial.heredity.carried_parameter_variants
-            );
-            assert_eq!(
-                opt_f64_bits(parallel.heredity.triple_trait_distance_to_parent),
-                opt_f64_bits(serial.heredity.triple_trait_distance_to_parent)
-            );
-            assert_eq!(
-                opt_f64_bits(parallel.heredity.triple_trait_distance_to_grandparent),
-                opt_f64_bits(serial.heredity.triple_trait_distance_to_grandparent)
-            );
+            for workers in [2_usize, 4, 8] {
+                let parallel = Survey::of_with_workers(&world, workers);
+                assert_eq!(parallel.tick, serial.tick);
+                assert_eq!(parallel.live, serial.live);
+                assert_eq!(parallel.founders_alive, serial.founders_alive);
+                assert_eq!(parallel.descendants_alive, serial.descendants_alive);
+                assert_eq!(parallel.max_generation, serial.max_generation);
+                assert_eq!(parallel.generations, serial.generations);
+                assert_eq!(parallel.lineages_alive, serial.lineages_alive);
+                assert_eq!(parallel.identities_issued, serial.identities_issued);
+                assert_eq!(parallel.distinct_genomes, serial.distinct_genomes);
+                assert_eq!(
+                    parallel.distinct_parameter_sets,
+                    serial.distinct_parameter_sets
+                );
+                assert_eq!(
+                    parallel.distinct_trait_vectors,
+                    serial.distinct_trait_vectors
+                );
+                assert_eq!(parallel.topologies, serial.topologies);
+                assert_eq!(parallel.heredity.pairs, serial.heredity.pairs);
+                assert_eq!(
+                    parallel.heredity.pairs_across_topologies,
+                    serial.heredity.pairs_across_topologies
+                );
+                assert_eq!(
+                    parallel.heredity.pair_parameters,
+                    serial.heredity.pair_parameters
+                );
+                assert_eq!(
+                    parallel.heredity.pair_parameters_identical,
+                    serial.heredity.pair_parameters_identical
+                );
+                assert_eq!(
+                    parallel.heredity.pairs_differing,
+                    serial.heredity.pairs_differing
+                );
+                assert_eq!(
+                    parallel.heredity.most_parameter_differences,
+                    serial.heredity.most_parameter_differences
+                );
+                assert_eq!(
+                    opt_f64_bits(parallel.heredity.pair_trait_distance),
+                    opt_f64_bits(serial.heredity.pair_trait_distance)
+                );
+                assert_eq!(
+                    parallel.heredity.founder_pairs,
+                    serial.heredity.founder_pairs
+                );
+                assert_eq!(
+                    parallel.heredity.founder_parameters,
+                    serial.heredity.founder_parameters
+                );
+                assert_eq!(
+                    parallel.heredity.founder_parameters_identical,
+                    serial.heredity.founder_parameters_identical
+                );
+                assert_eq!(
+                    opt_f64_bits(parallel.heredity.founder_trait_distance),
+                    opt_f64_bits(serial.heredity.founder_trait_distance)
+                );
+                assert_eq!(parallel.heredity.triples, serial.heredity.triples);
+                assert_eq!(
+                    parallel.heredity.parental_parameter_variants,
+                    serial.heredity.parental_parameter_variants
+                );
+                assert_eq!(
+                    parallel.heredity.carried_parameter_variants,
+                    serial.heredity.carried_parameter_variants
+                );
+                assert_eq!(
+                    opt_f64_bits(parallel.heredity.triple_trait_distance_to_parent),
+                    opt_f64_bits(serial.heredity.triple_trait_distance_to_parent)
+                );
+                assert_eq!(
+                    opt_f64_bits(parallel.heredity.triple_trait_distance_to_grandparent),
+                    opt_f64_bits(serial.heredity.triple_trait_distance_to_grandparent)
+                );
+            }
         }
     }
 }

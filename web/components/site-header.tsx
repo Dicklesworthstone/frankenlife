@@ -103,9 +103,9 @@ export function SiteHeader() {
               />
               <span className="text-[15px] font-extrabold tracking-tight text-white">{siteConfig.name}</span>
             </a>
-            {/* From 1,024 px: the six chapters need about 960 px beside the name and GitHub, and below that they
-                ran under both (measured in Chrome), so narrower screens, tablets and phones held sideways included,
-                get the dock. */}
+            {/* From 1,024 px: the six chapters fit beside the name and GitHub only on a screen about 1,000 px wide
+                (measured in Chrome: from 768 to 960 px they ran under both; at 1,024, 14 px to spare each side),
+                so narrower screens, tablets and phones held sideways included, get the dock. */}
             <nav aria-label="Chapters" className="hidden min-w-0 flex-1 justify-center lg:flex">
               <ul className="flex items-center gap-0.5 lg:gap-1">
                 {chapters.map((chapter, index) => {

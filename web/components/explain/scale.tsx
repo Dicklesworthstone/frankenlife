@@ -181,13 +181,15 @@ export function ScaleCalculator() {
                 width: percent(position(MEASURED_PLAIN_READ[1]) - position(MEASURED_PLAIN_READ[0])),
               }}
             />
-            {AXIS_TICKS.map((tick) => (
+            {/* Phones label every other decade (each still has its tick): at 320 px "1 TB/s" ran into "10 TB/s". */}
+            {AXIS_TICKS.map((tick, index) => (
               <div key={tick.at} className="absolute top-full" style={{ left: percent(position(tick.at)) }}>
                 <div className="h-1.5 w-px bg-white/25" />
                 <span
                   className={cn(
                     "absolute top-2 font-mono text-[10px] whitespace-nowrap text-slate-500",
                     tick.at === AXIS_MAX ? "-translate-x-full" : "-translate-x-1/2",
+                    index % 2 === 1 && "max-sm:hidden",
                   )}
                 >
                   {tick.label}

@@ -919,13 +919,15 @@ export function ZoomLadder({ index }: { index?: string }) {
 
             {/* The steps and the stop's words. */}
             <div className="min-w-0 space-y-5 lg:col-start-2 lg:row-start-2 lg:self-start">
+              {/* Below 400 px the arrows go (each step is a button of its own): beside them the five names do not
+                  fit (measured: at 320, "Organism" ran into "Network"; at 390 it lacked 1 px). */}
               <nav aria-label="Zoom steps" className="flex items-center gap-2">
                 <button
                   type="button"
                   onClick={() => goTo(stop - 1)}
                   aria-disabled={stop === 0}
                   aria-label="Zoom out a step"
-                  className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-white/15 text-white transition-[border-color,color,opacity] hover:border-green-400/60 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none aria-disabled:pointer-events-none aria-disabled:opacity-30 [@media(min-width:1024px)_and_(pointer:fine)_and_(prefers-reduced-motion:no-preference)]:hidden"
+                  className="flex h-11 w-11 shrink-0 max-[400px]:hidden items-center justify-center rounded-xl border border-white/15 text-white transition-[border-color,color,opacity] hover:border-green-400/60 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none aria-disabled:pointer-events-none aria-disabled:opacity-30 [@media(min-width:1024px)_and_(pointer:fine)_and_(prefers-reduced-motion:no-preference)]:hidden"
                 >
                   <ChevronLeft className="h-4 w-4" aria-hidden="true" />
                 </button>
@@ -945,7 +947,7 @@ export function ZoomLadder({ index }: { index?: string }) {
                           <span className={cn("font-mono", index === stop ? "text-green-300" : "text-slate-500")}>
                             {String(index + 1).padStart(2, "0")}
                           </span>
-                          <span className="truncate">{entry.rail}</span>
+                          <span className="max-w-full truncate">{entry.rail}</span>
                         </button>
                       </li>
                     ))}
@@ -963,7 +965,7 @@ export function ZoomLadder({ index }: { index?: string }) {
                   onClick={() => goTo(stop + 1)}
                   aria-disabled={stop === LAST}
                   aria-label="Zoom in a step"
-                  className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-white/15 text-white transition-[border-color,color,opacity] hover:border-green-400/60 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none aria-disabled:pointer-events-none aria-disabled:opacity-30 [@media(min-width:1024px)_and_(pointer:fine)_and_(prefers-reduced-motion:no-preference)]:hidden"
+                  className="flex h-11 w-11 shrink-0 max-[400px]:hidden items-center justify-center rounded-xl border border-white/15 text-white transition-[border-color,color,opacity] hover:border-green-400/60 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none aria-disabled:pointer-events-none aria-disabled:opacity-30 [@media(min-width:1024px)_and_(pointer:fine)_and_(prefers-reduced-motion:no-preference)]:hidden"
                 >
                   <ChevronRight className="h-4 w-4" aria-hidden="true" />
                 </button>

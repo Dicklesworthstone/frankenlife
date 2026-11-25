@@ -188,8 +188,10 @@ function SenescenceChart() {
       yTicks={[1, 16, 32, 48, 64].map((at) => ({ at, label: String(at) }))}
     >
       <path d={line(sample(0, 300, 150, (a) => senescenceMultiplier(a)), s)} stroke={TONE.energy} strokeWidth="1.8" fill="none" />
-      <Dot x={30} y={2} s={s} colour={TONE.energy} label="2× at 30 s" />
-      <Dot x={60} y={5} s={s} colour={TONE.energy} label="5× at 60 s" />
+      {/* 21 units apart: room above and left of each point, clear of the curve, for "2×" and "5×" alone (the
+          caption gives their ages); "2× at 30 s" and "5× at 60 s" ran into each other at every width. */}
+      <Dot x={30} y={2} s={s} colour={TONE.energy} label="2×" anchor="end" />
+      <Dot x={60} y={5} s={s} colour={TONE.energy} label="5×" anchor="end" />
       <Dot x={cap} y={64} s={s} colour={TONE.energy} label={`cap at ${cap.toFixed(0)} s`} anchor="end" />
     </Frame>
   );
@@ -207,12 +209,14 @@ function SurplusChart() {
       yTicks={[0, 0.5, 1, 1.5].map((at) => ({ at, label: String(at) }))}
     >
       <rect x={s.x(0)} y={PAD.top} width={s.x(SURPLUS_FLOOR) - s.x(0)} height={IH} fill={TONE.wrong} opacity="0.08" />
-      <path d={line(sample(0, 2, 80, (e) => e), s)} stroke="#64748b" strokeDasharray="3 3" strokeWidth="1" fill="none" />
+      {/* The floorless line stops at the top of the plot (1.6), not at E = 2 above the frame. */}
+      <path d={line(sample(0, 1.6, 64, (e) => e), s)} stroke="#64748b" strokeDasharray="3 3" strokeWidth="1" fill="none" />
       <path d={line(sample(0, 2, 80, (e) => emissionSurplus(e)), s)} stroke={TONE.rule} strokeWidth="1.8" fill="none" />
       <text x={s.x(0.04)} y={s.y(1.42)} fontSize="7" fill="#fda4af" fontFamily="var(--font-mono, ui-monospace)">
         protected
       </text>
-      <text x={s.x(1.95)} y={s.y(1.55) + 10} fontSize="7" fill="#64748b" textAnchor="end" fontFamily="var(--font-mono, ui-monospace)">
+      {/* Left of and above its own line, past the protected band: at the top right, both lines ran through it. */}
+      <text x={s.x(1.2)} y={s.y(1.36)} fontSize="7" fill="#64748b" textAnchor="end" fontFamily="var(--font-mono, ui-monospace)">
         without the floor
       </text>
     </Frame>
@@ -573,10 +577,17 @@ function Presence({ entry }: { entry: AtlasEntry }) {
 }
 
 /** The rule as numbers: its chart, its formula, the presets' values and where the energy goes. */
-function RulePanel({ entry }: { entry: AtlasEntry }) {
+function RulePanel({ entry, toggle }: { entry: AtlasEntry; toggle: boolean }) {
   return (
     <div className="flex flex-col gap-4 p-5 sm:p-7">
-      <span className="self-start rounded-full border border-cyan-300/25 bg-cyan-300/[0.06] px-2.5 py-1 font-mono text-[10px] font-bold tracking-[0.12em] text-cyan-100 uppercase">
+      {/* On phones, below the world/rule toggle (absolute, top right): beside it, at 390 px, the two ran into
+          each other. */}
+      <span
+        className={cn(
+          "self-start rounded-full border border-cyan-300/25 bg-cyan-300/[0.06] px-2.5 py-1 font-mono text-[10px] font-bold tracking-[0.12em] text-cyan-100 uppercase",
+          toggle && "max-sm:mt-10",
+        )}
+      >
         The rule, computed here
       </span>
       {entry.chart ? (
@@ -650,7 +661,7 @@ function Stage({ entry, view, setView }: { entry: AtlasEntry; view: "world" | "r
           </figcaption>
         </>
       ) : (
-        <RulePanel entry={entry} />
+        <RulePanel entry={entry} toggle={still !== null} />
       )}
     </figure>
   );

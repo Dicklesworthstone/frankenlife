@@ -227,11 +227,15 @@ export function BranchDiagram() {
               </div>
             ))}
             <div />
+            {/* Phones label every other tick: at 320 px the five labels shared 116 px and ran together. */}
             <div className="relative h-4" aria-hidden="true">
-              {AXIS.map((tick) => (
+              {AXIS.map((tick, index) => (
                 <span
                   key={tick}
-                  className="absolute top-0 -translate-x-1/2 font-mono text-[10px] text-slate-500 tabular-nums first:translate-x-0 last:-translate-x-full"
+                  className={cn(
+                    "absolute top-0 -translate-x-1/2 font-mono text-[10px] text-slate-500 tabular-nums first:translate-x-0 last:-translate-x-full",
+                    index % 2 === 1 && "max-sm:hidden",
+                  )}
                   style={{ left: at(tick) }}
                 >
                   {grouped(tick)}

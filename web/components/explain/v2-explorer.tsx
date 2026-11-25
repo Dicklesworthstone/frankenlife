@@ -244,17 +244,24 @@ export function V2Explorer() {
                               )}
                             />
                           </span>
+                          {/* The note on its own line: beside the name, in a three-column grid from 768 px, it left
+                              the name one word a line and "neighbours'" ran into it. */}
                           <span className="min-w-0 flex-1">
-                            <span className={cn("block text-[13px] leading-snug font-semibold", active ? "text-white" : "text-slate-400")}>
+                            <span
+                              className={cn(
+                                "block text-[13px] leading-snug font-semibold [overflow-wrap:anywhere]",
+                                active ? "text-white" : "text-slate-400",
+                              )}
+                            >
                               {atlasEntry(feature.slug).name}
                             </span>
                             <code className="block font-mono text-[10.5px] text-slate-500">{feature.slug}</code>
+                            {!feature.abiNote.startsWith("none") ? (
+                              <span className={cn("mt-0.5 block font-mono text-[10px] leading-tight", active ? "text-cyan-200" : "text-slate-600")}>
+                                {feature.abiNote}
+                              </span>
+                            ) : null}
                           </span>
-                          {!feature.abiNote.startsWith("none") ? (
-                            <span className={cn("max-w-[7.5rem] shrink-0 text-right font-mono text-[10px] leading-tight", active ? "text-cyan-200" : "text-slate-600")}>
-                              {feature.abiNote}
-                            </span>
-                          ) : null}
                         </button>
                       </li>
                     );

@@ -676,6 +676,9 @@ pub fn apical_ticks_mesh(
             indices.extend(quad_idx.map(|i| base + i));
         }
     }
+    if vertices.is_empty() {
+        return Ok(None);
+    }
     SurfaceMesh::new(vertices, indices)
         .map(Some)
         .map_err(|error| CoreError::NumericalInvalid {

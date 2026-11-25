@@ -326,6 +326,22 @@ fn apical_tick_geometry_winding_and_cpu_pixel_render() {
         .expect("all unpolarized")
         .is_none()
     );
+    // Polarized entries whose tick quads overflow f32 scene coordinates (e.g.
+    // `end = dot_radius * 1.45` is finite in f32, while a diagonal corner
+    // `dx * end + |lx| * half_w` exceeds `f32::MAX`) are skipped cleanly,
+    // returning Ok(None) rather than an empty-mesh error.
+    let near_max_radius = f64::from(f32::MAX) / 1.45 * 0.999;
+    assert!(
+        apical_ticks_mesh(
+            &viewport,
+            &[[16.0, 16.0]],
+            &[1000_i16],
+            near_max_radius,
+            APICAL_TICK_COLOR,
+        )
+        .expect("overflowing tick quad returns Ok(None)")
+        .is_none()
+    );
 
     // Real FrankenManim CPU ThreeDJob render test: a sphere-mode organism at
     // world center [16, 16] with northward polarity (world -y => drawable up).

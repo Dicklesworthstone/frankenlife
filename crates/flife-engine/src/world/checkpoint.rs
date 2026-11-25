@@ -685,8 +685,18 @@ impl World {
                         quantity: "grid cells",
                     })?;
                 field.enable_vascular(vascular.initial_conductance(), &limits)?;
-                let mut gx = Vec::with_capacity(cells);
-                let mut gy = Vec::with_capacity(cells);
+                let mut gx = Vec::new();
+                gx.try_reserve_exact(cells)
+                    .map_err(|_| CoreError::AllocationFailed {
+                        buffer: "checkpoint vascular edges",
+                        bytes: flife_core::memory::bytes_for::<f32>(cells),
+                    })?;
+                let mut gy = Vec::new();
+                gy.try_reserve_exact(cells)
+                    .map_err(|_| CoreError::AllocationFailed {
+                        buffer: "checkpoint vascular edges",
+                        bytes: flife_core::memory::bytes_for::<f32>(cells),
+                    })?;
                 for _ in 0..cells {
                     gx.push(input.f32()?);
                 }

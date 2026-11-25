@@ -1396,3 +1396,134 @@ fn g10_cinema_60fps_square_4k_and_live_v2_overlay_cycling() {
         "LiveCapture frame 0 must bin density at the target Cinema resolution, matching SimulationTime"
     );
 }
+
+/// Regression: in `SimulationTime` Cinema export, `TimelineRecord::Select` for
+/// an organism born/introduced since the previous sample tick must be applied
+/// *after* `view.show(epoch)` for `sample.tick` (not against the stale prior
+/// sample's epoch, which would fail identity lookup and silently drop the
+/// selection ring).
+#[test]
+fn simulation_time_export_preserves_selection_of_newly_introduced_organism() {
+    use std::collections::BTreeSet;
+
+    use flife_engine::{Intervention, Stepped};
+    use flife_studio::{AppliedCommand, TimelineIntervention};
+
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    let toml = preset_with(
+        &[
+            ("width", "16.0"),
+            ("height", "16.0"),
+            ("grid_width", "16"),
+            ("grid_height", "16"),
+            ("initial_count", "4"),
+            ("maximum_count", "32"),
+            ("maximum_total_bytes", "4294967296"),
+        ],
+        "field-ecology-v1",
+        false,
+    );
+    let config = ValidatedConfig::from_toml(&toml).expect("valid config");
+    let mut world = found(&config);
+    let before: BTreeSet<_> = world.population().ids().collect();
+    let intervention = Intervention::IntroduceOrganisms {
+        cell: [8, 8],
+        count: 1,
+        energy: 2.0,
+    };
+    let Stepped::Published(_) = world.step_with(&[intervention]).expect("step tick 0 -> 1") else {
+        panic!("expected tick 1 to publish");
+    };
+    let newborn = world
+        .population()
+        .ids()
+        .find(|id| !before.contains(id))
+        .expect("introduced organism exists at tick 1");
+    let applied = vec![AppliedCommand {
+        command: 1,
+        tick: 0,
+        published: 1,
+        energy: Exact(2.0),
+        intervention: TimelineIntervention::from(&intervention),
+    }];
+    let digest = world.digest().to_hex();
+    let base_records = |select: Option<u64>| {
+        let mut records = vec![
+            TimelineRecord::header(&config, [160, 160], Style::default()),
+            TimelineRecord::Show {
+                prior: None,
+                current: 0,
+                fraction: Exact(1.0),
+            },
+            TimelineRecord::Draw {
+                frame: 0,
+                tick: 0,
+                wall_seconds: Exact(0.0),
+            },
+            TimelineRecord::Show {
+                prior: Some(0),
+                current: 1,
+                fraction: Exact(1.0),
+            },
+        ];
+        if let Some(organism) = select {
+            records.push(TimelineRecord::Select {
+                organism: Some(organism),
+            });
+        }
+        records.push(TimelineRecord::Draw {
+            frame: 1,
+            tick: 1,
+            wall_seconds: Exact(0.05),
+        });
+        records.push(TimelineRecord::End {
+            tick: 1,
+            digest: digest.clone(),
+            applied: applied.clone(),
+        });
+        timeline_text(&records)
+    };
+    let with_select_text = base_records(Some(newborn.get()));
+    let without_select_text = base_records(None);
+
+    let sim_opts = CinemaOptions {
+        frames_per_second: NonZeroU32::new(30).expect("fps"),
+        cpu_workers: NonZeroUsize::new(2),
+        mp4: false,
+        mode: ExportMode::SimulationTime {
+            every_ticks: NonZeroU64::new(1).expect("every 1"),
+        },
+        resolution: Some([160, 160]),
+        pixels_per_point: Some(1.0),
+        camera: None,
+    };
+    let live_opts = CinemaOptions {
+        mode: ExportMode::LiveCapture,
+        ..sim_opts.clone()
+    };
+
+    let out_sim_with = fresh("sim-select-with");
+    let out_sim_without = fresh("sim-select-without");
+    let out_live_with = fresh("live-select-with");
+    let sim_with =
+        export_cinema(&config, &with_select_text, &sim_opts, &out_sim_with).expect("sim with");
+    let sim_without = export_cinema(&config, &without_select_text, &sim_opts, &out_sim_without)
+        .expect("sim without");
+    let live_with =
+        export_cinema(&config, &with_select_text, &live_opts, &out_live_with).expect("live with");
+
+    assert_eq!(sim_with.frames.len(), 2);
+    assert_eq!(sim_without.frames.len(), 2);
+    assert_eq!(live_with.frames.len(), 2);
+    assert_ne!(
+        sim_with.frames[1].sha256, sim_without.frames[1].sha256,
+        "SimulationTime frame 1 must draw the selection ring around the newly introduced organism"
+    );
+    assert_eq!(
+        sim_with.frames[1].sha256, live_with.frames[1].sha256,
+        "SimulationTime frame 1 with newborn selection must match LiveCapture bit-for-bit"
+    );
+}

@@ -1282,6 +1282,7 @@ pub(crate) fn replay_with<S>(
         let mut pending_drawable = validated.size;
         let mut pending_scale = 1.0_f64;
         let mut geometry_dirty = false;
+        let mut pending_select: Option<Option<OrganismId>> = None;
         let mut current_epoch = Some(opening);
         for sample in samples {
             // Apply all presentation updates recorded at or before sample.tick.
@@ -1319,7 +1320,7 @@ pub(crate) fn replay_with<S>(
                         view.set_view(viewport)?;
                     }
                     TimelineRecord::Select { organism } => {
-                        view.select(organism.map(OrganismId::new))?;
+                        pending_select = Some(organism.map(OrganismId::new));
                     }
                     TimelineRecord::Region { region } => {
                         view.set_region(region.map(Region::try_from).transpose()?)?;
@@ -1352,6 +1353,9 @@ pub(crate) fn replay_with<S>(
                 view.set_view(viewport)?;
             }
             view.show(epoch)?;
+            if let Some(selected) = pending_select.take() {
+                view.select(selected)?;
+            }
             let job = view.job()?;
             let (pixels, _) = renderer
                 .render_three_d_rgba8(&job)

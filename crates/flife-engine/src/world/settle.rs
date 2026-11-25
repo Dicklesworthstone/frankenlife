@@ -1133,6 +1133,7 @@ impl crate::reproduction::FirstCandidateWave for WaveMutator<'_> {
             };
             let start = values.weights().len();
             let Ok(member) = self.mutator.unmutated(request.genome, attempt, values) else {
+                truncate(values, start);
                 continue;
             };
             let end = values.weights().len();

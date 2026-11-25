@@ -243,8 +243,8 @@ struct Cli {
     /// Disable all 21 `field-ecology-v2` features (equivalent to
     /// `--disable all-v2`), applied in exact command-line order.
     /// Founding-only: refused with `--resume` (`INV-14`) and on v1 models.
-    #[arg(long, conflicts_with = "resume")]
-    v1_compat: bool,
+    #[arg(long, action = clap::ArgAction::Count, conflicts_with = "resume")]
+    v1_compat: u8,
     /// Print all 21 `field-ecology-v2` feature slugs, default profile
     /// memberships, `INV-08` status, and ABI impact, then exit.
     #[arg(
@@ -279,7 +279,11 @@ fn extract_feature_overrides(cli: &Cli, matches: &ArgMatches) -> Vec<FeatureOver
             ordered.push((index, FeatureOverride::Enable(value.clone())));
         }
     }
-    if cli.v1_compat
+    // Clap's `ArgAction::Count` records the index of the final `--v1-compat`
+    // occurrence, which is exact because `V1Compat` is a total reset: every
+    // earlier `--enable`/`--disable` still stays in `ordered` for validation.
+    if cli.v1_compat > 0
+        && matches.value_source("v1_compat") == Some(clap::parser::ValueSource::CommandLine)
         && let Some(indices) = matches.indices_of("v1_compat")
     {
         for index in indices {
@@ -735,7 +739,6 @@ enum Record<'a> {
         /// The newest checkpoint's tick (`--run`).
         checkpoint_tick: Option<u64>,
     },
-    /// `--export`'s summary (FL-023); the manifest in `out` has the rest.
     /// One `field-ecology-v2` feature entry printed by `--list-features`.
     Feature {
         schema: &'static str,
@@ -747,6 +750,7 @@ enum Record<'a> {
         inv08_status: &'static str,
         abi_impact: &'static str,
     },
+    /// `--export`'s summary (FL-023); the manifest in `out` has the rest.
     Export {
         schema: &'static str,
         mode: &'a str,
@@ -3019,6 +3023,28 @@ mod tests {
                 FeatureOverride::V1Compat,
             ]
         );
+        // Repeated `--v1-compat` is accepted (matching `flife-cli`) and keeps
+        // the final reset position, preserving exact resolved semantics.
+        let (_, compat_repeated_last) =
+            parse_raw(&["v2.toml", "--v1-compat", "--enable", "oases", "--v1-compat"])
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            compat_repeated_last,
+            vec![
+                FeatureOverride::Enable("oases".to_owned()),
+                FeatureOverride::V1Compat,
+            ]
+        );
+        let (_, compat_repeated_first) =
+            parse_raw(&["v2.toml", "--v1-compat", "--v1-compat", "--enable", "oases"])
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            compat_repeated_first,
+            vec![
+                FeatureOverride::V1Compat,
+                FeatureOverride::Enable("oases".to_owned()),
+            ]
+        );
 
         // Export accepts founding toggles so exported timelines match config_hash.
         let (export_cli, export_overrides) = parse_raw(&[
@@ -3094,6 +3120,12 @@ mod tests {
         assert_eq!(all_off.v2_feature_bitmask(), 0);
         assert_eq!(all_off.v2_abi().action_width, 36);
         assert_ne!(only_so2.config_hash(), all_off.config_hash());
+        let repeated_off =
+            super::load_toml(&v2_toml, &compat_repeated_last).expect("repeated compat last");
+        assert_eq!(repeated_off.v2_feature_bitmask(), 0);
+        let repeated_oases =
+            super::load_toml(&v2_toml, &compat_repeated_first).expect("repeated compat first");
+        assert_eq!(repeated_oases.v2_feature_bitmask(), V2Feature::Oases.bit());
 
         // `V2-16` CLI `--color` and `--field-mapping` parse and gate cleanly
         // on `v2-visual-mappings`.

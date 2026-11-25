@@ -550,6 +550,47 @@ pub fn observe_for_controller_f32(
     Ok(gradients)
 }
 
+/// Compute only the unsaturated F64 motion gradients for an organism whose
+/// controller is not due this tick (skipping all 69 `tanh` controller-input
+/// saturations), while enforcing the exact same normalization and finiteness
+/// error checks as [`observe`].
+///
+/// # Errors
+/// As [`observe`].
+pub fn observe_gradients_only(
+    raw: &RawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+) -> Result<[[f64; 2]; PLANES], CoreError> {
+    let (values, gradients, energy_norm, age_norm) = normalize_single(raw, intrinsic, scales)?;
+    let l = scales.gradient_length;
+    for &[gx, gy] in &gradients {
+        let sx = l * gx;
+        let sy = l * gy;
+        if !sx.is_finite() || !sy.is_finite() {
+            let bad = if !sx.is_finite() { sx } else { sy };
+            return Err(CoreError::NumericalInvalid {
+                quantity: "sensor input",
+                detail: format!("tanh({bad}) is undefined"),
+            });
+        }
+    }
+    for arg in [
+        intrinsic.velocity[0] / scales.velocity,
+        intrinsic.velocity[1] / scales.velocity,
+        intrinsic.energy_change_per_second / scales.energy_change_per_second,
+    ] {
+        if !arg.is_finite() {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "sensor input",
+                detail: format!("tanh({arg}) is undefined"),
+            });
+        }
+    }
+    check_finite_single_parts(&values, energy_norm, age_norm, &gradients)?;
+    Ok(gradients)
+}
+
 #[inline]
 fn saturate_4(xs: [f64; 4]) -> Result<[f32; 4], CoreError> {
     tanh_f64_as_f32_4(xs).ok_or_else(|| CoreError::NumericalInvalid {
@@ -903,6 +944,62 @@ pub fn observe_dual_for_controller_f32(
         sat.de,
     ]);
     *out_trail_f32 = [dual.q1 as f32, sat.t1x, sat.t1y, dual.z1_norm as f32];
+    Ok(dual.gradients)
+}
+
+/// Compute only the unsaturated F64 motion gradients for a 34-plane
+/// dual-carrier organism whose controller is not due this tick (skipping all
+/// 71 `tanh` saturations), while enforcing the exact same normalization and
+/// finiteness error checks as [`observe_dual`].
+///
+/// # Errors
+/// As [`observe_dual`].
+pub fn observe_dual_gradients_only(
+    raw: &DualRawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    trail_energy_density_scale: f64,
+) -> Result<[[f64; 2]; PLANES], CoreError> {
+    let dual = normalize_dual(raw, intrinsic, scales, trail_energy_density_scale)?;
+    let l = scales.gradient_length;
+    for &[gx, gy] in &dual.gradients {
+        let sx = l * gx;
+        let sy = l * gy;
+        if !sx.is_finite() || !sy.is_finite() {
+            let bad = if !sx.is_finite() { sx } else { sy };
+            return Err(CoreError::NumericalInvalid {
+                quantity: "sensor input",
+                detail: format!("tanh({bad}) is undefined"),
+            });
+        }
+    }
+    for arg in [
+        intrinsic.velocity[0] / scales.velocity,
+        intrinsic.velocity[1] / scales.velocity,
+        intrinsic.energy_change_per_second / scales.energy_change_per_second,
+        l * dual.dq1_x,
+        l * dual.dq1_y,
+    ] {
+        if !arg.is_finite() {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "sensor input",
+                detail: format!("tanh({arg}) is undefined"),
+            });
+        }
+    }
+    for &value in
+        dual.values
+            .iter()
+            .chain(&[dual.energy_norm, dual.age_norm, dual.q1, dual.z1_norm])
+    {
+        if !value.is_finite() {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "sensor input",
+                detail: format!("{value} is not finite"),
+            });
+        }
+    }
+    check_finite_gradients(&dual.gradients)?;
     Ok(dual.gradients)
 }
 
@@ -1320,5 +1417,50 @@ mod batch_sensor_tests {
                 "dual direct f32 trail {i}"
             );
         }
+        let grad_only =
+            observe_dual_gradients_only(&raw, &intrinsic, &scales, 8.0).expect("dual grad only");
+        for (i, (&e, &g)) in exact.base.gradients.iter().zip(&grad_only).enumerate() {
+            assert_eq!(e[0].to_bits(), g[0].to_bits(), "dual grad-only x {i}");
+            assert_eq!(e[1].to_bits(), g[1].to_bits(), "dual grad-only y {i}");
+        }
+
+        // Error parity on nonfinite velocity and nonfinite gradient.
+        let mut bad_intr = intrinsic;
+        bad_intr.velocity[0] = f64::INFINITY;
+        assert!(observe_dual_gradients_only(&raw, &bad_intr, &scales, 8.0).is_err());
+        let mut bad_raw = raw;
+        bad_raw.dx[0] = f64::NAN;
+        assert!(observe_dual_gradients_only(&bad_raw, &intrinsic, &scales, 8.0).is_err());
+    }
+
+    #[test]
+    fn observe_gradients_only_matches_observe_and_errors_bit_for_bit() {
+        let scales = test_scales();
+        let intrinsic = test_intrinsic();
+        let mut raw = RawSample {
+            values: [0.0; PLANES],
+            dx: [0.0; PLANES],
+            dy: [0.0; PLANES],
+        };
+        raw.values[0] = 2.75;
+        raw.dx[0] = -1.25;
+        raw.dy[0] = 0.65;
+        for k in 1..PLANES {
+            raw.values[k] = (k as f64) * 0.03;
+            raw.dx[k] = -(k as f64) * 0.07;
+            raw.dy[k] = (k as f64) * 0.05;
+        }
+        let exact = observe(&raw, &intrinsic, &scales).expect("observe");
+        let grads = observe_gradients_only(&raw, &intrinsic, &scales).expect("grad only");
+        for (i, (&e, &g)) in exact.gradients.iter().zip(&grads).enumerate() {
+            assert_eq!(e[0].to_bits(), g[0].to_bits(), "grad-only x {i}");
+            assert_eq!(e[1].to_bits(), g[1].to_bits(), "grad-only y {i}");
+        }
+        let mut bad_intr = intrinsic;
+        bad_intr.energy_change_per_second = f64::NAN;
+        assert!(observe_gradients_only(&raw, &bad_intr, &scales).is_err());
+        let mut bad_raw = raw;
+        bad_raw.values[0] = -0.1;
+        assert!(observe_gradients_only(&bad_raw, &intrinsic, &scales).is_err());
     }
 }

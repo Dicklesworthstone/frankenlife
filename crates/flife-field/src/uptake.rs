@@ -1286,8 +1286,8 @@ pub fn apply_grants_on(
         }
     }
     let ratios: &[Share] = &grants.shares;
-    if !ratios.is_empty() {
-        let active_moments = field.carrier0_moments_count();
+    let active_moments = field.carrier0_moments_count();
+    if !ratios.is_empty() && active_moments > 0 {
         let used = workers.clamp(1, active_moments);
         let plane_len = cells.max(1);
         if used <= 1 {

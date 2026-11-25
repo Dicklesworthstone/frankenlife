@@ -13,9 +13,9 @@ use flife_field::sources::unit_direction;
 use flife_field::state::CHANNELS;
 use flife_field::transport::{MAX_SUBSTEPS, transport};
 use flife_field::{
-    BufferLimits, Cell, ConeTolerance, FieldGrid, FieldPair, FieldState, FieldWork, PathSegment,
-    Source, SourceKernel, SourceSupport, TransportPlan, TransportScratch, advance_field,
-    advance_field_on,
+    BufferLimits, Cell, ConeTolerance, ExchangeStencil, FieldGrid, FieldPair, FieldState,
+    FieldWork, PathSegment, SensorPyramid, SensorQuery, Source, SourceKernel, SourceSupport,
+    TransportPlan, TransportScratch, advance_field, advance_field_on,
 };
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -1283,4 +1283,221 @@ fn support_into_matches_scalar_weight_bit_for_bit_across_seams_and_wide_grids() 
             "unwrapped center {bad:?} refusal mismatch"
         );
     }
+}
+
+#[test]
+fn exchange_stencil_fast_path_matches_general_oracle_bit_for_bit() {
+    let oracle_stencil = |grid: &FieldGrid, pos: [f64; 2]| -> (Vec<usize>, Vec<u64>) {
+        let [x, y] = grid.wrap_position(pos).expect("finite pos");
+        let cx_f = x / grid.cell_width() - 0.5;
+        let cy_f = y / grid.cell_height() - 0.5;
+        let col = cx_f.floor() as i64;
+        let row = cy_f.floor() as i64;
+        let fx = cx_f - cx_f.floor();
+        let fy = cy_f - cy_f.floor();
+        let corners = [
+            (0, 0, (1.0 - fx) * (1.0 - fy)),
+            (1, 0, fx * (1.0 - fy)),
+            (0, 1, (1.0 - fx) * fy),
+            (1, 1, fx * fy),
+        ];
+        let mut pairs: Vec<(usize, f64)> = Vec::new();
+        for (dx, dy, w) in corners {
+            if w == 0.0 {
+                continue;
+            }
+            let (wx, wy) = grid.wrap_cell(col + dx, row + dy);
+            let idx = grid.cell_index(wx, wy).expect("in grid");
+            if let Some((_, weight)) = pairs.iter_mut().find(|(c, _)| *c == idx) {
+                *weight += w;
+            } else {
+                pairs.push((idx, w));
+            }
+        }
+        pairs.sort_by_key(|&(c, _)| c);
+        (
+            pairs.iter().map(|&(c, _)| c).collect(),
+            pairs.iter().map(|&(_, w)| w.to_bits()).collect(),
+        )
+    };
+
+    for (nx, ny, lx, ly) in [
+        (1, 1, 1.0, 1.0),
+        (1, 4, 2.0, 8.0),
+        (4, 1, 8.0, 2.0),
+        (2, 2, 2.0, 2.0),
+        (3, 5, 6.0, 15.0),
+        (17, 19, 17.0, 19.0),
+        (64, 64, 64.0, 64.0),
+    ] {
+        let grid = FieldGrid::new(nx, ny, lx, ly).expect("grid");
+        let hx = grid.cell_width();
+        let hy = grid.cell_height();
+        let xs = [
+            -3.7 * lx,
+            -0.25 * hx,
+            0.0,
+            0.25 * hx,
+            0.5 * hx,
+            hx,
+            0.5 * lx,
+            lx - 0.5 * hx,
+            lx - 0.1 * hx,
+            lx - 1.0e-12,
+            lx + 0.37 * hx,
+        ];
+        let ys = [
+            -2.3 * ly,
+            -0.25 * hy,
+            0.0,
+            0.25 * hy,
+            0.5 * hy,
+            hy,
+            0.5 * ly,
+            ly - 0.5 * hy,
+            ly - 0.1 * hy,
+            ly - 1.0e-12,
+            ly + 0.61 * hy,
+        ];
+        for &x in &xs {
+            for &y in &ys {
+                let got = ExchangeStencil::at(&grid, [x, y]).expect("stencil");
+                let (want_cells, want_weights) = oracle_stencil(&grid, [x, y]);
+                assert_eq!(
+                    got.cells(),
+                    want_cells.as_slice(),
+                    "grid {nx}x{ny} pos [{x}, {y}] cells mismatch"
+                );
+                let got_weights: Vec<u64> = got.weights().iter().map(|w| w.to_bits()).collect();
+                assert_eq!(
+                    got_weights, want_weights,
+                    "grid {nx}x{ny} pos [{x}, {y}] weights mismatch"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn pyramid_sample_batch_each_matches_scalar_and_preserves_canonical_error_order() {
+    let grid = FieldGrid::new(32, 32, 32.0, 32.0).expect("grid");
+    let limits = BufferLimits::new(1 << 28);
+    let mut single = FieldState::zeroed(grid, &limits).expect("single field");
+    let mut dual = FieldState::zeroed_with_planes(grid, 34, &limits).expect("dual field");
+    let cells = grid.cell_count() as usize;
+    for (p, plane) in single.as_mut_slice().chunks_exact_mut(cells).enumerate() {
+        for (c, slot) in plane.iter_mut().enumerate() {
+            *slot = if p == 0 {
+                1.0 + ((c * 17 + 3) % 97) as f32 * 0.05
+            } else {
+                (((c * (p + 5)) % 41) as f32 - 20.0) * 0.002
+            };
+        }
+    }
+    for (p, plane) in dual.as_mut_slice().chunks_exact_mut(cells).enumerate() {
+        for (c, slot) in plane.iter_mut().enumerate() {
+            *slot = if p == 0 || p == 25 {
+                1.0 + ((c * 13 + p) % 89) as f32 * 0.04
+            } else {
+                (((c * (p + 3)) % 37) as f32 - 18.0) * 0.002
+            };
+        }
+    }
+
+    // 600 queries (> BATCH=512) mixing level-0, level-0/1 blend, and coarse levels.
+    let scales = [1.0, 1.35, 2.0, 2.75, 4.0, 5.5, 8.0];
+    let queries: Vec<SensorQuery> = (0..600_usize)
+        .map(|i| SensorQuery {
+            position: [((i * 37) % 320) as f64 * 0.1, ((i * 53) % 320) as f64 * 0.1],
+            scale: scales[i % scales.len()],
+        })
+        .collect();
+
+    let mut pyr_single = SensorPyramid::new(grid, 3, &limits).expect("pyr single");
+    let view_single = pyr_single.build(&single).expect("rebuild single");
+    let mut got_single = vec![None; queries.len()];
+    view_single
+        .sample_batch_each(&queries, |qi, sample| {
+            got_single[qi] = Some(*sample);
+            Ok(())
+        })
+        .expect("sample_batch_each");
+    for (i, (q, got)) in queries.iter().zip(&got_single).enumerate() {
+        let want = view_single.sample(q.position, q.scale).expect("scalar");
+        let got = got.expect("slot filled");
+        assert_eq!(
+            got.values.map(f64::to_bits),
+            want.values.map(f64::to_bits),
+            "single values[{i}]"
+        );
+        assert_eq!(
+            got.dx.map(f64::to_bits),
+            want.dx.map(f64::to_bits),
+            "single dx[{i}]"
+        );
+        assert_eq!(
+            got.dy.map(f64::to_bits),
+            want.dy.map(f64::to_bits),
+            "single dy[{i}]"
+        );
+    }
+
+    // Canonical first-error order when callback fails on two out-of-order indices.
+    let err = view_single
+        .sample_batch_each(&queries[..64], |qi, _| {
+            if qi == 11 || qi == 47 {
+                Err(CoreError::StateConflict {
+                    operation: "test callback",
+                    detail: format!("failed at {qi}"),
+                })
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("failed at 11"),
+        "expected canonical first error at query 11, got: {err}"
+    );
+
+    // Dual-carrier 34-plane `sample_dual_batch_each` matches scalar `sample_dual` bit-for-bit.
+    let mut pyr_dual = SensorPyramid::new_with_planes(grid, 3, 34, &limits).expect("pyr dual");
+    let view_dual = pyr_dual.build(&dual).expect("rebuild dual");
+    let mut got_dual = vec![None; queries.len()];
+    view_dual
+        .sample_dual_batch_each(&queries, |qi, sample| {
+            got_dual[qi] = Some(*sample);
+            Ok(())
+        })
+        .expect("sample_dual_batch_each");
+    for (i, (q, got)) in queries.iter().zip(&got_dual).enumerate() {
+        let want = view_dual
+            .sample_dual(q.position, q.scale)
+            .expect("scalar dual");
+        let got = got.expect("dual slot filled");
+        assert_eq!(
+            got.values.map(f64::to_bits),
+            want.values.map(f64::to_bits),
+            "dual values[{i}]"
+        );
+        assert_eq!(
+            got.dx.map(f64::to_bits),
+            want.dx.map(f64::to_bits),
+            "dual dx[{i}]"
+        );
+        assert_eq!(
+            got.dy.map(f64::to_bits),
+            want.dy.map(f64::to_bits),
+            "dual dy[{i}]"
+        );
+    }
+
+    // Nonfinite field value triggers canonical fallback refusal rather than silent pass.
+    single.as_mut_slice()[5 * cells + 17] = f32::NAN;
+    let view_nan = pyr_single.build(&single).expect("rebuild nan");
+    let nan_err = view_nan.sample_batch_each(&queries[..64], |_, _| Ok(()));
+    assert!(
+        matches!(nan_err, Err(CoreError::NumericalInvalid { .. })),
+        "expected NumericalInvalid on NaN field, got: {nan_err:?}"
+    );
 }

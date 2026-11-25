@@ -194,13 +194,17 @@ impl SourceKernel {
     ) -> Result<(), CoreError> {
         self.candidates_into(grid, center, support)?;
         let SourceSupport {
-            cells,
+            cell_indices,
+            cell_weights,
+            max_cell,
             weight_sum,
             columns,
             rows,
             ..
         } = support;
-        cells.clear();
+        cell_indices.clear();
+        cell_weights.clear();
+        *max_cell = 0;
         *weight_sum = 0.0;
         if let (Some(&first_col), Some(&first_row)) = (columns.first(), rows.first()) {
             let (radius_squared, two_sigma_squared) = self.weight_constants();
@@ -290,8 +294,13 @@ impl SourceKernel {
                             fallback
                         };
                         for lane in 0..4 {
+                            let idx = batch_idx[lane];
                             let weight = weights[lane];
-                            cells.push((batch_idx[lane], weight));
+                            cell_indices.push(idx);
+                            cell_weights.push(weight);
+                            if idx > *max_cell {
+                                *max_cell = idx;
+                            }
                             *weight_sum += weight;
                         }
                         batch_len = 0;
@@ -306,11 +315,16 @@ impl SourceKernel {
                         detail: format!("|d|² = {distance_squared:?} has no weight"),
                     }
                 })?;
-                cells.push((batch_idx[lane], weight));
+                let idx = batch_idx[lane];
+                cell_indices.push(idx);
+                cell_weights.push(weight);
+                if idx > *max_cell {
+                    *max_cell = idx;
+                }
                 *weight_sum += weight;
             }
         }
-        if cells.is_empty() || *weight_sum <= 0.0 || !weight_sum.is_finite() {
+        if cell_indices.is_empty() || *weight_sum <= 0.0 || !weight_sum.is_finite() {
             return Err(CoreError::NumericalInvalid {
                 quantity: "source support",
                 detail: format!(
@@ -357,7 +371,9 @@ impl SourceKernel {
         center: [f64; 2],
         support: &mut SourceSupport,
     ) -> Result<(), CoreError> {
-        support.cells.clear();
+        support.cell_indices.clear();
+        support.cell_weights.clear();
+        support.max_cell = 0;
         support.weight_sum = 0.0;
         let columns = axis_candidates(
             center[0],
@@ -401,13 +417,17 @@ impl SourceKernel {
         mut weigh: impl FnMut(u32, u32) -> Result<Option<f64>, CoreError>,
     ) -> Result<(), CoreError> {
         let SourceSupport {
-            cells,
+            cell_indices,
+            cell_weights,
+            max_cell,
             weight_sum,
             columns,
             rows,
             ..
         } = support;
-        cells.clear();
+        cell_indices.clear();
+        cell_weights.clear();
+        *max_cell = 0;
         *weight_sum = 0.0;
         for &row in rows.iter() {
             for &column in columns.iter() {
@@ -415,11 +435,15 @@ impl SourceKernel {
                     continue;
                 };
                 let index = grid.cell_index(column, row).ok_or_else(overflow)?;
-                cells.push((index, weight));
+                cell_indices.push(index);
+                cell_weights.push(weight);
+                if index > *max_cell {
+                    *max_cell = index;
+                }
                 *weight_sum += weight;
             }
         }
-        if cells.is_empty() || *weight_sum <= 0.0 || !weight_sum.is_finite() {
+        if cell_indices.is_empty() || *weight_sum <= 0.0 || !weight_sum.is_finite() {
             return Err(CoreError::NumericalInvalid {
                 quantity: "source support",
                 detail: format!(
@@ -504,14 +528,18 @@ fn axis_candidates(
 }
 
 /// A source's support: cell indices and raw weights, in cell-index order.
+/// Stored as parallel SoA arrays so 32-plane moment deposition streams dense
+/// `cell_indices` without dragging unused raw weights through cache.
 /// It is reused across ticks, so steady state does not allocate.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SourceSupport {
-    cells: Vec<(usize, f64)>,
+    cell_indices: Vec<usize>,
+    cell_weights: Vec<f64>,
+    max_cell: usize,
     weight_sum: f64,
     columns: Vec<u32>,
     rows: Vec<u32>,
-    /// Each cell's deposited energy this tick, in `cells` order.
+    /// Each cell's deposited energy this tick, in `cell_indices` order.
     amounts: Vec<f64>,
 }
 
@@ -545,9 +573,13 @@ impl SourceSupport {
             .try_reserve_exact(rows)
             .map_err(|_| refused(bytes_for::<u32>(rows)))?;
         support
-            .cells
+            .cell_indices
             .try_reserve_exact(cells)
-            .map_err(|_| refused(bytes_for::<(usize, f64)>(cells)))?;
+            .map_err(|_| refused(bytes_for::<usize>(cells)))?;
+        support
+            .cell_weights
+            .try_reserve_exact(cells)
+            .map_err(|_| refused(bytes_for::<f64>(cells)))?;
         support
             .amounts
             .try_reserve_exact(cells)
@@ -559,7 +591,8 @@ impl SourceSupport {
     #[must_use]
     pub fn allocated_bytes(&self) -> u64 {
         total([
-            capacity_bytes(&self.cells),
+            capacity_bytes(&self.cell_indices),
+            capacity_bytes(&self.cell_weights),
             capacity_bytes(&self.columns),
             capacity_bytes(&self.rows),
             capacity_bytes(&self.amounts),
@@ -569,13 +602,13 @@ impl SourceSupport {
     /// Cells in the support.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.cells.len()
+        self.cell_indices.len()
     }
 
     /// Whether the support holds no cell.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.cells.is_empty()
+        self.cell_indices.is_empty()
     }
 
     /// `Σ k_c` in cell-index order.
@@ -609,16 +642,19 @@ impl SourceSupport {
     /// Clear support cells and amounts when a source has zero power this tick
     /// (`V2-02` inactive oasis), retaining allocated capacity.
     pub(crate) fn clear_for_zero_power(&mut self) {
-        self.cells.clear();
+        self.cell_indices.clear();
+        self.cell_weights.clear();
+        self.max_cell = 0;
         self.weight_sum = 0.0;
         self.amounts.clear();
     }
 
     /// `(cell index, k_c / Σ k)` in cell-index order.
     pub fn normalized(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
-        self.cells
+        self.cell_indices
             .iter()
-            .map(|&(index, weight)| (index, weight / self.weight_sum))
+            .zip(&self.cell_weights)
+            .map(|(&index, &weight)| (index, weight / self.weight_sum))
     }
 }
 
@@ -1076,12 +1112,8 @@ pub fn deposit_energy(
     let mut applied = 0.0;
     support.amounts.clear();
     let energy = state.energy_mut();
-    for (index, weight) in support
-        .cells
-        .iter()
-        .map(|&(index, weight)| (index, weight / support.weight_sum))
-    {
-        let amount = declared * weight;
+    for (&index, &weight) in support.cell_indices.iter().zip(&support.cell_weights) {
+        let amount = declared * (weight / support.weight_sum);
         normalized_total += amount;
         let energy = energy.get_mut(index).ok_or_else(outside)?;
         let before = f64::from(*energy);
@@ -1155,12 +1187,8 @@ pub fn deposit_energy_fused(
         }
         let declared = source.power * f64::from(step.numerator()) / f64::from(step.denominator());
         let mut normalized_total = 0.0;
-        for (index, weight) in support
-            .cells
-            .iter()
-            .map(|&(index, weight)| (index, weight / support.weight_sum))
-        {
-            let amount = declared * weight;
+        for (&index, &weight) in support.cell_indices.iter().zip(&support.cell_weights) {
+            let amount = declared * (weight / support.weight_sum);
             normalized_total += amount;
             let slot = deltas.get_mut(index).ok_or_else(outside)?;
             *slot += amount;
@@ -1234,7 +1262,7 @@ pub(crate) fn deposit_moments_fused(
         if c == 0.0 {
             continue;
         }
-        for (&(index, _), &amount) in support.cells.iter().zip(&support.amounts) {
+        for (&index, &amount) in support.cell_indices.iter().zip(&support.amounts) {
             let slot = deltas.get_mut(index).ok_or_else(outside)?;
             *slot += amount * c;
         }
@@ -1258,7 +1286,31 @@ pub(crate) fn deposit_moment(
     if component == 0.0 {
         return Ok(());
     }
-    for (&(index, _), &amount) in support.cells.iter().zip(&support.amounts) {
+    let len = support.cell_indices.len().min(support.amounts.len());
+    if len == 0 {
+        return Ok(());
+    }
+    if support.max_cell < plane.len() {
+        let indices = &support.cell_indices[..len];
+        let amounts = &support.amounts[..len];
+        let (idx_chunks, idx_rem) = indices.as_chunks::<4>();
+        let (amt_chunks, amt_rem) = amounts.as_chunks::<4>();
+        for (&[i0, i1, i2, i3], &[a0, a1, a2, a3]) in idx_chunks.iter().zip(amt_chunks) {
+            let d0 = a0 * component;
+            let d1 = a1 * component;
+            let d2 = a2 * component;
+            let d3 = a3 * component;
+            plane[i0] = (f64::from(plane[i0]) + d0) as f32;
+            plane[i1] = (f64::from(plane[i1]) + d1) as f32;
+            plane[i2] = (f64::from(plane[i2]) + d2) as f32;
+            plane[i3] = (f64::from(plane[i3]) + d3) as f32;
+        }
+        for (&index, &amount) in idx_rem.iter().zip(amt_rem) {
+            plane[index] = (f64::from(plane[index]) + amount * component) as f32;
+        }
+        return Ok(());
+    }
+    for (&index, &amount) in support.cell_indices.iter().zip(&support.amounts) {
         let moment = plane.get_mut(index).ok_or_else(outside)?;
         *moment = (f64::from(*moment) + amount * component) as f32;
     }

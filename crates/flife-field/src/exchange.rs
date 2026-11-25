@@ -542,6 +542,94 @@ impl ExchangeStencil {
         let [x, y] = grid.wrap_position(position)?;
         let (column, fx) = split(x / grid.cell_width() - 0.5);
         let (row, fy) = split(y / grid.cell_height() - 0.5);
+        let cx_u32 = grid.cells_x();
+        let cy_u32 = grid.cells_y();
+        // Fast path for non-degenerate grids (`cells_x >= 2`, `cells_y >= 2`):
+        // all four corners are guaranteed distinct and interior positions
+        // (`x0 < x1`, `y0 < y1`, `fx > 0`, `fy > 0`, ~99%+ of calls) are
+        // already in strictly ascending cell-index order with zero `rem_euclid`
+        // divisions, dedup scans, or insertion sort.
+        if cx_u32 >= 2 && cy_u32 >= 2 && usize::try_from(grid.cell_count()).is_ok() {
+            let cx_i = i64::from(cx_u32);
+            let cy_i = i64::from(cy_u32);
+            if (-1..=cx_i).contains(&column) && (-1..=cy_i).contains(&row) {
+                let cx = cx_u32 as usize;
+                let cy = cy_u32 as usize;
+                #[expect(
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation,
+                    reason = "column is checked in 0..cx_i <= u32::MAX"
+                )]
+                let x0 = if column < 0 {
+                    cx - 1
+                } else if column >= cx_i {
+                    0
+                } else {
+                    column as usize
+                };
+                let x1 = if x0 + 1 < cx { x0 + 1 } else { 0 };
+                #[expect(
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation,
+                    reason = "row is checked in 0..cy_i <= u32::MAX"
+                )]
+                let y0 = if row < 0 {
+                    cy - 1
+                } else if row >= cy_i {
+                    0
+                } else {
+                    row as usize
+                };
+                let y1 = if y0 + 1 < cy { y0 + 1 } else { 0 };
+                let one_minus_fx = 1.0 - fx;
+                let one_minus_fy = 1.0 - fy;
+                let w00 = one_minus_fx * one_minus_fy;
+                let w10 = fx * one_minus_fy;
+                let w01 = one_minus_fx * fy;
+                let w11 = fx * fy;
+                let row0 = y0 * cx;
+                let row1 = y1 * cx;
+                if x0 < x1 && y0 < y1 && w00 > 0.0 && w10 > 0.0 && w01 > 0.0 && w11 > 0.0 {
+                    return Ok(Self {
+                        cells: [row0 + x0, row0 + x1, row1 + x0, row1 + x1],
+                        weights: [w00, w10, w01, w11],
+                        len: 4,
+                    });
+                }
+                // Edge-wrapped or zero-weight corner on a `>= 2x2` grid: all
+                // corners remain distinct; arrange rows then columns in
+                // ascending cell order without `rem_euclid` or dedup.
+                let (xa, xb, wx_a, wx_b) = if x0 < x1 {
+                    (x0, x1, one_minus_fx, fx)
+                } else {
+                    (x1, x0, fx, one_minus_fx)
+                };
+                let (ra, rb, wy_a, wy_b) = if y0 < y1 {
+                    (row0, row1, one_minus_fy, fy)
+                } else {
+                    (row1, row0, fy, one_minus_fy)
+                };
+                let ordered = [
+                    (ra + xa, wx_a * wy_a),
+                    (ra + xb, wx_b * wy_a),
+                    (rb + xa, wx_a * wy_b),
+                    (rb + xb, wx_b * wy_b),
+                ];
+                let mut stencil = Self {
+                    cells: [0; 4],
+                    weights: [0.0; 4],
+                    len: 0,
+                };
+                for (cell, weight) in ordered {
+                    if weight != 0.0 {
+                        stencil.cells[stencil.len] = cell;
+                        stencil.weights[stencil.len] = weight;
+                        stencil.len += 1;
+                    }
+                }
+                return Ok(stencil);
+            }
+        }
         let corners = [
             (0, 0, (1.0 - fx) * (1.0 - fy)),
             (1, 0, fx * (1.0 - fy)),

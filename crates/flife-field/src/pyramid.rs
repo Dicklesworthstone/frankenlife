@@ -760,6 +760,36 @@ impl PyramidView<'_> {
         queries: &[SensorQuery],
         out: &mut [RawSample],
     ) -> Result<(), CoreError> {
+        if queries.len() != out.len() {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "sensor samples",
+                detail: format!("{} outputs for {} queries", out.len(), queries.len()),
+            });
+        }
+        self.sample_batch_each(queries, |qi, sample| {
+            out[qi] = *sample;
+            Ok(())
+        })
+    }
+
+    /// Sample `queries` plane-by-plane and deliver each L1D-hot [`RawSample`]
+    /// straight to `on_sample(query_index, sample)` without copying samples
+    /// through an intermediate `Vec<RawSample>`.
+    ///
+    /// Queries may be delivered in spatially tile-sorted order within each
+    /// batch; if any sample is nonfinite or `on_sample` returns an error, the
+    /// affected batch is re-evaluated in ascending query order to report the
+    /// canonical first error, so `on_sample` must write idempotently by query
+    /// index.
+    ///
+    /// # Errors
+    /// The first error [`PyramidView::sample`] or `on_sample` would return in
+    /// ascending query order.
+    pub fn sample_batch_each(
+        &self,
+        queries: &[SensorQuery],
+        on_sample: impl FnMut(usize, &RawSample) -> Result<(), CoreError>,
+    ) -> Result<(), CoreError> {
         if self.pyramid.planes != PLANES {
             return Err(CoreError::LayoutMismatch {
                 buffer: "sensor pyramid",
@@ -769,31 +799,27 @@ impl PyramidView<'_> {
                 ),
             });
         }
-        self.sample_batch_planes::<PLANES, RawSample>(queries, out, |q| {
-            self.sample(q.position, q.scale)
-        })
+        self.sample_batch_planes_each::<PLANES, RawSample>(
+            queries,
+            |q| self.sample(q.position, q.scale),
+            on_sample,
+        )
     }
 
     #[expect(
         clippy::too_many_lines,
         reason = "plane-major batched bilinear sampler partitioned into level-0, level-0/1 blend, and coarse-level fast paths with hoisted invariants"
     )]
-    fn sample_batch_planes<const P: usize, S: SampleSlot<P>>(
+    fn sample_batch_planes_each<const P: usize, S: SampleSlot<P>>(
         &self,
         queries: &[SensorQuery],
-        out: &mut [S],
         fallback: impl Fn(&SensorQuery) -> Result<S, CoreError>,
+        mut on_sample: impl FnMut(usize, &S) -> Result<(), CoreError>,
     ) -> Result<(), CoreError> {
-        if queries.len() != out.len() {
-            return Err(CoreError::LayoutMismatch {
-                buffer: "sensor samples",
-                detail: format!("{} outputs for {} queries", out.len(), queries.len()),
-            });
-        }
         if queries.is_empty() {
             return Ok(());
         }
-        const BATCH: usize = 256;
+        const BATCH: usize = 512;
         const SUB_BATCH: usize = 32;
         const TILES: usize = 64;
 
@@ -812,10 +838,10 @@ impl PyramidView<'_> {
         struct PreparedLevel {
             level: u32,
             tile: u8,
-            i00: usize,
-            i10: usize,
-            i01: usize,
-            i11: usize,
+            i00: u32,
+            i10: u32,
+            i01: u32,
+            i11: u32,
             fx: f64,
             fy: f64,
         }
@@ -826,16 +852,16 @@ impl PyramidView<'_> {
             t: f64,
         }
 
-        let sort_by_tile = |indices: &[usize], prepared: &[PreparedQuery], sorted: &mut [usize]| {
+        let sort_by_tile = |indices: &[u16], prepared: &[PreparedQuery], sorted: &mut [u16]| {
             let mut counts = [0_u16; TILES + 1];
             for &qi in indices {
-                counts[prepared[qi].lo.tile as usize + 1] += 1;
+                counts[prepared[qi as usize].lo.tile as usize + 1] += 1;
             }
             for tile in 1..=TILES {
                 counts[tile] += counts[tile - 1];
             }
             for &qi in indices {
-                let bucket = prepared[qi].lo.tile as usize;
+                let bucket = prepared[qi as usize].lo.tile as usize;
                 let dst = counts[bucket] as usize;
                 counts[bucket] += 1;
                 sorted[dst] = qi;
@@ -864,6 +890,7 @@ impl PyramidView<'_> {
                     usize::try_from(geometry.cells_y),
                 )
                 && let Some(cells) = cx.checked_mul(cy)
+                && u32::try_from(cells).is_ok()
                 && let Some(total_needed) = P.checked_mul(cells)
             {
                 let has_data = if level == 0 {
@@ -928,16 +955,15 @@ impl PyramidView<'_> {
             let ty = ((y0 as u64) * 8) / (meta.cy as u64);
             #[expect(
                 clippy::cast_possible_truncation,
-                reason = "tx and ty are strictly in 0..8, so (ty << 3) | tx is in 0..64"
+                reason = "tx and ty are strictly in 0..8, and cells <= u32::MAX is checked in level_meta"
             )]
-            let tile = ((ty << 3) | tx) as u8;
             Ok(PreparedLevel {
                 level,
-                tile,
-                i00: y0 * meta.cx + x0,
-                i10: y0 * meta.cx + x1,
-                i01: y1 * meta.cx + x0,
-                i11: y1 * meta.cx + x1,
+                tile: ((ty << 3) | tx) as u8,
+                i00: (y0 * meta.cx + x0) as u32,
+                i10: (y0 * meta.cx + x1) as u32,
+                i01: (y1 * meta.cx + x0) as u32,
+                i11: (y1 * meta.cx + x1) as u32,
                 fx,
                 fy,
             })
@@ -950,10 +976,10 @@ impl PyramidView<'_> {
 
         #[derive(Clone, Copy)]
         struct PackedCorners {
-            i00: usize,
-            i10: usize,
-            i01: usize,
-            i11: usize,
+            i00: u32,
+            i10: u32,
+            i01: u32,
+            i11: u32,
             fx: f64,
             fy: f64,
         }
@@ -1024,17 +1050,16 @@ impl PyramidView<'_> {
             hi: None,
             t: 0.0,
         }; BATCH];
-        let mut l0_idx = [0_usize; BATCH];
-        let mut l0_sorted = [0_usize; BATCH];
-        let mut l01_idx = [0_usize; BATCH];
-        let mut l01_sorted = [0_usize; BATCH];
-        let mut other_idx = [0_usize; BATCH];
-        let mut other_sorted = [0_usize; BATCH];
-        // Compact L1D-resident sub-batch staging (~25 KiB for `sub_out` + 1.5–4.8 KiB
+        let mut l0_idx = [0_u16; BATCH];
+        let mut l0_sorted = [0_u16; BATCH];
+        let mut l01_idx = [0_u16; BATCH];
+        let mut l01_sorted = [0_u16; BATCH];
+        let mut other_idx = [0_u16; BATCH];
+        let mut other_sorted = [0_u16; BATCH];
+        // Compact L1D-resident sub-batch staging (~25 KiB for `sub_out` + 1–4.5 KiB
         // packed corner descriptors) hoisted once outside the chunk loop so the
-        // `0..P` plane loops stream sequentially without scattering writes across
-        // the ~203 KiB `out_chunk` or re-indexing `prepared[qi]` / `level_meta`
-        // 33/34 times.
+        // `0..P` plane loops stream sequentially and deliver directly to
+        // `on_sample` while hot in L1D.
         let mut sub_lo = [dummy_corners; SUB_BATCH];
         let mut sub_blend = [dummy_blend; SUB_BATCH];
         let mut sub_coarse = [PackedCoarse {
@@ -1044,8 +1069,8 @@ impl PyramidView<'_> {
         }; SUB_BATCH];
         let mut sub_out = [S::ZERO; SUB_BATCH];
 
-        for (q_chunk, out_chunk) in queries.chunks(BATCH).zip(out.chunks_mut(BATCH)) {
-            let count = q_chunk.len();
+        for (chunk_idx, q_chunk) in queries.chunks(BATCH).enumerate() {
+            let chunk_base = chunk_idx * BATCH;
             let mut n_l0 = 0_usize;
             let mut n_l01 = 0_usize;
             let mut n_other = 0_usize;
@@ -1058,188 +1083,154 @@ impl PyramidView<'_> {
                 } else {
                     Some(prepare_level(level + 1, wrapped)?)
                 };
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "qi < BATCH (512) <= u16::MAX"
+                )]
+                let qi_u16 = qi as u16;
                 if level == 0 {
                     if hi.is_none() {
-                        l0_idx[n_l0] = qi;
+                        l0_idx[n_l0] = qi_u16;
                         n_l0 += 1;
                     } else {
-                        l01_idx[n_l01] = qi;
+                        l01_idx[n_l01] = qi_u16;
                         n_l01 += 1;
                     }
                 } else {
-                    other_idx[n_other] = qi;
+                    other_idx[n_other] = qi_u16;
                     n_other += 1;
                 }
                 *slot = PreparedQuery { lo, hi, t };
             }
 
-            let mut all_finite = true;
+            let mut need_fallback = false;
 
-            // Fast bucket 1: level-0-only queries (eliminates the `all_level0`
-            // cliff when a few queries in the block have mutated scale, and
-            // groups 256-query batches by 8x8 coarse tile into 32-query L1D
-            // sub-batches so all P planes stay resident in L1 cache).
+            // Fast bucket 1: level-0-only queries grouped by 8x8 coarse tile
+            // into 32-query L1D sub-batches. An IEEE-754 non-cancelling finite
+            // accumulator (`NaN`/`±Inf` stays nonfinite under addition) checks
+            // finiteness once per sub-batch instead of 3× per plane.
             if n_l0 > 0 {
                 let cells0 = meta0.cells;
-                if n_l0 == count && n_l0 <= SUB_BATCH {
-                    if unit_l0 {
+                let ordered = if n_l0 > SUB_BATCH {
+                    sort_by_tile(&l0_idx[..n_l0], &prepared, &mut l0_sorted[..n_l0]);
+                    &l0_sorted[..n_l0]
+                } else {
+                    &l0_idx[..n_l0]
+                };
+                if unit_l0 {
+                    for sub in ordered.chunks(SUB_BATCH) {
+                        let n = sub.len();
+                        for (dst, &qi) in sub_lo[..n].iter_mut().zip(sub) {
+                            *dst = PackedCorners::from_level(prepared[qi as usize].lo);
+                        }
+                        let mut finite_acc = 0.0_f64;
                         for plane in 0..P {
                             let plane_slice = &field_data[plane * cells0..(plane + 1) * cells0];
-                            for (pq, sample) in
-                                prepared.iter().zip(out_chunk.iter_mut()).take(count)
-                            {
-                                let p = &pq.lo;
+                            for (p, sample) in sub_lo[..n].iter().zip(&mut sub_out[..n]) {
                                 let (value, dx, dy) = bilinear_raw(
-                                    f64::from(plane_slice[p.i00]),
-                                    f64::from(plane_slice[p.i10]),
-                                    f64::from(plane_slice[p.i01]),
-                                    f64::from(plane_slice[p.i11]),
+                                    f64::from(plane_slice[p.i00 as usize]),
+                                    f64::from(plane_slice[p.i10 as usize]),
+                                    f64::from(plane_slice[p.i01 as usize]),
+                                    f64::from(plane_slice[p.i11 as usize]),
                                     p.fx,
                                     p.fy,
                                 );
-                                all_finite &= value.is_finite() & dx.is_finite() & dy.is_finite();
+                                finite_acc += (value + dx) + dy;
                                 sample.set_plane(plane, value, dx, dy);
                             }
                         }
-                    } else if let (Some(ra), Some(rx), Some(ry)) =
-                        (inv_area, meta0.inv_sx, meta0.inv_sy)
-                    {
+                        if !finite_acc.is_finite() {
+                            need_fallback = true;
+                            break;
+                        }
+                        for (&qi, sample) in sub.iter().zip(&sub_out[..n]) {
+                            if on_sample(chunk_base + qi as usize, sample).is_err() {
+                                need_fallback = true;
+                                break;
+                            }
+                        }
+                        if need_fallback {
+                            break;
+                        }
+                    }
+                } else if let (Some(ra), Some(rx), Some(ry)) =
+                    (inv_area, meta0.inv_sx, meta0.inv_sy)
+                {
+                    for sub in ordered.chunks(SUB_BATCH) {
+                        let n = sub.len();
+                        for (dst, &qi) in sub_lo[..n].iter_mut().zip(sub) {
+                            *dst = PackedCorners::from_level(prepared[qi as usize].lo);
+                        }
+                        let mut finite_acc = 0.0_f64;
                         for plane in 0..P {
                             let plane_slice = &field_data[plane * cells0..(plane + 1) * cells0];
-                            for (pq, sample) in
-                                prepared.iter().zip(out_chunk.iter_mut()).take(count)
-                            {
-                                let p = &pq.lo;
+                            for (p, sample) in sub_lo[..n].iter().zip(&mut sub_out[..n]) {
                                 let (value, dx_num, dy_num) = bilinear_raw(
-                                    f64::from(plane_slice[p.i00]) * ra,
-                                    f64::from(plane_slice[p.i10]) * ra,
-                                    f64::from(plane_slice[p.i01]) * ra,
-                                    f64::from(plane_slice[p.i11]) * ra,
+                                    f64::from(plane_slice[p.i00 as usize]) * ra,
+                                    f64::from(plane_slice[p.i10 as usize]) * ra,
+                                    f64::from(plane_slice[p.i01 as usize]) * ra,
+                                    f64::from(plane_slice[p.i11 as usize]) * ra,
                                     p.fx,
                                     p.fy,
                                 );
                                 let dx = dx_num * rx;
                                 let dy = dy_num * ry;
-                                all_finite &= value.is_finite() & dx.is_finite() & dy.is_finite();
+                                finite_acc += (value + dx) + dy;
                                 sample.set_plane(plane, value, dx, dy);
                             }
                         }
-                    } else {
-                        let sx = meta0.spacing_x;
-                        let sy = meta0.spacing_y;
+                        if !finite_acc.is_finite() {
+                            need_fallback = true;
+                            break;
+                        }
+                        for (&qi, sample) in sub.iter().zip(&sub_out[..n]) {
+                            if on_sample(chunk_base + qi as usize, sample).is_err() {
+                                need_fallback = true;
+                                break;
+                            }
+                        }
+                        if need_fallback {
+                            break;
+                        }
+                    }
+                } else {
+                    let sx = meta0.spacing_x;
+                    let sy = meta0.spacing_y;
+                    for sub in ordered.chunks(SUB_BATCH) {
+                        let n = sub.len();
+                        for (dst, &qi) in sub_lo[..n].iter_mut().zip(sub) {
+                            *dst = PackedCorners::from_level(prepared[qi as usize].lo);
+                        }
+                        let mut finite_acc = 0.0_f64;
                         for plane in 0..P {
                             let plane_slice = &field_data[plane * cells0..(plane + 1) * cells0];
-                            for (pq, sample) in
-                                prepared.iter().zip(out_chunk.iter_mut()).take(count)
-                            {
-                                let p = &pq.lo;
+                            for (p, sample) in sub_lo[..n].iter().zip(&mut sub_out[..n]) {
                                 let (value, dx_num, dy_num) = bilinear_raw(
-                                    f64::from(plane_slice[p.i00]) / area,
-                                    f64::from(plane_slice[p.i10]) / area,
-                                    f64::from(plane_slice[p.i01]) / area,
-                                    f64::from(plane_slice[p.i11]) / area,
+                                    f64::from(plane_slice[p.i00 as usize]) / area,
+                                    f64::from(plane_slice[p.i10 as usize]) / area,
+                                    f64::from(plane_slice[p.i01 as usize]) / area,
+                                    f64::from(plane_slice[p.i11 as usize]) / area,
                                     p.fx,
                                     p.fy,
                                 );
                                 let dx = dx_num / sx;
                                 let dy = dy_num / sy;
-                                all_finite &= value.is_finite() & dx.is_finite() & dy.is_finite();
+                                finite_acc += (value + dx) + dy;
                                 sample.set_plane(plane, value, dx, dy);
                             }
                         }
-                    }
-                } else {
-                    let ordered = if n_l0 > SUB_BATCH {
-                        sort_by_tile(&l0_idx[..n_l0], &prepared, &mut l0_sorted[..n_l0]);
-                        &l0_sorted[..n_l0]
-                    } else {
-                        &l0_idx[..n_l0]
-                    };
-                    if unit_l0 {
-                        for sub in ordered.chunks(SUB_BATCH) {
-                            let n = sub.len();
-                            for (dst, &qi) in sub_lo[..n].iter_mut().zip(sub) {
-                                *dst = PackedCorners::from_level(prepared[qi].lo);
-                            }
-                            for plane in 0..P {
-                                let plane_slice = &field_data[plane * cells0..(plane + 1) * cells0];
-                                for (p, sample) in sub_lo[..n].iter().zip(&mut sub_out[..n]) {
-                                    let (value, dx, dy) = bilinear_raw(
-                                        f64::from(plane_slice[p.i00]),
-                                        f64::from(plane_slice[p.i10]),
-                                        f64::from(plane_slice[p.i01]),
-                                        f64::from(plane_slice[p.i11]),
-                                        p.fx,
-                                        p.fy,
-                                    );
-                                    all_finite &=
-                                        value.is_finite() & dx.is_finite() & dy.is_finite();
-                                    sample.set_plane(plane, value, dx, dy);
-                                }
-                            }
-                            for (&qi, &sample) in sub.iter().zip(&sub_out[..n]) {
-                                out_chunk[qi] = sample;
+                        if !finite_acc.is_finite() {
+                            need_fallback = true;
+                            break;
+                        }
+                        for (&qi, sample) in sub.iter().zip(&sub_out[..n]) {
+                            if on_sample(chunk_base + qi as usize, sample).is_err() {
+                                need_fallback = true;
+                                break;
                             }
                         }
-                    } else if let (Some(ra), Some(rx), Some(ry)) =
-                        (inv_area, meta0.inv_sx, meta0.inv_sy)
-                    {
-                        for sub in ordered.chunks(SUB_BATCH) {
-                            let n = sub.len();
-                            for (dst, &qi) in sub_lo[..n].iter_mut().zip(sub) {
-                                *dst = PackedCorners::from_level(prepared[qi].lo);
-                            }
-                            for plane in 0..P {
-                                let plane_slice = &field_data[plane * cells0..(plane + 1) * cells0];
-                                for (p, sample) in sub_lo[..n].iter().zip(&mut sub_out[..n]) {
-                                    let (value, dx_num, dy_num) = bilinear_raw(
-                                        f64::from(plane_slice[p.i00]) * ra,
-                                        f64::from(plane_slice[p.i10]) * ra,
-                                        f64::from(plane_slice[p.i01]) * ra,
-                                        f64::from(plane_slice[p.i11]) * ra,
-                                        p.fx,
-                                        p.fy,
-                                    );
-                                    let dx = dx_num * rx;
-                                    let dy = dy_num * ry;
-                                    all_finite &=
-                                        value.is_finite() & dx.is_finite() & dy.is_finite();
-                                    sample.set_plane(plane, value, dx, dy);
-                                }
-                            }
-                            for (&qi, &sample) in sub.iter().zip(&sub_out[..n]) {
-                                out_chunk[qi] = sample;
-                            }
-                        }
-                    } else {
-                        let sx = meta0.spacing_x;
-                        let sy = meta0.spacing_y;
-                        for sub in ordered.chunks(SUB_BATCH) {
-                            let n = sub.len();
-                            for (dst, &qi) in sub_lo[..n].iter_mut().zip(sub) {
-                                *dst = PackedCorners::from_level(prepared[qi].lo);
-                            }
-                            for plane in 0..P {
-                                let plane_slice = &field_data[plane * cells0..(plane + 1) * cells0];
-                                for (p, sample) in sub_lo[..n].iter().zip(&mut sub_out[..n]) {
-                                    let (value, dx_num, dy_num) = bilinear_raw(
-                                        f64::from(plane_slice[p.i00]) / area,
-                                        f64::from(plane_slice[p.i10]) / area,
-                                        f64::from(plane_slice[p.i01]) / area,
-                                        f64::from(plane_slice[p.i11]) / area,
-                                        p.fx,
-                                        p.fy,
-                                    );
-                                    let dx = dx_num / sx;
-                                    let dy = dy_num / sy;
-                                    all_finite &=
-                                        value.is_finite() & dx.is_finite() & dy.is_finite();
-                                    sample.set_plane(plane, value, dx, dy);
-                                }
-                            }
-                            for (&qi, &sample) in sub.iter().zip(&sub_out[..n]) {
-                                out_chunk[qi] = sample;
-                            }
+                        if need_fallback {
+                            break;
                         }
                     }
                 }
@@ -1248,10 +1239,8 @@ impl PyramidView<'_> {
             // Fast bucket 2: level-0 / level-1 blended queries (the dominant
             // mutated-scale case) with tile-sorted L1D sub-batches and both
             // plane slices and all reciprocals hoisted outside the 0..P loop.
-            // Because `t > 0` strictly in every blended query, `lv + t*(hv - lv)`
-            // is finite only if both `lv` and `hv` are finite, so checking only
-            // `(v, dx, dy)` is mathematically equivalent to checking all 9.
-            if n_l01 > 0
+            if !need_fallback
+                && n_l01 > 0
                 && let Some(coarse1) = self.pyramid.coarse.first()
             {
                 let cells0 = meta0.cells;
@@ -1267,7 +1256,7 @@ impl PyramidView<'_> {
                     for sub in ordered.chunks(SUB_BATCH) {
                         let n = sub.len();
                         for (dst, &qi) in sub_blend[..n].iter_mut().zip(sub) {
-                            let pq = &prepared[qi];
+                            let pq = &prepared[qi as usize];
                             let hi = pq.hi.unwrap_or(pq.lo);
                             *dst = PackedBlend {
                                 lo: PackedCorners::from_level(pq.lo),
@@ -1275,6 +1264,7 @@ impl PyramidView<'_> {
                                 t: pq.t,
                             };
                         }
+                        let mut finite_acc = 0.0_f64;
                         for plane in 0..P {
                             let p0 = &field_data[plane * cells0..(plane + 1) * cells0];
                             let p1 = &coarse1[plane * cells1..(plane + 1) * cells1];
@@ -1282,15 +1272,20 @@ impl PyramidView<'_> {
                                 let lo = &pb.lo;
                                 let hi = &pb.hi;
                                 let (lv, ldx, ldy) = bilinear_raw(
-                                    f64::from(p0[lo.i00]),
-                                    f64::from(p0[lo.i10]),
-                                    f64::from(p0[lo.i01]),
-                                    f64::from(p0[lo.i11]),
+                                    f64::from(p0[lo.i00 as usize]),
+                                    f64::from(p0[lo.i10 as usize]),
+                                    f64::from(p0[lo.i01 as usize]),
+                                    f64::from(p0[lo.i11 as usize]),
                                     lo.fx,
                                     lo.fy,
                                 );
                                 let (hv, hdx_num, hdy_num) = bilinear_raw(
-                                    p1[hi.i00], p1[hi.i10], p1[hi.i01], p1[hi.i11], hi.fx, hi.fy,
+                                    p1[hi.i00 as usize],
+                                    p1[hi.i10 as usize],
+                                    p1[hi.i01 as usize],
+                                    p1[hi.i11 as usize],
+                                    hi.fx,
+                                    hi.fy,
                                 );
                                 let hdx = hdx_num * rx1;
                                 let hdy = hdy_num * ry1;
@@ -1298,12 +1293,22 @@ impl PyramidView<'_> {
                                 let v = lv + t * (hv - lv);
                                 let dx = ldx + t * (hdx - ldx);
                                 let dy = ldy + t * (hdy - ldy);
-                                all_finite &= v.is_finite() & dx.is_finite() & dy.is_finite();
+                                finite_acc += (v + dx) + dy;
                                 sample.set_plane(plane, v, dx, dy);
                             }
                         }
-                        for (&qi, &sample) in sub.iter().zip(&sub_out[..n]) {
-                            out_chunk[qi] = sample;
+                        if !finite_acc.is_finite() {
+                            need_fallback = true;
+                            break;
+                        }
+                        for (&qi, sample) in sub.iter().zip(&sub_out[..n]) {
+                            if on_sample(chunk_base + qi as usize, sample).is_err() {
+                                need_fallback = true;
+                                break;
+                            }
+                        }
+                        if need_fallback {
+                            break;
                         }
                     }
                 } else if let (Some(ra), Some(rx0), Some(ry0), Some(rx1), Some(ry1)) = (
@@ -1316,7 +1321,7 @@ impl PyramidView<'_> {
                     for sub in ordered.chunks(SUB_BATCH) {
                         let n = sub.len();
                         for (dst, &qi) in sub_blend[..n].iter_mut().zip(sub) {
-                            let pq = &prepared[qi];
+                            let pq = &prepared[qi as usize];
                             let hi = pq.hi.unwrap_or(pq.lo);
                             *dst = PackedBlend {
                                 lo: PackedCorners::from_level(pq.lo),
@@ -1324,6 +1329,7 @@ impl PyramidView<'_> {
                                 t: pq.t,
                             };
                         }
+                        let mut finite_acc = 0.0_f64;
                         for plane in 0..P {
                             let p0 = &field_data[plane * cells0..(plane + 1) * cells0];
                             let p1 = &coarse1[plane * cells1..(plane + 1) * cells1];
@@ -1331,17 +1337,22 @@ impl PyramidView<'_> {
                                 let lo = &pb.lo;
                                 let hi = &pb.hi;
                                 let (lv, ldx_num, ldy_num) = bilinear_raw(
-                                    f64::from(p0[lo.i00]) * ra,
-                                    f64::from(p0[lo.i10]) * ra,
-                                    f64::from(p0[lo.i01]) * ra,
-                                    f64::from(p0[lo.i11]) * ra,
+                                    f64::from(p0[lo.i00 as usize]) * ra,
+                                    f64::from(p0[lo.i10 as usize]) * ra,
+                                    f64::from(p0[lo.i01 as usize]) * ra,
+                                    f64::from(p0[lo.i11 as usize]) * ra,
                                     lo.fx,
                                     lo.fy,
                                 );
                                 let ldx = ldx_num * rx0;
                                 let ldy = ldy_num * ry0;
                                 let (hv, hdx_num, hdy_num) = bilinear_raw(
-                                    p1[hi.i00], p1[hi.i10], p1[hi.i01], p1[hi.i11], hi.fx, hi.fy,
+                                    p1[hi.i00 as usize],
+                                    p1[hi.i10 as usize],
+                                    p1[hi.i01 as usize],
+                                    p1[hi.i11 as usize],
+                                    hi.fx,
+                                    hi.fy,
                                 );
                                 let hdx = hdx_num * rx1;
                                 let hdy = hdy_num * ry1;
@@ -1349,12 +1360,22 @@ impl PyramidView<'_> {
                                 let v = lv + t * (hv - lv);
                                 let dx = ldx + t * (hdx - ldx);
                                 let dy = ldy + t * (hdy - ldy);
-                                all_finite &= v.is_finite() & dx.is_finite() & dy.is_finite();
+                                finite_acc += (v + dx) + dy;
                                 sample.set_plane(plane, v, dx, dy);
                             }
                         }
-                        for (&qi, &sample) in sub.iter().zip(&sub_out[..n]) {
-                            out_chunk[qi] = sample;
+                        if !finite_acc.is_finite() {
+                            need_fallback = true;
+                            break;
+                        }
+                        for (&qi, sample) in sub.iter().zip(&sub_out[..n]) {
+                            if on_sample(chunk_base + qi as usize, sample).is_err() {
+                                need_fallback = true;
+                                break;
+                            }
+                        }
+                        if need_fallback {
+                            break;
                         }
                     }
                 } else {
@@ -1363,7 +1384,7 @@ impl PyramidView<'_> {
                     for sub in ordered.chunks(SUB_BATCH) {
                         let n = sub.len();
                         for (dst, &qi) in sub_blend[..n].iter_mut().zip(sub) {
-                            let pq = &prepared[qi];
+                            let pq = &prepared[qi as usize];
                             let hi = pq.hi.unwrap_or(pq.lo);
                             *dst = PackedBlend {
                                 lo: PackedCorners::from_level(pq.lo),
@@ -1371,6 +1392,7 @@ impl PyramidView<'_> {
                                 t: pq.t,
                             };
                         }
+                        let mut finite_acc = 0.0_f64;
                         for plane in 0..P {
                             let p0 = &field_data[plane * cells0..(plane + 1) * cells0];
                             let p1 = &coarse1[plane * cells1..(plane + 1) * cells1];
@@ -1378,17 +1400,22 @@ impl PyramidView<'_> {
                                 let lo = &pb.lo;
                                 let hi = &pb.hi;
                                 let (lv, ldx_num, ldy_num) = bilinear_raw(
-                                    div_exact(f64::from(p0[lo.i00]), area, inv_area),
-                                    div_exact(f64::from(p0[lo.i10]), area, inv_area),
-                                    div_exact(f64::from(p0[lo.i01]), area, inv_area),
-                                    div_exact(f64::from(p0[lo.i11]), area, inv_area),
+                                    div_exact(f64::from(p0[lo.i00 as usize]), area, inv_area),
+                                    div_exact(f64::from(p0[lo.i10 as usize]), area, inv_area),
+                                    div_exact(f64::from(p0[lo.i01 as usize]), area, inv_area),
+                                    div_exact(f64::from(p0[lo.i11 as usize]), area, inv_area),
                                     lo.fx,
                                     lo.fy,
                                 );
                                 let ldx = div_exact(ldx_num, sx0, meta0.inv_sx);
                                 let ldy = div_exact(ldy_num, sy0, meta0.inv_sy);
                                 let (hv, hdx_num, hdy_num) = bilinear_raw(
-                                    p1[hi.i00], p1[hi.i10], p1[hi.i01], p1[hi.i11], hi.fx, hi.fy,
+                                    p1[hi.i00 as usize],
+                                    p1[hi.i10 as usize],
+                                    p1[hi.i01 as usize],
+                                    p1[hi.i11 as usize],
+                                    hi.fx,
+                                    hi.fy,
                                 );
                                 let hdx = div_exact(hdx_num, sx1, meta1.inv_sx);
                                 let hdy = div_exact(hdy_num, sy1, meta1.inv_sy);
@@ -1396,23 +1423,30 @@ impl PyramidView<'_> {
                                 let v = lv + t * (hv - lv);
                                 let dx = ldx + t * (hdx - ldx);
                                 let dy = ldy + t * (hdy - ldy);
-                                all_finite &= v.is_finite() & dx.is_finite() & dy.is_finite();
+                                finite_acc += (v + dx) + dy;
                                 sample.set_plane(plane, v, dx, dy);
                             }
                         }
-                        for (&qi, &sample) in sub.iter().zip(&sub_out[..n]) {
-                            out_chunk[qi] = sample;
+                        if !finite_acc.is_finite() {
+                            need_fallback = true;
+                            break;
+                        }
+                        for (&qi, sample) in sub.iter().zip(&sub_out[..n]) {
+                            if on_sample(chunk_base + qi as usize, sample).is_err() {
+                                need_fallback = true;
+                                break;
+                            }
+                        }
+                        if need_fallback {
+                            break;
                         }
                     }
                 }
             }
 
             // Bucket 3: coarse-level queries (`lo.level >= 1`), tile-sorted and
-            // evaluated plane-outer across 32-query sub-batches so power-of-two
-            // coarse level planes (512 KiB / 128 KiB / 32 KiB) avoid 33-way L1D
-            // cache-set conflict misses while hoisting `level_meta` and slice
-            // lookups outside the `0..P` plane loop.
-            if n_other > 0 {
+            // evaluated plane-outer across 32-query sub-batches.
+            if !need_fallback && n_other > 0 {
                 let pack_coarse = |level: PreparedLevel| -> PackedCoarseLevel<'_> {
                     let meta = level_meta[level.level as usize];
                     PackedCoarseLevel {
@@ -1439,23 +1473,24 @@ impl PyramidView<'_> {
                     for sub in indices.chunks(SUB_BATCH) {
                         let n = sub.len();
                         for (dst, &qi) in sub_coarse[..n].iter_mut().zip(sub) {
-                            let pq = &prepared[qi];
+                            let pq = &prepared[qi as usize];
                             *dst = PackedCoarse {
                                 lo: pack_coarse(pq.lo),
                                 hi: pq.hi.map(pack_coarse),
                                 t: pq.t,
                             };
                         }
+                        let mut finite_acc = 0.0_f64;
                         for plane in 0..P {
                             for (pc, sample) in sub_coarse[..n].iter().zip(&mut sub_out[..n]) {
                                 let lo = &pc.lo;
                                 let c = &lo.corners;
                                 let lb = plane * lo.cells;
                                 let (lv, ldx_num, ldy_num) = bilinear_raw(
-                                    lo.data[lb + c.i00],
-                                    lo.data[lb + c.i10],
-                                    lo.data[lb + c.i01],
-                                    lo.data[lb + c.i11],
+                                    lo.data[lb + c.i00 as usize],
+                                    lo.data[lb + c.i10 as usize],
+                                    lo.data[lb + c.i01 as usize],
+                                    lo.data[lb + c.i11 as usize],
                                     c.fx,
                                     c.fy,
                                 );
@@ -1465,10 +1500,10 @@ impl PyramidView<'_> {
                                     let hc = &hi.corners;
                                     let hb = plane * hi.cells;
                                     let (hv, hdx_num, hdy_num) = bilinear_raw(
-                                        hi.data[hb + hc.i00],
-                                        hi.data[hb + hc.i10],
-                                        hi.data[hb + hc.i01],
-                                        hi.data[hb + hc.i11],
+                                        hi.data[hb + hc.i00 as usize],
+                                        hi.data[hb + hc.i10 as usize],
+                                        hi.data[hb + hc.i01 as usize],
+                                        hi.data[hb + hc.i11 as usize],
                                         hc.fx,
                                         hc.fy,
                                     );
@@ -1478,40 +1513,50 @@ impl PyramidView<'_> {
                                     let v = lv + t * (hv - lv);
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
-                                    all_finite &= v.is_finite() & dx.is_finite() & dy.is_finite();
+                                    finite_acc += (v + dx) + dy;
                                     sample.set_plane(plane, v, dx, dy);
                                 } else {
-                                    all_finite &=
-                                        lv.is_finite() & ldx.is_finite() & ldy.is_finite();
+                                    finite_acc += (lv + ldx) + ldy;
                                     sample.set_plane(plane, lv, ldx, ldy);
                                 }
                             }
                         }
-                        for (&qi, &sample) in sub.iter().zip(&sub_out[..n]) {
-                            out_chunk[qi] = sample;
+                        if !finite_acc.is_finite() {
+                            need_fallback = true;
+                            break;
+                        }
+                        for (&qi, sample) in sub.iter().zip(&sub_out[..n]) {
+                            if on_sample(chunk_base + qi as usize, sample).is_err() {
+                                need_fallback = true;
+                                break;
+                            }
+                        }
+                        if need_fallback {
+                            break;
                         }
                     }
                 } else {
                     for sub in indices.chunks(SUB_BATCH) {
                         let n = sub.len();
                         for (dst, &qi) in sub_coarse[..n].iter_mut().zip(sub) {
-                            let pq = &prepared[qi];
+                            let pq = &prepared[qi as usize];
                             *dst = PackedCoarse {
                                 lo: pack_coarse(pq.lo),
                                 hi: pq.hi.map(pack_coarse),
                                 t: pq.t,
                             };
                         }
+                        let mut finite_acc = 0.0_f64;
                         for plane in 0..P {
                             for (pc, sample) in sub_coarse[..n].iter().zip(&mut sub_out[..n]) {
                                 let lo = &pc.lo;
                                 let c = &lo.corners;
                                 let lb = plane * lo.cells;
                                 let (lv, ldx_num, ldy_num) = bilinear_raw(
-                                    lo.data[lb + c.i00],
-                                    lo.data[lb + c.i10],
-                                    lo.data[lb + c.i01],
-                                    lo.data[lb + c.i11],
+                                    lo.data[lb + c.i00 as usize],
+                                    lo.data[lb + c.i10 as usize],
+                                    lo.data[lb + c.i01 as usize],
+                                    lo.data[lb + c.i11 as usize],
                                     c.fx,
                                     c.fy,
                                 );
@@ -1521,10 +1566,10 @@ impl PyramidView<'_> {
                                     let hc = &hi.corners;
                                     let hb = plane * hi.cells;
                                     let (hv, hdx_num, hdy_num) = bilinear_raw(
-                                        hi.data[hb + hc.i00],
-                                        hi.data[hb + hc.i10],
-                                        hi.data[hb + hc.i01],
-                                        hi.data[hb + hc.i11],
+                                        hi.data[hb + hc.i00 as usize],
+                                        hi.data[hb + hc.i10 as usize],
+                                        hi.data[hb + hc.i01 as usize],
+                                        hi.data[hb + hc.i11 as usize],
                                         hc.fx,
                                         hc.fy,
                                     );
@@ -1534,25 +1579,35 @@ impl PyramidView<'_> {
                                     let v = lv + t * (hv - lv);
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
-                                    all_finite &= v.is_finite() & dx.is_finite() & dy.is_finite();
+                                    finite_acc += (v + dx) + dy;
                                     sample.set_plane(plane, v, dx, dy);
                                 } else {
-                                    all_finite &=
-                                        lv.is_finite() & ldx.is_finite() & ldy.is_finite();
+                                    finite_acc += (lv + ldx) + ldy;
                                     sample.set_plane(plane, lv, ldx, ldy);
                                 }
                             }
                         }
-                        for (&qi, &sample) in sub.iter().zip(&sub_out[..n]) {
-                            out_chunk[qi] = sample;
+                        if !finite_acc.is_finite() {
+                            need_fallback = true;
+                            break;
+                        }
+                        for (&qi, sample) in sub.iter().zip(&sub_out[..n]) {
+                            if on_sample(chunk_base + qi as usize, sample).is_err() {
+                                need_fallback = true;
+                                break;
+                            }
+                        }
+                        if need_fallback {
+                            break;
                         }
                     }
                 }
             }
 
-            if !all_finite {
-                for (query, sample) in q_chunk.iter().zip(out_chunk.iter_mut()) {
-                    *sample = fallback(query)?;
+            if need_fallback {
+                for (offset, query) in q_chunk.iter().enumerate() {
+                    let sample = fallback(query)?;
+                    on_sample(chunk_base + offset, &sample)?;
                 }
             }
         }
@@ -1725,6 +1780,34 @@ impl PyramidView<'_> {
         queries: &[SensorQuery],
         out: &mut [DualRawSample],
     ) -> Result<(), CoreError> {
+        if queries.len() != out.len() {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "sensor samples",
+                detail: format!("{} outputs for {} queries", out.len(), queries.len()),
+            });
+        }
+        self.sample_dual_batch_each(queries, |qi, sample| {
+            out[qi] = *sample;
+            Ok(())
+        })
+    }
+
+    /// Sample `queries` plane-by-plane on a 34-plane dual-carrier pyramid
+    /// (`V2-15`) and deliver each L1D-hot [`DualRawSample`] straight to
+    /// `on_sample(query_index, sample)` without an intermediate copy.
+    ///
+    /// As [`PyramidView::sample_batch_each`], `on_sample` must write
+    /// idempotently by query index so canonical ascending fallback works on
+    /// nonfinite or callback errors.
+    ///
+    /// # Errors
+    /// The first error [`PyramidView::sample_dual`] or `on_sample` would
+    /// return in ascending query order.
+    pub fn sample_dual_batch_each(
+        &self,
+        queries: &[SensorQuery],
+        on_sample: impl FnMut(usize, &DualRawSample) -> Result<(), CoreError>,
+    ) -> Result<(), CoreError> {
         if self.pyramid.planes != MAX_PLANES {
             return Err(CoreError::LayoutMismatch {
                 buffer: "sensor pyramid",
@@ -1734,9 +1817,11 @@ impl PyramidView<'_> {
                 ),
             });
         }
-        self.sample_batch_planes::<MAX_PLANES, DualRawSample>(queries, out, |q| {
-            self.sample_dual(q.position, q.scale)
-        })
+        self.sample_batch_planes_each::<MAX_PLANES, DualRawSample>(
+            queries,
+            |q| self.sample_dual(q.position, q.scale),
+            on_sample,
+        )
     }
 }
 

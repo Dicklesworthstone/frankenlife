@@ -5,7 +5,7 @@
 use flife_core::numerics::{
     exp, exp_neg, expm1_neg, ln, log2, normalize_turns, pow_positive,
     shrink_to_left_fold_norm_limit, sigmoid, sin_cos_turns, symplectic_rotate_channels, tanh,
-    tanh_f32, tanh_f64_as_f32,
+    tanh_f32, tanh_f64_as_f32, tanh_f64_as_f32_4,
 };
 
 /// A total order on finite `f64` in which adjacent values differ by one.
@@ -903,4 +903,100 @@ fn numerics_normalize_turns_shrink_and_symplectic_channels() {
         }
     }
     assert!(symplectic_rotate_channels(&a, 33, 1.0).is_err());
+}
+
+#[test]
+fn tanh_f64_as_f32_and_batch_pade10_match_tanh_bit_for_bit() {
+    let check_scalar = |x: f64| {
+        let want = tanh(x).map(|v| (v as f32).to_bits());
+        let got = tanh_f64_as_f32(x).map(f32::to_bits);
+        assert_eq!(got, want, "scalar tanh_f64_as_f32({x:?})");
+    };
+    let check_batch = |xs: [f64; 4]| {
+        let want = if xs.iter().all(|v| v.is_finite()) {
+            Some([
+                (tanh(xs[0]).expect("finite") as f32).to_bits(),
+                (tanh(xs[1]).expect("finite") as f32).to_bits(),
+                (tanh(xs[2]).expect("finite") as f32).to_bits(),
+                (tanh(xs[3]).expect("finite") as f32).to_bits(),
+            ])
+        } else {
+            None
+        };
+        let got = tanh_f64_as_f32_4(xs).map(|out| out.map(f32::to_bits));
+        assert_eq!(got, want, "batch tanh_f64_as_f32_4({xs:?})");
+    };
+
+    // Dense sweep across Padé [9/10] regime `[0, 2.25]`, boundary `2.25`, and
+    // Cody–Waite regime `(2.25, 20)`.
+    let mut grid = Vec::with_capacity(60_000);
+    for i in 0..=45_000_u32 {
+        let x = f64::from(i) * (2.25 / 45_000.0);
+        grid.push(x);
+        grid.push(-x);
+    }
+    for i in 1..=5_000_u32 {
+        let x = 2.25 + f64::from(i) * (17.75 / 5_000.0);
+        grid.push(x);
+        grid.push(-x);
+    }
+    // Special values: ±0, subnormals, F32 min normal, exact regime transitions,
+    // saturation threshold, huge values, and F32 rounding-tie neighborhoods.
+    let mut special = vec![
+        0.0,
+        -0.0,
+        f64::from(f32::MIN_POSITIVE) * 0.25,
+        -f64::from(f32::MIN_POSITIVE) * 0.5,
+        f64::from(f32::MIN_POSITIVE),
+        2.0 * f64::from(f32::MIN_POSITIVE),
+        1.0e-12,
+        -1.0e-7,
+        1.0 / 32.0,
+        2.25_f64.next_down(),
+        2.25,
+        2.25_f64.next_up(),
+        19.999_999,
+        20.0_f64.next_down(),
+        20.0,
+        -20.0,
+        1.0e100,
+        -1.0e300,
+    ];
+    // Synthesize near-F32-tie inputs `x = atanh(tie)` across Padé & Estrin.
+    for target in [0.001_f64, 0.25, 0.75, 0.978, 0.9999] {
+        let base_bits = (target.to_bits() & !((1_u64 << 29) - 1)) | (1_u64 << 28);
+        for delta in -4_i64..=4 {
+            let y = f64::from_bits(base_bits.wrapping_add_signed(delta));
+            if y > 0.0 && y < 1.0 {
+                let x = y.atanh();
+                special.push(x);
+                special.push(-x);
+            }
+        }
+    }
+    for &x in &special {
+        check_scalar(x);
+    }
+    for &x in &grid {
+        check_scalar(x);
+    }
+    for &chunk in grid.as_chunks::<4>().0 {
+        check_batch(chunk);
+    }
+    // All-zero / all-saturated fast exit, pure Padé, pure large, and mixed-regime 4-tuples.
+    for batch in [
+        [0.0, -0.0, 20.0, -1.0e100],
+        [0.0, 0.0, 0.0, 0.0],
+        [25.0, -25.0, 100.0, -100.0],
+        [0.0, 1.0e-5, 0.5, 2.25],
+        [-2.25, 1.0e-40, 0.0, 20.0],
+        [0.001, 2.25_f64.next_up(), -0.5, 5.0],
+        [-19.5, 0.0, 1.75, 25.0],
+        [3.0, -4.5, 8.2, 15.0],
+        [0.5, f64::NAN, 1.0, 2.0],
+        [f64::INFINITY, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, f64::NEG_INFINITY],
+    ] {
+        check_batch(batch);
+    }
 }

@@ -413,10 +413,23 @@ pub fn reduce_dual_carrier_field_on(
     let carrier0 = field.carrier0();
     apply_grants_on(field, grants, workers)?;
     let [emissions_0, recycling] = carrier0_deposits;
-    let c0_summaries = [
-        apply_deposits_to_carrier_on(field, emissions_0, carrier0, workers)?,
-        apply_deposits_to_carrier_on(field, recycling, carrier0, workers)?,
-    ];
+    let mut c0_out = [None; 2];
+    crate::deposit::apply_deposit_streams_to_carrier_on(
+        field,
+        &mut [emissions_0, recycling],
+        carrier0,
+        workers,
+        &mut c0_out,
+    )?;
+    let c0_summaries = match c0_out {
+        [Some(a), Some(b)] => [a, b],
+        _ => {
+            return Err(CoreError::StateConflict {
+                operation: "reduce dual-carrier field deposits",
+                detail: "missing Carrier 0 deposit reduction summaries".to_owned(),
+            });
+        }
+    };
     let c1_summary = apply_deposits_to_carrier_on(field, trail_deposits, carrier1, workers)?;
     Ok((c0_summaries, c1_summary))
 }

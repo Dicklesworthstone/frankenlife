@@ -117,13 +117,13 @@ use flife_neural::{
     DualObservation, FlatControllerJob, FlatOutputs, Intrinsic, MAX_ACTION_WIDTH, MAX_SENSOR_WIDTH,
     MAXIMUM_RECURRENT_STATE_WIDTH, Observation, RawOutputs, ReferenceController, SENSOR_WIDTH,
     SensorLayout, SensorScales, decode_with_layout, observe_dual_for_controller,
-    observe_dual_for_controller_f32, observe_for_controller, observe_for_controller_f32,
-    update_recurrent_state, widen_slice,
+    observe_dual_for_controller_f32, observe_dual_gradients_only, observe_for_controller,
+    observe_for_controller_f32, observe_gradients_only, update_recurrent_state, widen_slice,
 };
 
 use crate::ancestry::{Ancestry, AncestryHeld, Followed};
 use crate::chemistry::{
-    Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition, corpse_affinity_direction,
+    Affinity, Chemistry, UptakeSettlement, composition, corpse_affinity_direction,
     effective_affinity, symplectic_waste_direction,
 };
 use crate::contact::{
@@ -891,9 +891,12 @@ struct Scratch {
     grants: Grants,
     /// Each organism's grant packets, grouped by demand in cell order.
     by_demand: Bins,
-    /// Each grant packet's composition, in packet order (phase 6): room for
-    /// four a row, and as long as the most packets a tick has had.
+    /// Deduplicated cell compositions (at most `min(cells, packets)` unique
+    /// debited cells per tick, phase 6) indexed by `packet_compositions`.
     compositions: Vec<[f64; CHANNELS]>,
+    /// Per-packet index into `compositions` (`4 B` per packet vs `256 B`,
+    /// eliminating per-packet broadcast copies in phase 6).
+    packet_compositions: Vec<u32>,
     emissions: Deposits,
     /// Carrier-1 trail emissions (`V2-15` `dual-carrier-trails`); `None` (0 bytes)
     /// when disabled.
@@ -973,11 +976,12 @@ struct DecisionLane {
     /// Start index and count of this lane's due jobs inside a legacy batched tick.
     due_offset: usize,
     due_count: usize,
-    /// Phases 6 and 7 of this lane's run: one organism's packets at a
-    /// time, the run's ledger flows and staged emissions in identity order,
-    /// which the tick takes in lane order, and the watched organism's
+    /// Phases 6 and 7 of this lane's run: one organism's `(granted, comp_idx)`
+    /// packet pairs when an exchange footprint exceeds 4 cells, the run's
+    /// ledger flows and staged emissions in identity order (empty when large-
+    /// world `settle_tiles` owns staging), and the watched organism's
     /// transactions if the run holds it.
-    packets: Vec<ChemicalPacket>,
+    packets: Vec<(f64, u32)>,
     flows: LedgerLog,
     emissions: Deposits,
     /// Dedicated Carrier-1 trail emission staging (`V2-15`); `None` (0 bytes)
@@ -1550,12 +1554,19 @@ impl World {
             .as_deref()
             .is_some_and(|backend| !backend.supports_flat_f32());
         let capacity = capacity_of(&self.rules)?;
-        fit_lanes(lanes, &self.rules, capacity, legacy_batched)?;
+        let use_tiles = uses_settle_tiles(
+            workers,
+            &self.rules,
+            capacity,
+            self.settle.backend.is_some(),
+        );
+        fit_lanes(lanes, &self.rules, capacity, legacy_batched, !use_tiles)?;
         fit_settle_tiles(
             &mut self.scratch.settle_tiles,
             workers,
             &self.rules,
             capacity,
+            self.settle.backend.is_some(),
         )
     }
 
@@ -1638,14 +1649,32 @@ impl World {
                 "flat controller valid flags",
             )?;
             controllers.flat_outputs.output_width = 0;
-            fit_lanes(&mut self.scratch.lanes, &self.rules, rows, false)
+            let use_tiles = uses_settle_tiles(
+                self.scratch.lanes.len(),
+                &self.rules,
+                rows,
+                self.settle.backend.is_some(),
+            );
+            fit_lanes(
+                &mut self.scratch.lanes,
+                &self.rules,
+                rows,
+                false,
+                !use_tiles,
+            )
         } else {
             let controllers = &mut self.controllers;
             controllers.flat_inputs_f32 = Vec::new();
             controllers.flat_inputs_finite = Vec::new();
             controllers.flat_outputs = FlatOutputs::default();
             fit(&mut controllers.outputs, rows, "controller outputs")?;
-            fit_lanes(&mut self.scratch.lanes, &self.rules, rows, true)
+            let use_tiles = uses_settle_tiles(
+                self.scratch.lanes.len(),
+                &self.rules,
+                rows,
+                self.settle.backend.is_some(),
+            );
+            fit_lanes(&mut self.scratch.lanes, &self.rules, rows, true, !use_tiles)
         }
     }
 
@@ -1795,22 +1824,74 @@ impl World {
     /// capacity (FL-043). If the host refuses them, the backend is not
     /// installed, and the report says why.
     pub fn set_settle_backend(&mut self, backend: Option<Box<dyn SettleBackend>>) {
-        let settle = &mut self.settle;
-        settle.report.backend = backend.as_ref().map(|backend| backend.describe());
-        settle.report.failure = None;
-        settle.work = settle::SettleWork::default();
-        settle.backend = None;
+        let legacy_batched = self
+            .controllers
+            .backend
+            .as_deref()
+            .is_some_and(|ctrl| !ctrl.supports_flat_f32());
+        let workers = self.scratch.lanes.len();
+        self.settle.report.backend = backend.as_ref().map(|backend| backend.describe());
+        self.settle.report.failure = None;
+        self.settle.work = settle::SettleWork::default();
+        self.settle.backend = None;
         if backend.is_none() {
+            if let Ok(capacity) = capacity_of(&self.rules) {
+                let use_tiles = uses_settle_tiles(workers, &self.rules, capacity, false);
+                if fit_settle_tiles(
+                    &mut self.scratch.settle_tiles,
+                    workers,
+                    &self.rules,
+                    capacity,
+                    false,
+                )
+                .is_ok()
+                {
+                    let _ = fit_lanes(
+                        &mut self.scratch.lanes,
+                        &self.rules,
+                        capacity,
+                        legacy_batched,
+                        !use_tiles,
+                    );
+                }
+            }
             return;
         }
-        if let Err(error) = capacity_of(&self.rules)
-            .and_then(|rows| settle.work.reserve(rows, self.rules.v2.needs_motion_v2()))
-        {
-            settle.report.failure = Some(error.to_string());
-            settle.work = settle::SettleWork::default();
+        let prepared = capacity_of(&self.rules).and_then(|rows| {
+            self.settle
+                .work
+                .reserve(rows, self.rules.v2.needs_motion_v2())?;
+            fit_lanes(
+                &mut self.scratch.lanes,
+                &self.rules,
+                rows,
+                legacy_batched,
+                true,
+            )?;
+            fit_settle_tiles(
+                &mut self.scratch.settle_tiles,
+                workers,
+                &self.rules,
+                rows,
+                true,
+            )
+        });
+        if let Err(error) = prepared {
+            self.settle.report.failure = Some(error.to_string());
+            self.settle.work = settle::SettleWork::default();
+            if let Ok(capacity) = capacity_of(&self.rules) {
+                let use_tiles = uses_settle_tiles(workers, &self.rules, capacity, false);
+                let _ = fit_lanes(
+                    &mut self.scratch.lanes,
+                    &self.rules,
+                    capacity,
+                    legacy_batched,
+                    !use_tiles,
+                );
+            }
             return;
         }
-        settle.backend = backend;
+        self.settle.backend = backend;
     }
 
     /// What the settle backend has done so far.
@@ -2131,6 +2212,7 @@ impl World {
                 scratch.grants.allocated_bytes(),
                 scratch.by_demand.allocated_bytes(),
                 capacity_bytes(&scratch.compositions),
+                capacity_bytes(&scratch.packet_compositions),
                 scratch.emissions.allocated_bytes(),
                 scratch
                     .trail_emissions
@@ -2772,6 +2854,7 @@ impl World {
             grants,
             by_demand,
             compositions,
+            packet_compositions,
             emissions,
             trail_emissions,
             byproducts,
@@ -3152,8 +3235,8 @@ impl World {
             rules,
             population,
             observed,
-            (by_demand, granted),
-            compositions,
+            (by_demand, granted, grants.bins()),
+            (compositions, packet_compositions),
             from,
             watch.organism,
             working,
@@ -4357,26 +4440,31 @@ impl Scratch {
                 None
             };
         let worker_count = workers(workers_configured)?.get();
+        let use_tiles = uses_settle_tiles(worker_count, rules, rows, false);
         let mut settle_tiles = Vec::new();
-        fit_settle_tiles(&mut settle_tiles, worker_count, rules, rows)?;
+        fit_settle_tiles(&mut settle_tiles, worker_count, rules, rows, false)?;
+        let packet_cap = usize::try_from(packets).map_err(|_| CoreError::Overflow {
+            quantity: "organism packets",
+        })?;
+        let comp_cap = usize::try_from(rules.grid.cell_count().min(packets)).map_err(|_| {
+            CoreError::Overflow {
+                quantity: "packet compositions",
+            }
+        })?;
         Ok(Self {
             field,
             pyramid: SensorPyramid::from_config(config, &limits)?,
             rows: reserved(rows, "organism rows")?,
             decisions: reserved(rows, "decisions")?,
-            lanes: lanes(worker_count, rules)?,
+            lanes: lanes(worker_count, rules, !use_tiles)?,
             settle_tiles,
             sampled: Vec::with_capacity(sources),
             working: reserved(rows, "working organisms")?,
             demands: reserved(rows, "organism demands")?,
             grants: Grants::with_capacity_for(&rules.grid, organisms, rules.exchange, &limits)?,
             by_demand: Bins::with_capacity("organism packets", organisms, packets, &limits)?,
-            compositions: reserved(
-                usize::try_from(packets).map_err(|_| CoreError::Overflow {
-                    quantity: "organism packets",
-                })?,
-                "packet compositions",
-            )?,
+            compositions: reserved(comp_cap, "packet compositions")?,
+            packet_compositions: reserved(packet_cap, "packet composition indices")?,
             emissions: Deposits::with_capacity_for(
                 &rules.grid,
                 organisms,
@@ -4658,13 +4746,23 @@ fn workers(workers: u32) -> Result<NonZeroUsize, CoreError> {
 /// `workers` decision lanes, each with its decisions reserved for the most
 /// rows it can take and its controller scratch for the catalog's widest
 /// member (FL-043).
-fn lanes(workers: usize, rules: &Rules) -> Result<Vec<DecisionLane>, CoreError> {
+fn lanes(
+    workers: usize,
+    rules: &Rules,
+    lane_settle_buffers: bool,
+) -> Result<Vec<DecisionLane>, CoreError> {
     let workers = workers.max(1);
     let mut lanes = reserved(workers, "decision lanes")?;
     for _ in 0..workers {
         lanes.push(lane(rules)?);
     }
-    fit_lanes(&mut lanes, rules, capacity_of(rules)?, false)?;
+    fit_lanes(
+        &mut lanes,
+        rules,
+        capacity_of(rules)?,
+        false,
+        lane_settle_buffers,
+    )?;
     Ok(lanes)
 }
 
@@ -4738,37 +4836,46 @@ fn lane_rows(organisms: usize, lanes: usize) -> usize {
         .min(organisms)
 }
 
-/// Reserve each lane's decisions, ledger flows and staged emissions, and
-/// with `batched` its observations, for the most rows it can take of
-/// `organisms`, and its packets for one organism; without `batched`,
-/// release its observations.
+/// Reserve each lane's decisions, ledger flows and staged emissions (unless
+/// large-world `settle_tiles` owns staging), and with `batched` its
+/// observations, for the most rows it can take of `organisms`; without
+/// `batched`, release its observations.
 fn fit_lanes(
     lanes: &mut [DecisionLane],
     rules: &Rules,
     organisms: usize,
     batched: bool,
+    lane_settle_buffers: bool,
 ) -> Result<(), CoreError> {
     let rows = lane_rows(organisms, lanes.len());
     let needs_expanded = rules.v2.sensors().input_width() > SENSOR_WIDTH;
+    let packet_cap = if rules.exchange.is_grid_cic() {
+        0
+    } else {
+        rules.max_exchange_cells
+    };
     for lane in lanes {
-        fit(
-            &mut lane.packets,
-            rules.max_exchange_cells,
-            "organism packets",
-        )?;
-        lane.flows.fit(rows.saturating_mul(FLOWS_PER_ORGANISM))?;
-        lane.emissions
-            .fit_staging_for_kernel(&rules.grid, rows, rules.exchange)?;
-        if rules.v2.dual_carrier().is_some() {
-            let trail = lane.trail_emissions.get_or_insert_with(Deposits::new);
-            trail.fit_staging_for_kernel(&rules.grid, rows, rules.exchange)?;
+        fit(&mut lane.packets, packet_cap, "organism packets")?;
+        if lane_settle_buffers {
+            lane.flows.fit(rows.saturating_mul(FLOWS_PER_ORGANISM))?;
+            lane.emissions
+                .fit_staging_for_kernel(&rules.grid, rows, rules.exchange)?;
+            if rules.v2.dual_carrier().is_some() {
+                let trail = lane.trail_emissions.get_or_insert_with(Deposits::new);
+                trail.fit_staging_for_kernel(&rules.grid, rows, rules.exchange)?;
+            } else {
+                lane.trail_emissions = None;
+            }
+            if rules.v2.waste().is_some() {
+                let byproducts = lane.byproducts.get_or_insert_with(Deposits::new);
+                byproducts.fit_staging_for_kernel(&rules.grid, rows, rules.exchange)?;
+            } else {
+                lane.byproducts = None;
+            }
         } else {
+            lane.flows = LedgerLog::default();
+            lane.emissions = Deposits::new();
             lane.trail_emissions = None;
-        }
-        if rules.v2.waste().is_some() {
-            let byproducts = lane.byproducts.get_or_insert_with(Deposits::new);
-            byproducts.fit_staging_for_kernel(&rules.grid, rows, rules.exchange)?;
-        } else {
             lane.byproducts = None;
         }
         lane.transactions = None;
@@ -4959,7 +5066,9 @@ fn reduce_field_with(
         return Ok(());
     }
     apply_grants_on(next, grants, workers)?;
-    for ((deposit, carrier), slot) in deposits.iter_mut().zip(out.iter_mut()) {
+    let mut cursor = 0_usize;
+    while cursor < deposits.len() {
+        let carrier = deposits[cursor].1;
         let layout = match carrier {
             CarrierSpec::Carrier0 => next.carrier0(),
             CarrierSpec::Carrier1 => next.carrier1().ok_or_else(|| CoreError::LayoutMismatch {
@@ -4967,9 +5076,22 @@ fn reduce_field_with(
                 detail: "Carrier1 deposit offered to a 33-plane single-carrier field".to_owned(),
             })?,
         };
-        *slot = Some(apply_deposits_to_carrier_on(
-            next, deposit, layout, workers,
-        )?);
+        let mut end = cursor + 1;
+        while end < deposits.len() && deposits[end].1 == carrier {
+            end += 1;
+        }
+        let mut group: Vec<&mut Deposits> = deposits[cursor..end]
+            .iter_mut()
+            .map(|(deposit, _)| &mut **deposit)
+            .collect();
+        apply_deposit_streams_to_carrier_on(
+            next,
+            &mut group,
+            layout,
+            workers,
+            &mut out[cursor..end],
+        )?;
+        cursor = end;
     }
     Ok(())
 }
@@ -5550,6 +5672,52 @@ fn encode_dual_for_controller_f32(
     )
 }
 
+/// Gradient-only encoding for an organism whose controller is not due this
+/// tick (skips all 69 `tanh` saturations while keeping exact error semantics).
+fn encode_gradients_only(
+    rules: &Rules,
+    organism: &Organism,
+    raw: &RawSample,
+    from: Tick,
+) -> Result<[[f64; 2]; RESPONSE_TERMS], CoreError> {
+    let intrinsic = Intrinsic {
+        energy: organism.energy,
+        age_seconds: age_seconds(organism.birth_tick, from, rules.step)?,
+        velocity: organism.velocity,
+        energy_change_per_second: organism.energy_change_rate,
+    };
+    observe_gradients_only(raw, &intrinsic, &rules.scales)
+}
+
+/// Gradient-only dual-carrier encoding (`V2-15`) for an organism whose
+/// controller is not due this tick (skips all 71 `tanh` saturations).
+fn encode_dual_gradients_only(
+    rules: &Rules,
+    organism: &Organism,
+    raw: &DualRawSample,
+    from: Tick,
+) -> Result<[[f64; 2]; RESPONSE_TERMS], CoreError> {
+    let dual = rules
+        .v2
+        .dual_carrier()
+        .ok_or_else(|| CoreError::StateConflict {
+            operation: "encode dual-carrier sensors",
+            detail: "dual-carrier encoding invoked without v2.carriers enabled".to_owned(),
+        })?;
+    let intrinsic = Intrinsic {
+        energy: organism.energy,
+        age_seconds: age_seconds(organism.birth_tick, from, rules.step)?,
+        velocity: organism.velocity,
+        energy_change_per_second: organism.energy_change_rate,
+    };
+    observe_dual_gradients_only(
+        raw,
+        &intrinsic,
+        &rules.scales,
+        dual.trail_energy_density_scale(),
+    )
+}
+
 /// Whether the organism evaluates its controller for tick `to`: due on its
 /// phase, or forced because it holds no valid output.
 fn due(rules: &Rules, organism: &Organism, to: Tick) -> bool {
@@ -5978,20 +6146,32 @@ fn settle_tile_target(workers: usize) -> usize {
         .saturating_mul(workers.max(1))
 }
 
+/// Whether `(workers, rules, capacity, has_settle_backend)` uses pre-reserved
+/// dynamic work-stealing `settle_tiles` instead of per-lane settle buffers.
+const fn uses_settle_tiles(
+    workers: usize,
+    rules: &Rules,
+    capacity: usize,
+    has_settle_backend: bool,
+) -> bool {
+    !has_settle_backend
+        && workers > 1
+        && capacity >= SETTLE_TILE_THRESHOLD
+        && matches!(rules.exchange, ExchangeKernel::GridCicV1)
+}
+
 /// Reserve or release [`Scratch::settle_tiles`] for `(workers, capacity)` so
-/// large multi-worker `grid-cic-v1` worlds (`capacity ≥ 24,576`) settle with
-/// zero per-tick allocations while small or single-worker worlds hold `0` bytes
-/// (FL-043).
+/// large multi-worker `grid-cic-v1` worlds (`capacity ≥ 24,576`, CPU settle)
+/// settle with zero per-tick allocations and without duplicating per-lane
+/// settle staging buffers (FL-043).
 fn fit_settle_tiles(
     tiles: &mut Vec<SettleTileBuf>,
     workers: usize,
     rules: &Rules,
     capacity: usize,
+    has_settle_backend: bool,
 ) -> Result<(), CoreError> {
-    if workers <= 1
-        || capacity < SETTLE_TILE_THRESHOLD
-        || !matches!(rules.exchange, ExchangeKernel::GridCicV1)
-    {
+    if !uses_settle_tiles(workers, rules, capacity, has_settle_backend) {
         tiles.clear();
         tiles.shrink_to_fit();
         return Ok(());
@@ -6035,14 +6215,14 @@ fn fit_settle_tiles(
 fn settle_all(
     rules: &Rules,
     population: &Population,
-    grants: (&Bins, &[GrantPacket], &[[f64; CHANNELS]]),
+    grants: (&Bins, &[GrantPacket], &[[f64; CHANNELS]], &[u32]),
     from: Tick,
     watched: Option<OrganismId>,
     working: &mut [Working],
     lanes: &mut [DecisionLane],
     settle_tiles: &mut Vec<SettleTileBuf>,
 ) -> Result<usize, CoreError> {
-    let (by_demand, granted, compositions) = grants;
+    let (by_demand, granted, compositions, packet_compositions) = grants;
     for lane in lanes.iter_mut() {
         lane.flows.clear();
         lane.emissions.clear();
@@ -6056,12 +6236,14 @@ fn settle_all(
     }
     let worker_budget = lanes.len();
     if worker_budget > 1
-        && working.len() >= SETTLE_TILE_THRESHOLD
+        && !working.is_empty()
+        && !settle_tiles.is_empty()
         && matches!(rules.exchange, ExchangeKernel::GridCicV1)
     {
-        let has_trail = lanes.first().is_some_and(|l| l.trail_emissions.is_some());
-        let has_byproducts = lanes.first().is_some_and(|l| l.byproducts.is_some());
-        let tile_count = settle_tile_target(worker_budget)
+        let has_trail = rules.v2.dual_carrier().is_some();
+        let has_byproducts = rules.v2.waste().is_some();
+        let tile_count = settle_tiles
+            .len()
             .min(working.len().div_ceil(MINIMUM_ROWS_PER_LANE).max(1))
             .max(1);
         let sub_len = working.len().div_ceil(tile_count).max(1);
@@ -6105,19 +6287,33 @@ fn settle_all(
                 let mut live = sub_run
                     .first()
                     .map(|first| population.ascending_from(first.committed.id));
+                let mut stack_packets = [(0.0_f64, 0_u32); PACKETS_PER_ORGANISM];
                 for (offset, organism) in sub_run.iter_mut().enumerate() {
-                    packets.clear();
-                    for (packet, composition) in
-                        by_demand.bucket(*start + offset).iter().filter_map(|&at| {
+                    let bucket = by_demand.bucket(*start + offset);
+                    let packet_slice: &[(f64, u32)] = if bucket.len() <= PACKETS_PER_ORGANISM {
+                        let mut n = 0_usize;
+                        for &at in bucket {
                             let at = at as usize;
-                            granted.get(at).zip(compositions.get(at))
-                        })
-                    {
-                        packets.push(ChemicalPacket {
-                            granted: packet.granted,
-                            composition: *composition,
-                        });
-                    }
+                            if let (Some(packet), Some(&comp_idx)) =
+                                (granted.get(at), packet_compositions.get(at))
+                            {
+                                stack_packets[n] = (packet.granted, comp_idx);
+                                n += 1;
+                            }
+                        }
+                        &stack_packets[..n]
+                    } else {
+                        packets.clear();
+                        for &at in bucket {
+                            let at = at as usize;
+                            if let (Some(packet), Some(&comp_idx)) =
+                                (granted.get(at), packet_compositions.get(at))
+                            {
+                                packets.push((packet.granted, comp_idx));
+                            }
+                        }
+                        packets.as_slice()
+                    };
                     let genome = live
                         .as_mut()
                         .and_then(|walk| walk.next(organism.committed.id).0)
@@ -6129,7 +6325,8 @@ fn settle_all(
                     let mut stages = Reference {
                         traits,
                         parameters: parameter_count(&rules.catalog, genome)?,
-                        packets,
+                        packets: packet_slice,
+                        compositions,
                     };
                     let record =
                         (watched == Some(organism.committed.id)).then_some(&mut buf.transactions);
@@ -6167,17 +6364,33 @@ fn settle_all(
         let mut live = run
             .first()
             .map(|first| population.ascending_from(first.committed.id));
+        let mut stack_packets = [(0.0_f64, 0_u32); PACKETS_PER_ORGANISM];
         for (offset, organism) in run.iter_mut().enumerate() {
-            packets.clear();
-            for (packet, composition) in by_demand.bucket(start + offset).iter().filter_map(|&at| {
-                let at = at as usize;
-                granted.get(at).zip(compositions.get(at))
-            }) {
-                packets.push(ChemicalPacket {
-                    granted: packet.granted,
-                    composition: *composition,
-                });
-            }
+            let bucket = by_demand.bucket(start + offset);
+            let packet_slice: &[(f64, u32)] = if bucket.len() <= PACKETS_PER_ORGANISM {
+                let mut n = 0_usize;
+                for &at in bucket {
+                    let at = at as usize;
+                    if let (Some(packet), Some(&comp_idx)) =
+                        (granted.get(at), packet_compositions.get(at))
+                    {
+                        stack_packets[n] = (packet.granted, comp_idx);
+                        n += 1;
+                    }
+                }
+                &stack_packets[..n]
+            } else {
+                packets.clear();
+                for &at in bucket {
+                    let at = at as usize;
+                    if let (Some(packet), Some(&comp_idx)) =
+                        (granted.get(at), packet_compositions.get(at))
+                    {
+                        packets.push((packet.granted, comp_idx));
+                    }
+                }
+                packets.as_slice()
+            };
             let genome = live
                 .as_mut()
                 .and_then(|walk| walk.next(organism.committed.id).0)
@@ -6189,7 +6402,8 @@ fn settle_all(
             let mut stages = Reference {
                 traits,
                 parameters: parameter_count(&rules.catalog, genome)?,
-                packets,
+                packets: packet_slice,
+                compositions,
             };
             let record = (watched == Some(organism.committed.id)).then_some(&mut *transactions);
             settle_stages(
@@ -6212,132 +6426,206 @@ fn settle_all(
     Ok(0)
 }
 
-/// The fewest packets a lane takes in [`compositions_into`].
-const MINIMUM_PACKETS_PER_LANE: usize = 1_024;
+/// The fewest unique debited cells a lane takes in [`compositions_into`].
+const MINIMUM_CELLS_PER_LANE: usize = 256;
 
-/// Phase 6's compositions: `out[at]` becomes [`composition`] of
-/// `granted[at]`'s cell in `observed`, on at most `lanes` threads (this one
-/// and scoped workers joined before returning), each taking a contiguous
-/// run of packets. A composition is a function of the observed field and
-/// the cell alone, so the split changes no value. The packets are in cell
-/// order, so within a run a packet whose cell is the previous packet's
-/// copies its composition. `out` keeps the length of the most packets a tick
-/// has had, within the room reserved for four a row, so a tick writes only
-/// the compositions it reads. The error returned is the first in packet
-/// order.
+/// Phase 6's deduplicated cell compositions: computes one `[f64; CHANNELS]`
+/// composition per unique debited cell into `out` and maps every packet `at`
+/// in `granted` to its index in `packet_indices[at]` (`4 B` per packet vs
+/// `256 B` broadcast), on at most `lanes` threads. A composition depends only
+/// on the observed field and the cell, so tile splitting changes no bit.
+#[expect(
+    clippy::too_many_lines,
+    reason = "deduplicated plane-major cell composition builder with dynamic work-stealing tiles and fallback"
+)]
 fn compositions_into(
     observed: &FieldState,
     granted: &[GrantPacket],
+    grants_bins: &Bins,
     lanes: usize,
     out: &mut Vec<[f64; CHANNELS]>,
+    packet_indices: &mut Vec<u32>,
 ) -> Result<(), CoreError> {
-    if out.len() < granted.len() {
-        reserve_for(out, granted.len() - out.len(), "packet compositions")?;
-        out.resize(granted.len(), [0.0; CHANNELS]);
+    if granted.is_empty() {
+        out.clear();
+        packet_indices.clear();
+        return Ok(());
     }
-    let out = out
-        .get_mut(..granted.len())
-        .ok_or_else(|| CoreError::StateConflict {
-            operation: "compose packets",
-            detail: format!("no room for {} compositions", granted.len()),
-        })?;
+    if packet_indices.len() < granted.len() {
+        reserve_for(
+            packet_indices,
+            granted.len() - packet_indices.len(),
+            "packet composition indices",
+        )?;
+        packet_indices.resize(granted.len(), 0);
+    }
+    let pkt_idx_slice =
+        packet_indices
+            .get_mut(..granted.len())
+            .ok_or_else(|| CoreError::StateConflict {
+                operation: "compose packets",
+                detail: format!("no room for {} packet composition indices", granted.len()),
+            })?;
     let energy_plane = observed.energy();
     let total_cells = energy_plane.len();
     let all_data = observed.as_slice();
     let planes = observed.planes() as usize;
     let active_channels = observed.carrier0_moments_count();
     let planar_ok = all_data.len() == planes.saturating_mul(total_cells);
-    let run = |packets: &[GrantPacket], slots: &mut [[f64; CHANNELS]]| -> Result<(), CoreError> {
-        if !planar_ok {
-            let mut previous: Option<(usize, [f64; CHANNELS])> = None;
-            for (packet, slot) in packets.iter().zip(slots) {
-                let value = match previous {
-                    Some((cell, value)) if cell == packet.cell => value,
-                    _ => composition(observed, packet.cell)?,
-                };
-                *slot = value;
-                previous = Some((packet.cell, value));
-            }
-            return Ok(());
+    let occupied = grants_bins.occupied_buckets();
+    let offsets = grants_bins.offsets();
+
+    if planar_ok && grants_bins.order().len() == granted.len() && !occupied.is_empty() {
+        let distinct = occupied.len();
+        if out.len() < distinct {
+            reserve_for(out, distinct - out.len(), "packet compositions")?;
+            out.resize(distinct, [0.0; CHANNELS]);
         }
-        // Batch up to 32 distinct nonempty cells and read moment planes
-        // plane-by-plane so 512² (1 MiB plane stride) avoids 33-way L1D
-        // cache-set conflict misses while computing the exact same bits.
-        const COMP_BATCH: usize = 32;
-        let mut cells = [0_usize; COMP_BATCH];
-        let mut energies = [0.0_f64; COMP_BATCH];
-        let mut ranges = [(0_usize, 0_usize); COMP_BATCH];
-        let mut batch = [[0.0_f64; CHANNELS]; COMP_BATCH];
-        let mut i = 0_usize;
-        let n = packets.len();
-        while i < n {
-            let mut count = 0_usize;
-            while i < n && count < COMP_BATCH {
-                let cell = packets[i].cell;
-                let &e_raw = energy_plane
-                    .get(cell)
-                    .ok_or_else(|| CoreError::LayoutMismatch {
-                        buffer: "field",
-                        detail: format!("cell {cell} is not in this field"),
+        let comp_slice = out
+            .get_mut(..distinct)
+            .ok_or_else(|| CoreError::StateConflict {
+                operation: "compose packets",
+                detail: format!("no room for {distinct} compositions"),
+            })?;
+        let run_cells = |occ_base: usize,
+                         occ_chunk: &[u32],
+                         comp_chunk: &mut [[f64; CHANNELS]],
+                         pkt_base: usize,
+                         pkt_chunk: &mut [u32]|
+         -> Result<(), CoreError> {
+            // Batch up to 32 distinct nonempty cells and read moment planes
+            // plane-by-plane so 512² (1 MiB plane stride) avoids 33-way L1D
+            // cache-set conflict misses while writing each cell once.
+            const COMP_BATCH: usize = 32;
+            let mut cells = [0_usize; COMP_BATCH];
+            let mut energies = [0.0_f64; COMP_BATCH];
+            let mut slots = [0_usize; COMP_BATCH];
+            let mut i = 0_usize;
+            let n = occ_chunk.len();
+            while i < n {
+                let mut count = 0_usize;
+                while i < n && count < COMP_BATCH {
+                    let cell = occ_chunk[i] as usize;
+                    let &e_raw =
+                        energy_plane
+                            .get(cell)
+                            .ok_or_else(|| CoreError::LayoutMismatch {
+                                buffer: "field",
+                                detail: format!("cell {cell} is not in this field"),
+                            })?;
+                    let first = offsets[cell] as usize;
+                    let end = offsets[cell + 1] as usize;
+                    let comp_id = u32::try_from(occ_base + i).map_err(|_| CoreError::Overflow {
+                        quantity: "packet compositions",
                     })?;
-                let start = i;
-                i += 1;
-                while i < n && packets[i].cell == cell {
+                    if let (Some(rel_first), Some(rel_end)) =
+                        (first.checked_sub(pkt_base), end.checked_sub(pkt_base))
+                        && let Some(range_slice) = pkt_chunk.get_mut(rel_first..rel_end)
+                    {
+                        range_slice.fill(comp_id);
+                    }
+                    let e = f64::from(e_raw);
+                    if e > 0.0 {
+                        cells[count] = cell;
+                        energies[count] = e;
+                        slots[count] = i;
+                        if active_channels < CHANNELS {
+                            comp_chunk[i][active_channels..].fill(0.0);
+                        }
+                        count += 1;
+                    } else {
+                        comp_chunk[i] = [0.0; CHANNELS];
+                    }
                     i += 1;
                 }
-                let e = f64::from(e_raw);
-                if e > 0.0 {
-                    cells[count] = cell;
-                    energies[count] = e;
-                    ranges[count] = (start, i);
-                    count += 1;
-                } else {
-                    for slot in &mut slots[start..i] {
-                        *slot = [0.0; CHANNELS];
+                if count > 0 {
+                    for (channel, plane) in all_data[total_cells..]
+                        .chunks_exact(total_cells)
+                        .enumerate()
+                        .take(active_channels)
+                    {
+                        for b in 0..count {
+                            comp_chunk[slots[b]][channel] =
+                                f64::from(plane[cells[b]]) / energies[b];
+                        }
                     }
                 }
             }
-            if count > 0 {
-                for (channel, plane) in all_data[total_cells..]
-                    .chunks_exact(total_cells)
-                    .enumerate()
-                    .take(active_channels)
-                {
-                    for b in 0..count {
-                        batch[b][channel] = f64::from(plane[cells[b]]) / energies[b];
-                    }
-                }
-                for b in 0..count {
-                    let (start, end) = ranges[b];
-                    let z = batch[b];
-                    for slot in &mut slots[start..end] {
-                        *slot = z;
-                    }
-                }
-            }
+            Ok(())
+        };
+
+        let base_used = lanes.min(distinct.div_ceil(MINIMUM_CELLS_PER_LANE)).max(1);
+        if base_used == 1 {
+            let pkt_base = offsets[occupied[0] as usize] as usize;
+            return run_cells(0, occupied, comp_slice, pkt_base, pkt_idx_slice);
         }
-        Ok(())
-    };
-    let base_used = lanes
-        .min(granted.len().div_ceil(MINIMUM_PACKETS_PER_LANE))
-        .max(1);
-    if base_used == 1 {
-        return run(granted, out);
+        let tile_count = lanes
+            .saturating_mul(4)
+            .min(64)
+            .min(distinct.div_ceil(MINIMUM_CELLS_PER_LANE))
+            .max(base_used);
+        let tile_len = distinct.div_ceil(tile_count);
+        struct CompTile<'a> {
+            occ_base: usize,
+            occ: &'a [u32],
+            comps: &'a mut [[f64; CHANNELS]],
+            pkt_base: usize,
+            pkt_idx: &'a mut [u32],
+        }
+        let mut tiles = Vec::with_capacity(tile_count);
+        let mut rem_comp = comp_slice;
+        let mut rem_pkt = pkt_idx_slice;
+        let mut pkt_cursor = 0_usize;
+        for (t_idx, occ_chunk) in occupied.chunks(tile_len).enumerate() {
+            let (comp_head, comp_tail) = rem_comp.split_at_mut(occ_chunk.len());
+            rem_comp = comp_tail;
+            let last_cell = *occ_chunk.last().unwrap_or(&0) as usize;
+            let pkt_end = offsets[last_cell + 1] as usize;
+            let pkt_len = pkt_end.saturating_sub(pkt_cursor);
+            let (pkt_head, pkt_tail) = rem_pkt.split_at_mut(pkt_len);
+            rem_pkt = pkt_tail;
+            tiles.push(CompTile {
+                occ_base: t_idx * tile_len,
+                occ: occ_chunk,
+                comps: comp_head,
+                pkt_base: pkt_cursor,
+                pkt_idx: pkt_head,
+            });
+            pkt_cursor = pkt_end;
+        }
+        return flife_core::pool::try_parallel_tasks(
+            lanes,
+            "compose packets",
+            &mut tiles,
+            |_, tile| {
+                run_cells(
+                    tile.occ_base,
+                    tile.occ,
+                    tile.comps,
+                    tile.pkt_base,
+                    tile.pkt_idx,
+                )
+            },
+        );
     }
-    let tile_count = lanes
-        .saturating_mul(4)
-        .min(64)
-        .min(granted.len().div_ceil(MINIMUM_PACKETS_PER_LANE))
-        .max(base_used);
-    let length = granted.len().div_ceil(tile_count);
-    let mut tiles: Vec<(&[GrantPacket], &mut [[f64; CHANNELS]])> =
-        granted.chunks(length).zip(out.chunks_mut(length)).collect();
-    flife_core::pool::try_parallel_tasks(
-        lanes,
-        "compose packets",
-        &mut tiles,
-        |_, (packets, slots)| run(packets, slots),
-    )
+
+    // Fallback when field is non-planar or `grants_bins` does not match `granted`.
+    out.clear();
+    let mut previous_cell: Option<usize> = None;
+    let mut current_idx = 0_u32;
+    for (packet, idx_slot) in granted.iter().zip(pkt_idx_slice.iter_mut()) {
+        if previous_cell != Some(packet.cell) {
+            let value = composition(observed, packet.cell)?;
+            current_idx = u32::try_from(out.len()).map_err(|_| CoreError::Overflow {
+                quantity: "packet compositions",
+            })?;
+            reserve_for(out, 1, "packet compositions")?;
+            out.push(value);
+            previous_cell = Some(packet.cell);
+        }
+        *idx_slot = current_idx;
+    }
+    Ok(())
 }
 
 fn reserve_for<T>(
@@ -6715,12 +7003,14 @@ fn pass1_flat_f32<'p>(
     [from, to]: [Tick; 2],
     start: usize,
     run: &[Organism],
-    lane: &mut DecisionLane,
     decisions_out: &mut [Decision],
     in_f32: &mut [f32],
     in_finite: &mut [u8],
     jobs_out: &mut Vec<FlatControllerJob<'p>>,
 ) -> Result<(), CoreError> {
+    const FLAT_SAMPLE_BATCH: usize = 512;
+    const NOT_DUE: u32 = u32::MAX;
+
     let sensors = rules.v2.sensors();
     let input_width = sensors.input_width();
     let obs_width = sensors.observation_width();
@@ -6728,91 +7018,56 @@ fn pass1_flat_f32<'p>(
     let needs_expanded = input_width > SENSOR_WIDTH;
     let dual_carrier = rules.v2.dual_carrier().is_some();
 
-    let DecisionLane {
-        sample_queries,
-        raw_samples,
-        dual_raw_samples,
-        ..
-    } = lane;
     let mut live = run.first().map(|first| population.ascending_from(first.id));
     let mut local_due = 0_usize;
 
-    let mut emit_one = |local_idx: usize,
-                        row_idx: usize,
-                        organism: &Organism,
-                        genome: &'p Genome,
-                        slot: Option<ArenaSlot>,
-                        gradients: [[f64; 2]; RESPONSE_TERMS],
-                        base_f32: &[f32; SENSOR_WIDTH],
-                        trail_f32: Option<[f32; 4]>|
-     -> Result<(), CoreError> {
-        if due(rules, organism, to) {
-            let base_off = local_due * input_width;
-            let dst = in_f32
-                .get_mut(base_off..base_off + input_width)
-                .ok_or_else(|| CoreError::StateConflict {
-                    operation: "controller batch",
-                    detail: "flat input buffer shorter than due count".to_owned(),
-                })?;
-            dst[..SENSOR_WIDTH].copy_from_slice(base_f32);
-            if needs_expanded {
-                dst[SENSOR_WIDTH..].fill(0.0);
-                if let (Some(slot_idx), Some(trail)) = (sensors.dual_carrier_trails(), trail_f32) {
-                    dst[slot_idx..slot_idx + trail.len()].copy_from_slice(&trail);
-                }
-                if let (Some(slot_idx), Some(n_loc)) = (
-                    sensors.hippo_crowding(),
-                    crowding_counts.get(row_idx).copied(),
-                ) {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "matches ReferenceController F32 input narrowing"
-                    )]
-                    {
-                        dst[slot_idx] = hippo_crowding_sensor(n_loc) as f32;
-                    }
-                }
-                if let Some(slot_idx) = sensors.notch_delta() {
-                    dst[slot_idx] = organism.last_neighbor_h0;
-                }
-                if state_width > 0 {
-                    let prev = organism.held.recurrent_state_array();
-                    dst[obs_width..input_width].copy_from_slice(&prev[..state_width]);
+    let finish_due_row = |dst: &mut [f32],
+                          finite_slot: &mut u8,
+                          row_idx: usize,
+                          organism: &Organism,
+                          trail_f32: Option<[f32; 4]>| {
+        if needs_expanded {
+            dst[SENSOR_WIDTH..].fill(0.0);
+            if let (Some(slot_idx), Some(trail)) = (sensors.dual_carrier_trails(), trail_f32) {
+                dst[slot_idx..slot_idx + trail.len()].copy_from_slice(&trail);
+            }
+            if let (Some(slot_idx), Some(n_loc)) = (
+                sensors.hippo_crowding(),
+                crowding_counts.get(row_idx).copied(),
+            ) {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "matches ReferenceController F32 input narrowing"
+                )]
+                {
+                    dst[slot_idx] = hippo_crowding_sensor(n_loc) as f32;
                 }
             }
-            let finite_slot =
-                in_finite
-                    .get_mut(local_due)
-                    .ok_or_else(|| CoreError::StateConflict {
-                        operation: "controller batch",
-                        detail: "flat finite flag buffer shorter than due count".to_owned(),
-                    })?;
-            *finite_slot = u8::from(dst.iter().all(|v| v.is_finite()));
-            let arena_slot = slot.ok_or_else(|| CoreError::StateConflict {
-                operation: "controller batch",
-                detail: format!("{} holds no arena slot", organism.id),
-            })?;
-            jobs_out.push(FlatControllerJob {
-                genome: organism.genome,
-                slot: arena_slot,
-                controller: genome.controller(&rules.catalog, &rules.limits)?,
-            });
-            local_due += 1;
-            decisions_out[local_idx] = Decision {
-                held: organism.held,
-                evaluated: true,
-                actions: DecodedActions::default(),
-                gradients,
-            };
-        } else {
-            decisions_out[local_idx] =
-                finish_from_gradients(rules, organism, organism.held, false, gradients)?;
+            if let Some(slot_idx) = sensors.notch_delta() {
+                dst[slot_idx] = organism.last_neighbor_h0;
+            }
+            if state_width > 0 {
+                let prev = organism.held.recurrent_state_array();
+                dst[obs_width..input_width].copy_from_slice(&prev[..state_width]);
+            }
         }
-        Ok(())
+        *finite_slot = u8::from(dst.iter().all(|v| v.is_finite()));
     };
 
-    let mut base_f32 = [0.0_f32; SENSOR_WIDTH];
-    let mut trail_f32 = [0.0_f32; 4];
+    let build_job = |organism: &Organism,
+                     genome: &'p Genome,
+                     slot: Option<ArenaSlot>|
+     -> Result<FlatControllerJob<'p>, CoreError> {
+        let arena_slot = slot.ok_or_else(|| CoreError::StateConflict {
+            operation: "controller batch",
+            detail: format!("{} holds no arena slot", organism.id),
+        })?;
+        Ok(FlatControllerJob {
+            genome: organism.genome,
+            slot: arena_slot,
+            controller: genome.controller(&rules.catalog, &rules.limits)?,
+        })
+    };
 
     if dual_carrier {
         if let Some(Sampled::Dual(samples)) = sampled {
@@ -6828,37 +7083,64 @@ fn pass1_flat_f32<'p>(
                     Some(raw) => *raw,
                     None => view.sample_dual(organism.position, genome.traits().sensing_scale())?,
                 };
-                let gradients = encode_dual_for_controller_f32(
-                    rules,
-                    organism,
-                    &raw,
-                    from,
-                    &mut base_f32,
-                    &mut trail_f32,
-                )?;
-                emit_one(
-                    index,
-                    start + index,
-                    organism,
-                    genome,
-                    slot,
-                    gradients,
-                    &base_f32,
-                    Some(trail_f32),
-                )?;
+                if due(rules, organism, to) {
+                    let base_off = local_due * input_width;
+                    let dst = in_f32
+                        .get_mut(base_off..base_off + input_width)
+                        .ok_or_else(|| CoreError::StateConflict {
+                            operation: "controller batch",
+                            detail: "flat input buffer shorter than due count".to_owned(),
+                        })?;
+                    let base_arr: &mut [f32; SENSOR_WIDTH] = (&mut dst[..SENSOR_WIDTH])
+                        .try_into()
+                        .map_err(|_| CoreError::StateConflict {
+                            operation: "controller batch",
+                            detail: "flat input slice narrower than SENSOR_WIDTH".to_owned(),
+                        })?;
+                    let mut trail_f32 = [0.0_f32; 4];
+                    let gradients = encode_dual_for_controller_f32(
+                        rules,
+                        organism,
+                        &raw,
+                        from,
+                        base_arr,
+                        &mut trail_f32,
+                    )?;
+                    let finite_slot =
+                        in_finite
+                            .get_mut(local_due)
+                            .ok_or_else(|| CoreError::StateConflict {
+                                operation: "controller batch",
+                                detail: "flat finite flag buffer shorter than due count".to_owned(),
+                            })?;
+                    finish_due_row(dst, finite_slot, start + index, organism, Some(trail_f32));
+                    jobs_out.push(build_job(organism, genome, slot)?);
+                    local_due += 1;
+                    decisions_out[index] = Decision {
+                        held: organism.held,
+                        evaluated: true,
+                        actions: DecodedActions::default(),
+                        gradients,
+                    };
+                } else {
+                    let gradients = encode_dual_gradients_only(rules, organism, &raw, from)?;
+                    decisions_out[index] =
+                        finish_from_gradients(rules, organism, organism.held, false, gradients)?;
+                }
             }
             return Ok(());
         }
-        let batch_cap = SAMPLE_BATCH
-            .min(sample_queries.len())
-            .min(dual_raw_samples.len())
-            .max(1);
-        let mut batch_meta: [(Option<&'p Genome>, Option<ArenaSlot>); SAMPLE_BATCH] =
-            [(None, None); SAMPLE_BATCH];
-        for (chunk_idx, chunk) in run.chunks(batch_cap).enumerate() {
+        let mut queries = [SensorQuery {
+            position: [0.0, 0.0],
+            scale: 1.0,
+        }; FLAT_SAMPLE_BATCH];
+        let mut batch_meta: [(Option<&'p Genome>, Option<ArenaSlot>, u32); FLAT_SAMPLE_BATCH] =
+            [(None, None, NOT_DUE); FLAT_SAMPLE_BATCH];
+        for (chunk_idx, chunk) in run.chunks(FLAT_SAMPLE_BATCH).enumerate() {
             let count = chunk.len();
-            let local_base = chunk_idx * batch_cap;
+            let local_base = chunk_idx * FLAT_SAMPLE_BATCH;
             let base = start + local_base;
+            let mut chunk_due = 0_usize;
             for i in 0..count {
                 let organism = &chunk[i];
                 let (genome, slot) = live
@@ -6868,36 +7150,93 @@ fn pass1_flat_f32<'p>(
                     operation: "read genome",
                     detail: format!("{} has no genome", organism.id),
                 })?;
-                batch_meta[i] = (Some(genome), slot);
-                sample_queries[i] = SensorQuery {
+                let due_slot = if due(rules, organism, to) {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "chunk_due < FLAT_SAMPLE_BATCH (512) < u32::MAX"
+                    )]
+                    let d = chunk_due as u32;
+                    chunk_due += 1;
+                    d
+                } else {
+                    NOT_DUE
+                };
+                batch_meta[i] = (Some(genome), slot, due_slot);
+                queries[i] = SensorQuery {
                     position: organism.position,
                     scale: genome.traits().sensing_scale(),
                 };
             }
-            view.sample_dual_batch(&sample_queries[..count], &mut dual_raw_samples[..count])?;
-            for i in 0..count {
-                let (Some(genome), slot) = batch_meta[i] else {
-                    continue;
+            let mut chunk_jobs: [Option<FlatControllerJob<'p>>; FLAT_SAMPLE_BATCH] =
+                std::array::from_fn(|_| None);
+            let chunk_in_f32 = in_f32
+                .get_mut(local_due * input_width..(local_due + chunk_due) * input_width)
+                .ok_or_else(|| CoreError::StateConflict {
+                    operation: "controller batch",
+                    detail: "flat input buffer shorter than due count".to_owned(),
+                })?;
+            let chunk_in_fin = in_finite
+                .get_mut(local_due..local_due + chunk_due)
+                .ok_or_else(|| CoreError::StateConflict {
+                    operation: "controller batch",
+                    detail: "flat finite flag buffer shorter than due count".to_owned(),
+                })?;
+            let chunk_dec = decisions_out
+                .get_mut(local_base..local_base + count)
+                .ok_or_else(|| CoreError::StateConflict {
+                    operation: "controller batch",
+                    detail: "decision buffer shorter than organism chunk".to_owned(),
+                })?;
+            view.sample_dual_batch_each(&queries[..count], |i, raw| {
+                let (Some(genome), slot, due_slot) = batch_meta[i] else {
+                    return Ok(());
                 };
-                let gradients = encode_dual_for_controller_f32(
-                    rules,
-                    &chunk[i],
-                    &dual_raw_samples[i],
-                    from,
-                    &mut base_f32,
-                    &mut trail_f32,
-                )?;
-                emit_one(
-                    local_base + i,
-                    base + i,
-                    &chunk[i],
-                    genome,
-                    slot,
-                    gradients,
-                    &base_f32,
-                    Some(trail_f32),
-                )?;
+                let organism = &chunk[i];
+                if due_slot != NOT_DUE {
+                    let d = due_slot as usize;
+                    let dst = &mut chunk_in_f32[d * input_width..(d + 1) * input_width];
+                    let base_arr: &mut [f32; SENSOR_WIDTH] = (&mut dst[..SENSOR_WIDTH])
+                        .try_into()
+                        .map_err(|_| CoreError::StateConflict {
+                            operation: "controller batch",
+                            detail: "flat input slice narrower than SENSOR_WIDTH".to_owned(),
+                        })?;
+                    let mut trail_f32 = [0.0_f32; 4];
+                    let gradients = encode_dual_for_controller_f32(
+                        rules,
+                        organism,
+                        raw,
+                        from,
+                        base_arr,
+                        &mut trail_f32,
+                    )?;
+                    finish_due_row(
+                        dst,
+                        &mut chunk_in_fin[d],
+                        base + i,
+                        organism,
+                        Some(trail_f32),
+                    );
+                    chunk_jobs[d] = Some(build_job(organism, genome, slot)?);
+                    chunk_dec[i] = Decision {
+                        held: organism.held,
+                        evaluated: true,
+                        actions: DecodedActions::default(),
+                        gradients,
+                    };
+                } else {
+                    let gradients = encode_dual_gradients_only(rules, organism, raw, from)?;
+                    chunk_dec[i] =
+                        finish_from_gradients(rules, organism, organism.held, false, gradients)?;
+                }
+                Ok(())
+            })?;
+            for job in chunk_jobs[..chunk_due].iter_mut() {
+                if let Some(job) = job.take() {
+                    jobs_out.push(job);
+                }
             }
+            local_due += chunk_due;
         }
         return Ok(());
     }
@@ -6915,31 +7254,57 @@ fn pass1_flat_f32<'p>(
                 Some(raw) => *raw,
                 None => view.sample(organism.position, genome.traits().sensing_scale())?,
             };
-            let gradients = encode_for_controller_f32(rules, organism, &raw, from, &mut base_f32)?;
-            emit_one(
-                index,
-                start + index,
-                organism,
-                genome,
-                slot,
-                gradients,
-                &base_f32,
-                None,
-            )?;
+            if due(rules, organism, to) {
+                let base_off = local_due * input_width;
+                let dst = in_f32
+                    .get_mut(base_off..base_off + input_width)
+                    .ok_or_else(|| CoreError::StateConflict {
+                        operation: "controller batch",
+                        detail: "flat input buffer shorter than due count".to_owned(),
+                    })?;
+                let base_arr: &mut [f32; SENSOR_WIDTH] = (&mut dst[..SENSOR_WIDTH])
+                    .try_into()
+                    .map_err(|_| CoreError::StateConflict {
+                        operation: "controller batch",
+                        detail: "flat input slice narrower than SENSOR_WIDTH".to_owned(),
+                    })?;
+                let gradients = encode_for_controller_f32(rules, organism, &raw, from, base_arr)?;
+                let finite_slot =
+                    in_finite
+                        .get_mut(local_due)
+                        .ok_or_else(|| CoreError::StateConflict {
+                            operation: "controller batch",
+                            detail: "flat finite flag buffer shorter than due count".to_owned(),
+                        })?;
+                finish_due_row(dst, finite_slot, start + index, organism, None);
+                jobs_out.push(build_job(organism, genome, slot)?);
+                local_due += 1;
+                decisions_out[index] = Decision {
+                    held: organism.held,
+                    evaluated: true,
+                    actions: DecodedActions::default(),
+                    gradients,
+                };
+            } else {
+                let gradients = encode_gradients_only(rules, organism, &raw, from)?;
+                decisions_out[index] =
+                    finish_from_gradients(rules, organism, organism.held, false, gradients)?;
+            }
         }
         return Ok(());
     }
 
-    let batch_cap = SAMPLE_BATCH
-        .min(sample_queries.len())
-        .min(raw_samples.len())
-        .max(1);
-    let mut batch_meta: [(Option<&'p Genome>, Option<ArenaSlot>); SAMPLE_BATCH] =
-        [(None, None); SAMPLE_BATCH];
-    for (chunk_idx, chunk) in run.chunks(batch_cap).enumerate() {
+    let mut queries = [SensorQuery {
+        position: [0.0, 0.0],
+        scale: 1.0,
+    }; FLAT_SAMPLE_BATCH];
+    let mut batch_meta: [(Option<&'p Genome>, Option<ArenaSlot>, u32); FLAT_SAMPLE_BATCH] =
+        [(None, None, NOT_DUE); FLAT_SAMPLE_BATCH];
+    for (chunk_idx, chunk) in run.chunks(FLAT_SAMPLE_BATCH).enumerate() {
         let count = chunk.len();
-        let local_base = chunk_idx * batch_cap;
+        let local_base = chunk_idx * FLAT_SAMPLE_BATCH;
         let base = start + local_base;
+        let mut chunk_due = 0_usize;
         for i in 0..count {
             let organism = &chunk[i];
             let (genome, slot) = live
@@ -6949,30 +7314,79 @@ fn pass1_flat_f32<'p>(
                 operation: "read genome",
                 detail: format!("{} has no genome", organism.id),
             })?;
-            batch_meta[i] = (Some(genome), slot);
-            sample_queries[i] = SensorQuery {
+            let due_slot = if due(rules, organism, to) {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "chunk_due < FLAT_SAMPLE_BATCH (512) < u32::MAX"
+                )]
+                let d = chunk_due as u32;
+                chunk_due += 1;
+                d
+            } else {
+                NOT_DUE
+            };
+            batch_meta[i] = (Some(genome), slot, due_slot);
+            queries[i] = SensorQuery {
                 position: organism.position,
                 scale: genome.traits().sensing_scale(),
             };
         }
-        view.sample_batch(&sample_queries[..count], &mut raw_samples[..count])?;
-        for i in 0..count {
-            let (Some(genome), slot) = batch_meta[i] else {
-                continue;
+        let mut chunk_jobs: [Option<FlatControllerJob<'p>>; FLAT_SAMPLE_BATCH] =
+            std::array::from_fn(|_| None);
+        let chunk_in_f32 = in_f32
+            .get_mut(local_due * input_width..(local_due + chunk_due) * input_width)
+            .ok_or_else(|| CoreError::StateConflict {
+                operation: "controller batch",
+                detail: "flat input buffer shorter than due count".to_owned(),
+            })?;
+        let chunk_in_fin = in_finite
+            .get_mut(local_due..local_due + chunk_due)
+            .ok_or_else(|| CoreError::StateConflict {
+                operation: "controller batch",
+                detail: "flat finite flag buffer shorter than due count".to_owned(),
+            })?;
+        let chunk_dec = decisions_out
+            .get_mut(local_base..local_base + count)
+            .ok_or_else(|| CoreError::StateConflict {
+                operation: "controller batch",
+                detail: "decision buffer shorter than organism chunk".to_owned(),
+            })?;
+        view.sample_batch_each(&queries[..count], |i, raw| {
+            let (Some(genome), slot, due_slot) = batch_meta[i] else {
+                return Ok(());
             };
-            let gradients =
-                encode_for_controller_f32(rules, &chunk[i], &raw_samples[i], from, &mut base_f32)?;
-            emit_one(
-                local_base + i,
-                base + i,
-                &chunk[i],
-                genome,
-                slot,
-                gradients,
-                &base_f32,
-                None,
-            )?;
+            let organism = &chunk[i];
+            if due_slot != NOT_DUE {
+                let d = due_slot as usize;
+                let dst = &mut chunk_in_f32[d * input_width..(d + 1) * input_width];
+                let base_arr: &mut [f32; SENSOR_WIDTH] = (&mut dst[..SENSOR_WIDTH])
+                    .try_into()
+                    .map_err(|_| CoreError::StateConflict {
+                        operation: "controller batch",
+                        detail: "flat input slice narrower than SENSOR_WIDTH".to_owned(),
+                    })?;
+                let gradients = encode_for_controller_f32(rules, organism, raw, from, base_arr)?;
+                finish_due_row(dst, &mut chunk_in_fin[d], base + i, organism, None);
+                chunk_jobs[d] = Some(build_job(organism, genome, slot)?);
+                chunk_dec[i] = Decision {
+                    held: organism.held,
+                    evaluated: true,
+                    actions: DecodedActions::default(),
+                    gradients,
+                };
+            } else {
+                let gradients = encode_gradients_only(rules, organism, raw, from)?;
+                chunk_dec[i] =
+                    finish_from_gradients(rules, organism, organism.held, false, gradients)?;
+            }
+            Ok(())
+        })?;
+        for job in chunk_jobs[..chunk_due].iter_mut() {
+            if let Some(job) = job.take() {
+                jobs_out.push(job);
+            }
         }
+        local_due += chunk_due;
     }
     Ok(())
 }
@@ -7086,7 +7500,6 @@ fn decide_batched_flat_f32(
             [from, to],
             0,
             rows,
-            &mut lanes[0],
             decisions.as_mut_slice(),
             flat_inputs_f32.as_mut_slice(),
             flat_inputs_finite.as_mut_slice(),
@@ -7126,29 +7539,22 @@ fn decide_batched_flat_f32(
                 jobs,
             });
         }
-        flife_core::pool::try_parallel_tasks_with_lanes(
-            worker_budget,
-            "decide",
-            lanes,
-            &mut tiles,
-            |_, tile, lane| {
-                pass1_flat_f32(
-                    rules,
-                    population,
-                    view,
-                    sampled,
-                    crowding_counts,
-                    [from, to],
-                    tile.start,
-                    tile.run,
-                    lane,
-                    tile.decisions,
-                    tile.in_f32,
-                    tile.in_fin,
-                    &mut tile.jobs,
-                )
-            },
-        )?;
+        flife_core::pool::try_parallel_tasks(worker_budget, "decide", &mut tiles, |_, tile| {
+            pass1_flat_f32(
+                rules,
+                population,
+                view,
+                sampled,
+                crowding_counts,
+                [from, to],
+                tile.start,
+                tile.run,
+                tile.decisions,
+                tile.in_f32,
+                tile.in_fin,
+                &mut tile.jobs,
+            )
+        })?;
         let mut merged = Vec::new();
         reserve_for(&mut merged, total_due, "controller jobs")?;
         for mut tile in tiles {
@@ -7942,11 +8348,13 @@ trait Stages {
 }
 
 /// The reference's stages for one organism with genome `traits`, a
-/// controller of `parameters` weights, and its granted `packets`.
+/// controller of `parameters` weights, and its granted `(amount, comp_idx)`
+/// packet pairs referencing the deduplicated per-cell `compositions` table.
 struct Reference<'a> {
     traits: &'a Traits,
     parameters: u32,
-    packets: &'a [ChemicalPacket],
+    packets: &'a [(f64, u32)],
+    compositions: &'a [[f64; CHANNELS]],
 }
 
 impl Stages for Reference<'_> {
@@ -7967,7 +8375,9 @@ impl Stages for Reference<'_> {
         } else {
             Affinity::new(a_eff, &rules.chemistry)?
         };
-        rules.chemistry.settle(&affinity, self.packets, budget)
+        rules
+            .chemistry
+            .settle_indexed(&affinity, self.packets, self.compositions, budget)
     }
 
     fn maintenance(

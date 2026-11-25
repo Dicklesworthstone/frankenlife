@@ -164,8 +164,8 @@ pub(super) fn settle_with(
     rules: &Rules,
     population: &Population,
     observed: &FieldState,
-    grants: (&Bins, &[GrantPacket]),
-    compositions: &mut Vec<[f64; CHANNELS]>,
+    grants: (&Bins, &[GrantPacket], &Bins),
+    compositions: (&mut Vec<[f64; CHANNELS]>, &mut Vec<u32>),
     from: Tick,
     watched: Option<OrganismId>,
     working: &mut [Working],
@@ -173,7 +173,8 @@ pub(super) fn settle_with(
     settle_tiles: &mut Vec<SettleTileBuf>,
     settle: &mut Settle,
 ) -> Result<usize, CoreError> {
-    let (by_demand, granted) = grants;
+    let (by_demand, granted, grants_bins) = grants;
+    let (cell_compositions, packet_compositions) = compositions;
     let Settle {
         backend,
         report,
@@ -182,7 +183,16 @@ pub(super) fn settle_with(
     let mut failure = None;
     if let Some(device) = backend.as_deref_mut() {
         match settle_on(
-            device, rules, population, observed, grants, from, watched, working, lanes, work,
+            device,
+            rules,
+            population,
+            observed,
+            (by_demand, granted),
+            from,
+            watched,
+            working,
+            lanes,
+            work,
         ) {
             Ok(()) => {
                 report.ticks = report.ticks.saturating_add(1);
@@ -194,11 +204,18 @@ pub(super) fn settle_with(
             }
         }
     }
-    compositions_into(observed, granted, lanes.len(), compositions)?;
+    compositions_into(
+        observed,
+        granted,
+        grants_bins,
+        lanes.len(),
+        cell_compositions,
+        packet_compositions,
+    )?;
     let active_tiles = settle_all(
         rules,
         population,
-        (by_demand, granted, compositions),
+        (by_demand, granted, cell_compositions, packet_compositions),
         from,
         watched,
         working,

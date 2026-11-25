@@ -210,6 +210,56 @@ impl Chemistry {
         };
         settle_efficiencies(self.toxicity_sensitivity, list, budget)
     }
+
+    /// Zero-copy counterpart to [`Chemistry::settle`] where each packet holds
+    /// `(granted, composition_index)` into a deduplicated per-cell `compositions`
+    /// table, eliminating per-packet 256-byte composition copies while computing
+    /// bit-identical efficiencies and settlement.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] if any `composition_index` is out of bounds;
+    /// otherwise as [`Chemistry::settle`].
+    pub(crate) fn settle_indexed(
+        &self,
+        affinity: &Affinity,
+        packets: &[(f64, u32)],
+        compositions: &[[f64; CHANNELS]],
+        budget: &mut EnergyBudget,
+    ) -> Result<UptakeSettlement, CoreError> {
+        let mut efficiencies = [(0.0, 0.0); 4];
+        let mut scored = Vec::new();
+        let list: &mut [(f64, f64)] = if packets.len() <= efficiencies.len() {
+            for (slot, &(granted, comp_idx)) in efficiencies.iter_mut().zip(packets) {
+                let comp = compositions.get(comp_idx as usize).ok_or_else(|| {
+                    CoreError::LayoutMismatch {
+                        buffer: "packet compositions",
+                        detail: format!(
+                            "composition index {comp_idx} out of bounds for {}",
+                            compositions.len()
+                        ),
+                    }
+                })?;
+                *slot = (granted, self.efficiency(affinity, comp)?);
+            }
+            &mut efficiencies[..packets.len()]
+        } else {
+            scored.reserve(packets.len());
+            for &(granted, comp_idx) in packets {
+                let comp = compositions.get(comp_idx as usize).ok_or_else(|| {
+                    CoreError::LayoutMismatch {
+                        buffer: "packet compositions",
+                        detail: format!(
+                            "composition index {comp_idx} out of bounds for {}",
+                            compositions.len()
+                        ),
+                    }
+                })?;
+                scored.push((granted, self.efficiency(affinity, comp)?));
+            }
+            &mut scored
+        };
+        settle_efficiencies(self.toxicity_sensitivity, list, budget)
+    }
 }
 
 /// A heritable affinity direction `a` with `||a||₂` at most the run's limit,

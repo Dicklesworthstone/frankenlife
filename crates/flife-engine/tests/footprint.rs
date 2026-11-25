@@ -6,8 +6,11 @@
 
 use std::num::NonZeroUsize;
 
-use flife_core::ValidatedConfig;
+use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, Footprint, NumericalProfile, Stepped, World};
+use flife_neural::{
+    ControllerBackend, ControllerJob, ControllerScratch, FlatControllerJob, FlatOutputs, RawOutputs,
+};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 
@@ -174,4 +177,118 @@ fn large_world_settle_tiles_hold_exact_footprint_and_match_serial_bit_for_bit() 
         .set_cpu_workers(NonZeroUsize::MIN)
         .expect("1 worker");
     assert_eq!(parallel.allocated().scratch, serial.footprint().scratch);
+}
+
+#[derive(Debug)]
+struct ExactFlatF32Backend;
+
+impl ControllerBackend for ExactFlatF32Backend {
+    fn describe(&self) -> String {
+        "exact-flat-f32-reference".to_owned()
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        0
+    }
+
+    fn forget(&mut self) {}
+
+    fn evaluate(
+        &mut self,
+        jobs: &[ControllerJob<'_>],
+        outputs: &mut Vec<Option<RawOutputs>>,
+    ) -> Result<(), CoreError> {
+        outputs.clear();
+        outputs.resize(jobs.len(), None);
+        Ok(())
+    }
+
+    fn supports_flat_f32(&self) -> bool {
+        true
+    }
+
+    fn evaluate_flat_f32(
+        &mut self,
+        jobs: &[FlatControllerJob<'_>],
+        input_width: usize,
+        inputs_f32: &[f32],
+        inputs_finite: &[u8],
+        outputs: &mut FlatOutputs,
+    ) -> Result<(), CoreError> {
+        let out_width = jobs
+            .first()
+            .map_or(0, |j| j.controller.topology().output_width());
+        outputs.output_width = out_width;
+        outputs.values.clear();
+        outputs.values.resize(jobs.len() * out_width, 0.0_f32);
+        outputs.valid.clear();
+        outputs.valid.resize(jobs.len(), 0);
+        for (idx, job) in jobs.iter().enumerate() {
+            if inputs_finite.get(idx).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            let in_row = &inputs_f32[idx * input_width..(idx + 1) * input_width];
+            let wide: Vec<f64> = in_row.iter().map(|&v| f64::from(v)).collect();
+            let mut scratch = ControllerScratch::new(job.controller.topology())?;
+            let raw = job.controller.evaluate_raw(&wide, &mut scratch)?;
+            outputs.values[idx * out_width..(idx + 1) * out_width].copy_from_slice(raw.as_slice());
+            outputs.valid[idx] = 1;
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn flat_f32_multirate_streaming_sample_and_dedup_compositions_match_serial_bit_for_bit() {
+    // Exercises:
+    // - `PyramidView::sample_batch_each` (> 512 organisms per tick across 4 workers),
+    // - direct-to-`in_f32` encoding for due organisms,
+    // - `observe_gradients_only` for the 75% non-due organisms at `k = 4`,
+    // - deduplicated per-cell `compositions` + zero-copy `Chemistry::settle_indexed`.
+    let toml = PRESET
+        .replace("initial_count = 4096", "initial_count = 1536")
+        .replace("maximum_count = 16384", "maximum_count = 2048")
+        .replace(
+            "evaluation_interval_ticks = 1",
+            "evaluation_interval_ticks = 4",
+        )
+        .replace("hidden_widths = [64, 32]", "hidden_widths = [8]");
+    let cfg = ValidatedConfig::from_toml(&toml).expect("valid multirate config");
+
+    let mut serial = found(&cfg);
+    let mut batched = found(&cfg);
+    batched
+        .set_cpu_workers(NonZeroUsize::new(4).expect("4"))
+        .expect("4 workers");
+    batched.set_controller_backend(Some(Box::new(ExactFlatF32Backend)));
+
+    let founded = batched.allocated();
+    let bound = batched.footprint();
+    assert_eq!(founded.scratch, bound.scratch);
+
+    for tick in 1..=8 {
+        assert!(matches!(
+            serial.step().expect("serial"),
+            Stepped::Published(_)
+        ));
+        assert!(matches!(
+            batched.step().expect("batched"),
+            Stepped::Published(_)
+        ));
+        assert_eq!(
+            batched.allocated().scratch,
+            founded.scratch,
+            "batched multirate tick {tick} grew scratch"
+        );
+        assert_eq!(
+            batched.digest(),
+            serial.digest(),
+            "batched flat-F32 multirate diverged from serial at tick {tick}"
+        );
+    }
+    assert!(
+        batched.controller_report().batched > 0 && batched.controller_report().deferred == 0,
+        "flat-F32 path must have executed batched evaluations: {:?}",
+        batched.controller_report()
+    );
 }

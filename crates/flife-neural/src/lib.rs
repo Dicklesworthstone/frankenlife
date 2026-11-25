@@ -52,6 +52,7 @@ pub use controller::{
 pub use sensors::{
     DualObservation, Intrinsic, MAX_SENSOR_WIDTH, Observation, SENSOR_WIDTH, SensorLayout,
     SensorScales, observe, observe_dual, observe_dual_for_controller,
-    observe_dual_for_controller_f32, observe_for_controller, observe_for_controller_f32,
+    observe_dual_for_controller_f32, observe_dual_gradients_only, observe_for_controller,
+    observe_for_controller_f32, observe_gradients_only,
 };
 pub use weights::{Weight, WeightDtype, Weights};

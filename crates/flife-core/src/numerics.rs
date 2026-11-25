@@ -601,16 +601,70 @@ fn finalize_tanh_f32_4(xs: [f32; 4], mags: [f64; 4], approx: [f64; 4]) -> [f32; 
     out
 }
 
+/// Upper magnitude bound for the branchless Level-10 Padé `[9/10]`
+/// approximation in [`tanh_f64_as_f32`] / [`tanh_f64_as_f32_4`].
+/// Over `[0, 2.25]`, Padé `[9/10]` stays within `1,380` F64 ulps of
+/// correctly rounded `tanh` (`< 2.2%` of the `65,536`-ulp double-rounding
+/// tie margin) while handling `0.0`, tiny, small, and medium arguments in a
+/// single branchless polynomial ratio with zero range reduction.
+const TANH_PADE_MAX: f64 = 2.25;
+
+/// Exact integer coefficients of the Level-10 continued-fraction Padé `[9/10]`
+/// approximant `tanh(x) ≈ x * P(x²) / Q(x²)`.
+const TANH_PADE_P: [f64; 5] = [654_729_075.0, 91_891_800.0, 2_837_835.0, 25_740.0, 55.0];
+const TANH_PADE_Q: [f64; 6] = [
+    654_729_075.0,
+    310_134_825.0,
+    18_918_900.0,
+    315_315.0,
+    1_485.0,
+    1.0,
+];
+
+/// Branchless Level-10 Padé `[9/10]` approximation of `tanh(a)` for
+/// `0 ≤ a ≤ 2.25` (exact `0.0` at `a = 0.0`, within `1,380` F64 ulps over
+/// `[0, 2.25]`).
+#[inline]
+fn tanh_pade10(a: f64) -> f64 {
+    let t = a * a;
+    let t2 = t * t;
+    let t4 = t2 * t2;
+    let p = ((TANH_PADE_P[0] + TANH_PADE_P[1] * t) + (TANH_PADE_P[2] + TANH_PADE_P[3] * t) * t2)
+        + TANH_PADE_P[4] * t4;
+    let q = ((TANH_PADE_Q[0] + TANH_PADE_Q[1] * t) + (TANH_PADE_Q[2] + TANH_PADE_Q[3] * t) * t2)
+        + (TANH_PADE_Q[4] + t) * t4;
+    (a * p) / q
+}
+
+/// Four-lane lockstep [`tanh_pade10`], auto-vectorized across lanes without
+/// FMA contraction or regime branches.
+#[inline]
+fn tanh_pade10_4(a: [f64; 4]) -> [f64; 4] {
+    let mut out = [0.0_f64; 4];
+    for (dst, &ai) in out.iter_mut().zip(&a) {
+        let t = ai * ai;
+        let t2 = t * t;
+        let t4 = t2 * t2;
+        let p = ((TANH_PADE_P[0] + TANH_PADE_P[1] * t)
+            + (TANH_PADE_P[2] + TANH_PADE_P[3] * t) * t2)
+            + TANH_PADE_P[4] * t4;
+        let q = ((TANH_PADE_Q[0] + TANH_PADE_Q[1] * t)
+            + (TANH_PADE_Q[2] + TANH_PADE_Q[3] * t) * t2)
+            + (TANH_PADE_Q[4] + t) * t4;
+        *dst = (ai * p) / q;
+    }
+    out
+}
+
 /// [`tanh`] of an F64 argument, rounded once to F32: for every `f64` `x`,
 /// `tanh_f64_as_f32(x)` is `tanh(x).map(|t| t as f32)`, bit for bit.
 ///
-/// Evaluates `tanh_estrin` (one division instead of 13+) guarded by a
-/// double-rounding margin: `tanh_estrin`'s worst-case error over `(0, 20)`
-/// is below `4,000` F64 ulps, so whenever `approx` is safely normal in F32
-/// and the 29 truncated mantissa bits lie more than `65,536` ulps from the
-/// F32 rounding tie `0x1000_0000`, `approx as f32` cannot differ from
-/// `tanh(x) as f32`. Near a tie or in the F32 subnormal range (< 0.05% of
-/// inputs) it falls back to [`tanh`].
+/// Evaluates Padé `[9/10]` for `|x| ≤ 2.25` (error ≤ 1,380 F64 ulps, zero
+/// range reduction) and Cody–Waite Estrin for `2.25 < |x| < 20`, guarded by a
+/// double-rounding tie margin of `65,536` F64 ulps around `0x1000_0000`. Near
+/// a tie or in the F32 subnormal range (< 0.05% of inputs) it falls back to
+/// [`tanh`].
+#[inline]
 #[must_use]
 pub fn tanh_f64_as_f32(x: f64) -> Option<f32> {
     if !x.is_finite() {
@@ -623,7 +677,11 @@ pub fn tanh_f64_as_f32(x: f64) -> Option<f32> {
     if magnitude >= TANH_SATURATES {
         return Some(if x.is_sign_negative() { -1.0 } else { 1.0 });
     }
-    let approx = tanh_estrin(magnitude);
+    let approx = if magnitude <= TANH_PADE_MAX {
+        tanh_pade10(magnitude)
+    } else {
+        tanh_estrin_large(magnitude)
+    };
     const TIE: u64 = 1 << 28;
     const LOW_MASK: u64 = (1 << 29) - 1;
     const MARGIN: u64 = 65_536;
@@ -640,102 +698,144 @@ pub fn tanh_f64_as_f32(x: f64) -> Option<f32> {
 /// Four-lane batch [`tanh_f64_as_f32`], bit-identical to
 /// `[tanh_f64_as_f32(xs[0])?, tanh_f64_as_f32(xs[1])?, tanh_f64_as_f32(xs[2])?, tanh_f64_as_f32(xs[3])?]`.
 ///
-/// Runs Estrin polynomial evaluation and Cody–Waite range reduction in
-/// lockstep across all four lanes (with exact double-rounding tie guards and
-/// scalar [`tanh`] fallback on tie/subnormal lanes) so LLVM auto-vectorizes
-/// across lanes (`fmul.2d` / `fadd.2d` / `fdiv.2d`) while preserving every
-/// F32 bit. Returns `None` if any lane is nonfinite.
+/// Uses a fast zero/saturated exit, a single branchless 4-lane Padé `[9/10]`
+/// path covering every active lane in `(0, 2.25]` (no mixed-regime fallback),
+/// and a 4-lane Cody–Waite Estrin path with branchless `2^(-n)` for lanes in
+/// `(2.25, 20)` (patching any `≤ 2.25` lanes with [`tanh_pade10`]). Every lane
+/// passes the exact double-rounding tie guard and falls back to scalar [`tanh`]
+/// on ties or F32 subnormals. Returns `None` if any lane is nonfinite.
+#[inline]
 #[must_use]
 pub fn tanh_f64_as_f32_4(xs: [f64; 4]) -> Option<[f32; 4]> {
     if !xs[0].is_finite() || !xs[1].is_finite() || !xs[2].is_finite() || !xs[3].is_finite() {
         return None;
     }
     let mags = [xs[0].abs(), xs[1].abs(), xs[2].abs(), xs[3].abs()];
-    let s = [2.0 * mags[0], 2.0 * mags[1], 2.0 * mags[2], 2.0 * mags[3]];
-
-    let mut any_small_nz = false;
-    let mut any_mid = false;
-    for (&x, (&mag, &si)) in xs.iter().zip(mags.iter().zip(&s)) {
-        if x != 0.0 && mag < TANH_SATURATES {
-            if si < TANH_SERIES_BELOW {
-                any_small_nz = true;
+    let any_active = (mags[0] > 0.0 && mags[0] < TANH_SATURATES)
+        | (mags[1] > 0.0 && mags[1] < TANH_SATURATES)
+        | (mags[2] > 0.0 && mags[2] < TANH_SATURATES)
+        | (mags[3] > 0.0 && mags[3] < TANH_SATURATES);
+    if !any_active {
+        return Some([
+            if mags[0] == 0.0 {
+                xs[0] as f32
+            } else if xs[0].is_sign_negative() {
+                -1.0
             } else {
-                any_mid = true;
-            }
+                1.0
+            },
+            if mags[1] == 0.0 {
+                xs[1] as f32
+            } else if xs[1].is_sign_negative() {
+                -1.0
+            } else {
+                1.0
+            },
+            if mags[2] == 0.0 {
+                xs[2] as f32
+            } else if xs[2].is_sign_negative() {
+                -1.0
+            } else {
+                1.0
+            },
+            if mags[3] == 0.0 {
+                xs[3] as f32
+            } else if xs[3].is_sign_negative() {
+                -1.0
+            } else {
+                1.0
+            },
+        ]);
+    }
+
+    let any_large = (mags[0] > TANH_PADE_MAX && mags[0] < TANH_SATURATES)
+        | (mags[1] > TANH_PADE_MAX && mags[1] < TANH_SATURATES)
+        | (mags[2] > TANH_PADE_MAX && mags[2] < TANH_SATURATES)
+        | (mags[3] > TANH_PADE_MAX && mags[3] < TANH_SATURATES);
+    if !any_large {
+        // Every active lane lies in `(0, 2.25]`: single branchless 4-lane SIMD
+        // Padé `[9/10]` evaluation handles zero, tiny, small, and medium values
+        // together without Cody–Waite range reduction or mixed-regime fallbacks.
+        let a_safe = [
+            if mags[0] >= TANH_SATURATES {
+                0.0
+            } else {
+                mags[0]
+            },
+            if mags[1] >= TANH_SATURATES {
+                0.0
+            } else {
+                mags[1]
+            },
+            if mags[2] >= TANH_SATURATES {
+                0.0
+            } else {
+                mags[2]
+            },
+            if mags[3] >= TANH_SATURATES {
+                0.0
+            } else {
+                mags[3]
+            },
+        ];
+        let approx = tanh_pade10_4(a_safe);
+        return finalize_tanh_f64_as_f32_4(xs, mags, approx);
+    }
+
+    let s = [2.0 * mags[0], 2.0 * mags[1], 2.0 * mags[2], 2.0 * mags[3]];
+    let s_safe = [
+        if mags[0] > TANH_PADE_MAX && mags[0] < TANH_SATURATES {
+            s[0]
+        } else {
+            0.0
+        },
+        if mags[1] > TANH_PADE_MAX && mags[1] < TANH_SATURATES {
+            s[1]
+        } else {
+            0.0
+        },
+        if mags[2] > TANH_PADE_MAX && mags[2] < TANH_SATURATES {
+            s[2]
+        } else {
+            0.0
+        },
+        if mags[3] > TANH_PADE_MAX && mags[3] < TANH_SATURATES {
+            s[3]
+        } else {
+            0.0
+        },
+    ];
+    let n = [
+        (s_safe[0] * core::f64::consts::LOG2_E).round(),
+        (s_safe[1] * core::f64::consts::LOG2_E).round(),
+        (s_safe[2] * core::f64::consts::LOG2_E).round(),
+        (s_safe[3] * core::f64::consts::LOG2_E).round(),
+    ];
+    let neg_r = [
+        -((s_safe[0] - n[0] * LN2_HI) - n[0] * LN2_LO),
+        -((s_safe[1] - n[1] * LN2_HI) - n[1] * LN2_LO),
+        -((s_safe[2] - n[2] * LN2_HI) - n[2] * LN2_LO),
+        -((s_safe[3] - n[3] * LN2_HI) - n[3] * LN2_LO),
+    ];
+    let poly = estrin12_4(neg_r, &EXP_COEFFICIENTS);
+    let d = [
+        poly[0] * power_of_two_neg_small(n[0]),
+        poly[1] * power_of_two_neg_small(n[1]),
+        poly[2] * power_of_two_neg_small(n[2]),
+        poly[3] * power_of_two_neg_small(n[3]),
+    ];
+    let mut approx = [
+        (1.0 - d[0]) / (1.0 + d[0]),
+        (1.0 - d[1]) / (1.0 + d[1]),
+        (1.0 - d[2]) / (1.0 + d[2]),
+        (1.0 - d[3]) / (1.0 + d[3]),
+    ];
+    for (ap, &mag) in approx.iter_mut().zip(&mags) {
+        if mag > 0.0 && mag <= TANH_PADE_MAX {
+            *ap = tanh_pade10(mag);
         }
     }
-
-    if !any_small_nz {
-        // Every active lane lies in `[TANH_SERIES_BELOW, 2 * TANH_SATURATES)`;
-        // zero and saturated lanes pass `0.0` safely through the lockstep path
-        // and receive their exact outputs in `finalize_tanh_f64_as_f32_4`.
-        let s_safe = [
-            if mags[0] >= TANH_SATURATES { 0.0 } else { s[0] },
-            if mags[1] >= TANH_SATURATES { 0.0 } else { s[1] },
-            if mags[2] >= TANH_SATURATES { 0.0 } else { s[2] },
-            if mags[3] >= TANH_SATURATES { 0.0 } else { s[3] },
-        ];
-        let n = [
-            (s_safe[0] * core::f64::consts::LOG2_E).round(),
-            (s_safe[1] * core::f64::consts::LOG2_E).round(),
-            (s_safe[2] * core::f64::consts::LOG2_E).round(),
-            (s_safe[3] * core::f64::consts::LOG2_E).round(),
-        ];
-        let neg_r = [
-            -((s_safe[0] - n[0] * LN2_HI) - n[0] * LN2_LO),
-            -((s_safe[1] - n[1] * LN2_HI) - n[1] * LN2_LO),
-            -((s_safe[2] - n[2] * LN2_HI) - n[2] * LN2_LO),
-            -((s_safe[3] - n[3] * LN2_HI) - n[3] * LN2_LO),
-        ];
-        let poly = estrin12_4(neg_r, &EXP_COEFFICIENTS);
-        let d = [
-            poly[0] * power_of_two(-(n[0] as i32)),
-            poly[1] * power_of_two(-(n[1] as i32)),
-            poly[2] * power_of_two(-(n[2] as i32)),
-            poly[3] * power_of_two(-(n[3] as i32)),
-        ];
-        let approx = [
-            (1.0 - d[0]) / (1.0 + d[0]),
-            (1.0 - d[1]) / (1.0 + d[1]),
-            (1.0 - d[2]) / (1.0 + d[2]),
-            (1.0 - d[3]) / (1.0 + d[3]),
-        ];
-        return finalize_tanh_f64_as_f32_4(xs, mags, approx);
-    }
-
-    if !any_mid {
-        // Every active lane lies in `(0, TANH_SERIES_BELOW)`.
-        let s_safe = [
-            if mags[0] >= TANH_SATURATES { 0.0 } else { s[0] },
-            if mags[1] >= TANH_SATURATES { 0.0 } else { s[1] },
-            if mags[2] >= TANH_SATURATES { 0.0 } else { s[2] },
-            if mags[3] >= TANH_SATURATES { 0.0 } else { s[3] },
-        ];
-        let poly = estrin8_4(
-            [-s_safe[0], -s_safe[1], -s_safe[2], -s_safe[3]],
-            &EXPM1_COEFFICIENTS,
-        );
-        let m = [
-            s_safe[0] * poly[0],
-            s_safe[1] * poly[1],
-            s_safe[2] * poly[2],
-            s_safe[3] * poly[3],
-        ];
-        let approx = [
-            m[0] / (2.0 - m[0]),
-            m[1] / (2.0 - m[1]),
-            m[2] / (2.0 - m[2]),
-            m[3] / (2.0 - m[3]),
-        ];
-        return finalize_tanh_f64_as_f32_4(xs, mags, approx);
-    }
-
-    Some([
-        tanh_f64_as_f32(xs[0])?,
-        tanh_f64_as_f32(xs[1])?,
-        tanh_f64_as_f32(xs[2])?,
-        tanh_f64_as_f32(xs[3])?,
-    ])
+    finalize_tanh_f64_as_f32_4(xs, mags, approx)
 }
 
 #[inline]
@@ -825,8 +925,20 @@ const EXPM1_COEFFICIENTS: [f64; 8] = [
     1.0 / 40_320.0,
 ];
 
+/// `tanh(a)` for `2.25 < a < 20` via Cody–Waite range reduction and Estrin
+/// degree-11 `exp(-r)`, using branchless `2^(-n)`.
+#[inline]
+fn tanh_estrin_large(a: f64) -> f64 {
+    let s = 2.0 * a;
+    let n = (s * core::f64::consts::LOG2_E).round();
+    let r = (s - n * LN2_HI) - n * LN2_LO;
+    let d = estrin12(-r, &EXP_COEFFICIENTS) * power_of_two_neg_small(n);
+    (1.0 - d) / (1.0 + d)
+}
+
 /// `tanh(a)` for `0 < a < 20` in F64, within a few ulp: close enough that
 /// its F32 rounding is [`tanh`]'s (checked for every F32 argument).
+#[inline]
 fn tanh_estrin(a: f64) -> f64 {
     let s = 2.0 * a;
     if s < TANH_SERIES_BELOW {

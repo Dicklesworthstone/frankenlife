@@ -162,6 +162,13 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     0.8): the fine points of plan §2.3 where a world is too large for its window. Zoomed in past the cap (FL-020), dots stop growing on screen, so
     close organisms separate, and a dot stays small against the perspective frame's focal distance (about 1.2 frame
     heights), where its projection is the disk the viewport places;
+  - a declared body (`set_body_radius`, a contact model's half diameter; the Studio and `flife render` set it from
+    the configuration) replaces `DOT_RADIUS` and keeps its world size past the 24-point cap, up to
+    `BODY_RADIUS_MAX_FRAME = 1/8` of the drawable's height (never less than 24 points), so touching bodies touch on
+    screen at deep zoom (`dot_radius_with(viewport, min, Some(body))`; `tests/cloud.rs`
+    `a_declared_body_keeps_its_size_past_the_point_cap`). At that bound a body is about a tenth of the focal distance
+    and its largest halo under half of it. Under the point cap a confluent world's bodies were drawn at 47 of their
+    108 pixels at 32x in a 1080 frame (FL-024's G5 review);
   - colour `mapped_color(style.mapping, row, speed limit)`;
   - in the glow look, one halo per dot, in the same order and drawn under every dot: the dot's colour at alpha
     `HALO_ALPHA = 0.42`, radius `dot · halo_factor(energy)` with `halo_factor(e) = 2 + 2.5·e/(e + 2)` (2 to 4.5;
@@ -676,8 +683,9 @@ Metal. A view shows one image of the torus at zoom 1 to 4,096.
   validated against the newest shown epoch, a projection of a committed world, not by a query to the session's
   world.
 - Density bins do not refine with the zoom (they keep the fit's), so a deep zoom shows wide bins.
-- FrankenManim's frame is a perspective one; there is no orthographic camera, so dots are capped on screen rather
-  than drawn at world size at deep zoom.
+- FrankenManim's frame is a perspective one; there is no orthographic camera, so point organisms' dots are capped on
+  screen rather than drawn at world size at deep zoom, and a declared body is drawn at world size only up to an
+  eighth of the frame's height (about 80x for the confluent world in a 1080 frame).
 - The field's texture covers the whole torus. A pan keeps it by comparing the placed values with a copy of those it
   was built from (64 KiB for the reference world's 128 x 128 texels), not by epoch identity, which is unique only
   within a feed. Its speed is not qualified: on the 4K points view (16,384 organisms, two pixels per point) two

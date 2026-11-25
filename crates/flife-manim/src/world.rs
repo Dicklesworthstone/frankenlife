@@ -563,8 +563,10 @@ impl WorldView {
     /// fine points of plan §2.3 where a world is too large for its window,
     /// in place of [`DOT_RADIUS_MIN_POINTS`](crate::DOT_RADIUS_MIN_POINTS).
     /// Zoomed in, a dot grows to its world radius and stops at
-    /// [`DOT_RADIUS_MAX_POINTS`](crate::DOT_RADIUS_MAX_POINTS), as before. The
-    /// shown dots, their halos and the selection ring change at once.
+    /// [`DOT_RADIUS_MAX_POINTS`](crate::DOT_RADIUS_MAX_POINTS), or for a
+    /// declared body at [`BODY_RADIUS_MAX_FRAME`](crate::BODY_RADIUS_MAX_FRAME)
+    /// of the drawable's height, as before. The shown dots, their halos and
+    /// the selection ring change at once.
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] unless `points` is finite, positive
@@ -572,7 +574,7 @@ impl WorldView {
     /// [`selection_ring_around`]. The view is unchanged on error.
     pub fn set_point_radius(&mut self, points: f64) -> Result<(), CoreError> {
         check_min_radius_points(points)?;
-        let dot_radius = dot_radius_with(&self.viewport, points, self.cloud.body_radius());
+        let dot_radius = dot_radius_with(&self.viewport, points, self.cloud.declared_body());
         let ring = match self.selected_position() {
             Some(position) => Some(selection_ring_around(&self.viewport, position, dot_radius)?),
             None => None,
@@ -597,8 +599,10 @@ impl WorldView {
     }
 
     /// Draw each organism at `radius` world units, its body (a contact
-    /// model's half diameter) in place of [`DOT_RADIUS`](crate::DOT_RADIUS),
-    /// within the same on-screen bounds.
+    /// model's half diameter) in place of [`DOT_RADIUS`](crate::DOT_RADIUS):
+    /// at least the point radius on screen, and at its world size up to
+    /// [`BODY_RADIUS_MAX_FRAME`](crate::BODY_RADIUS_MAX_FRAME) of the
+    /// drawable's height, so touching bodies touch at deep zoom.
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] unless `radius` is finite and
@@ -611,7 +615,8 @@ impl WorldView {
                 detail: format!("{radius:?} world units is not a positive radius"),
             });
         }
-        let dot_radius = dot_radius_with(&self.viewport, self.cloud.min_radius_points(), radius);
+        let dot_radius =
+            dot_radius_with(&self.viewport, self.cloud.min_radius_points(), Some(radius));
         let ring = match self.selected_position() {
             Some(position) => Some(selection_ring_around(&self.viewport, position, dot_radius)?),
             None => None,

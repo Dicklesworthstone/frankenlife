@@ -40,8 +40,9 @@ mod viewport;
 mod world;
 
 pub use cloud::{
-    DOT_RADIUS, DOT_RADIUS_MAX_POINTS, DOT_RADIUS_MIN_POINTS, HALO_ALPHA, HALO_HALF_ENERGY,
-    ParticleCloud, SPHERE_SHADING, dot_radius, dot_radius_at_least, dot_radius_with, halo_factor,
+    BODY_RADIUS_MAX_FRAME, DOT_RADIUS, DOT_RADIUS_MAX_POINTS, DOT_RADIUS_MIN_POINTS, HALO_ALPHA,
+    HALO_HALF_ENERGY, ParticleCloud, SPHERE_SHADING, dot_radius, dot_radius_at_least,
+    dot_radius_with, halo_factor,
 };
 pub use density::{
     DENSITY_BIN_POINTS, DENSITY_BINS_MAX, DensityLayer, density_bins, density_level,

@@ -43,6 +43,17 @@ pub const DOT_RADIUS_MIN_POINTS: f64 = 1.5;
 /// is the disk the viewport places.
 pub const DOT_RADIUS_MAX_POINTS: f64 = 24.0;
 
+/// The largest radius a declared body (a contact model's) is drawn at, as a
+/// fraction of the drawable's height, and never less than
+/// [`DOT_RADIUS_MAX_POINTS`] points. Up to it a body is drawn at its world
+/// size, so bodies that touch in the world touch on screen: under the point
+/// cap a confluent world's tissue fell apart into loose dots past about 14x
+/// (FL-024's G5 review). The camera stands about 1.2 frame heights away, so
+/// at this bound a body's radius is about a tenth of that distance and its
+/// largest glow halo (4.5 times) under half of it; a billboard's size error
+/// is second order in that ratio.
+pub const BODY_RADIUS_MAX_FRAME: f64 = 0.125;
+
 /// The sphere look's `(reflectiveness, gloss, shadow)`: FrankenManim's
 /// true-dot lighting, which shades each dot as a sphere facing the camera.
 /// Both lifts towards white are kept small and the shadow deep, so a body
@@ -83,21 +94,32 @@ pub fn dot_radius(viewport: &Viewport) -> f64 {
 /// point.
 #[must_use]
 pub fn dot_radius_at_least(viewport: &Viewport, min_points: f64) -> f64 {
-    dot_radius_with(viewport, min_points, DOT_RADIUS)
+    dot_radius_with(viewport, min_points, None)
 }
 
 /// The dot radius in world units for a viewport whose dots are at least
-/// `min_points` on screen and whose organisms' bodies are `body` world
-/// units in radius: `body`, but at least `min_points` and at most
-/// [`DOT_RADIUS_MAX_POINTS`] points, at the viewport's pixels per point.
+/// `min_points` on screen, at the viewport's pixels per point.
+///
+/// - Point organisms (`body` is `None`): [`DOT_RADIUS`], at most
+///   [`DOT_RADIUS_MAX_POINTS`] points.
+/// - Organisms whose bodies are `body` world units in radius: `body`, at
+///   most [`BODY_RADIUS_MAX_FRAME`] of the drawable's height (never less
+///   than [`DOT_RADIUS_MAX_POINTS`] points).
 #[must_use]
-pub fn dot_radius_with(viewport: &Viewport, min_points: f64, body: f64) -> f64 {
+pub fn dot_radius_with(viewport: &Viewport, min_points: f64, body: Option<f64>) -> f64 {
     // Points to pixels first: at one pixel per point the product is exact,
     // so the radius is bit for bit what a pixel bound gives.
     let pixels = viewport.pixels_per_point();
     let scale = viewport.scale();
-    body.max(min_points * pixels / scale)
-        .min(DOT_RADIUS_MAX_POINTS * pixels / scale)
+    let point_cap = DOT_RADIUS_MAX_POINTS * pixels;
+    let (radius, cap) = match body {
+        None => (DOT_RADIUS, point_cap),
+        Some(body) => (
+            body,
+            (f64::from(viewport.drawable()[1]) * BODY_RADIUS_MAX_FRAME).max(point_cap),
+        ),
+    };
+    radius.max(min_points * pixels / scale).min(cap / scale)
 }
 
 /// Refuse a smallest dot radius that is not finite, positive and at most
@@ -125,8 +147,9 @@ pub struct ParticleCloud {
     radius: f64,
     /// The smallest radius a dot takes on screen, in points.
     min_points: f64,
-    /// An organism's radius in world units.
-    body: f64,
+    /// An organism's body radius in world units, if the model declares one;
+    /// point organisms are drawn at [`DOT_RADIUS`].
+    body: Option<f64>,
     capacity: usize,
 }
 
@@ -152,7 +175,7 @@ impl ParticleCloud {
             halos: reserve("particle cloud halos")?,
             radius: DOT_RADIUS,
             min_points: DOT_RADIUS_MIN_POINTS,
-            body: DOT_RADIUS,
+            body: None,
             capacity,
         })
     }
@@ -454,27 +477,37 @@ impl ParticleCloud {
         self.halos.clear();
     }
 
-    /// The radius a dot takes in world units on `viewport`: the body radius
-    /// within the on-screen bounds.
+    /// The radius a dot takes in world units on `viewport`
+    /// ([`dot_radius_with`]): the body radius within the on-screen bounds.
     #[must_use]
     pub fn radius_on(&self, viewport: &Viewport) -> f64 {
         dot_radius_with(viewport, self.min_points, self.body)
     }
 
-    /// An organism's radius in world units.
+    /// An organism's radius in world units: its declared body's, or
+    /// [`DOT_RADIUS`] for a point organism.
     #[must_use]
     pub const fn body_radius(&self) -> f64 {
+        match self.body {
+            Some(body) => body,
+            None => DOT_RADIUS,
+        }
+    }
+
+    /// The declared body radius in world units, `None` for point organisms.
+    #[must_use]
+    pub const fn declared_body(&self) -> Option<f64> {
         self.body
     }
 
-    /// Draw organisms at `body` world units in radius, refitting the
+    /// Draw organisms as bodies `body` world units in radius, refitting the
     /// current draws to `viewport`. Non-finite or non-positive radii are
     /// ignored.
     pub fn set_body_radius(&mut self, body: f64, viewport: &Viewport) {
         if !(body.is_finite() && body > 0.0) {
             return;
         }
-        self.body = body;
+        self.body = Some(body);
         self.refit(viewport);
     }
 

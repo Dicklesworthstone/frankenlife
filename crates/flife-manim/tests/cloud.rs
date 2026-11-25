@@ -8,7 +8,7 @@ use flife_core::ids::OrganismId;
 use flife_manim::{
     DOT_RADIUS, DOT_RADIUS_MAX_POINTS, DOT_RADIUS_MIN_POINTS, LINEAGE_PALETTE, Look, MAXIMUM_ZOOM,
     ParticleCloud, SPHERE_SHADING, Style, Viewport, WorldView, density_bins, dot_radius,
-    dot_radius_at_least, hex_rgb, lineage_color, lineage_slot, selection_ring,
+    dot_radius_at_least, dot_radius_with, hex_rgb, lineage_color, lineage_slot, selection_ring,
     selection_ring_around,
 };
 use fmn_render::ThreeDDraw;
@@ -381,6 +381,87 @@ fn sizes_in_points_look_the_same_on_a_2x_screen() -> Result<(), CoreError> {
         two.set_pixels_per_point(f64::NAN),
         Err(CoreError::NumericalInvalid { .. })
     ));
+    Ok(())
+}
+
+/// FL-024's G5 review: past the 24-point cap a confluent world's touching
+/// bodies were drawn at under half their size, as loose dots with gaps the
+/// world does not have. A declared body keeps its world size up to an eighth
+/// of the drawable's height; point organisms keep the cap.
+#[test]
+#[expect(clippy::float_cmp, reason = "radii are compared bit for bit")]
+fn a_declared_body_keeps_its_size_past_the_point_cap() -> Result<(), CoreError> {
+    let config = common::small();
+    let world = common::found(&config);
+    let epoch = common::epoch(&world);
+    // 640 px over 32 world units: 20 px per unit at zoom 1.
+    let mut view = WorldView::for_epoch(&epoch, [640, 640], [0, 0, 0])?;
+    view.show(&epoch)?;
+    let id = OrganismId::new(epoch.ids()[3]);
+    assert_eq!(view.select(Some(id))?, Some(id));
+    let middle = [320.0, 320.0];
+    view.set_view(view.viewport().zoomed_about(middle, 10.0)?)?;
+    view.show(&epoch)?;
+    assert_eq!(view.viewport().scale(), 200.0);
+    // A point organism stops at 24 px.
+    assert!(
+        dots(view.cloud().draws())
+            .iter()
+            .all(|dot| dot.radius == DOT_RADIUS_MAX_POINTS / 200.0)
+    );
+    assert!(!view.cloud().draws().is_empty());
+
+    // A body of 0.2 units is 40 px: drawn at its size, past the 24 px cap,
+    // and so is the selection ring around it.
+    view.set_body_radius(0.2)?;
+    assert!(
+        dots(view.cloud().draws())
+            .iter()
+            .all(|dot| dot.radius == 0.2)
+    );
+    let selected = view.selected_position().expect("drawn");
+    assert!(ring_around(&view, selected, 0.2)?);
+    view.show(&epoch)?;
+    assert!(
+        dots(view.cloud().draws())
+            .iter()
+            .all(|dot| dot.radius == 0.2)
+    );
+
+    // At 32x (640 px per unit) the body would be 128 px: it stops at an
+    // eighth of the 640 px drawable, 80 px.
+    view.set_view(view.viewport().zoomed_about(middle, 3.2)?)?;
+    view.show(&epoch)?;
+    let scale = view.viewport().scale();
+    assert!((scale - 640.0).abs() < 1e-9, "{scale}");
+    assert!(
+        dots(view.cloud().draws())
+            .iter()
+            .all(|dot| dot.radius == 80.0 / scale)
+    );
+
+    // The free rule: point organisms are unchanged, and a drawable too small
+    // for an eighth to reach 24 px keeps the 24 px cap for bodies too.
+    let fitted = fit([32.0, 32.0], [640, 640]).zoomed_about(middle, 10.0)?;
+    assert_eq!(
+        dot_radius_with(&fitted, DOT_RADIUS_MIN_POINTS, None),
+        dot_radius(&fitted)
+    );
+    assert_eq!(
+        dot_radius_with(&fitted, DOT_RADIUS_MIN_POINTS, Some(0.2)),
+        0.2
+    );
+    let tiny = fit([32.0, 32.0], [64, 64]).zoomed_about([32.0, 32.0], 100.0)?;
+    assert_eq!(tiny.scale(), 200.0);
+    assert_eq!(
+        dot_radius_with(&tiny, DOT_RADIUS_MIN_POINTS, Some(0.2)),
+        DOT_RADIUS_MAX_POINTS / 200.0
+    );
+    // A body smaller than the floor still takes the floor.
+    assert_eq!(
+        dot_radius_with(&fitted, DOT_RADIUS_MIN_POINTS, Some(0.001)),
+        DOT_RADIUS_MIN_POINTS / 200.0
+    );
     Ok(())
 }
 

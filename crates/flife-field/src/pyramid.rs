@@ -1042,6 +1042,10 @@ impl PyramidView<'_> {
         let mut soa_v = [[0.0_f64; SUB_BATCH]; P];
         let mut soa_dx = [[0.0_f64; SUB_BATCH]; P];
         let mut soa_dy = [[0.0_f64; SUB_BATCH]; P];
+        // One reusable sample slot hoisted outside all chunk/sub-batch loops so
+        // `load_from_soa_lane` writes directly into it without per-organism
+        // zero-initialization or 792-byte by-value `sret` copies.
+        let mut sample = S::ZERO;
 
         for (chunk_idx, q_chunk) in queries.chunks(BATCH).enumerate() {
             let chunk_base = chunk_idx * BATCH;
@@ -1241,7 +1245,7 @@ impl PyramidView<'_> {
                         break;
                     }
                     for (j, &qi) in sub.iter().enumerate() {
-                        let sample = S::from_soa_lane(&soa_v, &soa_dx, &soa_dy, j);
+                        sample.load_from_soa_lane(&soa_v, &soa_dx, &soa_dy, j);
                         if on_sample(chunk_base + qi as usize, &sample).is_err() {
                             need_fallback = true;
                             break;
@@ -1488,7 +1492,7 @@ impl PyramidView<'_> {
                         break;
                     }
                     for (j, &qi) in sub.iter().enumerate() {
-                        let sample = S::from_soa_lane(&soa_v, &soa_dx, &soa_dy, j);
+                        sample.load_from_soa_lane(&soa_v, &soa_dx, &soa_dy, j);
                         if on_sample(chunk_base + qi as usize, &sample).is_err() {
                             need_fallback = true;
                             break;
@@ -1640,7 +1644,7 @@ impl PyramidView<'_> {
                         break;
                     }
                     for (j, &qi) in sub.iter().enumerate() {
-                        let sample = S::from_soa_lane(&soa_v, &soa_dx, &soa_dy, j);
+                        sample.load_from_soa_lane(&soa_v, &soa_dx, &soa_dy, j);
                         if on_sample(chunk_base + qi as usize, &sample).is_err() {
                             need_fallback = true;
                             break;
@@ -1875,12 +1879,14 @@ impl PyramidView<'_> {
 
 trait SampleSlot<const P: usize>: Copy {
     const ZERO: Self;
-    fn from_soa_lane<const N: usize>(
+
+    fn load_from_soa_lane<const N: usize>(
+        &mut self,
         values: &[[f64; N]; P],
         dx: &[[f64; N]; P],
         dy: &[[f64; N]; P],
         lane: usize,
-    ) -> Self;
+    );
 }
 
 impl SampleSlot<PLANES> for RawSample {
@@ -1891,19 +1897,20 @@ impl SampleSlot<PLANES> for RawSample {
     };
 
     #[inline]
-    fn from_soa_lane<const N: usize>(
+    fn load_from_soa_lane<const N: usize>(
+        &mut self,
         values: &[[f64; N]; PLANES],
         dx: &[[f64; N]; PLANES],
         dy: &[[f64; N]; PLANES],
         lane: usize,
-    ) -> Self {
-        let mut out = Self::ZERO;
-        for plane in 0..PLANES {
-            out.values[plane] = values[plane][lane];
-            out.dx[plane] = dx[plane][lane];
-            out.dy[plane] = dy[plane][lane];
+    ) {
+        if lane < N {
+            for plane in 0..PLANES {
+                self.values[plane] = values[plane][lane];
+                self.dx[plane] = dx[plane][lane];
+                self.dy[plane] = dy[plane][lane];
+            }
         }
-        out
     }
 }
 
@@ -1915,19 +1922,20 @@ impl SampleSlot<MAX_PLANES> for DualRawSample {
     };
 
     #[inline]
-    fn from_soa_lane<const N: usize>(
+    fn load_from_soa_lane<const N: usize>(
+        &mut self,
         values: &[[f64; N]; MAX_PLANES],
         dx: &[[f64; N]; MAX_PLANES],
         dy: &[[f64; N]; MAX_PLANES],
         lane: usize,
-    ) -> Self {
-        let mut out = Self::ZERO;
-        for plane in 0..MAX_PLANES {
-            out.values[plane] = values[plane][lane];
-            out.dx[plane] = dx[plane][lane];
-            out.dy[plane] = dy[plane][lane];
+    ) {
+        if lane < N {
+            for plane in 0..MAX_PLANES {
+                self.values[plane] = values[plane][lane];
+                self.dx[plane] = dx[plane][lane];
+                self.dy[plane] = dy[plane][lane];
+            }
         }
-        out
     }
 }
 

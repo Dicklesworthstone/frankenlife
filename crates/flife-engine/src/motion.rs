@@ -174,31 +174,49 @@ impl Motion {
     /// # Errors
     /// [`CoreError::NumericalInvalid`] for a ratio outside `[0, 1]` or a
     /// nonfinite gradient.
+    #[inline]
     pub fn acceleration(
         &self,
         uptake_ratio: f64,
         response: &MotionResponse,
         gradients: &[[f64; 2]; RESPONSE_TERMS],
     ) -> Result<[f64; 2], CoreError> {
-        if !(0.0..=1.0).contains(&uptake_ratio) {
-            return Err(CoreError::NumericalInvalid {
+        #[cold]
+        #[inline(never)]
+        fn err_uptake_ratio(uptake_ratio: f64) -> CoreError {
+            CoreError::NumericalInvalid {
                 quantity: "uptake ratio",
                 detail: format!("{uptake_ratio} is outside [0, 1]"),
-            });
-        }
-        let mut sum = [0.0, 0.0];
-        for (coefficient, gradient) in response.0.iter().zip(gradients) {
-            if !gradient[0].is_finite() || !gradient[1].is_finite() {
-                return Err(CoreError::NumericalInvalid {
-                    quantity: "sensor gradient",
-                    detail: format!("{gradient:?} is not finite"),
-                });
             }
-            sum[0] += coefficient * gradient[0];
-            sum[1] += coefficient * gradient[1];
+        }
+        #[cold]
+        #[inline(never)]
+        fn err_nonfinite_gradient(gradient: [f64; 2]) -> CoreError {
+            CoreError::NumericalInvalid {
+                quantity: "sensor gradient",
+                detail: format!("{gradient:?} is not finite"),
+            }
+        }
+        if !(0.0..=1.0).contains(&uptake_ratio) {
+            return Err(err_uptake_ratio(uptake_ratio));
+        }
+        let mut sum0 = 0.0_f64;
+        let mut sum1 = 0.0_f64;
+        let mut finite_acc = 0.0_f64;
+        for (&coefficient, &gradient) in response.0.iter().zip(gradients) {
+            finite_acc += gradient[0] + gradient[1];
+            sum0 += coefficient * gradient[0];
+            sum1 += coefficient * gradient[1];
+        }
+        if !finite_acc.is_finite() {
+            for &gradient in gradients {
+                if !gradient[0].is_finite() || !gradient[1].is_finite() {
+                    return Err(err_nonfinite_gradient(gradient));
+                }
+            }
         }
         Ok(clamp_radius(
-            [uptake_ratio * sum[0], uptake_ratio * sum[1]],
+            [uptake_ratio * sum0, uptake_ratio * sum1],
             self.maximum_acceleration,
         ))
     }

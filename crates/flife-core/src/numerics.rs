@@ -507,17 +507,38 @@ pub fn expm1_neg_4(xs: [f64; 4]) -> Option<[f64; 4]> {
         }
         return Some(m);
     }
-    if xs[0] >= ln2
-        && xs[0] < EXPM1_SATURATES
-        && xs[1] >= ln2
-        && xs[1] < EXPM1_SATURATES
-        && xs[2] >= ln2
-        && xs[2] < EXPM1_SATURATES
-        && xs[3] >= ln2
-        && xs[3] < EXPM1_SATURATES
-    {
-        let e = exp_neg_4(xs)?;
-        return Some([1.0 - e[0], 1.0 - e[1], 1.0 - e[2], 1.0 - e[3]]);
+    if xs[0] >= ln2 && xs[1] >= ln2 && xs[2] >= ln2 && xs[3] >= ln2 {
+        // Every lane is `>= ln 2` (including saturating `>= 40`): vectorize
+        // active `[ln 2, 40)` lanes in one `exp_neg_4` pass.
+        let xm = [
+            if xs[0] < EXPM1_SATURATES { xs[0] } else { 0.0 },
+            if xs[1] < EXPM1_SATURATES { xs[1] } else { 0.0 },
+            if xs[2] < EXPM1_SATURATES { xs[2] } else { 0.0 },
+            if xs[3] < EXPM1_SATURATES { xs[3] } else { 0.0 },
+        ];
+        let e = exp_neg_4(xm)?;
+        return Some([
+            if xs[0] >= EXPM1_SATURATES {
+                1.0
+            } else {
+                1.0 - e[0]
+            },
+            if xs[1] >= EXPM1_SATURATES {
+                1.0
+            } else {
+                1.0 - e[1]
+            },
+            if xs[2] >= EXPM1_SATURATES {
+                1.0
+            } else {
+                1.0 - e[2]
+            },
+            if xs[3] >= EXPM1_SATURATES {
+                1.0
+            } else {
+                1.0 - e[3]
+            },
+        ]);
     }
     Some([
         expm1_neg(xs[0])?,
@@ -564,9 +585,10 @@ pub fn tanh(x: f64) -> Option<f64> {
 /// Four-lane batch [`tanh`], bit-identical to
 /// `[tanh(xs[0])?, tanh(xs[1])?, tanh(xs[2])?, tanh(xs[3])?]`.
 ///
-/// Vectorizes both the `|x| < 1` ([`expm1_neg_4`]) and `1 ≤ |x| < 20`
-/// ([`exp_neg_4`]) regimes in lockstep 4-lane arrays with the exact same
-/// IEEE-754 operations and rounding per lane. Returns `None` if any lane is
+/// Fast-paths the dominant `|x| < 1` regime through [`expm1_neg_4`] and
+/// delegates any lane with `|x| ≥ 1` to [`tanh_4_large`] (which vectorizes the
+/// unified `|x| ∈ {0} ∪ [ln(2)/2, ∞)` regime in one [`exp_neg_4`] call even
+/// when lanes straddle `1.0` or `20.0`). Returns `None` if any lane is
 /// nonfinite.
 #[inline]
 #[must_use]
@@ -575,8 +597,9 @@ pub fn tanh_4(xs: [f64; 4]) -> Option<[f64; 4]> {
         return None;
     }
     let mags = [xs[0].abs(), xs[1].abs(), xs[2].abs(), xs[3].abs()];
+    let two_mags = [2.0 * mags[0], 2.0 * mags[1], 2.0 * mags[2], 2.0 * mags[3]];
     if mags[0] < 1.0 && mags[1] < 1.0 && mags[2] < 1.0 && mags[3] < 1.0 {
-        let m = expm1_neg_4([2.0 * mags[0], 2.0 * mags[1], 2.0 * mags[2], 2.0 * mags[3]])?;
+        let m = expm1_neg_4(two_mags)?;
         let mut out = [0.0_f64; 4];
         for ((dst, &x), &mi) in out.iter_mut().zip(&xs).zip(&m) {
             *dst = if x == 0.0 {
@@ -588,20 +611,80 @@ pub fn tanh_4(xs: [f64; 4]) -> Option<[f64; 4]> {
         }
         return Some(out);
     }
-    if mags[0] >= 1.0
-        && mags[0] < TANH_SATURATES
-        && mags[1] >= 1.0
-        && mags[1] < TANH_SATURATES
-        && mags[2] >= 1.0
-        && mags[2] < TANH_SATURATES
-        && mags[3] >= 1.0
-        && mags[3] < TANH_SATURATES
-    {
-        let d = exp_neg_4([2.0 * mags[0], 2.0 * mags[1], 2.0 * mags[2], 2.0 * mags[3]])?;
+    tanh_4_large(xs, mags, two_mags)
+}
+
+#[inline(never)]
+fn tanh_4_large(xs: [f64; 4], mags: [f64; 4], two_mags: [f64; 4]) -> Option<[f64; 4]> {
+    let ln2 = core::f64::consts::LN_2;
+    // Both `ln(2)/2 ≤ |x| < 1` (`m = 1 - exp_neg(2|x|); m/(2 - m)`) and
+    // `1 ≤ |x| < 20` (`d = exp_neg(2|x|); 1 - 2d/(1 + d)`) evaluate the exact
+    // same `exp_neg(2|x|)`; handle them together with `0.0` and `>= 20` in one
+    // vectorized `exp_neg_4` pass so straddling `1.0` never drops to scalar.
+    let exp_ok = (two_mags[0] >= ln2 || mags[0] == 0.0)
+        && (two_mags[1] >= ln2 || mags[1] == 0.0)
+        && (two_mags[2] >= ln2 || mags[2] == 0.0)
+        && (two_mags[3] >= ln2 || mags[3] == 0.0);
+    if exp_ok {
+        let active = [
+            mags[0] > 0.0 && mags[0] < TANH_SATURATES,
+            mags[1] > 0.0 && mags[1] < TANH_SATURATES,
+            mags[2] > 0.0 && mags[2] < TANH_SATURATES,
+            mags[3] > 0.0 && mags[3] < TANH_SATURATES,
+        ];
+        if !(active[0] | active[1] | active[2] | active[3]) {
+            return Some([
+                if mags[0] == 0.0 {
+                    xs[0]
+                } else if xs[0].is_sign_negative() {
+                    -1.0
+                } else {
+                    1.0
+                },
+                if mags[1] == 0.0 {
+                    xs[1]
+                } else if xs[1].is_sign_negative() {
+                    -1.0
+                } else {
+                    1.0
+                },
+                if mags[2] == 0.0 {
+                    xs[2]
+                } else if xs[2].is_sign_negative() {
+                    -1.0
+                } else {
+                    1.0
+                },
+                if mags[3] == 0.0 {
+                    xs[3]
+                } else if xs[3].is_sign_negative() {
+                    -1.0
+                } else {
+                    1.0
+                },
+            ]);
+        }
+        let d = exp_neg_4([
+            if active[0] { two_mags[0] } else { 1.0 },
+            if active[1] { two_mags[1] } else { 1.0 },
+            if active[2] { two_mags[2] } else { 1.0 },
+            if active[3] { two_mags[3] } else { 1.0 },
+        ])?;
         let mut out = [0.0_f64; 4];
-        for ((dst, &x), &di) in out.iter_mut().zip(&xs).zip(&d) {
-            let v = 1.0 - 2.0 * di / (1.0 + di);
-            *dst = if x.is_sign_negative() { -v } else { v };
+        for ((dst, (&x, &mag)), &di) in out.iter_mut().zip(xs.iter().zip(&mags)).zip(&d) {
+            *dst = if mag == 0.0 {
+                x
+            } else {
+                let v = if mag >= TANH_SATURATES {
+                    1.0
+                } else if mag >= 1.0 {
+                    1.0 - 2.0 * di / (1.0 + di)
+                } else {
+                    let m = 1.0 - di;
+                    m / (2.0 - m)
+                };
+                if x.is_sign_negative() { -v } else { v }
+            };
         }
         return Some(out);
     }
@@ -798,94 +881,133 @@ pub fn tanh_f64_as_f32_4(xs: [f64; 4]) -> Option<[f32; 4]> {
         | (mags[1] > TANH_PADE_MAX && mags[1] < TANH_SATURATES)
         | (mags[2] > TANH_PADE_MAX && mags[2] < TANH_SATURATES)
         | (mags[3] > TANH_PADE_MAX && mags[3] < TANH_SATURATES);
-    if !any_large {
+    let any_sat = (mags[0] >= TANH_SATURATES)
+        | (mags[1] >= TANH_SATURATES)
+        | (mags[2] >= TANH_SATURATES)
+        | (mags[3] >= TANH_SATURATES);
+    let approx = if !any_large {
         // Every active lane lies in `(0, 2.25]`: single branchless 4-lane SIMD
         // Padé `[9/10]` evaluation handles zero, tiny, small, and medium values
         // together without Cody–Waite range reduction or mixed-regime fallbacks.
-        let a_safe = [
-            if mags[0] >= TANH_SATURATES {
-                0.0
+        let a_safe = if !any_sat {
+            mags
+        } else {
+            [
+                if mags[0] >= TANH_SATURATES {
+                    0.0
+                } else {
+                    mags[0]
+                },
+                if mags[1] >= TANH_SATURATES {
+                    0.0
+                } else {
+                    mags[1]
+                },
+                if mags[2] >= TANH_SATURATES {
+                    0.0
+                } else {
+                    mags[2]
+                },
+                if mags[3] >= TANH_SATURATES {
+                    0.0
+                } else {
+                    mags[3]
+                },
+            ]
+        };
+        tanh_pade10_4(a_safe)
+    } else {
+        let s = [2.0 * mags[0], 2.0 * mags[1], 2.0 * mags[2], 2.0 * mags[3]];
+        let s_safe = [
+            if mags[0] > TANH_PADE_MAX && mags[0] < TANH_SATURATES {
+                s[0]
             } else {
-                mags[0]
+                0.0
             },
-            if mags[1] >= TANH_SATURATES {
-                0.0
+            if mags[1] > TANH_PADE_MAX && mags[1] < TANH_SATURATES {
+                s[1]
             } else {
-                mags[1]
+                0.0
             },
-            if mags[2] >= TANH_SATURATES {
-                0.0
+            if mags[2] > TANH_PADE_MAX && mags[2] < TANH_SATURATES {
+                s[2]
             } else {
-                mags[2]
+                0.0
             },
-            if mags[3] >= TANH_SATURATES {
-                0.0
+            if mags[3] > TANH_PADE_MAX && mags[3] < TANH_SATURATES {
+                s[3]
             } else {
-                mags[3]
+                0.0
             },
         ];
-        let approx = tanh_pade10_4(a_safe);
-        return finalize_tanh_f64_as_f32_4(xs, mags, approx);
-    }
-
-    let s = [2.0 * mags[0], 2.0 * mags[1], 2.0 * mags[2], 2.0 * mags[3]];
-    let s_safe = [
-        if mags[0] > TANH_PADE_MAX && mags[0] < TANH_SATURATES {
-            s[0]
-        } else {
-            0.0
-        },
-        if mags[1] > TANH_PADE_MAX && mags[1] < TANH_SATURATES {
-            s[1]
-        } else {
-            0.0
-        },
-        if mags[2] > TANH_PADE_MAX && mags[2] < TANH_SATURATES {
-            s[2]
-        } else {
-            0.0
-        },
-        if mags[3] > TANH_PADE_MAX && mags[3] < TANH_SATURATES {
-            s[3]
-        } else {
-            0.0
-        },
-    ];
-    let n = [
-        (s_safe[0] * core::f64::consts::LOG2_E).round(),
-        (s_safe[1] * core::f64::consts::LOG2_E).round(),
-        (s_safe[2] * core::f64::consts::LOG2_E).round(),
-        (s_safe[3] * core::f64::consts::LOG2_E).round(),
-    ];
-    let neg_r = [
-        -((s_safe[0] - n[0] * LN2_HI) - n[0] * LN2_LO),
-        -((s_safe[1] - n[1] * LN2_HI) - n[1] * LN2_LO),
-        -((s_safe[2] - n[2] * LN2_HI) - n[2] * LN2_LO),
-        -((s_safe[3] - n[3] * LN2_HI) - n[3] * LN2_LO),
-    ];
-    let poly = estrin12_4(neg_r, &EXP_COEFFICIENTS);
-    let d = [
-        poly[0] * power_of_two_neg_small(n[0]),
-        poly[1] * power_of_two_neg_small(n[1]),
-        poly[2] * power_of_two_neg_small(n[2]),
-        poly[3] * power_of_two_neg_small(n[3]),
-    ];
-    let mut approx = [
-        (1.0 - d[0]) / (1.0 + d[0]),
-        (1.0 - d[1]) / (1.0 + d[1]),
-        (1.0 - d[2]) / (1.0 + d[2]),
-        (1.0 - d[3]) / (1.0 + d[3]),
-    ];
-    for (ap, &mag) in approx.iter_mut().zip(&mags) {
-        if mag > 0.0 && mag <= TANH_PADE_MAX {
-            *ap = tanh_pade10(mag);
+        let n = [
+            (s_safe[0] * core::f64::consts::LOG2_E).round(),
+            (s_safe[1] * core::f64::consts::LOG2_E).round(),
+            (s_safe[2] * core::f64::consts::LOG2_E).round(),
+            (s_safe[3] * core::f64::consts::LOG2_E).round(),
+        ];
+        let neg_r = [
+            -((s_safe[0] - n[0] * LN2_HI) - n[0] * LN2_LO),
+            -((s_safe[1] - n[1] * LN2_HI) - n[1] * LN2_LO),
+            -((s_safe[2] - n[2] * LN2_HI) - n[2] * LN2_LO),
+            -((s_safe[3] - n[3] * LN2_HI) - n[3] * LN2_LO),
+        ];
+        let poly = estrin12_4(neg_r, &EXP_COEFFICIENTS);
+        let d = [
+            poly[0] * power_of_two_neg_small(n[0]),
+            poly[1] * power_of_two_neg_small(n[1]),
+            poly[2] * power_of_two_neg_small(n[2]),
+            poly[3] * power_of_two_neg_small(n[3]),
+        ];
+        let mut ap = [
+            (1.0 - d[0]) / (1.0 + d[0]),
+            (1.0 - d[1]) / (1.0 + d[1]),
+            (1.0 - d[2]) / (1.0 + d[2]),
+            (1.0 - d[3]) / (1.0 + d[3]),
+        ];
+        for (dst, &mag) in ap.iter_mut().zip(&mags) {
+            if mag > 0.0 && mag <= TANH_PADE_MAX {
+                *dst = tanh_pade10(mag);
+            }
         }
+        ap
+    };
+
+    // Single inline exit: when no lane saturated and every lane is either exact
+    // `0.0` or safely away from F32 subnormals and F32 rounding ties (>99.9% of
+    // calls), narrow and copy sign purely in FP/NEON registers without calling
+    // out-of-line slow fallback.
+    const TIE: u64 = 1 << 28;
+    const LOW_MASK: u64 = (1 << 29) - 1;
+    const MARGIN: u64 = 65_536;
+    let min_normal = 2.0 * f64::from(f32::MIN_POSITIVE);
+    if !any_sat
+        && ((approx[0] == 0.0 || approx[0] >= min_normal)
+            & (approx[1] == 0.0 || approx[1] >= min_normal)
+            & (approx[2] == 0.0 || approx[2] >= min_normal)
+            & (approx[3] == 0.0 || approx[3] >= min_normal)
+            & ((approx[0].to_bits() & LOW_MASK).abs_diff(TIE) > MARGIN)
+            & ((approx[1].to_bits() & LOW_MASK).abs_diff(TIE) > MARGIN)
+            & ((approx[2].to_bits() & LOW_MASK).abs_diff(TIE) > MARGIN)
+            & ((approx[3].to_bits() & LOW_MASK).abs_diff(TIE) > MARGIN))
+    {
+        return Some([
+            approx[0].copysign(xs[0]) as f32,
+            approx[1].copysign(xs[1]) as f32,
+            approx[2].copysign(xs[2]) as f32,
+            approx[3].copysign(xs[3]) as f32,
+        ]);
     }
-    finalize_tanh_f64_as_f32_4(xs, mags, approx)
+    finalize_tanh_f64_as_f32_4_slow(xs, mags, approx)
 }
 
-#[inline]
-fn finalize_tanh_f64_as_f32_4(xs: [f64; 4], mags: [f64; 4], approx: [f64; 4]) -> Option<[f32; 4]> {
+#[cold]
+#[inline(never)]
+fn finalize_tanh_f64_as_f32_4_slow(
+    xs: [f64; 4],
+    mags: [f64; 4],
+    approx: [f64; 4],
+) -> Option<[f32; 4]> {
     const TIE: u64 = 1 << 28;
     const LOW_MASK: u64 = (1 << 29) - 1;
     const MARGIN: u64 = 65_536;

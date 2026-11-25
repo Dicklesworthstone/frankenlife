@@ -775,19 +775,19 @@ pub fn decode_with_layout(
 
     // Vectorize the four baseline logistic gates through one bit-exact
     // 4-lane `sigmoid_4` (all entries in `raw` are already verified finite).
-    let [sig_repro, sig_child, emission_gate, sig_spend] = match sigmoid_4([
+    let (sig_repro, sig_child, emission_gate, sig_spend) = match sigmoid_4([
         output(REPRODUCTION),
         output(CHILD_SHARE),
         output(EMISSION_GATE),
         output(EMISSION_SPEND),
     ]) {
-        Some(gates) => gates,
-        None => [
+        Some([r, c, g, s]) => (r, c, g, Some(s)),
+        None => (
             squash(REPRODUCTION)?,
             squash(CHILD_SHARE)?,
             squash(EMISSION_GATE)?,
-            0.0,
-        ],
+            None,
+        ),
     };
 
     let attempt_rate = decoding.maximum_attempt_rate * sig_repro;
@@ -814,9 +814,13 @@ pub fn decode_with_layout(
         && norm > decoding.direction_zero_threshold
         && norm > 0.0
     {
+        let spend_sig = match sig_spend {
+            Some(s) => s,
+            None => squash(EMISSION_SPEND)?,
+        };
         Some(Emission {
             direction: unit_direction(&direction)?,
-            spend_fraction: interval(decoding.maximum_spend_rate * sig_spend)?,
+            spend_fraction: interval(decoding.maximum_spend_rate * spend_sig)?,
         })
     } else {
         None

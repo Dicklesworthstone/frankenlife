@@ -1793,6 +1793,7 @@ struct Run<'a> {
 const REDUCE_BATCH: usize = 32;
 
 /// Flush `count` buffered cell updates into `moments`, one plane at a time.
+#[inline]
 fn flush_moment_batch_const<const M: usize>(
     moments: &mut [&mut [f32]],
     count: usize,
@@ -1858,7 +1859,10 @@ fn reduce_run_const<const M: usize>(
         let slice = &order[first..end];
         let before = run.energy[at];
         let mut total = 0.0_f64;
-        let mut moment = [0.0_f64; M];
+        // Accumulate directly into `accum[batch_len]` to avoid copying 256 B
+        // per cell before batch flush.
+        let moment = &mut accum[batch_len];
+        moment.fill(0.0);
         match sequence {
             None => {
                 for &ord in slice {
@@ -1900,7 +1904,6 @@ fn reduce_run_const<const M: usize>(
         if factor != 0.0 {
             cell_at[batch_len] = at;
             factors[batch_len] = factor;
-            accum[batch_len] = moment;
             batch_len += 1;
             if batch_len == REDUCE_BATCH {
                 flush_moment_batch_const::<M>(

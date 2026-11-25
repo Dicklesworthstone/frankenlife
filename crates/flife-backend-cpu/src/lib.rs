@@ -570,13 +570,17 @@ enum AdmitOutcome {
     Deferred,
 }
 
-/// One disjoint slot-packing work item executed across worker lanes.
-struct PackTask<'a> {
+/// One touched shard's pending slot-packing batch executed in a single fused
+/// wave (zero prior `__bzero` on contiguous appends; 8×8 transpose targets a
+/// 40 KB L1D-hot per-lane buffer before streaming into `shard.values`).
+struct ShardPackWork<'a> {
     layers: &'a [Layer],
-    job_idx: usize,
-    dst: &'a mut [f32],
-    pending_idx: usize,
-    failed: bool,
+    values: &'a mut Vec<f32>,
+    start: usize,
+    end: usize,
+    succeeded: u64,
+    failed_indices: Vec<usize>,
+    first_err: Option<(usize, CoreError)>,
 }
 
 /// One catalog member's packed slots, in shards.
@@ -962,155 +966,91 @@ impl CpuBackend {
         Ok(widest)
     }
 
-    /// Flush every admitted [`PendingPack`] into its shard, deduplicating
-    /// duplicate-slot overwrites so only the last writer per slot is packed.
+    /// Flush every admitted [`PendingPack`] into its shard in a single fused
+    /// wave, deduplicating duplicate-slot overwrites so only the last writer
+    /// per slot is packed. Contiguous appends transpose into a 40 KB L1D-hot
+    /// lane buffer and stream via `extend_from_slice` with zero prior
+    /// `__bzero` pass and zero DRAM read-for-ownership traffic.
     fn flush_pending_packs<J: JobView + Sync>(
         &mut self,
         jobs: &[J],
         pending: &mut Vec<PendingPack>,
     ) -> Result<(), CoreError> {
         dedup_pending_packs(pending);
-        if pending.len() < PARALLEL_PACK_MIN_JOBS || self.lanes.get() <= 1 {
-            self.flush_pending_serial(jobs, pending)
-        } else {
-            self.flush_pending_parallel(jobs, pending)
-        }
-    }
-
-    fn flush_pending_serial<J: JobView>(
-        &mut self,
-        jobs: &[J],
-        pending: &[PendingPack],
-    ) -> Result<(), CoreError> {
-        for (idx, p) in pending.iter().enumerate() {
-            let result = (|| -> Result<(), CoreError> {
-                let Some(packing) = self
-                    .buckets
-                    .get_mut(p.topology)
-                    .and_then(Option::as_mut)
-                    .and_then(|bucket| bucket.packing.as_mut())
-                else {
-                    return Err(CoreError::StateConflict {
-                        operation: "cpu controller pack",
-                        detail: format!("bucket {} missing", p.topology),
-                    });
-                };
-                let Some(shard) = packing.shards.get_mut(p.shard_key) else {
-                    return Err(CoreError::StateConflict {
-                        operation: "cpu controller pack",
-                        detail: format!("shard {} missing", p.shard_key),
-                    });
-                };
-                if shard.values.len() < p.end {
-                    shard.values.resize(p.end, 0.0);
-                }
-                let controller = jobs[p.job_idx].controller();
-                pack(
-                    controller.parameters(),
-                    controller.topology(),
-                    &packing.layers,
-                    &mut shard.values[p.offset..p.end],
-                )
-            })();
-            match result {
-                Ok(()) => self.packs += 1,
-                Err(error) => {
-                    rollback_pending(&mut self.buckets, &mut self.held, &pending[idx..]);
-                    return Err(error);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn flush_pending_parallel<J: JobView + Sync>(
-        &mut self,
-        jobs: &[J],
-        pending: &[PendingPack],
-    ) -> Result<(), CoreError> {
-        // Sub-step A: grow every touched shard's `values` to its peak `end`
-        // (capacity was already reserved via `try_reserve_exact` in Pass 1).
-        if let Err(error) = self.parallel_resize_shards(pending) {
+        let mut shard_work: Vec<ShardPackWork<'_>> = Vec::new();
+        if let Err(error) =
+            visit_touched_shards_mut(&mut self.buckets, pending, |layers, shard, start, end| {
+                shard_work.push(ShardPackWork {
+                    layers,
+                    values: &mut shard.values,
+                    start,
+                    end,
+                    succeeded: 0,
+                    failed_indices: Vec::new(),
+                    first_err: None,
+                });
+                Ok(())
+            })
+        {
+            drop(shard_work);
             rollback_pending(&mut self.buckets, &mut self.held, pending);
             return Err(error);
         }
-        // Sub-step B: transpose all newly-admitted slots in parallel across
-        // disjoint `&mut [f32]` slices on the persistent worker pool.
-        self.parallel_pack_slots(jobs, pending)
-    }
-
-    fn parallel_resize_shards(&mut self, pending: &[PendingPack]) -> Result<(), CoreError> {
-        let mut resize_tasks: Vec<(&mut Vec<f32>, usize)> = Vec::new();
-        visit_touched_shards_mut(&mut self.buckets, pending, |_layers, shard, _start, end| {
-            let max_end = pending[end - 1].end;
-            if shard.values.len() < max_end {
-                resize_tasks.push((&mut shard.values, max_end));
-            }
-            Ok(())
-        })?;
-        if resize_tasks.len() <= 1 {
-            for (values, max_end) in resize_tasks {
-                values.resize(max_end, 0.0);
-            }
-            return Ok(());
-        }
-        let workers = self.lanes.get().min(resize_tasks.len());
-        let chunk_len = resize_tasks.len().div_ceil(workers);
-        pool::scope_workers(self.lanes.get(), "cpu controller shard init", |scope| {
-            let mut chunks = resize_tasks.chunks_mut(chunk_len);
-            let head = chunks.next();
-            for chunk in chunks {
-                scope.spawn(move || {
-                    for (values, max_end) in chunk {
-                        values.resize(*max_end, 0.0);
-                    }
-                });
-            }
-            if let Some(head) = head {
-                for (values, max_end) in head {
-                    values.resize(*max_end, 0.0);
+        let max_slot_len = pending
+            .iter()
+            .map(|p| p.end.saturating_sub(p.offset))
+            .max()
+            .unwrap_or(0);
+        let run_parallel = shard_work.len() >= 2
+            && pending.len() >= PARALLEL_PACK_MIN_JOBS
+            && self.lanes.get() > 1;
+        if !run_parallel {
+            let mut slot_buf = match alloc_pack_scratch(max_slot_len) {
+                Ok(buf) => buf,
+                Err(error) => {
+                    drop(shard_work);
+                    rollback_pending(&mut self.buckets, &mut self.held, pending);
+                    return Err(error);
                 }
+            };
+            for work in &mut shard_work {
+                pack_shard_work(jobs, pending, work, &mut slot_buf);
             }
-        })
-    }
-
-    fn parallel_pack_slots<J: JobView + Sync>(
-        &mut self,
-        jobs: &[J],
-        pending: &[PendingPack],
-    ) -> Result<(), CoreError> {
-        let mut pack_tasks = match build_pack_tasks(&mut self.buckets, pending) {
-            Ok(tasks) => tasks,
-            Err(error) => {
+        } else {
+            let used_lanes = self.lanes.get().min(shard_work.len());
+            let mut lane_bufs: Vec<Vec<f32>> = Vec::new();
+            let alloc_result = (|| -> Result<(), CoreError> {
+                reserve(&mut lane_bufs, used_lanes, "cpu controller pack scratch")?;
+                for _ in 0..used_lanes {
+                    lane_bufs.push(alloc_pack_scratch(max_slot_len)?);
+                }
+                Ok(())
+            })();
+            if let Err(error) = alloc_result {
+                drop(shard_work);
                 rollback_pending(&mut self.buckets, &mut self.held, pending);
                 return Err(error);
             }
-        };
-        let workers = self.lanes.get().min(pack_tasks.len().div_ceil(16)).max(1);
-        let chunk_len = pack_tasks.len().div_ceil(workers);
-        let mut chunks = pack_tasks.chunks_mut(chunk_len);
-        let head = chunks.next();
-        let tail_count = chunks.len();
-        let mut tail_errors: Vec<Option<(usize, CoreError)>> =
-            (0..tail_count).map(|_| None).collect();
-        let scoped = pool::scope_workers(self.lanes.get(), "cpu controller pack", |scope| {
-            for (chunk, slot) in chunks.zip(tail_errors.iter_mut()) {
-                scope.spawn(move || {
-                    *slot = run_pack_chunk(jobs, chunk);
-                });
-            }
-            head.and_then(|chunk| run_pack_chunk(jobs, chunk))
-        });
-        let mut first_err = match scoped {
-            Ok(head_err) => head_err,
-            Err(error) => {
-                drop(pack_tasks);
+            if let Err(error) = pool::try_parallel_tasks_with_lanes(
+                self.lanes.get(),
+                "cpu controller pack",
+                &mut lane_bufs,
+                &mut shard_work,
+                |_, work, slot_buf| {
+                    pack_shard_work(jobs, pending, work, slot_buf);
+                    Ok(())
+                },
+            ) {
+                drop(shard_work);
                 rollback_pending(&mut self.buckets, &mut self.held, pending);
                 return Err(error);
             }
-        };
-        for tail_err in tail_errors {
-            if let Some((idx, error)) = tail_err
+        }
+        let mut succeeded = 0_u64;
+        let mut first_err: Option<(usize, CoreError)> = None;
+        for work in &mut shard_work {
+            succeeded = succeeded.saturating_add(work.succeeded);
+            if let Some((idx, error)) = work.first_err.take()
                 && first_err
                     .as_ref()
                     .is_none_or(|(best_idx, _)| idx < *best_idx)
@@ -1119,23 +1059,19 @@ impl CpuBackend {
             }
         }
         if let Some((_, error)) = first_err {
-            let mut succeeded = 0_u64;
             let mut failed: Vec<PendingPack> = Vec::new();
-            for task in &pack_tasks {
-                if task.failed {
-                    failed.push(pending[task.pending_idx]);
-                } else {
-                    succeeded += 1;
+            for work in &shard_work {
+                for &pending_idx in &work.failed_indices {
+                    failed.push(pending[pending_idx]);
                 }
             }
-            drop(pack_tasks);
+            drop(shard_work);
             self.packs = self.packs.saturating_add(succeeded);
             rollback_pending(&mut self.buckets, &mut self.held, &failed);
             return Err(error);
         }
-        let packed_count = pack_tasks.len() as u64;
-        drop(pack_tasks);
-        self.packs = self.packs.saturating_add(packed_count);
+        drop(shard_work);
+        self.packs = self.packs.saturating_add(succeeded);
         Ok(())
     }
 
@@ -1415,81 +1351,89 @@ where
     Ok(())
 }
 
-/// Slice every touched shard's `values` into disjoint mutable slot spans for
-/// parallel transposition across worker lanes.
-fn build_pack_tasks<'a>(
-    buckets: &'a mut [Option<Bucket>],
-    pending: &[PendingPack],
-) -> Result<Vec<PackTask<'a>>, CoreError> {
-    let mut pack_tasks: Vec<PackTask<'a>> = Vec::new();
-    reserve(&mut pack_tasks, pending.len(), "cpu controller pack tasks")?;
-    visit_touched_shards_mut(buckets, pending, |layers, shard, start, end| {
-        let mut tail = shard.values.as_mut_slice();
-        let mut base = 0_usize;
-        for (offset_in_group, p) in pending[start..end].iter().enumerate() {
-            let rel_start = p
-                .offset
-                .checked_sub(base)
-                .ok_or_else(|| CoreError::StateConflict {
-                    operation: "cpu controller pack",
-                    detail: "overlapping or unsorted pending pack offsets".to_owned(),
-                })?;
-            let len = p
-                .end
-                .checked_sub(p.offset)
-                .ok_or_else(|| CoreError::StateConflict {
-                    operation: "cpu controller pack",
-                    detail: "invalid pending pack range".to_owned(),
-                })?;
-            if rel_start.checked_add(len).is_none_or(|n| n > tail.len()) {
-                return Err(CoreError::StateConflict {
-                    operation: "cpu controller pack",
-                    detail: "pending pack range outside shard values".to_owned(),
-                });
-            }
-            let cur = std::mem::take(&mut tail);
-            let (_, from_start) = cur.split_at_mut(rel_start);
-            let (dst, after) = from_start.split_at_mut(len);
-            tail = after;
-            base = p.end;
-            pack_tasks.push(PackTask {
-                layers,
-                job_idx: p.job_idx,
-                dst,
-                pending_idx: start + offset_in_group,
-                failed: false,
-            });
-        }
-        Ok(())
-    })?;
-    Ok(pack_tasks)
+fn alloc_pack_scratch(len: usize) -> Result<Vec<f32>, CoreError> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len)
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer: "cpu controller pack scratch",
+            bytes: bytes_for::<f32>(len),
+        })?;
+    buf.resize(len, 0.0);
+    Ok(buf)
 }
 
-/// Transpose one worker lane's slice of disjoint [`PackTask`]s, recording the
-/// lowest `job_idx` error deterministically if any task fails.
-fn run_pack_chunk<J: JobView>(
+/// Pack every pending slot of one shard using a single L1D-hot `slot_buf`.
+///
+/// For contiguous appends (`work.values.len() == p.offset`, 100% of initial
+/// founder packing and sequential arena growth), transposes into `slot_buf`
+/// and calls `work.values.extend_from_slice` directly into reserved spare
+/// capacity — avoiding a separate 4 GB `__bzero` pass and cold DRAM RFO.
+fn pack_shard_work<J: JobView>(
     jobs: &[J],
-    chunk: &mut [PackTask<'_>],
-) -> Option<(usize, CoreError)> {
-    let mut first_err: Option<(usize, CoreError)> = None;
-    for task in chunk {
-        let controller = jobs[task.job_idx].controller();
+    pending: &[PendingPack],
+    work: &mut ShardPackWork<'_>,
+    slot_buf: &mut [f32],
+) {
+    let mut record_err = |pending_idx: usize, job_idx: usize, error: CoreError| {
+        work.failed_indices.push(pending_idx);
+        if work
+            .first_err
+            .as_ref()
+            .is_none_or(|(best_idx, _)| job_idx < *best_idx)
+        {
+            work.first_err = Some((job_idx, error));
+        }
+    };
+    for (offset_in_group, p) in pending[work.start..work.end].iter().enumerate() {
+        let pending_idx = work.start + offset_in_group;
+        let Some(len) = p.end.checked_sub(p.offset) else {
+            record_err(
+                pending_idx,
+                p.job_idx,
+                CoreError::StateConflict {
+                    operation: "cpu controller pack",
+                    detail: "invalid pending pack range".to_owned(),
+                },
+            );
+            continue;
+        };
+        if p.end > work.values.capacity() || len > slot_buf.len() {
+            record_err(
+                pending_idx,
+                p.job_idx,
+                CoreError::StateConflict {
+                    operation: "cpu controller pack",
+                    detail: "pending pack range outside shard capacity".to_owned(),
+                },
+            );
+            continue;
+        }
+        let dst_buf = &mut slot_buf[..len];
+        let controller = jobs[p.job_idx].controller();
         if let Err(error) = pack(
             controller.parameters(),
             controller.topology(),
-            task.layers,
-            task.dst,
+            work.layers,
+            dst_buf,
         ) {
-            task.failed = true;
-            if first_err
-                .as_ref()
-                .is_none_or(|(best_idx, _)| task.job_idx < *best_idx)
-            {
-                first_err = Some((task.job_idx, error));
-            }
+            record_err(pending_idx, p.job_idx, error);
+            continue;
         }
+        let cur_len = work.values.len();
+        if cur_len == p.offset {
+            work.values.extend_from_slice(dst_buf);
+        } else if p.offset > cur_len {
+            work.values.resize(p.offset, 0.0);
+            work.values.extend_from_slice(dst_buf);
+        } else if p.end <= cur_len {
+            work.values[p.offset..p.end].copy_from_slice(dst_buf);
+        } else {
+            let overlap = cur_len - p.offset;
+            work.values[p.offset..].copy_from_slice(&dst_buf[..overlap]);
+            work.values.extend_from_slice(&dst_buf[overlap..]);
+        }
+        work.succeeded += 1;
     }
-    first_err
 }
 
 /// Safe intra-batch per-topology pointer cache: every `&'a DenseTopology`

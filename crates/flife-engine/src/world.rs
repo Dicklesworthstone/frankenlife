@@ -117,8 +117,9 @@ use flife_neural::{
     DualObservation, FlatControllerJob, FlatOutputs, Intrinsic, MAX_ACTION_WIDTH, MAX_SENSOR_WIDTH,
     MAXIMUM_RECURRENT_STATE_WIDTH, Observation, RawOutputs, ReferenceController, SENSOR_WIDTH,
     SensorLayout, SensorScales, decode_with_layout, observe_dual_for_controller,
-    observe_dual_for_controller_f32, observe_dual_gradients_only, observe_for_controller,
-    observe_for_controller_f32, observe_gradients_only, update_recurrent_state, widen_slice,
+    observe_dual_for_controller_f32_into, observe_dual_gradients_only_into, observe_for_controller,
+    observe_for_controller_f32_into, observe_gradients_only_into, update_recurrent_state,
+    widen_slice,
 };
 
 use crate::ancestry::{Ancestry, AncestryHeld, Followed};
@@ -1523,54 +1524,68 @@ impl World {
     /// [`CoreError::AllocationFailed`] if the lanes cannot be reserved; the
     /// count is then unchanged.
     pub fn set_cpu_workers(&mut self, workers: NonZeroUsize) -> Result<(), CoreError> {
-        self.scratch.field.set_workers(workers)?;
-        let workers = workers.get();
-        let mut added = Vec::new();
-        for _ in self.scratch.lanes.len()..workers {
-            added.push(lane(&self.rules)?);
-        }
-        let lanes = &mut self.scratch.lanes;
-        if workers > lanes.len() {
-            lanes
-                .try_reserve_exact(workers - lanes.len())
-                .map_err(|_| CoreError::AllocationFailed {
-                    buffer: "decision lanes",
-                    bytes: bytes_for::<DecisionLane>(workers),
-                })?;
-        }
-        lanes.extend(added);
-        lanes.truncate(workers);
-        lanes.shrink_to(workers);
-        // A lane's share of the rows follows the count (FL-043). Only legacy
-        // non-flat-F32 backends use per-lane `observed` / `controller_inputs`.
+        let old_workers = NonZeroUsize::new(self.scratch.lanes.len()).unwrap_or(NonZeroUsize::MIN);
+        let target = workers.get();
         let legacy_batched = self
             .controllers
             .backend
             .as_deref()
             .is_some_and(|backend| !backend.supports_flat_f32());
         let capacity = capacity_of(&self.rules)?;
-        let use_tiles = uses_settle_tiles(
-            workers,
-            &self.rules,
-            capacity,
-            self.settle.backend.is_some(),
-        );
-        // Grow the newly active settle-staging store before shrinking the old
-        // one so an allocation refusal can never leave both stores empty.
-        if use_tiles {
-            fit_settle_tiles(
+        let use_tiles =
+            uses_settle_tiles(target, &self.rules, capacity, self.settle.backend.is_some());
+        self.scratch.field.set_workers(workers)?;
+        let mut added = Vec::new();
+        for _ in self.scratch.lanes.len()..target {
+            match lane(&self.rules) {
+                Ok(entry) => added.push(entry),
+                Err(error) => {
+                    let _ = self.scratch.field.set_workers(old_workers);
+                    return Err(error);
+                }
+            }
+        }
+        // When switching onto `settle_tiles`, reserve tiles BEFORE mutating
+        // `lanes` so an allocation failure leaves worker count and lanes intact.
+        if use_tiles
+            && let Err(error) = fit_settle_tiles(
                 &mut self.scratch.settle_tiles,
-                workers,
+                target,
                 &self.rules,
                 capacity,
                 self.settle.backend.is_some(),
-            )?;
+            )
+        {
+            let _ = self.scratch.field.set_workers(old_workers);
+            return Err(error);
+        }
+        let lanes = &mut self.scratch.lanes;
+        if target > lanes.len() && lanes.try_reserve_exact(target - lanes.len()).is_err() {
+            let _ = self.scratch.field.set_workers(old_workers);
+            let _ = fit_settle_tiles(
+                &mut self.scratch.settle_tiles,
+                old_workers.get(),
+                &self.rules,
+                capacity,
+                self.settle.backend.is_some(),
+            );
+            return Err(CoreError::AllocationFailed {
+                buffer: "decision lanes",
+                bytes: bytes_for::<DecisionLane>(target),
+            });
+        }
+        lanes.extend(added);
+        lanes.truncate(target);
+        lanes.shrink_to(target);
+        // A lane's share of the rows follows the count (FL-043). Only legacy
+        // non-flat-F32 backends use per-lane `observed` / `controller_inputs`.
+        if use_tiles {
             fit_lanes(lanes, &self.rules, capacity, legacy_batched, false)
         } else {
             fit_lanes(lanes, &self.rules, capacity, legacy_batched, true)?;
             fit_settle_tiles(
                 &mut self.scratch.settle_tiles,
-                workers,
+                target,
                 &self.rules,
                 capacity,
                 self.settle.backend.is_some(),
@@ -5598,33 +5613,44 @@ fn encode_dual_for_controller(
 }
 
 /// Direct F32 sensor encoding for flat-F32 controller backends, returning exact
-/// F64 motion gradients without an intermediate `[f64; 104]` buffer.
-fn encode_for_controller_f32(
+/// Direct F32 sensor encoding into `out_inputs_f32` and `out_gradients` with
+/// zero intermediate `[f64; 104]` or 528-byte gradient return copies.
+#[inline]
+fn encode_for_controller_f32_into(
     rules: &Rules,
     organism: &Organism,
     raw: &RawSample,
     from: Tick,
     out_inputs_f32: &mut [f32; SENSOR_WIDTH],
-) -> Result<[[f64; 2]; RESPONSE_TERMS], CoreError> {
+    out_gradients: &mut [[f64; 2]; RESPONSE_TERMS],
+) -> Result<(), CoreError> {
     let intrinsic = Intrinsic {
         energy: organism.energy,
         age_seconds: age_seconds(organism.birth_tick, from, rules.step)?,
         velocity: organism.velocity,
         energy_change_per_second: organism.energy_change_rate,
     };
-    observe_for_controller_f32(raw, &intrinsic, &rules.scales, out_inputs_f32)
+    observe_for_controller_f32_into(
+        raw,
+        &intrinsic,
+        &rules.scales,
+        out_inputs_f32,
+        out_gradients,
+    )
 }
 
-/// Direct F32 dual-carrier sensor encoding (`V2-15`) for flat-F32 controller
-/// backends, returning exact F64 motion gradients.
-fn encode_dual_for_controller_f32(
+/// Direct F32 dual-carrier sensor encoding (`V2-15`) into `out_inputs_f32`,
+/// `out_trail_f32`, and `out_gradients`.
+#[inline]
+fn encode_dual_for_controller_f32_into(
     rules: &Rules,
     organism: &Organism,
     raw: &DualRawSample,
     from: Tick,
     out_inputs_f32: &mut [f32; SENSOR_WIDTH],
     out_trail_f32: &mut [f32; 4],
-) -> Result<[[f64; 2]; RESPONSE_TERMS], CoreError> {
+    out_gradients: &mut [[f64; 2]; RESPONSE_TERMS],
+) -> Result<(), CoreError> {
     let dual = rules
         .v2
         .dual_carrier()
@@ -5638,41 +5664,46 @@ fn encode_dual_for_controller_f32(
         velocity: organism.velocity,
         energy_change_per_second: organism.energy_change_rate,
     };
-    observe_dual_for_controller_f32(
+    observe_dual_for_controller_f32_into(
         raw,
         &intrinsic,
         &rules.scales,
         dual.trail_energy_density_scale(),
         out_inputs_f32,
         out_trail_f32,
+        out_gradients,
     )
 }
 
-/// Gradient-only encoding for an organism whose controller is not due this
-/// tick (skips all 69 `tanh` saturations while keeping exact error semantics).
-fn encode_gradients_only(
+/// Gradient-only encoding directly into `out_gradients` for an organism whose
+/// controller is not due this tick (skips all 69 `tanh` saturations).
+#[inline]
+fn encode_gradients_only_into(
     rules: &Rules,
     organism: &Organism,
     raw: &RawSample,
     from: Tick,
-) -> Result<[[f64; 2]; RESPONSE_TERMS], CoreError> {
+    out_gradients: &mut [[f64; 2]; RESPONSE_TERMS],
+) -> Result<(), CoreError> {
     let intrinsic = Intrinsic {
         energy: organism.energy,
         age_seconds: age_seconds(organism.birth_tick, from, rules.step)?,
         velocity: organism.velocity,
         energy_change_per_second: organism.energy_change_rate,
     };
-    observe_gradients_only(raw, &intrinsic, &rules.scales)
+    observe_gradients_only_into(raw, &intrinsic, &rules.scales, out_gradients)
 }
 
-/// Gradient-only dual-carrier encoding (`V2-15`) for an organism whose
-/// controller is not due this tick (skips all 71 `tanh` saturations).
-fn encode_dual_gradients_only(
+/// Gradient-only dual-carrier encoding (`V2-15`) directly into `out_gradients`
+/// for an organism whose controller is not due this tick (skips 71 `tanh`s).
+#[inline]
+fn encode_dual_gradients_only_into(
     rules: &Rules,
     organism: &Organism,
     raw: &DualRawSample,
     from: Tick,
-) -> Result<[[f64; 2]; RESPONSE_TERMS], CoreError> {
+    out_gradients: &mut [[f64; 2]; RESPONSE_TERMS],
+) -> Result<(), CoreError> {
     let dual = rules
         .v2
         .dual_carrier()
@@ -5686,11 +5717,12 @@ fn encode_dual_gradients_only(
         velocity: organism.velocity,
         energy_change_per_second: organism.energy_change_rate,
     };
-    observe_dual_gradients_only(
+    observe_dual_gradients_only_into(
         raw,
         &intrinsic,
         &rules.scales,
         dual.trail_energy_density_scale(),
+        out_gradients,
     )
 }
 
@@ -5966,7 +5998,8 @@ fn decide_from_raw(
     controller: &mut ControllerScratch,
 ) -> Result<Decision, CoreError> {
     if !due(rules, organism, to) {
-        let gradients = encode_gradients_only(rules, organism, raw, from)?;
+        let mut gradients = [[0.0; 2]; RESPONSE_TERMS];
+        encode_gradients_only_into(rules, organism, raw, from, &mut gradients)?;
         return finish_from_gradients(rules, organism, organism.held, false, gradients);
     }
     let observation = encode_for_controller(rules, organism, raw, from)?;
@@ -5995,7 +6028,8 @@ fn decide_from_dual_raw(
     controller: &mut ControllerScratch,
 ) -> Result<Decision, CoreError> {
     if !due(rules, organism, to) {
-        let gradients = encode_dual_gradients_only(rules, organism, raw, from)?;
+        let mut gradients = [[0.0; 2]; RESPONSE_TERMS];
+        encode_dual_gradients_only_into(rules, organism, raw, from, &mut gradients)?;
         return finish_from_gradients(rules, organism, organism.held, false, gradients);
     }
     let dual_obs = encode_dual_for_controller(rules, organism, raw, from)?;
@@ -7058,6 +7092,7 @@ fn pass1_flat_f32<'p>(
                     Some(raw) => *raw,
                     None => view.sample_dual(organism.position, genome.traits().sensing_scale())?,
                 };
+                let dec = &mut decisions_out[index];
                 if due(rules, organism, to) {
                     let base_off = local_due * input_width;
                     let dst = in_f32
@@ -7073,13 +7108,14 @@ fn pass1_flat_f32<'p>(
                             detail: "flat input slice narrower than SENSOR_WIDTH".to_owned(),
                         })?;
                     let mut trail_f32 = [0.0_f32; 4];
-                    let gradients = encode_dual_for_controller_f32(
+                    encode_dual_for_controller_f32_into(
                         rules,
                         organism,
                         &raw,
                         from,
                         base_arr,
                         &mut trail_f32,
+                        &mut dec.gradients,
                     )?;
                     let finite_slot =
                         in_finite
@@ -7091,16 +7127,19 @@ fn pass1_flat_f32<'p>(
                     finish_due_row(dst, finite_slot, start + index, organism, Some(trail_f32));
                     jobs_out.push(build_job(organism, genome, slot)?);
                     local_due += 1;
-                    decisions_out[index] = Decision {
-                        held: organism.held,
-                        evaluated: true,
-                        actions: DecodedActions::default(),
-                        gradients,
-                    };
+                    dec.held = organism.held;
+                    dec.evaluated = true;
                 } else {
-                    let gradients = encode_dual_gradients_only(rules, organism, &raw, from)?;
-                    decisions_out[index] =
-                        finish_from_gradients(rules, organism, organism.held, false, gradients)?;
+                    encode_dual_gradients_only_into(
+                        rules,
+                        organism,
+                        &raw,
+                        from,
+                        &mut dec.gradients,
+                    )?;
+                    dec.held = organism.held;
+                    dec.evaluated = false;
+                    dec.actions = decode_held(rules, organism, &organism.held)?;
                 }
             }
             return Ok(());
@@ -7111,6 +7150,8 @@ fn pass1_flat_f32<'p>(
         }; FLAT_SAMPLE_BATCH];
         let mut batch_meta: [(Option<&'p Genome>, Option<ArenaSlot>, u32); FLAT_SAMPLE_BATCH] =
             [(None, None, NOT_DUE); FLAT_SAMPLE_BATCH];
+        let mut chunk_jobs: [Option<FlatControllerJob<'p>>; FLAT_SAMPLE_BATCH] =
+            std::array::from_fn(|_| None);
         for (chunk_idx, chunk) in run.chunks(FLAT_SAMPLE_BATCH).enumerate() {
             let count = chunk.len();
             let local_base = chunk_idx * FLAT_SAMPLE_BATCH;
@@ -7142,8 +7183,6 @@ fn pass1_flat_f32<'p>(
                     scale: genome.traits().sensing_scale(),
                 };
             }
-            let mut chunk_jobs: [Option<FlatControllerJob<'p>>; FLAT_SAMPLE_BATCH] =
-                std::array::from_fn(|_| None);
             let chunk_in_f32 = in_f32
                 .get_mut(local_due * input_width..(local_due + chunk_due) * input_width)
                 .ok_or_else(|| CoreError::StateConflict {
@@ -7167,6 +7206,7 @@ fn pass1_flat_f32<'p>(
                     return Ok(());
                 };
                 let organism = &chunk[i];
+                let dec = &mut chunk_dec[i];
                 if due_slot != NOT_DUE {
                     let d = due_slot as usize;
                     let dst = &mut chunk_in_f32[d * input_width..(d + 1) * input_width];
@@ -7177,13 +7217,14 @@ fn pass1_flat_f32<'p>(
                             detail: "flat input slice narrower than SENSOR_WIDTH".to_owned(),
                         })?;
                     let mut trail_f32 = [0.0_f32; 4];
-                    let gradients = encode_dual_for_controller_f32(
+                    encode_dual_for_controller_f32_into(
                         rules,
                         organism,
                         raw,
                         from,
                         base_arr,
                         &mut trail_f32,
+                        &mut dec.gradients,
                     )?;
                     finish_due_row(
                         dst,
@@ -7193,16 +7234,19 @@ fn pass1_flat_f32<'p>(
                         Some(trail_f32),
                     );
                     chunk_jobs[d] = Some(build_job(organism, genome, slot)?);
-                    chunk_dec[i] = Decision {
-                        held: organism.held,
-                        evaluated: true,
-                        actions: DecodedActions::default(),
-                        gradients,
-                    };
+                    dec.held = organism.held;
+                    dec.evaluated = true;
                 } else {
-                    let gradients = encode_dual_gradients_only(rules, organism, raw, from)?;
-                    chunk_dec[i] =
-                        finish_from_gradients(rules, organism, organism.held, false, gradients)?;
+                    encode_dual_gradients_only_into(
+                        rules,
+                        organism,
+                        raw,
+                        from,
+                        &mut dec.gradients,
+                    )?;
+                    dec.held = organism.held;
+                    dec.evaluated = false;
+                    dec.actions = decode_held(rules, organism, &organism.held)?;
                 }
                 Ok(())
             })?;
@@ -7229,6 +7273,7 @@ fn pass1_flat_f32<'p>(
                 Some(raw) => *raw,
                 None => view.sample(organism.position, genome.traits().sensing_scale())?,
             };
+            let dec = &mut decisions_out[index];
             if due(rules, organism, to) {
                 let base_off = local_due * input_width;
                 let dst = in_f32
@@ -7243,7 +7288,14 @@ fn pass1_flat_f32<'p>(
                         operation: "controller batch",
                         detail: "flat input slice narrower than SENSOR_WIDTH".to_owned(),
                     })?;
-                let gradients = encode_for_controller_f32(rules, organism, &raw, from, base_arr)?;
+                encode_for_controller_f32_into(
+                    rules,
+                    organism,
+                    &raw,
+                    from,
+                    base_arr,
+                    &mut dec.gradients,
+                )?;
                 let finite_slot =
                     in_finite
                         .get_mut(local_due)
@@ -7254,16 +7306,13 @@ fn pass1_flat_f32<'p>(
                 finish_due_row(dst, finite_slot, start + index, organism, None);
                 jobs_out.push(build_job(organism, genome, slot)?);
                 local_due += 1;
-                decisions_out[index] = Decision {
-                    held: organism.held,
-                    evaluated: true,
-                    actions: DecodedActions::default(),
-                    gradients,
-                };
+                dec.held = organism.held;
+                dec.evaluated = true;
             } else {
-                let gradients = encode_gradients_only(rules, organism, &raw, from)?;
-                decisions_out[index] =
-                    finish_from_gradients(rules, organism, organism.held, false, gradients)?;
+                encode_gradients_only_into(rules, organism, &raw, from, &mut dec.gradients)?;
+                dec.held = organism.held;
+                dec.evaluated = false;
+                dec.actions = decode_held(rules, organism, &organism.held)?;
             }
         }
         return Ok(());
@@ -7275,6 +7324,8 @@ fn pass1_flat_f32<'p>(
     }; FLAT_SAMPLE_BATCH];
     let mut batch_meta: [(Option<&'p Genome>, Option<ArenaSlot>, u32); FLAT_SAMPLE_BATCH] =
         [(None, None, NOT_DUE); FLAT_SAMPLE_BATCH];
+    let mut chunk_jobs: [Option<FlatControllerJob<'p>>; FLAT_SAMPLE_BATCH] =
+        std::array::from_fn(|_| None);
     for (chunk_idx, chunk) in run.chunks(FLAT_SAMPLE_BATCH).enumerate() {
         let count = chunk.len();
         let local_base = chunk_idx * FLAT_SAMPLE_BATCH;
@@ -7306,8 +7357,6 @@ fn pass1_flat_f32<'p>(
                 scale: genome.traits().sensing_scale(),
             };
         }
-        let mut chunk_jobs: [Option<FlatControllerJob<'p>>; FLAT_SAMPLE_BATCH] =
-            std::array::from_fn(|_| None);
         let chunk_in_f32 = in_f32
             .get_mut(local_due * input_width..(local_due + chunk_due) * input_width)
             .ok_or_else(|| CoreError::StateConflict {
@@ -7331,6 +7380,7 @@ fn pass1_flat_f32<'p>(
                 return Ok(());
             };
             let organism = &chunk[i];
+            let dec = &mut chunk_dec[i];
             if due_slot != NOT_DUE {
                 let d = due_slot as usize;
                 let dst = &mut chunk_in_f32[d * input_width..(d + 1) * input_width];
@@ -7340,19 +7390,23 @@ fn pass1_flat_f32<'p>(
                         operation: "controller batch",
                         detail: "flat input slice narrower than SENSOR_WIDTH".to_owned(),
                     })?;
-                let gradients = encode_for_controller_f32(rules, organism, raw, from, base_arr)?;
+                encode_for_controller_f32_into(
+                    rules,
+                    organism,
+                    raw,
+                    from,
+                    base_arr,
+                    &mut dec.gradients,
+                )?;
                 finish_due_row(dst, &mut chunk_in_fin[d], base + i, organism, None);
                 chunk_jobs[d] = Some(build_job(organism, genome, slot)?);
-                chunk_dec[i] = Decision {
-                    held: organism.held,
-                    evaluated: true,
-                    actions: DecodedActions::default(),
-                    gradients,
-                };
+                dec.held = organism.held;
+                dec.evaluated = true;
             } else {
-                let gradients = encode_gradients_only(rules, organism, raw, from)?;
-                chunk_dec[i] =
-                    finish_from_gradients(rules, organism, organism.held, false, gradients)?;
+                encode_gradients_only_into(rules, organism, raw, from, &mut dec.gradients)?;
+                dec.held = organism.held;
+                dec.evaluated = false;
+                dec.actions = decode_held(rules, organism, &organism.held)?;
             }
             Ok(())
         })?;
@@ -8368,15 +8422,27 @@ struct Reference<'a> {
 }
 
 impl Stages for Reference<'_> {
+    #[inline]
     fn uptake(
         &mut self,
         rules: &Rules,
         organism: &Working,
         budget: &mut EnergyBudget,
     ) -> Result<UptakeSettlement, CoreError> {
+        let h0 = organism.held.recurrent_state_array()[0];
+        if (!rules.v2.affinity_rotation_enabled() || h0 == 0.0)
+            && rules.limits.affinity_norm() <= rules.chemistry.affinity_norm_limit()
+        {
+            return rules.chemistry.settle_indexed_slice(
+                self.traits.affinity(),
+                self.packets,
+                self.compositions,
+                budget,
+            );
+        }
         let a_eff = effective_affinity(
             self.traits,
-            organism.held.recurrent_state_array()[0],
+            h0,
             &rules.v2,
             rules.chemistry.affinity_norm_limit(),
         )?;

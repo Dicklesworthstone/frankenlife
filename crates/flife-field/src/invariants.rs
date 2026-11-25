@@ -723,33 +723,45 @@ fn check_range_dual(
         for offset in 0..len {
             let e0_val = e0_vals[offset];
             let s0 = sq0[offset];
-            // Every finite `m_raw` has `0 ≤ m² ≤ 1.2e77`, so across ≤32 planes
-            // `s0` is non-finite iff at least one moment plane held NaN/±Inf.
-            if !s0.is_finite() {
-                let _ = check_cell(e0, m0, base + offset, bounds.tolerance, width)?;
-            }
-            let r0 = if s0 == 0.0 {
-                0.0
-            } else {
-                (s0.sqrt() - e0_val).max(0.0)
-            };
-            if !bounds.tolerance.allows(r0, e0_val) {
-                let _ = check_cell(e0, m0, base + offset, bounds.tolerance, width)?;
-            }
-
             let e1_val = e1_vals[offset];
             let s1 = sq1[offset];
-            if !s1.is_finite() {
-                let _ = check_cell(e1, m1, base + offset, bounds.tolerance, width)?;
+            // Every finite `f32` widened to `f64` has at most 24 significand
+            // bits, so `e * e` is exact in `f64` (<= 48 bits, no overflow or
+            // underflow). Hence `s <= e * e` iff `sqrt(s) <= e` (residual 0),
+            // skipping two `fsqrt` calls on 99.9%+ of valid cells while `NaN`
+            // and `+Inf` compare false and fall through to `check_cell`.
+            if s0 <= e0_val * e0_val && s1 <= e1_val * e1_val {
+                if e0_val == 0.0 {
+                    summary.empty_cells += 1;
+                }
+                continue;
             }
-            let r1 = if s1 == 0.0 {
+            // Every finite `m_raw` has `0 ≤ m² ≤ 1.2e77`, so across ≤32 planes
+            // `s0` is non-finite iff at least one moment plane held NaN/±Inf.
+            let r0 = if s0 <= e0_val * e0_val {
                 0.0
             } else {
-                (s1.sqrt() - e1_val).max(0.0)
+                if !s0.is_finite() {
+                    let _ = check_cell(e0, m0, base + offset, bounds.tolerance, width)?;
+                }
+                let r = (s0.sqrt() - e0_val).max(0.0);
+                if !bounds.tolerance.allows(r, e0_val) {
+                    let _ = check_cell(e0, m0, base + offset, bounds.tolerance, width)?;
+                }
+                r
             };
-            if !bounds.tolerance.allows(r1, e1_val) {
-                let _ = check_cell(e1, m1, base + offset, bounds.tolerance, width)?;
-            }
+            let r1 = if s1 <= e1_val * e1_val {
+                0.0
+            } else {
+                if !s1.is_finite() {
+                    let _ = check_cell(e1, m1, base + offset, bounds.tolerance, width)?;
+                }
+                let r = (s1.sqrt() - e1_val).max(0.0);
+                if !bounds.tolerance.allows(r, e1_val) {
+                    let _ = check_cell(e1, m1, base + offset, bounds.tolerance, width)?;
+                }
+                r
+            };
 
             if !bounds.trigger.allows(r0, e0_val) || !bounds.trigger.allows(r1, e1_val) {
                 summary.any_exceeds_trigger = true;
@@ -866,14 +878,20 @@ fn check_range(
         }
 
         for (offset, (&e, &sq)) in energies.iter().zip(&squares).enumerate().take(len) {
+            // `e` came from a finite `f32` (<= 24 significand bits), so `e * e`
+            // is exact in `f64` (<= 48 bits, no overflow/underflow): `sq <= e * e`
+            // iff `sqrt(sq) <= e`, skipping `fsqrt` on 99.9%+ of valid cells
+            // while `NaN`/`+Inf` compare false and fall through to `check_cell`.
+            if sq <= e * e {
+                if e == 0.0 {
+                    summary.empty_cells += 1;
+                }
+                continue;
+            }
             if !sq.is_finite() {
                 let _ = check_cell(energy, moments, base + offset, bounds.tolerance, width)?;
             }
-            let residual = if sq == 0.0 {
-                0.0
-            } else {
-                (sq.sqrt() - e).max(0.0)
-            };
+            let residual = (sq.sqrt() - e).max(0.0);
             if !bounds.tolerance.allows(residual, e) {
                 // Fall back to `check_cell` from this exact cell to produce
                 // the identical error detail.

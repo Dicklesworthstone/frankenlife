@@ -221,8 +221,17 @@ impl Chemistry {
         affinity: &Affinity,
         composition: &[f64; CHANNELS],
     ) -> Result<f64, CoreError> {
+        self.efficiency_slice(&affinity.0, composition)
+    }
+
+    #[inline]
+    fn efficiency_slice(
+        &self,
+        aff: &[f64; CHANNELS],
+        composition: &[f64; CHANNELS],
+    ) -> Result<f64, CoreError> {
         let mut dot = 0.0;
-        for (a, z) in affinity.0.iter().zip(composition) {
+        for (a, z) in aff.iter().zip(composition) {
             dot += a * z;
         }
         let response =
@@ -321,6 +330,23 @@ impl Chemistry {
         compositions: &[[f64; CHANNELS]],
         budget: &mut EnergyBudget,
     ) -> Result<UptakeSettlement, CoreError> {
+        self.settle_indexed_slice(&affinity.0, packets, compositions, budget)
+    }
+
+    /// Borrowed-slice counterpart to [`Chemistry::settle_indexed`] avoiding
+    /// 256-byte affinity stack copies when the organism's affinity is already
+    /// validated and unrotated.
+    ///
+    /// # Errors
+    /// As [`Chemistry::settle_indexed`].
+    #[inline]
+    pub(crate) fn settle_indexed_slice(
+        &self,
+        aff: &[f64; CHANNELS],
+        packets: &[(f64, u32)],
+        compositions: &[[f64; CHANNELS]],
+        budget: &mut EnergyBudget,
+    ) -> Result<UptakeSettlement, CoreError> {
         let mut efficiencies = [(0.0, 0.0); 4];
         let mut scored = Vec::new();
         let list: &mut [(f64, f64)] = if packets.len() == 4
@@ -331,10 +357,9 @@ impl Chemistry {
                 compositions.get(packets[3].1 as usize),
             ) {
             // Fused 4-packet channel-order dot product + 4-lane SIMD `tanh_4`:
-            // reads `affinity` once and computes bit-identical IEEE-754 sums
+            // reads `aff` once and computes bit-identical IEEE-754 sums
             // and `tanh` evaluations as four sequential `efficiency` calls.
             let (mut d0, mut d1, mut d2, mut d3) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
-            let aff = &affinity.0;
             for ch in 0..CHANNELS {
                 let a = aff[ch];
                 d0 += a * c0[ch];
@@ -370,7 +395,7 @@ impl Chemistry {
                 let comp = compositions
                     .get(comp_idx as usize)
                     .ok_or_else(|| err_comp_oob(comp_idx, compositions.len()))?;
-                *slot = (granted, self.efficiency(affinity, comp)?);
+                *slot = (granted, self.efficiency_slice(aff, comp)?);
             }
             &mut efficiencies[..packets.len()]
         } else {
@@ -381,7 +406,7 @@ impl Chemistry {
                 let comp = compositions
                     .get(comp_idx as usize)
                     .ok_or_else(|| err_comp_oob(comp_idx, compositions.len()))?;
-                scored.push((granted, self.efficiency(affinity, comp)?));
+                scored.push((granted, self.efficiency_slice(aff, comp)?));
             }
             &mut scored
         };

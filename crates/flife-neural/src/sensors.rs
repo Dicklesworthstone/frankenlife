@@ -518,6 +518,112 @@ pub fn observe_for_controller(
     Ok(Observation { inputs, gradients })
 }
 
+#[cold]
+#[inline(never)]
+fn err_sensor_invalid(quantity: &'static str, detail: String) -> CoreError {
+    CoreError::NumericalInvalid { quantity, detail }
+}
+
+#[cold]
+#[inline(never)]
+fn err_nonfinite_sensor_value(value: f64) -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity: "sensor input",
+        detail: format!("{value} is not finite"),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn err_tanh_undef(value: f64) -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity: "sensor input",
+        detail: format!("tanh({value}) is undefined"),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn err_tanh4_undef(xs: [f64; 4]) -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity: "sensor input",
+        detail: format!("tanh({xs:?}) is undefined"),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn check_finite_single_parts_slow(
+    values: &[f64; PLANES],
+    energy_norm: f64,
+    age_norm: f64,
+    gradients: &[[f64; 2]; PLANES],
+) -> Result<(), CoreError> {
+    for &value in values.iter().chain(&[energy_norm, age_norm]) {
+        if !value.is_finite() {
+            return Err(err_nonfinite_sensor_value(value));
+        }
+    }
+    check_finite_gradients_slow(gradients)
+}
+
+#[cold]
+#[inline(never)]
+fn check_finite_gradients_slow(gradients: &[[f64; 2]; PLANES]) -> Result<(), CoreError> {
+    for &[gx, gy] in gradients {
+        if !gx.is_finite() {
+            return Err(err_nonfinite_sensor_value(gx));
+        }
+        if !gy.is_finite() {
+            return Err(err_nonfinite_sensor_value(gy));
+        }
+    }
+    Ok(())
+}
+
+/// Encode `raw` and `intrinsic` directly into a controller's F32 input buffer
+/// `out_inputs_f32` and caller-owned unsaturated F64 `out_gradients`, with
+/// zero intermediate array copies or large struct returns.
+///
+/// Every entry written to `out_inputs_f32` is bit-identical to
+/// `observe(raw, intrinsic, scales)?.inputs[k] as f32`, and `out_gradients` is
+/// bit-identical to `observe(raw, intrinsic, scales)?.gradients`.
+///
+/// # Errors
+/// As [`observe`].
+#[inline]
+pub fn observe_for_controller_f32_into(
+    raw: &RawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    out_inputs_f32: &mut [f32; SENSOR_WIDTH],
+    out_gradients: &mut [[f64; 2]; PLANES],
+) -> Result<(), CoreError> {
+    let (observed, own) = out_inputs_f32.split_at_mut(3 * PLANES);
+    let (value_slots, derivative_slots) = observed.split_at_mut(PLANES);
+    let (x_slots, y_slots) = derivative_slots.split_at_mut(PLANES);
+    let (energy_norm, age_norm, val_finite_acc) =
+        normalize_single_to_f32(raw, intrinsic, scales, value_slots, out_gradients)?;
+    let (vx, vy, de) =
+        saturate_single_gradients_f32_into(out_gradients, intrinsic, scales, x_slots, y_slots)?;
+    let mut finite_acc = val_finite_acc + (energy_norm + age_norm);
+    for &[gx, gy] in out_gradients.iter() {
+        finite_acc += gx + gy;
+    }
+    if !finite_acc.is_finite() {
+        return check_finite_single_from_raw_slow(
+            raw,
+            intrinsic,
+            scales,
+            energy_norm,
+            age_norm,
+            out_gradients,
+        );
+    }
+    own.copy_from_slice(&[energy_norm as f32, age_norm as f32, vx, vy, de]);
+    Ok(())
+}
+
 /// Encode `raw` and `intrinsic` directly into a controller's F32 input buffer
 /// `out_inputs_f32` via 4-lane [`tanh_f64_as_f32_4`], returning the exact
 /// unsaturated F64 motion gradients without an intermediate `[f64; 104]`
@@ -529,25 +635,73 @@ pub fn observe_for_controller(
 ///
 /// # Errors
 /// As [`observe`].
+#[inline]
 pub fn observe_for_controller_f32(
     raw: &RawSample,
     intrinsic: &Intrinsic,
     scales: &SensorScales,
     out_inputs_f32: &mut [f32; SENSOR_WIDTH],
 ) -> Result<[[f64; 2]; PLANES], CoreError> {
-    let (values, gradients, energy_norm, age_norm) = normalize_single(raw, intrinsic, scales)?;
-    let (x_f32, y_f32, vx, vy, de) = saturate_single_gradients_f32(&gradients, intrinsic, scales)?;
-    check_finite_single_parts(&values, energy_norm, age_norm, &gradients)?;
-    let (observed, own) = out_inputs_f32.split_at_mut(3 * PLANES);
-    let (value_slots, derivative_slots) = observed.split_at_mut(PLANES);
-    let (x_slots, y_slots) = derivative_slots.split_at_mut(PLANES);
-    for (dst, &src) in value_slots.iter_mut().zip(&values) {
-        *dst = src as f32;
-    }
-    x_slots.copy_from_slice(&x_f32);
-    y_slots.copy_from_slice(&y_f32);
-    own.copy_from_slice(&[energy_norm as f32, age_norm as f32, vx, vy, de]);
+    let mut gradients = [[0.0; 2]; PLANES];
+    observe_for_controller_f32_into(raw, intrinsic, scales, out_inputs_f32, &mut gradients)?;
     Ok(gradients)
+}
+
+/// Write only the unsaturated F64 motion gradients directly into
+/// `out_gradients` for an organism whose controller is not due this tick
+/// (skipping all 69 `tanh` controller-input saturations), while enforcing the
+/// exact same normalization and finiteness error checks as [`observe`].
+///
+/// # Errors
+/// As [`observe`].
+#[inline]
+pub fn observe_gradients_only_into(
+    raw: &RawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    out_gradients: &mut [[f64; 2]; PLANES],
+) -> Result<(), CoreError> {
+    let (energy_norm, age_norm, val_finite_acc) =
+        normalize_single_gradients_into(raw, intrinsic, scales, out_gradients)?;
+    let l = scales.gradient_length;
+    let mut finite_acc = 0.0_f64;
+    for &[gx, gy] in out_gradients.iter() {
+        finite_acc += l * gx + l * gy;
+    }
+    let vx_arg = intrinsic.velocity[0] / scales.velocity;
+    let vy_arg = intrinsic.velocity[1] / scales.velocity;
+    let de_arg = intrinsic.energy_change_per_second / scales.energy_change_per_second;
+    finite_acc += (vx_arg + vy_arg) + de_arg;
+    if !finite_acc.is_finite() {
+        for &[gx, gy] in out_gradients.iter() {
+            let sx = l * gx;
+            let sy = l * gy;
+            if !sx.is_finite() || !sy.is_finite() {
+                let bad = if !sx.is_finite() { sx } else { sy };
+                return Err(err_tanh_undef(bad));
+            }
+        }
+        for arg in [vx_arg, vy_arg, de_arg] {
+            if !arg.is_finite() {
+                return Err(err_tanh_undef(arg));
+            }
+        }
+    }
+    let mut parts_acc = val_finite_acc + (energy_norm + age_norm);
+    for &[gx, gy] in out_gradients.iter() {
+        parts_acc += gx + gy;
+    }
+    if !parts_acc.is_finite() {
+        return check_finite_single_from_raw_slow(
+            raw,
+            intrinsic,
+            scales,
+            energy_norm,
+            age_norm,
+            out_gradients,
+        );
+    }
+    Ok(())
 }
 
 /// Compute only the unsaturated F64 motion gradients for an organism whose
@@ -557,82 +711,63 @@ pub fn observe_for_controller_f32(
 ///
 /// # Errors
 /// As [`observe`].
+#[inline]
 pub fn observe_gradients_only(
     raw: &RawSample,
     intrinsic: &Intrinsic,
     scales: &SensorScales,
 ) -> Result<[[f64; 2]; PLANES], CoreError> {
-    let (values, gradients, energy_norm, age_norm) = normalize_single(raw, intrinsic, scales)?;
-    let l = scales.gradient_length;
-    for &[gx, gy] in &gradients {
-        let sx = l * gx;
-        let sy = l * gy;
-        if !sx.is_finite() || !sy.is_finite() {
-            let bad = if !sx.is_finite() { sx } else { sy };
-            return Err(CoreError::NumericalInvalid {
-                quantity: "sensor input",
-                detail: format!("tanh({bad}) is undefined"),
-            });
-        }
-    }
-    for arg in [
-        intrinsic.velocity[0] / scales.velocity,
-        intrinsic.velocity[1] / scales.velocity,
-        intrinsic.energy_change_per_second / scales.energy_change_per_second,
-    ] {
-        if !arg.is_finite() {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "sensor input",
-                detail: format!("tanh({arg}) is undefined"),
-            });
-        }
-    }
-    check_finite_single_parts(&values, energy_norm, age_norm, &gradients)?;
+    let mut gradients = [[0.0; 2]; PLANES];
+    observe_gradients_only_into(raw, intrinsic, scales, &mut gradients)?;
     Ok(gradients)
+}
+
+#[cold]
+#[inline(never)]
+fn check_finite_single_from_raw_slow(
+    raw: &RawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    energy_norm: f64,
+    age_norm: f64,
+    gradients: &[[f64; 2]; PLANES],
+) -> Result<(), CoreError> {
+    let (values, _, _, _) = normalize_single(raw, intrinsic, scales)?;
+    check_finite_single_parts_slow(&values, energy_norm, age_norm, gradients)
 }
 
 #[inline]
 fn saturate_4(xs: [f64; 4]) -> Result<[f32; 4], CoreError> {
-    tanh_f64_as_f32_4(xs).ok_or_else(|| CoreError::NumericalInvalid {
-        quantity: "sensor input",
-        detail: format!("tanh({xs:?}) is undefined"),
-    })
+    tanh_f64_as_f32_4(xs).ok_or_else(|| err_tanh4_undef(xs))
 }
 
 type NormalizedSingle = ([f64; PLANES], [[f64; 2]; PLANES], f64, f64);
 type SaturatedSingle = ([f32; PLANES], [f32; PLANES], f32, f32, f32);
 
-fn normalize_single(
-    raw: &RawSample,
+#[inline]
+fn validate_single_denoms(
+    density: f64,
     intrinsic: &Intrinsic,
     scales: &SensorScales,
-) -> Result<NormalizedSingle, CoreError> {
-    let invalid =
-        |quantity: &'static str, detail: String| CoreError::NumericalInvalid { quantity, detail };
-    let [density, moments @ ..] = raw.values;
-    let [density_x, moments_x @ ..] = raw.dx;
-    let [density_y, moments_y @ ..] = raw.dy;
+) -> Result<(f64, f64, f64, f64), CoreError> {
     if !density.is_finite() || density < 0.0 {
-        return Err(invalid(
+        return Err(err_sensor_invalid(
             "sensed energy density",
             format!("{density} is not a density"),
         ));
     }
     if !intrinsic.energy.is_finite() || intrinsic.energy < 0.0 {
-        return Err(invalid(
+        return Err(err_sensor_invalid(
             "internal energy",
             format!("{} is not an energy", intrinsic.energy),
         ));
     }
     if !intrinsic.age_seconds.is_finite() || intrinsic.age_seconds < 0.0 {
-        return Err(invalid(
+        return Err(err_sensor_invalid(
             "age",
             format!("{} is not an age", intrinsic.age_seconds),
         ));
     }
-
-    let mut values = [0.0; PLANES];
-    let mut gradients = [[0.0; 2]; PLANES];
     let shifted = density + scales.energy_density;
     let regularized = density + scales.composition_floor;
     let energy_denom = intrinsic.energy + scales.internal_energy;
@@ -642,21 +777,113 @@ fn normalize_single(
         || !energy_denom.is_finite()
         || !age_denom.is_finite()
     {
-        return Err(invalid(
+        return Err(err_sensor_invalid(
             "sensor normalization denominator",
             "density, energy, or age scale sum overflowed".to_owned(),
         ));
     }
+    Ok((shifted, regularized, energy_denom, age_denom))
+}
+
+#[inline]
+fn normalize_single_to_f32(
+    raw: &RawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    value_slots: &mut [f32],
+    out_gradients: &mut [[f64; 2]; PLANES],
+) -> Result<(f64, f64, f64), CoreError> {
+    let [density, ref moments @ ..] = raw.values;
+    let [density_x, ref moments_x @ ..] = raw.dx;
+    let [density_y, ref moments_y @ ..] = raw.dy;
+    let (shifted, regularized, energy_denom, age_denom) =
+        validate_single_denoms(density, intrinsic, scales)?;
+    let slope = scales.energy_density / (shifted * shifted);
+    let q0 = density / shifted;
+    let mut val_acc = q0;
+    if let Some(slot) = value_slots.first_mut() {
+        *slot = q0 as f32;
+    }
+    out_gradients[0] = [slope * density_x, slope * density_y];
+    for ((slot, gradient), ((&moment, &moment_x), &moment_y)) in value_slots
+        .iter_mut()
+        .skip(1)
+        .zip(out_gradients.iter_mut().skip(1))
+        .zip(moments.iter().zip(moments_x).zip(moments_y))
+    {
+        let z = moment / regularized;
+        val_acc += z;
+        *slot = z as f32;
+        *gradient = [
+            (moment_x - z * density_x) / regularized,
+            (moment_y - z * density_y) / regularized,
+        ];
+    }
+    Ok((
+        intrinsic.energy / energy_denom,
+        intrinsic.age_seconds / age_denom,
+        val_acc,
+    ))
+}
+
+#[inline]
+fn normalize_single_gradients_into(
+    raw: &RawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    out_gradients: &mut [[f64; 2]; PLANES],
+) -> Result<(f64, f64, f64), CoreError> {
+    let [density, ref moments @ ..] = raw.values;
+    let [density_x, ref moments_x @ ..] = raw.dx;
+    let [density_y, ref moments_y @ ..] = raw.dy;
+    let (shifted, regularized, energy_denom, age_denom) =
+        validate_single_denoms(density, intrinsic, scales)?;
+    let slope = scales.energy_density / (shifted * shifted);
+    let mut val_acc = density / shifted;
+    out_gradients[0] = [slope * density_x, slope * density_y];
+    for (gradient, ((&moment, &moment_x), &moment_y)) in out_gradients
+        .iter_mut()
+        .skip(1)
+        .zip(moments.iter().zip(moments_x).zip(moments_y))
+    {
+        let z = moment / regularized;
+        val_acc += z;
+        *gradient = [
+            (moment_x - z * density_x) / regularized,
+            (moment_y - z * density_y) / regularized,
+        ];
+    }
+    Ok((
+        intrinsic.energy / energy_denom,
+        intrinsic.age_seconds / age_denom,
+        val_acc,
+    ))
+}
+
+#[inline]
+fn normalize_single(
+    raw: &RawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+) -> Result<NormalizedSingle, CoreError> {
+    let [density, ref moments @ ..] = raw.values;
+    let [density_x, ref moments_x @ ..] = raw.dx;
+    let [density_y, ref moments_y @ ..] = raw.dy;
+    let (shifted, regularized, energy_denom, age_denom) =
+        validate_single_denoms(density, intrinsic, scales)?;
+
+    let mut values = [0.0; PLANES];
+    let mut gradients = [[0.0; 2]; PLANES];
     let slope = scales.energy_density / (shifted * shifted);
     if let (Some(value), Some(gradient)) = (values.first_mut(), gradients.first_mut()) {
         *value = density / shifted;
         *gradient = [slope * density_x, slope * density_y];
     }
-    for ((value, gradient), ((moment, moment_x), moment_y)) in values
+    for ((value, gradient), ((&moment, &moment_x), &moment_y)) in values
         .iter_mut()
         .zip(gradients.iter_mut())
         .skip(1)
-        .zip(moments.iter().zip(&moments_x).zip(&moments_y))
+        .zip(moments.iter().zip(moments_x).zip(moments_y))
     {
         let z = moment / regularized;
         *value = z;
@@ -673,49 +900,64 @@ fn normalize_single(
     ))
 }
 
-fn saturate_single_gradients_f32(
+#[inline]
+fn saturate_single_gradients_f32_into(
     gradients: &[[f64; 2]; PLANES],
     intrinsic: &Intrinsic,
     scales: &SensorScales,
-) -> Result<SaturatedSingle, CoreError> {
+    x_f32: &mut [f32],
+    y_f32: &mut [f32],
+) -> Result<(f32, f32, f32), CoreError> {
     let l = scales.gradient_length;
-    let mut x_f32 = [0.0_f32; PLANES];
-    let mut y_f32 = [0.0_f32; PLANES];
     let [ex, ey, vx, vy] = saturate_4([
         l * gradients[0][0],
         l * gradients[0][1],
         intrinsic.velocity[0] / scales.velocity,
         intrinsic.velocity[1] / scales.velocity,
     ])?;
-    x_f32[0] = ex;
-    y_f32[0] = ey;
-    for ((x_chunk, y_chunk), grad_chunk) in x_f32[1..]
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(y_f32[1..].as_chunks_mut::<4>().0.iter_mut())
-        .zip(gradients[1..].as_chunks::<4>().0)
+    if let (Some((x0, x_rest)), Some((y0, y_rest))) =
+        (x_f32.split_first_mut(), y_f32.split_first_mut())
     {
-        let tx = saturate_4([
-            l * grad_chunk[0][0],
-            l * grad_chunk[1][0],
-            l * grad_chunk[2][0],
-            l * grad_chunk[3][0],
-        ])?;
-        let ty = saturate_4([
-            l * grad_chunk[0][1],
-            l * grad_chunk[1][1],
-            l * grad_chunk[2][1],
-            l * grad_chunk[3][1],
-        ])?;
-        *x_chunk = tx;
-        *y_chunk = ty;
+        *x0 = ex;
+        *y0 = ey;
+        for ((x_chunk, y_chunk), grad_chunk) in x_rest
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(y_rest.as_chunks_mut::<4>().0.iter_mut())
+            .zip(gradients[1..].as_chunks::<4>().0)
+        {
+            let tx = saturate_4([
+                l * grad_chunk[0][0],
+                l * grad_chunk[1][0],
+                l * grad_chunk[2][0],
+                l * grad_chunk[3][0],
+            ])?;
+            let ty = saturate_4([
+                l * grad_chunk[0][1],
+                l * grad_chunk[1][1],
+                l * grad_chunk[2][1],
+                l * grad_chunk[3][1],
+            ])?;
+            *x_chunk = tx;
+            *y_chunk = ty;
+        }
     }
     let de_arg = intrinsic.energy_change_per_second / scales.energy_change_per_second;
-    let de = tanh_f64_as_f32(de_arg).ok_or_else(|| CoreError::NumericalInvalid {
-        quantity: "sensor input",
-        detail: format!("tanh({de_arg}) is undefined"),
-    })?;
+    let de = tanh_f64_as_f32(de_arg).ok_or_else(|| err_tanh_undef(de_arg))?;
+    Ok((vx, vy, de))
+}
+
+#[inline]
+fn saturate_single_gradients_f32(
+    gradients: &[[f64; 2]; PLANES],
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+) -> Result<SaturatedSingle, CoreError> {
+    let mut x_f32 = [0.0_f32; PLANES];
+    let mut y_f32 = [0.0_f32; PLANES];
+    let (vx, vy, de) =
+        saturate_single_gradients_f32_into(gradients, intrinsic, scales, &mut x_f32, &mut y_f32)?;
     Ok((x_f32, y_f32, vx, vy, de))
 }
 
@@ -725,46 +967,20 @@ fn check_finite_single(
 ) -> Result<(), CoreError> {
     for &value in inputs {
         if !value.is_finite() {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "sensor input",
-                detail: format!("{value} is not finite"),
-            });
+            return Err(err_nonfinite_sensor_value(value));
         }
     }
     check_finite_gradients(gradients)
 }
 
-fn check_finite_single_parts(
-    values: &[f64; PLANES],
-    energy_norm: f64,
-    age_norm: f64,
-    gradients: &[[f64; 2]; PLANES],
-) -> Result<(), CoreError> {
-    for &value in values.iter().chain(&[energy_norm, age_norm]) {
-        if !value.is_finite() {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "sensor input",
-                detail: format!("{value} is not finite"),
-            });
-        }
-    }
-    check_finite_gradients(gradients)
-}
-
+#[inline]
 fn check_finite_gradients(gradients: &[[f64; 2]; PLANES]) -> Result<(), CoreError> {
+    let mut acc = 0.0_f64;
     for &[gx, gy] in gradients {
-        if !gx.is_finite() {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "sensor input",
-                detail: format!("{gx} is not finite"),
-            });
-        }
-        if !gy.is_finite() {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "sensor input",
-                detail: format!("{gy} is not finite"),
-            });
-        }
+        acc += gx + gy;
+    }
+    if !acc.is_finite() {
+        return check_finite_gradients_slow(gradients);
     }
     Ok(())
 }
@@ -893,6 +1109,76 @@ pub fn observe_dual_for_controller(
     })
 }
 
+#[cold]
+#[inline(never)]
+fn check_finite_dual_parts_slow(dual: &NormalizedDual) -> Result<(), CoreError> {
+    for &value in
+        dual.values
+            .iter()
+            .chain(&[dual.energy_norm, dual.age_norm, dual.q1, dual.z1_norm])
+    {
+        if !value.is_finite() {
+            return Err(err_nonfinite_sensor_value(value));
+        }
+    }
+    check_finite_gradients_slow(&dual.gradients)
+}
+
+/// Encode a 34-plane [`DualRawSample`] directly into F32 controller buffers
+/// `out_inputs_f32`, `out_trail_f32`, and caller-owned unsaturated F64
+/// `out_gradients`, eliminating intermediate gradient/array stack copies.
+///
+/// # Errors
+/// As [`observe_dual`].
+#[inline]
+pub fn observe_dual_for_controller_f32_into(
+    raw: &DualRawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    trail_energy_density_scale: f64,
+    out_inputs_f32: &mut [f32; SENSOR_WIDTH],
+    out_trail_f32: &mut [f32; DUAL_CARRIER_TRAIL_INPUTS],
+    out_gradients: &mut [[f64; 2]; PLANES],
+) -> Result<(), CoreError> {
+    let (observed, own) = out_inputs_f32.split_at_mut(3 * PLANES);
+    let (value_slots, derivative_slots) = observed.split_at_mut(PLANES);
+    let (x_slots, y_slots) = derivative_slots.split_at_mut(PLANES);
+    let scalars = normalize_dual_to_f32(
+        raw,
+        intrinsic,
+        scales,
+        trail_energy_density_scale,
+        Some(value_slots),
+        out_gradients,
+    )?;
+    let (vx, vy, de, t1x, t1y) = saturate_dual_gradients_f32_into(
+        out_gradients,
+        scalars.dq1_x,
+        scalars.dq1_y,
+        intrinsic,
+        scales,
+        x_slots,
+        y_slots,
+    )?;
+    let mut acc =
+        scalars.val_acc + (scalars.energy_norm + scalars.age_norm) + (scalars.q1 + scalars.z1_norm);
+    for &[gx, gy] in out_gradients.iter() {
+        acc += gx + gy;
+    }
+    if !acc.is_finite() {
+        return check_finite_dual_from_raw_slow(raw, intrinsic, scales, trail_energy_density_scale);
+    }
+    own.copy_from_slice(&[
+        scalars.energy_norm as f32,
+        scalars.age_norm as f32,
+        vx,
+        vy,
+        de,
+    ]);
+    *out_trail_f32 = [scalars.q1 as f32, t1x, t1y, scalars.z1_norm as f32];
+    Ok(())
+}
+
 /// Encode a 34-plane [`DualRawSample`] directly into F32 controller buffers
 /// `out_inputs_f32` (104 base inputs) and `out_trail_f32` (4 Carrier-1 trail
 /// inputs) via 4-lane [`tanh_f64_as_f32_4`], returning the exact unsaturated
@@ -903,6 +1189,7 @@ pub fn observe_dual_for_controller(
 ///
 /// # Errors
 /// As [`observe_dual`].
+#[inline]
 pub fn observe_dual_for_controller_f32(
     raw: &DualRawSample,
     intrinsic: &Intrinsic,
@@ -911,40 +1198,77 @@ pub fn observe_dual_for_controller_f32(
     out_inputs_f32: &mut [f32; SENSOR_WIDTH],
     out_trail_f32: &mut [f32; DUAL_CARRIER_TRAIL_INPUTS],
 ) -> Result<[[f64; 2]; PLANES], CoreError> {
-    let dual = normalize_dual(raw, intrinsic, scales, trail_energy_density_scale)?;
-    let sat =
-        saturate_dual_gradients_f32(&dual.gradients, dual.dq1_x, dual.dq1_y, intrinsic, scales)?;
-    for &value in
-        dual.values
-            .iter()
-            .chain(&[dual.energy_norm, dual.age_norm, dual.q1, dual.z1_norm])
-    {
-        if !value.is_finite() {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "sensor input",
-                detail: format!("{value} is not finite"),
-            });
+    let mut gradients = [[0.0; 2]; PLANES];
+    observe_dual_for_controller_f32_into(
+        raw,
+        intrinsic,
+        scales,
+        trail_energy_density_scale,
+        out_inputs_f32,
+        out_trail_f32,
+        &mut gradients,
+    )?;
+    Ok(gradients)
+}
+
+/// Write only the unsaturated F64 motion gradients directly into
+/// `out_gradients` for a 34-plane dual-carrier organism whose controller is not
+/// due this tick (skipping all 71 `tanh` saturations), while enforcing the
+/// exact same normalization and finiteness error checks as [`observe_dual`].
+///
+/// # Errors
+/// As [`observe_dual`].
+#[inline]
+pub fn observe_dual_gradients_only_into(
+    raw: &DualRawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    trail_energy_density_scale: f64,
+    out_gradients: &mut [[f64; 2]; PLANES],
+) -> Result<(), CoreError> {
+    let scalars = normalize_dual_to_f32(
+        raw,
+        intrinsic,
+        scales,
+        trail_energy_density_scale,
+        None,
+        out_gradients,
+    )?;
+    let l = scales.gradient_length;
+    let mut finite_acc = 0.0_f64;
+    for &[gx, gy] in out_gradients.iter() {
+        finite_acc += l * gx + l * gy;
+    }
+    let vx_arg = intrinsic.velocity[0] / scales.velocity;
+    let vy_arg = intrinsic.velocity[1] / scales.velocity;
+    let de_arg = intrinsic.energy_change_per_second / scales.energy_change_per_second;
+    let t1x_arg = l * scalars.dq1_x;
+    let t1y_arg = l * scalars.dq1_y;
+    finite_acc += ((vx_arg + vy_arg) + de_arg) + (t1x_arg + t1y_arg);
+    if !finite_acc.is_finite() {
+        for &[gx, gy] in out_gradients.iter() {
+            let sx = l * gx;
+            let sy = l * gy;
+            if !sx.is_finite() || !sy.is_finite() {
+                let bad = if !sx.is_finite() { sx } else { sy };
+                return Err(err_tanh_undef(bad));
+            }
+        }
+        for arg in [vx_arg, vy_arg, de_arg, t1x_arg, t1y_arg] {
+            if !arg.is_finite() {
+                return Err(err_tanh_undef(arg));
+            }
         }
     }
-    check_finite_gradients(&dual.gradients)?;
-
-    let (observed, own) = out_inputs_f32.split_at_mut(3 * PLANES);
-    let (value_slots, derivative_slots) = observed.split_at_mut(PLANES);
-    let (x_slots, y_slots) = derivative_slots.split_at_mut(PLANES);
-    for (dst, &src) in value_slots.iter_mut().zip(&dual.values) {
-        *dst = src as f32;
+    let mut parts_acc =
+        scalars.val_acc + (scalars.energy_norm + scalars.age_norm) + (scalars.q1 + scalars.z1_norm);
+    for &[gx, gy] in out_gradients.iter() {
+        parts_acc += gx + gy;
     }
-    x_slots.copy_from_slice(&sat.x);
-    y_slots.copy_from_slice(&sat.y);
-    own.copy_from_slice(&[
-        dual.energy_norm as f32,
-        dual.age_norm as f32,
-        sat.vx,
-        sat.vy,
-        sat.de,
-    ]);
-    *out_trail_f32 = [dual.q1 as f32, sat.t1x, sat.t1y, dual.z1_norm as f32];
-    Ok(dual.gradients)
+    if !parts_acc.is_finite() {
+        return check_finite_dual_from_raw_slow(raw, intrinsic, scales, trail_energy_density_scale);
+    }
+    Ok(())
 }
 
 /// Compute only the unsaturated F64 motion gradients for a 34-plane
@@ -954,53 +1278,174 @@ pub fn observe_dual_for_controller_f32(
 ///
 /// # Errors
 /// As [`observe_dual`].
+#[inline]
 pub fn observe_dual_gradients_only(
     raw: &DualRawSample,
     intrinsic: &Intrinsic,
     scales: &SensorScales,
     trail_energy_density_scale: f64,
 ) -> Result<[[f64; 2]; PLANES], CoreError> {
+    let mut gradients = [[0.0; 2]; PLANES];
+    observe_dual_gradients_only_into(
+        raw,
+        intrinsic,
+        scales,
+        trail_energy_density_scale,
+        &mut gradients,
+    )?;
+    Ok(gradients)
+}
+
+#[cold]
+#[inline(never)]
+fn check_finite_dual_from_raw_slow(
+    raw: &DualRawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    trail_energy_density_scale: f64,
+) -> Result<(), CoreError> {
     let dual = normalize_dual(raw, intrinsic, scales, trail_energy_density_scale)?;
-    let l = scales.gradient_length;
-    for &[gx, gy] in &dual.gradients {
-        let sx = l * gx;
-        let sy = l * gy;
-        if !sx.is_finite() || !sy.is_finite() {
-            let bad = if !sx.is_finite() { sx } else { sy };
-            return Err(CoreError::NumericalInvalid {
-                quantity: "sensor input",
-                detail: format!("tanh({bad}) is undefined"),
-            });
-        }
+    check_finite_dual_parts_slow(&dual)
+}
+
+struct DualScalars {
+    val_acc: f64,
+    energy_norm: f64,
+    age_norm: f64,
+    q1: f64,
+    dq1_x: f64,
+    dq1_y: f64,
+    z1_norm: f64,
+}
+
+#[inline]
+fn normalize_dual_to_f32(
+    raw: &DualRawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    trail_energy_density_scale: f64,
+    mut value_slots: Option<&mut [f32]>,
+    out_gradients: &mut [[f64; 2]; PLANES],
+) -> Result<DualScalars, CoreError> {
+    if !trail_energy_density_scale.is_finite() || trail_energy_density_scale <= 0.0 {
+        return Err(err_sensor_invalid(
+            "v2.carriers.trail_energy_density_scale",
+            format!("{trail_energy_density_scale} is not a positive scale"),
+        ));
     }
-    for arg in [
-        intrinsic.velocity[0] / scales.velocity,
-        intrinsic.velocity[1] / scales.velocity,
-        intrinsic.energy_change_per_second / scales.energy_change_per_second,
-        l * dual.dq1_x,
-        l * dual.dq1_y,
-    ] {
-        if !arg.is_finite() {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "sensor input",
-                detail: format!("tanh({arg}) is undefined"),
-            });
-        }
+    let density0 = raw.values[0];
+    let density0_x = raw.dx[0];
+    let density0_y = raw.dy[0];
+    let c1_e = CARRIER1_ENERGY_PLANE as usize;
+    let density1 = raw.values[c1_e];
+    let density1_x = raw.dx[c1_e];
+    let density1_y = raw.dy[c1_e];
+    if !density0.is_finite() || density0 < 0.0 {
+        return Err(err_sensor_invalid(
+            "sensed energy density",
+            format!("{density0} is not a density"),
+        ));
     }
-    for &value in
-        dual.values
-            .iter()
-            .chain(&[dual.energy_norm, dual.age_norm, dual.q1, dual.z1_norm])
+    if !density1.is_finite() || density1 < 0.0 {
+        return Err(err_sensor_invalid(
+            "sensed trail energy density",
+            format!("{density1} is not a density"),
+        ));
+    }
+    if !intrinsic.energy.is_finite() || intrinsic.energy < 0.0 {
+        return Err(err_sensor_invalid(
+            "internal energy",
+            format!("{} is not an energy", intrinsic.energy),
+        ));
+    }
+    if !intrinsic.age_seconds.is_finite() || intrinsic.age_seconds < 0.0 {
+        return Err(err_sensor_invalid(
+            "age",
+            format!("{} is not an age", intrinsic.age_seconds),
+        ));
+    }
+    let shifted0 = density0 + scales.energy_density;
+    let reg0 = density0 + scales.composition_floor;
+    let shifted1 = density1 + trail_energy_density_scale;
+    let reg1 = density1 + scales.composition_floor;
+    let energy_denom = intrinsic.energy + scales.internal_energy;
+    let age_denom = intrinsic.age_seconds + scales.age_seconds;
+    if !shifted0.is_finite()
+        || !reg0.is_finite()
+        || !shifted1.is_finite()
+        || !reg1.is_finite()
+        || !energy_denom.is_finite()
+        || !age_denom.is_finite()
     {
-        if !value.is_finite() {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "sensor input",
-                detail: format!("{value} is not finite"),
-            });
-        }
+        return Err(err_sensor_invalid(
+            "sensor normalization denominator",
+            "density, energy, or age scale sum overflowed".to_owned(),
+        ));
     }
-    check_finite_gradients(&dual.gradients)?;
-    Ok(dual.gradients)
+    let slope0 = scales.energy_density / (shifted0 * shifted0);
+    let q0 = density0 / shifted0;
+    let mut val_acc = q0;
+    if let Some(slots) = value_slots.as_deref_mut()
+        && let Some(slot) = slots.first_mut()
+    {
+        *slot = q0 as f32;
+    }
+    out_gradients[0] = [slope0 * density0_x, slope0 * density0_y];
+
+    let c0_count = CARRIER0_MOMENT_CHANNELS as usize;
+    for k in 0..c0_count {
+        let p = 1 + k;
+        let z = raw.values[p] / reg0;
+        val_acc += z;
+        if let Some(slots) = value_slots.as_deref_mut()
+            && let Some(slot) = slots.get_mut(p)
+        {
+            *slot = z as f32;
+        }
+        out_gradients[p] = [
+            (raw.dx[p] - z * density0_x) / reg0,
+            (raw.dy[p] - z * density0_y) / reg0,
+        ];
+    }
+
+    let c1_first = CARRIER1_FIRST_MOMENT_PLANE as usize;
+    let c1_count = CARRIER1_MOMENT_CHANNELS as usize;
+    let mut z1_sq = 0.0_f64;
+    for j in 0..c1_count {
+        let src = c1_first + j;
+        let dst = 1 + c0_count + j;
+        let z = raw.values[src] / reg1;
+        z1_sq += z * z;
+        val_acc += z;
+        if let Some(slots) = value_slots.as_deref_mut()
+            && let Some(slot) = slots.get_mut(dst)
+        {
+            *slot = z as f32;
+        }
+        out_gradients[dst] = [
+            (raw.dx[src] - z * density1_x) / reg1,
+            (raw.dy[src] - z * density1_y) / reg1,
+        ];
+    }
+
+    let slope1 = trail_energy_density_scale / (shifted1 * shifted1);
+    let q1 = density1 / shifted1;
+    let dq1_x = slope1 * density1_x;
+    let dq1_y = slope1 * density1_y;
+    let z1_norm = if z1_sq.is_finite() {
+        z1_sq.sqrt().min(1.0)
+    } else {
+        f64::NAN
+    };
+    Ok(DualScalars {
+        val_acc,
+        energy_norm: intrinsic.energy / energy_denom,
+        age_norm: intrinsic.age_seconds / age_denom,
+        q1,
+        dq1_x,
+        dq1_y,
+        z1_norm,
+    })
 }
 
 struct SaturatedDual {
@@ -1024,16 +1469,15 @@ struct NormalizedDual {
     z1_norm: f64,
 }
 
+#[inline]
 fn normalize_dual(
     raw: &DualRawSample,
     intrinsic: &Intrinsic,
     scales: &SensorScales,
     trail_energy_density_scale: f64,
 ) -> Result<NormalizedDual, CoreError> {
-    let invalid =
-        |quantity: &'static str, detail: String| CoreError::NumericalInvalid { quantity, detail };
     if !trail_energy_density_scale.is_finite() || trail_energy_density_scale <= 0.0 {
-        return Err(invalid(
+        return Err(err_sensor_invalid(
             "v2.carriers.trail_energy_density_scale",
             format!("{trail_energy_density_scale} is not a positive scale"),
         ));
@@ -1046,25 +1490,25 @@ fn normalize_dual(
     let density1_x = raw.dx[c1_e];
     let density1_y = raw.dy[c1_e];
     if !density0.is_finite() || density0 < 0.0 {
-        return Err(invalid(
+        return Err(err_sensor_invalid(
             "sensed energy density",
             format!("{density0} is not a density"),
         ));
     }
     if !density1.is_finite() || density1 < 0.0 {
-        return Err(invalid(
+        return Err(err_sensor_invalid(
             "sensed trail energy density",
             format!("{density1} is not a density"),
         ));
     }
     if !intrinsic.energy.is_finite() || intrinsic.energy < 0.0 {
-        return Err(invalid(
+        return Err(err_sensor_invalid(
             "internal energy",
             format!("{} is not an energy", intrinsic.energy),
         ));
     }
     if !intrinsic.age_seconds.is_finite() || intrinsic.age_seconds < 0.0 {
-        return Err(invalid(
+        return Err(err_sensor_invalid(
             "age",
             format!("{} is not an age", intrinsic.age_seconds),
         ));
@@ -1085,7 +1529,7 @@ fn normalize_dual(
         || !energy_denom.is_finite()
         || !age_denom.is_finite()
     {
-        return Err(invalid(
+        return Err(err_sensor_invalid(
             "sensor normalization denominator",
             "density, energy, or age scale sum overflowed".to_owned(),
         ));
@@ -1141,45 +1585,50 @@ fn normalize_dual(
     })
 }
 
-fn saturate_dual_gradients_f32(
+#[inline]
+fn saturate_dual_gradients_f32_into(
     gradients: &[[f64; 2]; PLANES],
     dq1_x: f64,
     dq1_y: f64,
     intrinsic: &Intrinsic,
     scales: &SensorScales,
-) -> Result<SaturatedDual, CoreError> {
+    x_f32: &mut [f32],
+    y_f32: &mut [f32],
+) -> Result<(f32, f32, f32, f32, f32), CoreError> {
     let l = scales.gradient_length;
-    let mut x_f32 = [0.0_f32; PLANES];
-    let mut y_f32 = [0.0_f32; PLANES];
     let [ex, ey, vx, vy] = saturate_4([
         l * gradients[0][0],
         l * gradients[0][1],
         intrinsic.velocity[0] / scales.velocity,
         intrinsic.velocity[1] / scales.velocity,
     ])?;
-    x_f32[0] = ex;
-    y_f32[0] = ey;
-    for ((x_chunk, y_chunk), grad_chunk) in x_f32[1..]
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(y_f32[1..].as_chunks_mut::<4>().0.iter_mut())
-        .zip(gradients[1..].as_chunks::<4>().0)
+    if let (Some((x0, x_rest)), Some((y0, y_rest))) =
+        (x_f32.split_first_mut(), y_f32.split_first_mut())
     {
-        let tx = saturate_4([
-            l * grad_chunk[0][0],
-            l * grad_chunk[1][0],
-            l * grad_chunk[2][0],
-            l * grad_chunk[3][0],
-        ])?;
-        let ty = saturate_4([
-            l * grad_chunk[0][1],
-            l * grad_chunk[1][1],
-            l * grad_chunk[2][1],
-            l * grad_chunk[3][1],
-        ])?;
-        *x_chunk = tx;
-        *y_chunk = ty;
+        *x0 = ex;
+        *y0 = ey;
+        for ((x_chunk, y_chunk), grad_chunk) in x_rest
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(y_rest.as_chunks_mut::<4>().0.iter_mut())
+            .zip(gradients[1..].as_chunks::<4>().0)
+        {
+            let tx = saturate_4([
+                l * grad_chunk[0][0],
+                l * grad_chunk[1][0],
+                l * grad_chunk[2][0],
+                l * grad_chunk[3][0],
+            ])?;
+            let ty = saturate_4([
+                l * grad_chunk[0][1],
+                l * grad_chunk[1][1],
+                l * grad_chunk[2][1],
+                l * grad_chunk[3][1],
+            ])?;
+            *x_chunk = tx;
+            *y_chunk = ty;
+        }
     }
     let [de, t1x, t1y, _] = saturate_4([
         intrinsic.energy_change_per_second / scales.energy_change_per_second,
@@ -1187,6 +1636,22 @@ fn saturate_dual_gradients_f32(
         l * dq1_y,
         0.0,
     ])?;
+    Ok((vx, vy, de, t1x, t1y))
+}
+
+#[inline]
+fn saturate_dual_gradients_f32(
+    gradients: &[[f64; 2]; PLANES],
+    dq1_x: f64,
+    dq1_y: f64,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+) -> Result<SaturatedDual, CoreError> {
+    let mut x_f32 = [0.0_f32; PLANES];
+    let mut y_f32 = [0.0_f32; PLANES];
+    let (vx, vy, de, t1x, t1y) = saturate_dual_gradients_f32_into(
+        gradients, dq1_x, dq1_y, intrinsic, scales, &mut x_f32, &mut y_f32,
+    )?;
     Ok(SaturatedDual {
         x: x_f32,
         y: y_f32,

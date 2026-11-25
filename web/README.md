@@ -15,8 +15,9 @@ repository's change.
 
 ## The page's design
 
-The page is five chapters, defined by `chapters` in `lib/content.ts`: the world, why it is different, how
-it works, what it can show, and how to use it. The header's chapter links (a bottom dock on phones), each
+The page is six chapters, defined by `chapters` in `lib/content.ts`: the world, why it is different, how
+it works, version 2, what it can show, and how to use it. The header's chapter links (a bottom dock below
+1,024 px, where the six do not fit beside the name), each
 chapter's index and every section's number ("03.2") come from that list, so adding a section there is
 enough to number and link it. `components/section.tsx` has the two section layouts: `wide`, where an
 explainer gets the full width under its heading, and `split`, a sticky heading beside lists and prose.

@@ -261,8 +261,8 @@ body::before {
   outline-offset: 2px;
 }
 
-/* The mobile dock keeps the page's last lines clear of itself. */
-@media (max-width: 767px) {
+/* The dock (below 1,024 px, components/site-header.tsx) keeps the page's last lines clear of itself. */
+@media (max-width: 1023px) {
   .dock-clearance {
     padding-bottom: calc(5.5rem + env(safe-area-inset-bottom));
   }

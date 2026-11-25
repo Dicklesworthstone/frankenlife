@@ -19,9 +19,9 @@ const ICONS: Record<string, LucideIcon> = {
 const chapterColour = (index: number) => LINEAGE[index % LINEAGE.length] ?? "#4ade80";
 
 /**
- * The page's chrome. Wide screens: a floating pill with the chapters, the one in view marked, and a
- * hairline that fills as the page is read. Phones: the name and the code at the top, and the chapters in a
- * dock at the bottom, where a thumb reaches them.
+ * The page's chrome. Screens 1,024 px wide and more: a floating pill with the chapters, the one in view marked,
+ * and a hairline that fills as the page is read. Narrower ones (phones, tablets): the name and the code at the
+ * top, and the chapters in a dock at the bottom, where a thumb reaches them.
  */
 export function SiteHeader() {
   const [scrolled, setScrolled] = useState(false);
@@ -103,7 +103,10 @@ export function SiteHeader() {
               />
               <span className="text-[15px] font-extrabold tracking-tight text-white">{siteConfig.name}</span>
             </a>
-            <nav aria-label="Chapters" className="hidden min-w-0 flex-1 justify-center md:flex">
+            {/* From 1,024 px: the six chapters need about 960 px beside the name and GitHub, and below that they
+                ran under both (measured in Chrome), so narrower screens, tablets and phones held sideways included,
+                get the dock. */}
+            <nav aria-label="Chapters" className="hidden min-w-0 flex-1 justify-center lg:flex">
               <ul className="flex items-center gap-0.5 lg:gap-1">
                 {chapters.map((chapter, index) => {
                   const on = active === chapter.id;
@@ -135,7 +138,7 @@ export function SiteHeader() {
             </nav>
             <a
               href={siteConfig.github}
-              className="ml-auto inline-flex h-10 shrink-0 items-center gap-1.5 rounded-xl bg-green-500 px-3.5 text-[13px] font-extrabold text-black transition-colors hover:bg-green-400 md:ml-0"
+              className="ml-auto inline-flex h-10 shrink-0 items-center gap-1.5 rounded-xl bg-green-500 px-3.5 text-[13px] font-extrabold text-black transition-colors hover:bg-green-400 lg:ml-0"
             >
               GitHub <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
             </a>
@@ -157,10 +160,10 @@ export function SiteHeader() {
         </div>
       </header>
 
-      {/* Phones: the chapters in a dock at the bottom of the screen. */}
+      {/* Below 1,024 px: the chapters in a dock at the bottom of the screen. */}
       <nav
         aria-label="Chapters"
-        className="fixed inset-x-0 bottom-0 z-50 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] md:hidden"
+        className="fixed inset-x-0 bottom-0 z-50 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] lg:hidden"
       >
         <ul
           className="glass-modern mx-auto grid max-w-md rounded-2xl p-1"

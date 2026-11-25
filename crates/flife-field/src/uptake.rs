@@ -1264,54 +1264,67 @@ pub fn apply_grants_on(
     workers: usize,
 ) -> Result<f64, CoreError> {
     let cells = grants.check_debit(field)?;
+    // Apply energy debits and precompute each positive debit's F64 moment-scale
+    // ratio ONCE into `grants.shares` (idle scratch after `resolve_uptake`,
+    // already pre-reserved to `packets >= debits.len()` by `with_capacity_for`),
+    // avoiding 32× redundant F64 divisions and 40-byte `CellDebit` scans across
+    // every moment plane while preserving exact zero-allocation footprint.
     let energy = field.energy_mut();
-    for debit in grants.debits.iter().filter(|debit| debit.granted > 0.0) {
-        energy[debit.cell] = debit.energy_after;
-    }
-    let debits: &[CellDebit] = &grants.debits;
-    let scale = |planes: &mut [f32]| {
-        const CHUNK: usize = 64;
-        let mut batch = [(0_usize, 0.0_f64); CHUNK];
-        let mut batch_len = 0_usize;
-        let flush = |planes: &mut [f32], batch: &[(usize, f64)]| {
-            for plane in planes.chunks_exact_mut(cells.max(1)) {
-                for &(cell, ratio) in batch {
-                    let moment = &mut plane[cell];
-                    *moment = if ratio == 0.0 {
-                        0.0
-                    } else {
-                        (f64::from(*moment) * ratio) as f32
-                    };
-                }
-            }
-        };
-        for debit in debits.iter().filter(|debit| debit.granted > 0.0) {
+    grants.shares.clear();
+    for debit in &grants.debits {
+        if debit.granted > 0.0 {
+            energy[debit.cell] = debit.energy_after;
             let ratio = if debit.energy_after == 0.0 {
                 0.0
             } else {
                 f64::from(debit.energy_after) / f64::from(debit.energy_before)
             };
-            batch[batch_len] = (debit.cell, ratio);
-            batch_len += 1;
-            if batch_len == CHUNK {
-                flush(planes, &batch[..batch_len]);
-                batch_len = 0;
+            grants.shares.push(Share {
+                quanta: debit.cell as u64,
+                remainder: ratio,
+            });
+        }
+    }
+    let ratios: &[Share] = &grants.shares;
+    if !ratios.is_empty() {
+        let active_moments = field.carrier0_moments_count();
+        let used = workers.clamp(1, active_moments);
+        let plane_len = cells.max(1);
+        if used <= 1 {
+            let moments = field.moments_mut();
+            for chunk in ratios.chunks(64) {
+                for plane in moments.chunks_exact_mut(plane_len) {
+                    for item in chunk {
+                        let moment = &mut plane[item.quanta as usize];
+                        let ratio = item.remainder;
+                        *moment = if ratio == 0.0 {
+                            0.0
+                        } else {
+                            (f64::from(*moment) * ratio) as f32
+                        };
+                    }
+                }
             }
+        } else {
+            let mut plane_tasks: Vec<&mut [f32]> =
+                field.moments_mut().chunks_exact_mut(plane_len).collect();
+            flife_core::pool::parallel_tasks(
+                workers,
+                "apply grants",
+                &mut plane_tasks,
+                |_, plane| {
+                    for item in ratios {
+                        let moment = &mut plane[item.quanta as usize];
+                        let ratio = item.remainder;
+                        *moment = if ratio == 0.0 {
+                            0.0
+                        } else {
+                            (f64::from(*moment) * ratio) as f32
+                        };
+                    }
+                },
+            )?;
         }
-        if batch_len > 0 {
-            flush(planes, &batch[..batch_len]);
-        }
-    };
-    let active_moments = field.carrier0_moments_count();
-    let used = workers.clamp(1, active_moments);
-    if used <= 1 {
-        scale(field.moments_mut());
-    } else {
-        let mut plane_tasks: Vec<&mut [f32]> =
-            field.moments_mut().chunks_exact_mut(cells.max(1)).collect();
-        flife_core::pool::parallel_tasks(workers, "apply grants", &mut plane_tasks, |_, plane| {
-            scale(plane)
-        })?;
     }
     grants.applied = true;
     Ok(grants.summary.granted)

@@ -1273,3 +1273,135 @@ fn dual_carrier_check_invariants_blocked_matches_scalar_and_catches_every_fault(
     );
     assert_eq!(f_cone1.scan_invariants(tol).offending, Some(idx));
 }
+
+#[test]
+fn stencil_flux_vectorized_widths_and_fused_dual_carrier_transport_match_serial_bit_for_bit() {
+    let step = TimeStep::new(1, 32).expect("step");
+    let kernel = SourceKernel::new(1.5, 3.0).expect("kernel");
+    // Exercise width = 1, 2, 3 (no 4-wide chunks), 5 (3 interior), 19 (4 chunks + 1 rem),
+    // and 32 (7 chunks + 2 rem) across both single-carrier flux and fused 34-plane dual-carrier.
+    for &(cx, cy) in &[(1_u32, 4_u32), (2, 4), (3, 5), (5, 5), (19, 7), (32, 8)] {
+        let grid = FieldGrid::new(cx, cy, f64::from(cx), f64::from(cy)).expect("grid");
+        let plan0 = TransportPlan::new(&grid, step, 0.2, 0.05).expect("plan0");
+        let plan1 = TransportPlan::new(&grid, step, 0.02, 0.01).expect("plan1");
+        let cells = grid.cell_count() as usize;
+
+        let mut base =
+            FieldState::zeroed_dual_carrier(grid, &BufferLimits::host()).expect("dual field");
+        for plane in 0..base.planes() {
+            let slice = base.plane_mut(plane).expect("plane");
+            for (c, slot) in slice.iter_mut().enumerate() {
+                let v = ((c * 17 + plane as usize * 31) % 97) as f32 * 0.01;
+                *slot = if plane == 0 || plane == CARRIER1_ENERGY_PLANE {
+                    1.0 + v
+                } else {
+                    (v - 0.45) * 0.08
+                };
+            }
+        }
+        let mut e0 = FluxEdges::new(&grid, &BufferLimits::host()).expect("e0");
+        let mut e1 = FluxEdges::new(&grid, &BufferLimits::host()).expect("e1");
+        let (rx0, ry0) = plan0.ratios();
+        let (rx1, ry1) = plan1.ratios();
+        for c in 0..cells {
+            let f = 0.25 + 0.75 * (((c * 13) % 29) as f64 / 29.0);
+            e0.edge_x_mut()[c] = rx0 * f;
+            e0.edge_y_mut()[c] = ry0 * (1.0 - 0.5 * f);
+            e1.edge_x_mut()[c] = rx1 * (1.0 - 0.4 * f);
+            e1.edge_y_mut()[c] = ry1 * f;
+        }
+
+        let phase2 = FieldStepPhase2 {
+            source_kernels: None,
+            carrier0_edges: Some(&e0),
+            vascular: None,
+            trail_plan: Some(&plan1),
+            trail_edges: Some(&e1),
+        };
+        let mut p1 = FieldPair::from_states(
+            base.clone(),
+            FieldState::zeroed_dual_carrier(grid, &BufferLimits::host()).expect("next 1w"),
+        )
+        .expect("pair 1w");
+        let mut w1 = FieldWork::new(
+            &grid,
+            &BufferLimits::host(),
+            NonZeroUsize::new(1).expect("1"),
+        )
+        .expect("w1");
+        let r1 = advance_field_wave2_on(&mut p1, &plan0, &kernel, &[], step, phase2, &mut w1)
+            .expect("1w dual flux");
+        p1.commit();
+
+        // Compare against explicit sequential range calls (flux_checked oracle via width/workers).
+        let mut ref_next =
+            FieldState::zeroed_dual_carrier(grid, &BufferLimits::host()).expect("ref next");
+        let mut s_ref = TransportScratch::new(&grid, &BufferLimits::host()).expect("s_ref");
+        let seq0 = flife_field::transport_flux_range_on(
+            &plan0,
+            &e0,
+            &base,
+            &mut ref_next,
+            base.carrier0().plane_range(),
+            Some(0),
+            std::slice::from_mut(&mut s_ref),
+        )
+        .expect("seq0")
+        .expect("r0");
+        let seq1 = flife_field::transport_flux_range_on(
+            &plan1,
+            &e1,
+            &base,
+            &mut ref_next,
+            base.carrier1().expect("c1").plane_range(),
+            Some(CARRIER1_ENERGY_PLANE as usize),
+            std::slice::from_mut(&mut s_ref),
+        )
+        .expect("seq1")
+        .expect("r1");
+        assert_eq!(
+            r1.transport,
+            flife_field::combine_transport_reports(seq0, seq1),
+            "fused vs sequential report on {cx}x{cy}"
+        );
+        let p1_bits: Vec<u32> = p1
+            .current()
+            .as_slice()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let ref_bits: Vec<u32> = ref_next.as_slice().iter().map(|v| v.to_bits()).collect();
+        assert_eq!(
+            p1_bits, ref_bits,
+            "fused vs sequential field bits on {cx}x{cy}"
+        );
+
+        for workers in [2_usize, 4, 8, 12] {
+            let mut pw = FieldPair::from_states(
+                base.clone(),
+                FieldState::zeroed_dual_carrier(grid, &BufferLimits::host()).expect("next w"),
+            )
+            .expect("pair w");
+            let mut ww = FieldWork::new(
+                &grid,
+                &BufferLimits::host(),
+                NonZeroUsize::new(workers).expect("w"),
+            )
+            .expect("ww");
+            let rw = advance_field_wave2_on(&mut pw, &plan0, &kernel, &[], step, phase2, &mut ww)
+                .expect("w dual flux");
+            pw.commit();
+            assert_eq!(rw, r1, "report mismatch at {workers} workers on {cx}x{cy}");
+            let pw_bits: Vec<u32> = pw
+                .current()
+                .as_slice()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            assert_eq!(
+                pw_bits, p1_bits,
+                "field bits mismatch at {workers} workers on {cx}x{cy}"
+            );
+        }
+    }
+}

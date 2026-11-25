@@ -126,3 +126,52 @@ fn changing_workers_keeps_the_footprint_reserved() {
     let bound = world.footprint();
     step_within(&mut world, 30, &narrow, &bound);
 }
+
+#[test]
+fn large_world_settle_tiles_hold_exact_footprint_and_match_serial_bit_for_bit() {
+    // 24,576 organisms hits `SETTLE_TILE_THRESHOLD` so the reusable work-stealing
+    // `Scratch::settle_tiles` path runs and must neither allocate in steady state
+    // nor diverge by a single bit from 1-worker serial execution.
+    let toml = PRESET
+        .replace("initial_count = 4096", "initial_count = 24576")
+        .replace("maximum_count = 16384", "maximum_count = 24576")
+        .replace("hidden_widths = [64, 32]", "hidden_widths = [8]");
+    let cfg = ValidatedConfig::from_toml(&toml).expect("valid 24k config");
+
+    let mut serial = found(&cfg);
+    let mut parallel = found(&cfg);
+    parallel
+        .set_cpu_workers(NonZeroUsize::new(4).expect("4"))
+        .expect("4 workers");
+    let founded = parallel.allocated();
+    let bound = parallel.footprint();
+    assert_eq!(founded.field, bound.field);
+    assert_eq!(founded.scratch, bound.scratch);
+
+    for tick in 1..=3 {
+        assert!(matches!(
+            serial.step().expect("serial"),
+            Stepped::Published(_)
+        ));
+        assert!(matches!(
+            parallel.step().expect("parallel"),
+            Stepped::Published(_)
+        ));
+        let now = parallel.allocated();
+        assert_eq!(
+            now.scratch, founded.scratch,
+            "large-world settle tiles grew scratch at tick {tick}"
+        );
+        assert_eq!(
+            parallel.digest(),
+            serial.digest(),
+            "4-worker reusable settle tiles diverged from serial at tick {tick}"
+        );
+    }
+
+    // Scaling back down to 1 worker releases `settle_tiles` back to exact serial footprint.
+    parallel
+        .set_cpu_workers(NonZeroUsize::MIN)
+        .expect("1 worker");
+    assert_eq!(parallel.allocated().scratch, serial.footprint().scratch);
+}

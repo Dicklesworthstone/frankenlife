@@ -600,25 +600,30 @@ fn check_cell_dual(
     Ok(r0.max(r1))
 }
 
-/// Exact scalar fallback over `base..base + len` on a 34-plane dual-carrier
-/// field, preserving strict cell-index and Carrier-0-before-Carrier-1 error
-/// ordering when a block encounters an invalid energy or truncated plane.
-#[allow(clippy::too_many_arguments)]
+/// Borrowed energy and moment plane slices of a 34-plane dual-carrier field.
+#[derive(Clone, Copy)]
+struct DualCarrierPlanes<'a> {
+    e0: &'a [f32],
+    m0: &'a [&'a [f32]],
+    e1: &'a [f32],
+    m1: &'a [&'a [f32]],
+}
+
+/// Exact scalar fallback over `range` on a 34-plane dual-carrier field,
+/// preserving strict cell-index and Carrier-0-before-Carrier-1 error ordering
+/// when a block encounters an invalid energy or truncated plane.
 fn check_range_dual_scalar(
-    e0: &[f32],
-    m0: &[&[f32]],
-    e1: &[f32],
-    m1: &[&[f32]],
+    planes: DualCarrierPlanes<'_>,
     range: Range<usize>,
     bounds: CheckBounds,
     width: u64,
     summary: &mut RangeSummary,
 ) -> Result<(), CoreError> {
     for index in range {
-        let r0 = check_cell(e0, m0, index, bounds.tolerance, width)?;
-        let r1 = check_cell(e1, m1, index, bounds.tolerance, width)?;
-        let e0_val = e0.get(index).copied().map_or(0.0, f64::from);
-        let e1_val = e1.get(index).copied().map_or(0.0, f64::from);
+        let r0 = check_cell(planes.e0, planes.m0, index, bounds.tolerance, width)?;
+        let r1 = check_cell(planes.e1, planes.m1, index, bounds.tolerance, width)?;
+        let e0_val = planes.e0.get(index).copied().map_or(0.0, f64::from);
+        let e1_val = planes.e1.get(index).copied().map_or(0.0, f64::from);
         if !bounds.trigger.allows(r0, e0_val) || !bounds.trigger.allows(r1, e1_val) {
             summary.any_exceeds_trigger = true;
         }
@@ -647,6 +652,7 @@ fn check_range_dual(
     bounds: CheckBounds,
     width: u64,
 ) -> Result<RangeSummary, CoreError> {
+    let planes = DualCarrierPlanes { e0, m0, e1, m1 };
     let mut summary = RangeSummary::default();
     let end = range.end.min(e0.len());
     let mut base = range.start;
@@ -678,16 +684,7 @@ fn check_range_dual(
             }
         }
         if bad_energy {
-            check_range_dual_scalar(
-                e0,
-                m0,
-                e1,
-                m1,
-                base..base + len,
-                bounds,
-                width,
-                &mut summary,
-            )?;
+            check_range_dual_scalar(planes, base..base + len, bounds, width, &mut summary)?;
             base += len;
             continue;
         }
@@ -718,16 +715,7 @@ fn check_range_dual(
             }
         }
         if short_plane {
-            check_range_dual_scalar(
-                e0,
-                m0,
-                e1,
-                m1,
-                base..base + len,
-                bounds,
-                width,
-                &mut summary,
-            )?;
+            check_range_dual_scalar(planes, base..base + len, bounds, width, &mut summary)?;
             base += len;
             continue;
         }

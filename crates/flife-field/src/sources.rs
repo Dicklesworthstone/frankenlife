@@ -216,13 +216,20 @@ impl SourceKernel {
 
             // Hoist per-column `dx²` once so 2D support evaluation pays O(W + H)
             // minimum-image calls instead of O(W × H), with zero heap traffic for
-            // grids up to 512 candidate columns wide.
-            const STACK_COLS: usize = 512;
+            // grids up to 1024 candidate columns wide and fallible OOM-safe growth
+            // beyond that.
+            const STACK_COLS: usize = 1024;
             let mut dx_sq_stack = [0.0_f64; STACK_COLS];
             let mut dx_sq_heap = Vec::new();
             let dx_sq: &mut [f64] = if columns.len() <= STACK_COLS {
                 &mut dx_sq_stack[..columns.len()]
             } else {
+                dx_sq_heap.try_reserve_exact(columns.len()).map_err(|_| {
+                    CoreError::AllocationFailed {
+                        buffer: "source support column distances",
+                        bytes: bytes_for::<f64>(columns.len()),
+                    }
+                })?;
                 dx_sq_heap.resize(columns.len(), 0.0);
                 &mut dx_sq_heap
             };

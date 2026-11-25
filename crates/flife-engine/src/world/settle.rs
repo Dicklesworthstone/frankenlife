@@ -53,8 +53,9 @@ use flife_genome::{BirthAttempt, Mutator, ParameterValues, Prepared, TopologyId}
 use flife_neural::{DenseTopology, WeightDtype, Weights};
 
 use super::{
-    DecisionLane, ModelVariant, PACKETS_PER_ORGANISM, Rules, SettleReport, Settled, Stages,
-    Working, compositions_into, fit, in_runs_mut, parameter_count, settle_all, settle_stages,
+    DecisionLane, ModelVariant, PACKETS_PER_ORGANISM, Rules, SettleReport, SettleTileBuf, Settled,
+    Stages, Working, compositions_into, fit, in_runs_mut, parameter_count, settle_all,
+    settle_stages,
 };
 use crate::chemistry::{UptakeSettlement, effective_affinity};
 use crate::costs::{MaintenanceBill, MaintenanceSettlement};
@@ -152,6 +153,9 @@ impl SettleWork {
 /// ([`settle_all`]) with the packets' compositions computed first. A
 /// backend that fails where the reference does not is dropped, and its
 /// report says why.
+///
+/// Returns the number of populated `settle_tiles` when the large-world
+/// work-stealing tile path ran (`> 0`), or `0` when results live in `lanes`.
 #[expect(
     clippy::too_many_arguments,
     reason = "private stage runner of World::prepare; the arguments are the tick's working state"
@@ -166,8 +170,9 @@ pub(super) fn settle_with(
     watched: Option<OrganismId>,
     working: &mut [Working],
     lanes: &mut [DecisionLane],
+    settle_tiles: &mut Vec<SettleTileBuf>,
     settle: &mut Settle,
-) -> Result<(), CoreError> {
+) -> Result<usize, CoreError> {
     let (by_demand, granted) = grants;
     let Settle {
         backend,
@@ -181,7 +186,7 @@ pub(super) fn settle_with(
         ) {
             Ok(()) => {
                 report.ticks = report.ticks.saturating_add(1);
-                return Ok(());
+                return Ok(0);
             }
             Err(error) => {
                 report.reference_ticks = report.reference_ticks.saturating_add(1);
@@ -190,7 +195,7 @@ pub(super) fn settle_with(
         }
     }
     compositions_into(observed, granted, lanes.len(), compositions)?;
-    settle_all(
+    let active_tiles = settle_all(
         rules,
         population,
         (by_demand, granted, compositions),
@@ -198,12 +203,13 @@ pub(super) fn settle_with(
         watched,
         working,
         lanes,
+        settle_tiles,
     )?;
     if failure.is_some() {
         report.failure = failure;
         *backend = None;
     }
-    Ok(())
+    Ok(active_tiles)
 }
 
 /// Phases 6 and 7 with `device`'s chemistry, maintenance, motion, emission

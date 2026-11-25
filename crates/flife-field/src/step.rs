@@ -20,9 +20,9 @@ use crate::sources::{
 };
 use crate::state::{FieldPair, FieldState};
 use crate::transport::{
-    FluxEdges, TightJunctions, TransportPlan, TransportReport, TransportScratch, VascularField,
-    combine_transport_reports, count_cell_occupancy, transport, transport_flux_on,
-    transport_flux_range_on, transport_on, transport_range_on,
+    CarrierTransport, FluxEdges, TightJunctions, TransportPlan, TransportReport, TransportScratch,
+    VascularField, count_cell_occupancy, transport, transport_dual_carrier_on, transport_flux_on,
+    transport_on,
 };
 use crate::uptake::{Grants, apply_grants_on};
 
@@ -909,53 +909,19 @@ pub fn advance_field_wave2_on(
                 detail: "34-plane dual-carrier advance requires phase2.trail_plan".into(),
             });
         };
-        let c0_range = current.carrier0().plane_range();
-        let c1_range = carrier1.plane_range();
-        let r0 = match phase2.carrier0_edges {
-            Some(edges) => transport_flux_range_on(
-                plan,
-                edges,
-                current,
-                next,
-                c0_range,
-                Some(ENERGY_PLANE as usize),
-                scratches,
-            )?,
-            None => transport_range_on(
-                plan,
-                current,
-                next,
-                c0_range,
-                Some(ENERGY_PLANE as usize),
-                scratches,
-            )?,
-        }
-        .ok_or_else(|| {
-            crate::layout::mismatch("carrier 0 transport produced no energy report".into())
-        })?;
-        let r1 = match phase2.trail_edges {
-            Some(edges) => transport_flux_range_on(
-                trail_plan,
-                edges,
-                current,
-                next,
-                c1_range,
-                Some(CARRIER1_ENERGY_PLANE as usize),
-                scratches,
-            )?,
-            None => transport_range_on(
-                trail_plan,
-                current,
-                next,
-                c1_range,
-                Some(CARRIER1_ENERGY_PLANE as usize),
-                scratches,
-            )?,
-        }
-        .ok_or_else(|| {
-            crate::layout::mismatch("carrier 1 transport produced no energy report".into())
-        })?;
-        combine_transport_reports(r0, r1)
+        let c0 = CarrierTransport {
+            plan,
+            edges: phase2.carrier0_edges,
+            range: current.carrier0().plane_range(),
+            energy_plane: ENERGY_PLANE as usize,
+        };
+        let c1 = CarrierTransport {
+            plan: trail_plan,
+            edges: phase2.trail_edges,
+            range: carrier1.plane_range(),
+            energy_plane: CARRIER1_ENERGY_PLANE as usize,
+        };
+        transport_dual_carrier_on(&c0, &c1, current, next, scratches)?
     } else {
         match phase2.carrier0_edges {
             Some(edges) => transport_flux_on(plan, edges, current, next, scratches)?,

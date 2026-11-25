@@ -880,6 +880,11 @@ struct Scratch {
     decisions: Vec<Decision>,
     /// One per CPU worker (`[execution] cpu_workers`).
     lanes: Vec<DecisionLane>,
+    /// Pre-reserved dynamic work-stealing settle tiles for large multi-worker
+    /// `grid-cic-v1` worlds (`capacity ≥ 24,576`), eliminating per-tick
+    /// `LedgerLog` / `Deposits` alloc/free churn and the intermediate tile-to-lane
+    /// merge copy. Empty (`0` bytes) on smaller or single-worker worlds.
+    settle_tiles: Vec<SettleTileBuf>,
     sampled: Vec<Source>,
     working: Vec<Working>,
     demands: Vec<Demand>,
@@ -982,6 +987,69 @@ struct DecisionLane {
     /// when disabled.
     byproducts: Option<Deposits>,
     transactions: Option<Transactions>,
+}
+
+/// Minimum live / capacity organism count for dynamic work-stealing settle
+/// tiles (`settle_all`), avoiding heterogeneous P/E-core tail stragglers on
+/// large multi-worker worlds while keeping `0` bytes on small reference worlds.
+const SETTLE_TILE_THRESHOLD: usize = 24_576;
+
+/// Reusable staging buffers for one dynamic work-stealing settle tile.
+#[derive(Debug, Default)]
+pub(super) struct SettleTileBuf {
+    rows: usize,
+    flows: LedgerLog,
+    emissions: Deposits,
+    trail_emissions: Option<Deposits>,
+    byproducts: Option<Deposits>,
+    transactions: Option<Transactions>,
+}
+
+impl SettleTileBuf {
+    fn allocated_bytes(&self) -> u64 {
+        total([
+            self.flows.allocated_bytes(),
+            self.emissions.allocated_bytes(),
+            self.trail_emissions
+                .as_ref()
+                .map_or(0, Deposits::allocated_bytes),
+            self.byproducts
+                .as_ref()
+                .map_or(0, Deposits::allocated_bytes),
+        ])
+    }
+
+    fn fit(&mut self, rows: usize, has_trail: bool, has_byproducts: bool) -> Result<(), CoreError> {
+        self.flows.fit(rows.saturating_mul(FLOWS_PER_ORGANISM))?;
+        self.emissions.fit_staging(rows)?;
+        if has_trail {
+            let trail = self.trail_emissions.get_or_insert_with(Deposits::new);
+            trail.fit_staging(rows)?;
+        } else {
+            self.trail_emissions = None;
+        }
+        if has_byproducts {
+            let byproducts = self.byproducts.get_or_insert_with(Deposits::new);
+            byproducts.fit_staging(rows)?;
+        } else {
+            self.byproducts = None;
+        }
+        self.transactions = None;
+        self.rows = rows;
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.flows.clear();
+        self.emissions.clear();
+        if let Some(trail) = self.trail_emissions.as_mut() {
+            trail.clear();
+        }
+        if let Some(byproducts) = self.byproducts.as_mut() {
+            byproducts.clear();
+        }
+        self.transactions = None;
+    }
 }
 
 /// The most packets one organism's demand is granted: one a footprint
@@ -1481,11 +1549,13 @@ impl World {
             .backend
             .as_deref()
             .is_some_and(|backend| !backend.supports_flat_f32());
-        fit_lanes(
-            lanes,
+        let capacity = capacity_of(&self.rules)?;
+        fit_lanes(lanes, &self.rules, capacity, legacy_batched)?;
+        fit_settle_tiles(
+            &mut self.scratch.settle_tiles,
+            workers,
             &self.rules,
-            capacity_of(&self.rules)?,
-            legacy_batched,
+            capacity,
         )
     }
 
@@ -2054,6 +2124,7 @@ impl World {
                 capacity_bytes(&scratch.rows),
                 capacity_bytes(&scratch.decisions),
                 capacity_bytes(&scratch.lanes),
+                capacity_bytes(&scratch.settle_tiles),
                 capacity_bytes(&scratch.sampled),
                 capacity_bytes(&scratch.working),
                 capacity_bytes(&scratch.demands),
@@ -2097,7 +2168,13 @@ impl World {
                 self.settle.work.allocated_bytes(),
             ]
             .into_iter()
-            .chain(lanes),
+            .chain(lanes)
+            .chain(
+                scratch
+                    .settle_tiles
+                    .iter()
+                    .map(SettleTileBuf::allocated_bytes),
+            ),
         )
     }
 
@@ -2688,6 +2765,7 @@ impl World {
             rows,
             decisions,
             lanes,
+            settle_tiles,
             sampled,
             working,
             demands,
@@ -3070,7 +3148,7 @@ impl World {
         // The tick then takes each lane's ledger flows and staged emissions
         // in lane order: what one thread settling every organism in identity
         // order would have recorded, in its order.
-        settle_with(
+        let active_settle_tiles = settle_with(
             rules,
             population,
             observed,
@@ -3080,6 +3158,7 @@ impl World {
             watch.organism,
             working,
             lanes,
+            settle_tiles,
             settle_state,
         )?;
         let mut total_emission_paid = CompensatedSum::ZERO;
@@ -3090,30 +3169,48 @@ impl World {
                 }
             }
         }
-        if lanes.len() > 1 && working.len() >= 512 {
-            let mut lane_emissions: Vec<&mut Deposits> = Vec::with_capacity(lanes.len());
+        if active_settle_tiles > 0 || (lanes.len() > 1 && working.len() >= 512) {
+            let src_len = if active_settle_tiles > 0 {
+                active_settle_tiles
+            } else {
+                lanes.len()
+            };
+            let mut lane_emissions: Vec<&mut Deposits> = Vec::with_capacity(src_len);
             let mut lane_trails: Vec<&mut Deposits> = if trail_emissions.is_some() {
-                Vec::with_capacity(lanes.len())
+                Vec::with_capacity(src_len)
             } else {
                 Vec::new()
             };
             let mut lane_byproducts: Vec<&mut Deposits> = if byproducts.is_some() {
-                Vec::with_capacity(lanes.len())
+                Vec::with_capacity(src_len)
             } else {
                 Vec::new()
             };
             let merge_workers = lanes.len();
             let mut lane_flows: Vec<(&mut LedgerLog, Option<Transactions>)> =
-                Vec::with_capacity(merge_workers);
-            for lane in lanes.iter_mut() {
-                lane_emissions.push(&mut lane.emissions);
-                if let Some(src) = lane.trail_emissions.as_mut() {
-                    lane_trails.push(src);
+                Vec::with_capacity(src_len);
+            if active_settle_tiles > 0 {
+                for tile in &mut settle_tiles[..active_settle_tiles] {
+                    lane_emissions.push(&mut tile.emissions);
+                    if let Some(src) = tile.trail_emissions.as_mut() {
+                        lane_trails.push(src);
+                    }
+                    if let Some(src) = tile.byproducts.as_mut() {
+                        lane_byproducts.push(src);
+                    }
+                    lane_flows.push((&mut tile.flows, tile.transactions.take()));
                 }
-                if let Some(src) = lane.byproducts.as_mut() {
-                    lane_byproducts.push(src);
+            } else {
+                for lane in lanes.iter_mut() {
+                    lane_emissions.push(&mut lane.emissions);
+                    if let Some(src) = lane.trail_emissions.as_mut() {
+                        lane_trails.push(src);
+                    }
+                    if let Some(src) = lane.byproducts.as_mut() {
+                        lane_byproducts.push(src);
+                    }
+                    lane_flows.push((&mut lane.flows, lane.transactions.take()));
                 }
-                lane_flows.push((&mut lane.flows, lane.transactions.take()));
             }
             let mut em_res: Result<(), CoreError> = Ok(());
             let mut tr_res: Result<(), CoreError> = Ok(());
@@ -4259,12 +4356,16 @@ impl Scratch {
             } else {
                 None
             };
+        let worker_count = workers(workers_configured)?.get();
+        let mut settle_tiles = Vec::new();
+        fit_settle_tiles(&mut settle_tiles, worker_count, rules, rows)?;
         Ok(Self {
             field,
             pyramid: SensorPyramid::from_config(config, &limits)?,
             rows: reserved(rows, "organism rows")?,
             decisions: reserved(rows, "decisions")?,
-            lanes: lanes(workers(workers_configured)?.get(), rules)?,
+            lanes: lanes(worker_count, rules)?,
+            settle_tiles,
             sampled: Vec::with_capacity(sources),
             working: reserved(rows, "working organisms")?,
             demands: reserved(rows, "organism demands")?,
@@ -5867,16 +5968,69 @@ where
     Ok(())
 }
 
-/// Phases 6 and 7 for every working organism, on the lanes: each lane
-/// settles a contiguous identity-ordered run ([`in_runs_mut`]) and keeps,
-/// in identity order, the run's ledger flows, its staged emissions and the
-/// watched organism's transactions, for the tick to take in lane order.
-/// `grants` are the grant packets grouped by demand, the packets and their
-/// compositions ([`compositions_into`]). The error returned is the first in
-/// identity order, as a single thread would report it.
+/// Target number of dynamic work-stealing settle tiles for `workers` CPU
+/// workers (`2..=4` tiles per worker, targeting ~72 tiles to absorb
+/// heterogeneous P/E-core stragglers).
+fn settle_tile_target(workers: usize) -> usize {
+    72_usize
+        .div_ceil(workers.max(1))
+        .clamp(2, 4)
+        .saturating_mul(workers.max(1))
+}
+
+/// Reserve or release [`Scratch::settle_tiles`] for `(workers, capacity)` so
+/// large multi-worker `grid-cic-v1` worlds (`capacity ≥ 24,576`) settle with
+/// zero per-tick allocations while small or single-worker worlds hold `0` bytes
+/// (FL-043).
+fn fit_settle_tiles(
+    tiles: &mut Vec<SettleTileBuf>,
+    workers: usize,
+    rules: &Rules,
+    capacity: usize,
+) -> Result<(), CoreError> {
+    if workers <= 1
+        || capacity < SETTLE_TILE_THRESHOLD
+        || !matches!(rules.exchange, ExchangeKernel::GridCicV1)
+    {
+        tiles.clear();
+        tiles.shrink_to_fit();
+        return Ok(());
+    }
+    let max_tiles = settle_tile_target(workers)
+        .min(capacity.div_ceil(MINIMUM_ROWS_PER_LANE).max(1))
+        .max(1);
+    let max_sub = capacity.div_ceil(max_tiles).max(MINIMUM_ROWS_PER_LANE);
+    let has_trail = rules.v2.dual_carrier().is_some();
+    let has_byproducts = rules.v2.waste().is_some();
+    tiles.truncate(max_tiles);
+    tiles.shrink_to(max_tiles);
+    if tiles.len() < max_tiles {
+        tiles
+            .try_reserve_exact(max_tiles - tiles.len())
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "settle tiles",
+                bytes: bytes_for::<SettleTileBuf>(max_tiles),
+            })?;
+        while tiles.len() < max_tiles {
+            tiles.push(SettleTileBuf::default());
+        }
+    }
+    for tile in tiles.iter_mut() {
+        tile.fit(max_sub, has_trail, has_byproducts)?;
+    }
+    Ok(())
+}
+
+/// Phases 6 and 7 for every working organism, on the lanes (or pre-reserved
+/// `settle_tiles` for large multi-worker `grid-cic-v1` worlds): each unit
+/// settles a contiguous identity-ordered run and keeps, in identity order, its
+/// ledger flows, staged emissions, and watched organism's transactions.
+/// Returns the number of populated `settle_tiles` (`0` when results live in
+/// `lanes`). The error returned is the first in identity order, as a single
+/// thread would report it.
 #[expect(
-    clippy::too_many_lines,
-    reason = "handles both small-world per-lane runs and large-world work-stealing settle tiles with parallel lane merge"
+    clippy::too_many_arguments,
+    reason = "private phase-6/7 runner receiving the tick's working state and reusable tile buffers"
 )]
 fn settle_all(
     rules: &Rules,
@@ -5886,7 +6040,8 @@ fn settle_all(
     watched: Option<OrganismId>,
     working: &mut [Working],
     lanes: &mut [DecisionLane],
-) -> Result<(), CoreError> {
+    settle_tiles: &mut Vec<SettleTileBuf>,
+) -> Result<usize, CoreError> {
     let (by_demand, granted, compositions) = grants;
     for lane in lanes.iter_mut() {
         lane.flows.clear();
@@ -5901,84 +6056,59 @@ fn settle_all(
     }
     let worker_budget = lanes.len();
     if worker_budget > 1
-        && working.len() >= 24_576
+        && working.len() >= SETTLE_TILE_THRESHOLD
         && matches!(rules.exchange, ExchangeKernel::GridCicV1)
     {
         let has_trail = lanes.first().is_some_and(|l| l.trail_emissions.is_some());
         let has_byproducts = lanes.first().is_some_and(|l| l.byproducts.is_some());
-        let used = worker_budget
-            .min(working.len().div_ceil(MINIMUM_ROWS_PER_LANE))
+        let tile_count = settle_tile_target(worker_budget)
+            .min(working.len().div_ceil(MINIMUM_ROWS_PER_LANE).max(1))
             .max(1);
-        let lane_len = working.len().div_ceil(used);
-        let tiles_per_lane = 72_usize
-            .div_ceil(used)
-            .clamp(2, 4)
-            .min(lane_len.div_ceil(MINIMUM_ROWS_PER_LANE).max(1));
-        struct SettleTile<'a> {
-            lane_index: usize,
-            start: usize,
-            run: &'a mut [Working],
-            flows: LedgerLog,
-            emissions: Deposits,
-            trail_emissions: Option<Deposits>,
-            byproducts: Option<Deposits>,
-            transactions: Option<Transactions>,
-        }
-        let mut tiles: Vec<SettleTile<'_>> =
-            Vec::with_capacity(used.saturating_mul(tiles_per_lane));
-        for (lane_index, lane_run) in working.chunks_mut(lane_len).enumerate() {
-            let lane_base = lane_index * lane_len;
-            let sub_len = lane_run.len().div_ceil(tiles_per_lane).max(1);
-            for (sub_idx, sub_run) in lane_run.chunks_mut(sub_len).enumerate() {
-                let mut flows = LedgerLog::new();
-                flows.fit(sub_run.len().saturating_mul(FLOWS_PER_ORGANISM))?;
-                let mut emissions = Deposits::new();
-                emissions.fit_staging(sub_run.len())?;
-                let trail_emissions = if has_trail {
-                    let mut deposits = Deposits::new();
-                    deposits.fit_staging(sub_run.len())?;
-                    Some(deposits)
-                } else {
-                    None
-                };
-                let byproducts = if has_byproducts {
-                    let mut deposits = Deposits::new();
-                    deposits.fit_staging(sub_run.len())?;
-                    Some(deposits)
-                } else {
-                    None
-                };
-                tiles.push(SettleTile {
-                    lane_index,
-                    start: lane_base + sub_idx * sub_len,
-                    run: sub_run,
-                    flows,
-                    emissions,
-                    trail_emissions,
-                    byproducts,
-                    transactions: None,
-                });
+        let sub_len = working.len().div_ceil(tile_count).max(1);
+        let active_tiles = working.len().div_ceil(sub_len);
+        if settle_tiles.len() < active_tiles {
+            settle_tiles
+                .try_reserve_exact(active_tiles - settle_tiles.len())
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "settle tiles",
+                    bytes: bytes_for::<SettleTileBuf>(active_tiles),
+                })?;
+            while settle_tiles.len() < active_tiles {
+                settle_tiles.push(SettleTileBuf::default());
             }
         }
+        for tile in &mut settle_tiles[..active_tiles] {
+            if tile.rows < sub_len
+                || tile.trail_emissions.is_some() != has_trail
+                || tile.byproducts.is_some() != has_byproducts
+            {
+                tile.fit(sub_len, has_trail, has_byproducts)?;
+            } else {
+                tile.clear();
+            }
+        }
+        let mut tasks: Vec<(usize, &mut [Working], &mut SettleTileBuf)> = working
+            .chunks_mut(sub_len)
+            .zip(settle_tiles[..active_tiles].iter_mut())
+            .enumerate()
+            .map(|(idx, (sub_run, buf))| (idx * sub_len, sub_run, buf))
+            .collect();
         flife_core::pool::try_parallel_tasks_with_lanes(
             worker_budget,
             "settle",
             lanes,
-            &mut tiles,
-            |_, tile, lane| {
+            &mut tasks,
+            |_, (start, sub_run, buf), lane| {
                 let DecisionLane {
                     exchange, packets, ..
                 } = lane;
-                let mut live = tile
-                    .run
+                let mut live = sub_run
                     .first()
                     .map(|first| population.ascending_from(first.committed.id));
-                for (offset, organism) in tile.run.iter_mut().enumerate() {
+                for (offset, organism) in sub_run.iter_mut().enumerate() {
                     packets.clear();
-                    for (packet, composition) in by_demand
-                        .bucket(tile.start + offset)
-                        .iter()
-                        .filter_map(|&at| {
+                    for (packet, composition) in
+                        by_demand.bucket(*start + offset).iter().filter_map(|&at| {
                             let at = at as usize;
                             granted.get(at).zip(compositions.get(at))
                         })
@@ -6002,17 +6132,17 @@ fn settle_all(
                         packets,
                     };
                     let record =
-                        (watched == Some(organism.committed.id)).then_some(&mut tile.transactions);
+                        (watched == Some(organism.committed.id)).then_some(&mut buf.transactions);
                     settle_stages(
                         rules,
                         organism,
                         traits,
                         &mut stages,
                         from,
-                        &mut tile.flows,
-                        &mut tile.emissions,
-                        tile.trail_emissions.as_mut(),
-                        tile.byproducts.as_mut(),
+                        &mut buf.flows,
+                        &mut buf.emissions,
+                        buf.trail_emissions.as_mut(),
+                        buf.byproducts.as_mut(),
                         exchange,
                         record,
                     )?
@@ -6021,49 +6151,7 @@ fn settle_all(
                 Ok(())
             },
         )?;
-        // Merge each lane's contiguous sub-tiles back into `lanes[lane_index]`
-        // in exact ascending identity order, in parallel across lanes.
-        let mut counts = vec![0_usize; lanes.len()];
-        for tile in &tiles {
-            counts[tile.lane_index] += 1;
-        }
-        let mut rem_tiles = tiles.as_mut_slice();
-        let mut merge_tasks: Vec<(&mut DecisionLane, &mut [SettleTile<'_>])> =
-            Vec::with_capacity(used);
-        for (lane, &count) in lanes.iter_mut().zip(&counts) {
-            if count == 0 {
-                continue;
-            }
-            let (mine, rest) = rem_tiles.split_at_mut(count);
-            rem_tiles = rest;
-            merge_tasks.push((lane, mine));
-        }
-        flife_core::pool::try_parallel_tasks(
-            worker_budget,
-            "merge settle tiles",
-            &mut merge_tasks,
-            |_, (lane, mine)| {
-                for tile in mine.iter_mut() {
-                    lane.flows.append(&mut tile.flows)?;
-                    lane.emissions.append(&mut tile.emissions)?;
-                    if let (Some(dst), Some(src)) =
-                        (lane.trail_emissions.as_mut(), tile.trail_emissions.as_mut())
-                    {
-                        dst.append(src)?;
-                    }
-                    if let (Some(dst), Some(src)) =
-                        (lane.byproducts.as_mut(), tile.byproducts.as_mut())
-                    {
-                        dst.append(src)?;
-                    }
-                    if let Some(record) = tile.transactions.take() {
-                        lane.transactions = Some(record);
-                    }
-                }
-                Ok(())
-            },
-        )?;
-        return Ok(());
+        return Ok(active_tiles);
     }
     in_runs_mut(working, lanes, "settle", &|start, run, lane| {
         let DecisionLane {
@@ -6120,7 +6208,8 @@ fn settle_all(
             .apply(organism);
         }
         Ok(())
-    })
+    })?;
+    Ok(0)
 }
 
 /// The fewest packets a lane takes in [`compositions_into`].

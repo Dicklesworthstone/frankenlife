@@ -462,70 +462,50 @@ pub fn transport_range_on(
         width,
         height,
     };
-    let used = scratches.len().min(planes).min(64);
-    let per = planes.div_ceil(used.max(1));
-    let run = |first_plane: usize,
-               source: &[f32],
-               target: &mut [f32],
-               scratch: &mut TransportScratch|
-     -> Option<EnergyTerms> {
-        let mut energy = None;
-        for (offset, (source, target)) in source
-            .chunks_exact(cells)
-            .zip(target.chunks_exact_mut(cells))
-            .enumerate()
-        {
-            let is_energy = energy_plane == Some(first_plane + offset);
-            if let Some(terms) =
-                transport_plane(&coefficients, plan, source, target, scratch, is_energy)
-            {
-                energy = Some(terms);
-            }
-        }
-        energy
-    };
     let worker_budget = scratches.len();
-    let Some((head_scratch, others)) = scratches.split_first_mut() else {
+    let used = worker_budget.min(planes).min(64);
+    if used == 0 {
         return Err(CoreError::StateConflict {
             operation: "transport",
             detail: "no transport scratch".to_owned(),
         });
-    };
-    let mut sources = source.chunks(per * cells);
-    let mut targets = target.chunks_mut(per * cells);
-    let (Some(head_source), Some(head_target)) = (sources.next(), targets.next()) else {
-        return Err(missing_plane());
-    };
-    let run = &run;
-    let energy = if used <= 1 {
-        run(first_plane_index, head_source, head_target, head_scratch)
-    } else {
-        let mut tail_terms = [None; 64];
-        let mut head_energy = None;
-        flife_core::pool::scope_workers(worker_budget, "transport", |scope| {
-            for (index, (((source, target), scratch), slot)) in sources
-                .zip(targets)
-                .zip(others.iter_mut())
-                .zip(tail_terms.iter_mut())
-                .enumerate()
-            {
-                scope.spawn(move || {
-                    *slot = run(
-                        first_plane_index + (index + 1) * per,
-                        source,
-                        target,
-                        scratch,
-                    );
-                });
-            }
-            head_energy = run(first_plane_index, head_source, head_target, head_scratch);
-        })?;
-        let mut energy = head_energy;
-        for terms in tail_terms {
-            energy = energy.or(terms);
-        }
-        energy
-    };
+    }
+    struct PlaneTask<'a> {
+        plane: usize,
+        source: &'a [f32],
+        target: &'a mut [f32],
+        terms: Option<EnergyTerms>,
+    }
+    let mut tasks: Vec<PlaneTask<'_>> = source
+        .chunks_exact(cells)
+        .zip(target.chunks_exact_mut(cells))
+        .enumerate()
+        .map(|(offset, (source, target))| PlaneTask {
+            plane: first_plane_index + offset,
+            source,
+            target,
+            terms: None,
+        })
+        .collect();
+    flife_core::pool::try_parallel_tasks_with_lanes(
+        worker_budget,
+        "transport",
+        &mut scratches[..used],
+        &mut tasks,
+        |_, task, scratch| {
+            let is_energy = energy_plane == Some(task.plane);
+            task.terms = transport_plane(
+                &coefficients,
+                plan,
+                task.source,
+                task.target,
+                scratch,
+                is_energy,
+            );
+            Ok(())
+        },
+    )?;
+    let energy = tasks.into_iter().find_map(|task| task.terms);
     Ok(energy_before.and_then(|before| energy.map(|terms| report(plan, before, terms))))
 }
 
@@ -1223,71 +1203,265 @@ pub fn transport_flux_range_on(
         width,
         height,
     };
-    let used = scratches.len().min(planes).min(64);
-    let per = planes.div_ceil(used.max(1));
-    let run = |first_plane: usize,
-               source: &[f32],
-               target: &mut [f32],
-               scratch: &mut TransportScratch|
-     -> Option<EnergyTerms> {
-        let mut energy = None;
-        for (offset, (source, target)) in source
-            .chunks_exact(cells)
-            .zip(target.chunks_exact_mut(cells))
-            .enumerate()
-        {
-            let is_energy = energy_plane == Some(first_plane + offset);
-            if let Some(terms) =
-                transport_flux_plane(&flux, plan, source, target, scratch, is_energy)
-            {
-                energy = Some(terms);
-            }
-        }
-        energy
-    };
     let worker_budget = scratches.len();
-    let Some((head_scratch, others)) = scratches.split_first_mut() else {
+    let used = worker_budget.min(planes).min(64);
+    if used == 0 {
         return Err(CoreError::StateConflict {
             operation: "flux transport",
             detail: "no transport scratch".to_owned(),
         });
-    };
-    let mut sources = source.chunks(per * cells);
-    let mut targets = target.chunks_mut(per * cells);
-    let (Some(head_source), Some(head_target)) = (sources.next(), targets.next()) else {
-        return Err(missing_plane());
-    };
-    let run = &run;
-    let energy = if used <= 1 {
-        run(first_plane_index, head_source, head_target, head_scratch)
-    } else {
-        let mut tail_terms = [None; 64];
-        let mut head_energy = None;
-        flife_core::pool::scope_workers(worker_budget, "flux transport", |scope| {
-            for (index, (((source, target), scratch), slot)) in sources
-                .zip(targets)
-                .zip(others.iter_mut())
-                .zip(tail_terms.iter_mut())
-                .enumerate()
-            {
-                scope.spawn(move || {
-                    *slot = run(
-                        first_plane_index + (index + 1) * per,
-                        source,
-                        target,
-                        scratch,
-                    );
-                });
-            }
-            head_energy = run(first_plane_index, head_source, head_target, head_scratch);
-        })?;
-        let mut energy = head_energy;
-        for terms in tail_terms {
-            energy = energy.or(terms);
-        }
-        energy
-    };
+    }
+    struct PlaneTask<'a> {
+        plane: usize,
+        source: &'a [f32],
+        target: &'a mut [f32],
+        terms: Option<EnergyTerms>,
+    }
+    let mut tasks: Vec<PlaneTask<'_>> = source
+        .chunks_exact(cells)
+        .zip(target.chunks_exact_mut(cells))
+        .enumerate()
+        .map(|(offset, (source, target))| PlaneTask {
+            plane: first_plane_index + offset,
+            source,
+            target,
+            terms: None,
+        })
+        .collect();
+    flife_core::pool::try_parallel_tasks_with_lanes(
+        worker_budget,
+        "flux transport",
+        &mut scratches[..used],
+        &mut tasks,
+        |_, task, scratch| {
+            let is_energy = energy_plane == Some(task.plane);
+            task.terms =
+                transport_flux_plane(&flux, plan, task.source, task.target, scratch, is_energy);
+            Ok(())
+        },
+    )?;
+    let energy = tasks.into_iter().find_map(|task| task.terms);
     Ok(energy_before.and_then(|before| energy.map(|terms| report(plan, before, terms))))
+}
+
+/// Parameters for one carrier's plane slice inside [`transport_dual_carrier_on`].
+pub(crate) struct CarrierTransport<'a> {
+    pub(crate) plan: &'a TransportPlan,
+    pub(crate) edges: Option<&'a FluxEdges>,
+    pub(crate) range: Range<usize>,
+    pub(crate) energy_plane: usize,
+}
+
+/// Transport both Carrier 0 and Carrier 1 planes of a 34-plane dual-carrier
+/// field (`V2-15`) in a single work-stealing pool dispatch, eliminating the
+/// mid-transport thread barrier and idle workers between the 25-plane and
+/// 9-plane ranges while preserving bit-exact per-plane arithmetic and
+/// [`combine_transport_reports`].
+pub(crate) fn transport_dual_carrier_on(
+    c0: &CarrierTransport<'_>,
+    c1: &CarrierTransport<'_>,
+    current: &FieldState,
+    next: &mut FieldState,
+    scratches: &mut [TransportScratch],
+) -> Result<TransportReport, CoreError> {
+    // Validate Carrier 0 then Carrier 1 in the exact same order as two
+    // sequential range calls.
+    let validate_uniform =
+        |plan: &TransportPlan, range: &Range<usize>| -> Result<usize, CoreError> {
+            if *current.grid() != plan.grid || *next.grid() != plan.grid {
+                return Err(mismatch(
+                    "transport inputs do not share the transport plan's grid".into(),
+                ));
+            }
+            let cells = usize::try_from(plan.grid.cell_count()).map_err(|_| overflow())?;
+            if cells == 0 {
+                return Err(missing_plane());
+            }
+            let source_all = current.as_slice();
+            let target_all = next.as_slice();
+            if source_all.len() != target_all.len() || !source_all.len().is_multiple_of(cells) {
+                return Err(missing_plane());
+            }
+            let total_planes = source_all.len() / cells;
+            if range.start > range.end || range.end > total_planes {
+                return Err(mismatch(format!(
+                    "plane range {range:?} is outside 0..{total_planes}"
+                )));
+            }
+            for scratch in scratches.iter() {
+                if scratch.cells != scratch.first.len()
+                    || scratch.cells != scratch.second.len()
+                    || scratch.cells != cells
+                {
+                    return Err(mismatch(format!(
+                        "transport scratch for {} cells on a grid of {}",
+                        scratch.cells,
+                        plan.grid.cell_count()
+                    )));
+                }
+            }
+            Ok(cells)
+        };
+    let cells = match c0.edges {
+        Some(edges) => validate_flux_inputs(c0.plan, edges, current, next, &c0.range, scratches)?,
+        None => validate_uniform(c0.plan, &c0.range)?,
+    };
+    let cells1 = match c1.edges {
+        Some(edges) => validate_flux_inputs(c1.plan, edges, current, next, &c1.range, scratches)?,
+        None => validate_uniform(c1.plan, &c1.range)?,
+    };
+    if cells != cells1
+        || !c0.range.contains(&c0.energy_plane)
+        || !c1.range.contains(&c1.energy_plane)
+        || c0.range.end > c1.range.start
+    {
+        return Err(mismatch(
+            "dual-carrier transport plane ranges are not disjoint or miss energy planes".into(),
+        ));
+    }
+    let total_tasks = c0.range.len() + c1.range.len();
+    let worker_budget = scratches.len();
+    let used = worker_budget.min(total_tasks).min(64);
+    if used == 0 {
+        return Err(CoreError::StateConflict {
+            operation: if c0.edges.is_some() {
+                "flux transport"
+            } else {
+                "transport"
+            },
+            detail: "no transport scratch".to_owned(),
+        });
+    }
+    let width = usize::try_from(c0.plan.grid.cells_x()).map_err(|_| overflow())?;
+    let height = usize::try_from(c0.plan.grid.cells_y()).map_err(|_| overflow())?;
+    let c0_coeff = Coefficients {
+        center: c0.plan.center,
+        r_x: c0.plan.r_x,
+        r_y: c0.plan.r_y,
+        width,
+        height,
+    };
+    let c1_coeff = Coefficients {
+        center: c1.plan.center,
+        r_x: c1.plan.r_x,
+        r_y: c1.plan.r_y,
+        width,
+        height,
+    };
+    let c0_flux = c0.edges.map(|e| FluxCoefficients {
+        edge_x: &e.edge_x,
+        edge_y: &e.edge_y,
+        width,
+        height,
+    });
+    let c1_flux = c1.edges.map(|e| FluxCoefficients {
+        edge_x: &e.edge_x,
+        edge_y: &e.edge_y,
+        width,
+        height,
+    });
+    let source_all = current.as_slice();
+    let target_all = next.as_mut_slice();
+    let c0_before = sum(&source_all[c0.energy_plane * cells..(c0.energy_plane + 1) * cells]);
+    let c1_before = sum(&source_all[c1.energy_plane * cells..(c1.energy_plane + 1) * cells]);
+
+    struct DualPlaneTask<'a> {
+        carrier: u8,
+        is_energy: bool,
+        source: &'a [f32],
+        target: &'a mut [f32],
+        terms: Option<EnergyTerms>,
+    }
+    let mut tasks = Vec::with_capacity(total_tasks);
+    for (plane, (src, dst)) in source_all
+        .chunks_exact(cells)
+        .zip(target_all.chunks_exact_mut(cells))
+        .enumerate()
+    {
+        if c0.range.contains(&plane) {
+            tasks.push(DualPlaneTask {
+                carrier: 0,
+                is_energy: plane == c0.energy_plane,
+                source: src,
+                target: dst,
+                terms: None,
+            });
+        } else if c1.range.contains(&plane) {
+            tasks.push(DualPlaneTask {
+                carrier: 1,
+                is_energy: plane == c1.energy_plane,
+                source: src,
+                target: dst,
+                terms: None,
+            });
+        }
+    }
+    flife_core::pool::try_parallel_tasks_with_lanes(
+        worker_budget,
+        "dual-carrier transport",
+        &mut scratches[..used],
+        &mut tasks,
+        |_, task, scratch| {
+            task.terms = if task.carrier == 0 {
+                match c0_flux.as_ref() {
+                    Some(flux) => transport_flux_plane(
+                        flux,
+                        c0.plan,
+                        task.source,
+                        task.target,
+                        scratch,
+                        task.is_energy,
+                    ),
+                    None => transport_plane(
+                        &c0_coeff,
+                        c0.plan,
+                        task.source,
+                        task.target,
+                        scratch,
+                        task.is_energy,
+                    ),
+                }
+            } else {
+                match c1_flux.as_ref() {
+                    Some(flux) => transport_flux_plane(
+                        flux,
+                        c1.plan,
+                        task.source,
+                        task.target,
+                        scratch,
+                        task.is_energy,
+                    ),
+                    None => transport_plane(
+                        &c1_coeff,
+                        c1.plan,
+                        task.source,
+                        task.target,
+                        scratch,
+                        task.is_energy,
+                    ),
+                }
+            };
+            Ok(())
+        },
+    )?;
+    let mut c0_terms = None;
+    let mut c1_terms = None;
+    for task in tasks {
+        if let Some(terms) = task.terms {
+            if task.carrier == 0 {
+                c0_terms = Some(terms);
+            } else {
+                c1_terms = Some(terms);
+            }
+        }
+    }
+    let r0 = c0_terms
+        .map(|t| report(c0.plan, c0_before, t))
+        .ok_or_else(|| mismatch("carrier 0 transport produced no energy report".into()))?;
+    let r1 = c1_terms
+        .map(|t| report(c1.plan, c1_before, t))
+        .ok_or_else(|| mismatch("carrier 1 transport produced no energy report".into()))?;
+    Ok(combine_transport_reports(r0, r1))
 }
 
 struct FluxCoefficients<'a> {
@@ -1403,11 +1577,39 @@ fn stencil_flux_rows(flux: &FluxCoefficients<'_>, source: &[f32], target: &mut [
             out[width - 1] = edge(width - 1);
         }
         if width > 2 {
-            let inner = 1..width - 1;
-            for x in inner {
-                out[x] = flux_cell(
-                    [row[x], row[x - 1], row[x + 1], row_south[x], row_north[x]],
-                    [ex_row[x - 1], ex_row[x], ey_south[x], ey_row[x]],
+            let n = width - 2;
+            let (out_c, out_r) = out[1..width - 1].as_chunks_mut::<4>();
+            let (uc_c, uc_r) = row[1..width - 1].as_chunks::<4>();
+            let (uw_c, uw_r) = row[..n].as_chunks::<4>();
+            let (ue_c, ue_r) = row[2..width].as_chunks::<4>();
+            let (us_c, us_r) = row_south[1..width - 1].as_chunks::<4>();
+            let (un_c, un_r) = row_north[1..width - 1].as_chunks::<4>();
+            let (rw_c, rw_r) = ex_row[..n].as_chunks::<4>();
+            let (re_c, re_r) = ex_row[1..width - 1].as_chunks::<4>();
+            let (rs_c, rs_r) = ey_south[1..width - 1].as_chunks::<4>();
+            let (rn_c, rn_r) = ey_row[1..width - 1].as_chunks::<4>();
+            for i in 0..out_c.len() {
+                let dst = &mut out_c[i];
+                let uc = uc_c[i];
+                let uw = uw_c[i];
+                let ue = ue_c[i];
+                let us = us_c[i];
+                let un = un_c[i];
+                let rw = rw_c[i];
+                let re = re_c[i];
+                let rs = rs_c[i];
+                let rn = rn_c[i];
+                for lane in 0..4 {
+                    dst[lane] = flux_cell(
+                        [uc[lane], uw[lane], ue[lane], us[lane], un[lane]],
+                        [rw[lane], re[lane], rs[lane], rn[lane]],
+                    );
+                }
+            }
+            for i in 0..out_r.len() {
+                out_r[i] = flux_cell(
+                    [uc_r[i], uw_r[i], ue_r[i], us_r[i], un_r[i]],
+                    [rw_r[i], re_r[i], rs_r[i], rn_r[i]],
                 );
             }
         }

@@ -120,10 +120,15 @@ export function verifyMediaDirectory(
   return errors;
 }
 
-/** Each film's videos checked in `filmDir` (web/media-r2/): the errors, for videos whose local copy is wrong or absent. */
-export function verifyFilmVideos(filmManifests: readonly FilmManifest[], filmDir: string): string[] {
+/**
+ * Each film's videos checked in `filmDir` (web/media-r2/): the errors, for videos whose local copy is wrong or
+ * absent. With `absentIsFine` (the build's check, scripts/check-media.ts) an absent copy is no error, since the
+ * video is in R2; a copy that is there must still be the manifest's bytes.
+ */
+export function verifyFilmVideos(filmManifests: readonly FilmManifest[], filmDir: string, absentIsFine = false): string[] {
   return filmManifests
     .flatMap(filmVideoFiles)
+    .filter(({ name }) => !absentIsFine || existsSync(join(filmDir, name)))
     .map(({ name, file }) => checkFile(join(filmDir, name), file))
     .filter((problem): problem is string => problem !== null);
 }

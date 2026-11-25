@@ -51,8 +51,9 @@ export type FilmManifest = {
     /** The optional archival master of the same frames (scripts/media.ts --master-out), kept off the site. */
     master?: MasterVideo;
     /**
-     * The same frames scaled down for a phone (scripts/media.ts --small), at the same CRF: what a narrow screen
-     * plays (components/film.tsx, PHONE), a fraction of the bytes. Served from R2 like the film.
+     * The same frames scaled down for a phone (scripts/media.ts --small), at its own CRF (--small-crf, in its
+     * `encode`): what a narrow screen plays (components/film.tsx, PHONE), about half the bytes. Served from R2
+     * like the film.
      */
     small?: SmallVideo;
   };

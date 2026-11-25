@@ -384,6 +384,9 @@ describe("one film, one file, served from R2", () => {
       const otherBytes: FilmManifest = { ...filmManifest, video: { ...filmManifest.video, bytes: filmManifest.video.bytes + 1 } };
       expect(verifyFilmVideos([otherBytes], store).some((e) => e.includes("not the file its manifest names"))).toBe(true);
       expect(verifyFilmVideos([filmManifest], join(temp, "nowhere")).some((e) => e.includes("is missing"))).toBe(true);
+      // The build's check (scripts/check-media.ts): an absent copy is fine, it is in R2; a wrong one is not.
+      expect(verifyFilmVideos([filmManifest], join(temp, "nowhere"), true)).toEqual([]);
+      expect(verifyFilmVideos([otherBytes], store, true).some((e) => e.includes("not the file its manifest names"))).toBe(true);
 
       // A static file over Cloudflare's 25 MiB static-asset limit is refused; one at it is not.
       const hugeCard: FilmManifest = { ...filmManifest, social: { ...filmManifest.social, bytes: ASSET_LIMIT + 1 } };

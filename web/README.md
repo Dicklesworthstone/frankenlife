@@ -145,7 +145,7 @@ keyframe every second so a seek lands quickly, written to `media-r2/` (outside g
 `worker.ts`; Cloudflare's 25 MiB limit applies only to static assets, which the films no longer are.
 `--small HEIGHT` also encodes the same frames scaled to that height, `<id>-small-<hash>.mp4`, at
 `--small-crf` (default `--crf`): the player's `<source media>` gives it to screens at most 640 CSS pixels
-wide (`components/film.tsx`, `PHONE`), where the 4K film's extra pixels would be downscaled away and its
+wide or tall, so phones either way up (`components/film.tsx`, `PHONE`), where the 4K film's extra pixels would be downscaled away and its
 H.264 level 5.2 is more than some phones decode (the 1080 encode is level 4.2). At 1080, CRF 30 smeared
 single bodies that the 4K encode keeps when scaled down; CRF 26 matched it, at about 56% of the 4K
 film's bytes. `--master-out PATH` (outside
@@ -175,8 +175,9 @@ are read from there (`scripts/source-revision.ts`); the working tree's Rust sour
 they are not what runs. It renders into `--work`. Run it again with the same `--work` to re-encode the finished
 frames without rendering them, for example at another `--crf`. The poster, card and stills are copied into
 `public/media/` and the video into `media-r2/`, each under a content-hashed name. The frames
-are reproducible, the video's bytes are not: x264 on several threads encodes the same frames differently
-each time, so a re-encode gives the video a new name. The script never deletes anything, so move the
+are reproducible on any machine; the video's bytes only for the same frames, arguments, ffmpeg build and
+thread count (x264 is deterministic unless told otherwise, but its thread count shapes the stream), so
+re-encoding on this machine gives the same names, and on another machine new ones. The script never deletes anything, so move the
 previous render's files out of `public/media/` before building; `bun run build` names any it finds.
 
 The same configuration, seed and starting checkpoint give the same frames on any machine. The world's

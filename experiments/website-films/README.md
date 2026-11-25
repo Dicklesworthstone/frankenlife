@@ -248,7 +248,9 @@ from their committed worlds at a frame every 2 ticks instead of 4: 1,601 frames
 from tick 2,400 to 5,600, 26.7 s at 60 fps. The camera's pacing is now fixed in
 `web/scripts/director.ts` (`FILM_PACING`): 35% of the film on the whole torus
 before it moves (560 frames, 9.3 s), 5% for each move, 16% for each held shot
-and 10% on the whole torus at the end. Round 4's films held the whole torus
+and at least 10% on the whole torus at the end. Two shots fit, so each film
+closes on the whole torus for the rest: 288 frames, 4.8 s, 18%; with its
+opening that is 14.1 s of the film's 26.7 s. Round 4's films held the whole torus
 for 64 frames, about 1 s, and then three shots (×1.6, ×3, ×2.2); each film now
 holds two (×1.6 and ×3). The site's tests hold every film to at least a third
 of its length, and 9 s, on the whole torus first.
@@ -266,7 +268,8 @@ Each film is one MP4 at CRF 30, 55 to 58 Mbit/s, that `web/worker.ts` serves
 from R2 by byte range. That is H.264 High at level 5.2, which not every phone
 decodes, and on a phone screen most of its pixels are scaled away. So
 `--small 1080` also encodes the same frames at 1,080 × 1,080 (level 4.2, about
-32 Mbit/s), which screens at most 640 CSS pixels wide play instead.
+32 Mbit/s), which screens at most 640 CSS pixels wide or tall (phones either way
+up) play instead.
 
 The phone encode's CRF was chosen on a 3 s clip of the confluent film (frames
 1,050 to 1,229, its ×3 shot), compared at 1:1 against the 4K encode scaled to
@@ -285,4 +288,4 @@ replaced by CRF 26 (`--small-crf 26`, now in `media:4k60`). Those first
 encodes, the round-4 films' 801-frame single MP4s and their share cards are in
 `web/media-retired/films-801-and-phone-crf30-2026-11-25/`. Each 4K encode
 reran byte for byte when the phone encodes were added: x264's output is the
-same for the same frames and arguments.
+same for the same frames, arguments, build and thread count.

@@ -77,7 +77,7 @@ export function FilmProvenance({ film }: { film: FilmManifest }) {
           <MicroLabel>The film</MicroLabel>
           <dl className="ruled mt-2 text-sm">
             <Row label="Ticks" value={`${grouped(world.from.tick)} → ${grouped(world.to.tick)}, a frame every ${world.every}`} />
-            <Row label="Frames" value={`${video.frames} at ${video.fps} fps, ${video.width} × ${video.height}`} />
+            <Row label="Frames" value={`${grouped(video.frames)} at ${video.fps} fps, ${video.width} × ${video.height}`} />
             <Row
               label="File"
               value={
@@ -117,7 +117,14 @@ export function FilmProvenance({ film }: { film: FilmManifest }) {
         <p className="px-4 pb-4 text-xs leading-relaxed text-slate-400">
           Controllers ran on {render.controllers}; no result depends on the route. The PNG frames are flife&apos;s; the
           page&apos;s video encodes them with flife&apos;s own BT.709 colour chain, named by its SHA-256:{" "}
-          <code className="break-all text-slate-300">{video.sha256}</code>.
+          <code className="break-all text-slate-300">{video.sha256}</code>
+          {video.small ? (
+            <>
+              {" "}
+              (on a phone, <code className="break-all text-slate-300">{video.small.sha256}</code>)
+            </>
+          ) : null}
+          .
         </p>
       </details>
     </article>

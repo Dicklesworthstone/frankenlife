@@ -11,17 +11,13 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { controls, films, stills } from "../lib/media";
-import { checkFile, filmVideoFiles, verifyMediaDirectory } from "./media-verify";
+import { filmVideoFiles, verifyFilmVideos, verifyMediaDirectory } from "./media-verify";
 
 const PUBLIC = fileURLToPath(new URL("../public", import.meta.url));
 const FILMS = fileURLToPath(new URL("../media-r2", import.meta.url));
-const errors = verifyMediaDirectory(films, [controls, stills], PUBLIC);
+const errors = [...verifyMediaDirectory(films, [controls, stills], PUBLIC), ...verifyFilmVideos(films, FILMS, true)];
 const videos = films.flatMap(filmVideoFiles);
 const local = videos.filter(({ name }) => existsSync(`${FILMS}/${name}`));
-for (const { name, file } of local) {
-  const problem = checkFile(`${FILMS}/${name}`, file);
-  if (problem !== null) errors.push(problem);
-}
 if (errors.length > 0) {
   for (const error of errors) console.error(`check-media: ${error}`);
   process.exit(1);

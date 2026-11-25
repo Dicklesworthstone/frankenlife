@@ -141,11 +141,13 @@ function pulse(now: number): number {
 
 /**
  * Where the phone encode (manifest `video.small`, 1080 pixels square) plays instead of the 4K film: a screen at most
- * 640 CSS pixels wide, where the film spans about 1,300 device pixels at most (a 430-pixel phone at 3×). It is
- * H.264 level 4.2, which phones decode, where 2160² at 60 fps needs level 5.2, which not every phone does; and
- * about 56% of the bytes.
+ * 640 CSS pixels wide, where the film spans about 1,300 device pixels at most (a 430-pixel phone at 3×), or at most
+ * 640 tall, which is a phone held sideways (the source is chosen once, so turning it later changes nothing) or a
+ * window too short to show more than 1080 rows of the film. It is H.264 level 4.2, which phones decode, where 2160²
+ * at 60 fps needs level 5.2, which not every phone does; and about 56% of the bytes. A browser that ignores `media`
+ * on a video's source (Chrome and Firefox before 120) takes the first source, this one, wherever it is.
  */
-export const PHONE = "(max-width: 640px)";
+export const PHONE = "(max-width: 640px), (max-height: 640px)";
 
 /** How often the seek control's own value follows the film; nothing on screen reads it. */
 const SEEK_EVERY_MS = 250;

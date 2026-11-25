@@ -129,7 +129,9 @@ async function filmFromR2(request: Request, env: Env, path: string, known: numbe
     "Accept-Ranges": "bytes",
     "X-Content-Type-Options": "nosniff",
   });
-  // RFC 9110 §14.2: Range applies to GET alone; a HEAD describes the whole film.
+  // RFC 9110 §14.2: Range applies to GET alone; a HEAD describes the whole film. `If-Range` is not
+  // compared (§13.1.5): a film's key is its SHA-256, so any validator a client holds for it names these
+  // same bytes, even after a re-upload changes R2's ETag.
   const range = head ? null : request.headers.get("Range");
   const wanted = range === null ? null : parseRange(range, size);
   if (wanted === "unsatisfiable") {

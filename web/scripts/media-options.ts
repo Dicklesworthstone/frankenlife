@@ -357,7 +357,9 @@ const BT709_VF =
  * ffmpeg arguments for a film's web MP4, served from R2: quality set by the CRF alone, with no
  * bitrate cap. A keyframe every second (closed GOP, no scene-cut keyframes) keeps a seek anywhere in
  * the film to at most a second of decoding. With `size`, the frames are first scaled to it (Lanczos,
- * in the same scale filter as the colour conversion): the phone encode.
+ * in the same scale filter as the colour conversion): the phone encode. x264 clamps `-keyint_min` to
+ * half the GOP plus one (31 at 60 fps), so it changes nothing beside `-sc_threshold 0`; it stays so
+ * that a re-encode of the published films reproduces their bytes (x264 writes its settings into the stream).
  */
 export function buildWebEncodeArgs(crf: number, fps: number, size?: readonly [number, number]): string[] {
   if (!Number.isFinite(fps) || fps <= 0) throw new Error("fps must be a positive number");

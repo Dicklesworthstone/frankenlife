@@ -72,7 +72,8 @@ describe("zoomView", () => {
 });
 
 describe("cameraSpans", () => {
-  // The 1,601-frame films: a frame every 2 ticks at 60 fps, 35% whole-torus opening, two shots, 10% whole closing.
+  // The 1,601-frame films: a frame every 2 ticks at 60 fps, 35% whole-torus opening, two shots, and the rest (at
+  // least 10%; 18% here, as no third shot fits) whole at the close.
   const keys = [
     { tick: 2400, zoom: 1 },
     { tick: 3520, zoom: 1 },

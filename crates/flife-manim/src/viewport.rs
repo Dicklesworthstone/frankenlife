@@ -187,17 +187,32 @@ impl Viewport {
     /// The same view in a drawable of `drawable` pixels.
     ///
     /// # Errors
-    /// As [`Viewport::fit`].
+    /// As [`Viewport::fit`], or [`CoreError::NumericalInvalid`] if resizing
+    /// at the current zoom overflows scale or coordinates.
     pub fn resized(&self, drawable: [u32; 2]) -> Result<Self, CoreError> {
         let fitted = Self::fit(self.extent, drawable)?;
-        Ok(Self::placed(
+        let viewport = Self::placed(
             self.extent,
             drawable,
             fitted.fit_scale,
             self.center,
             self.zoom,
             self.pixels_per_point,
-        ))
+        );
+        if !viewport.scale.is_finite()
+            || viewport.scale <= 0.0
+            || !viewport.origin.iter().all(|c| c.is_finite())
+            || !viewport.frame_shape().iter().all(|c| c.is_finite())
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "viewport drawable size",
+                detail: format!(
+                    "drawable {drawable:?} at zoom {} overflows viewport scale or coordinates",
+                    self.zoom
+                ),
+            });
+        }
+        Ok(viewport)
     }
 
     /// The whole torus again, centered at zoom 1, in this drawable and at

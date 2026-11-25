@@ -796,3 +796,34 @@ byproduct_recycle_fraction = 0.50
     );
     assert!(live_on > 0, "symplectic-waste ecology must remain viable");
 }
+
+#[test]
+fn corpse_affinity_direction_rejects_nonfinite_on_full_and_dual_carrier_paths() {
+    for active in [CHANNELS, 24] {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for idx in [0, active - 1] {
+                let mut affinity = [0.0_f64; CHANNELS];
+                affinity[idx] = bad;
+                for dir in [
+                    CorpseDirection::GeneticAffinity,
+                    CorpseDirection::NegatedAffinity,
+                    CorpseDirection::SymplecticAffinity,
+                ] {
+                    assert!(
+                        matches!(
+                            corpse_affinity_direction(&affinity, dir, active, 1.0),
+                            Err(flife_core::CoreError::NumericalInvalid { .. })
+                        ),
+                        "expected NumericalInvalid for {dir:?} active={active} idx={idx} bad={bad}"
+                    );
+                }
+            }
+        }
+    }
+    // Negative zero is normalized to +0.0 on the full-32 GeneticAffinity path too.
+    let mut neg_zero = [0.0_f64; CHANNELS];
+    neg_zero[0] = -0.0;
+    let out = corpse_affinity_direction(&neg_zero, CorpseDirection::GeneticAffinity, CHANNELS, 1.0)
+        .expect("finite");
+    assert_eq!(out[0].to_bits(), 0.0_f64.to_bits());
+}

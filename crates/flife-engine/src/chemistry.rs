@@ -637,7 +637,15 @@ pub fn corpse_affinity_direction(
     match direction {
         CorpseDirection::GeneticAffinity => {
             if active_carrier0_channels == CHANNELS {
-                return Ok(*affinity);
+                for &src in affinity {
+                    if !src.is_finite() {
+                        return Err(CoreError::NumericalInvalid {
+                            quantity: "corpse affinity direction",
+                            detail: format!("component {src} is not finite"),
+                        });
+                    }
+                }
+                return Ok(affinity.map(|src| src + 0.0));
             }
             let mut out = [0.0_f64; CHANNELS];
             for (dst, &src) in out[..active_carrier0_channels]

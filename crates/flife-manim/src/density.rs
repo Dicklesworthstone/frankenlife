@@ -21,7 +21,7 @@ use flife_core::CoreError;
 use flife_render::Epoch;
 use fmn_render::{SurfaceDraw, SurfaceMesh, Texture, ThreeDDraw};
 
-use crate::mapping::{EpochColors, Look, Style};
+use crate::mapping::{ColorMapping, EpochColors, Look, Style};
 use crate::{SCALE_DECAY, Viewport};
 
 /// The target bin width in points (drawable pixels at one pixel per point).
@@ -86,6 +86,37 @@ fn quad_key(viewport: &Viewport, bins: [u32; 2]) -> QuadKey {
     )
 }
 
+/// Key identifying the binned `(counts, sums)` buffers so unchanged pan/zoom
+/// placements skip re-binning while mapping changes, bin-grid changes, or
+/// different epochs re-bin cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BinnedKey {
+    mapping: ColorMapping,
+    bins: [u32; 2],
+    epoch_id: u64,
+    resource: u64,
+    tick: u64,
+    len: usize,
+    first_pos: Option<[u32; 2]>,
+    last_pos: Option<[u32; 2]>,
+    positions_ptr: usize,
+}
+
+fn binned_key(epoch: &Epoch, mapping: ColorMapping, bins: [u32; 2]) -> BinnedKey {
+    let positions = epoch.positions();
+    BinnedKey {
+        mapping,
+        bins,
+        epoch_id: epoch.id().get(),
+        resource: epoch.resource().get(),
+        tick: epoch.tick().get(),
+        len: positions.len(),
+        first_pos: positions.first().map(|p| p.map(f32::to_bits)),
+        last_pos: positions.last().map(|p| p.map(f32::to_bits)),
+        positions_ptr: positions.as_ptr() as usize,
+    }
+}
+
 /// Organism counts and mean colours per screen bin, as one texture.
 #[derive(Debug)]
 pub struct DensityLayer {
@@ -98,6 +129,8 @@ pub struct DensityLayer {
     /// colours and scale; `None` while it does not show them (before the first
     /// build, and from the start of each update until its build succeeds).
     built: Option<Look>,
+    /// Provenance of the currently binned `(counts, sums)` and texture.
+    binned: Option<BinnedKey>,
     quad: Option<SurfaceMesh>,
     quad_key: Option<QuadKey>,
     scale: f64,
@@ -114,20 +147,23 @@ impl DensityLayer {
             sums: Vec::new(),
             texture: None,
             built: None,
+            binned: None,
             quad: None,
             quad_key: None,
             scale: 0.0,
         }
     }
 
-    /// Use `viewport` from the next [`DensityLayer::update`]. The current
-    /// texture and quad stay valid meanwhile: bins are world-aligned and
-    /// scene points do not depend on the drawable.
+    /// Use `viewport` from the next [`DensityLayer::update`] or
+    /// [`DensityLayer::place_epoch`]. The current texture and quad stay valid
+    /// meanwhile: bins are world-aligned and scene points do not depend on the
+    /// drawable.
     pub const fn refit(&mut self, viewport: &Viewport) {
         self.viewport = *viewport;
     }
 
-    /// Bin `epoch` and build the texture for `style`.
+    /// Bin `epoch` and build the texture for `style`, advancing the decaying
+    /// display scale.
     ///
     /// # Errors
     /// [`CoreError::LayoutMismatch`] for an epoch of another world than the
@@ -136,6 +172,33 @@ impl DensityLayer {
     /// FrankenManim refuses the texture or the quad. The previous texture
     /// and quad are kept on error.
     pub fn update(&mut self, epoch: &Epoch, style: &Style) -> Result<(), CoreError> {
+        self.bin_and_place(epoch, style, true)
+    }
+
+    /// Place `epoch` in the layer at the current viewport and `style` without
+    /// advancing display-scale decay: what a pan, zoom, resize, or style
+    /// change redraws.
+    ///
+    /// When `epoch`, `style.mapping`, and the viewport's bin grid match the
+    /// currently binned buffers, reuses those bins directly via
+    /// [`DensityLayer::place`] (keeping texels and moving only the quad when
+    /// the look is unchanged). When entering density mode from points,
+    /// changing colour mapping, resizing the bin grid, or placing another
+    /// epoch, re-bins `epoch` while keeping an existing nonzero display scale
+    /// unmoved on an unchanged bin grid.
+    ///
+    /// # Errors
+    /// As [`DensityLayer::update`].
+    pub fn place_epoch(&mut self, epoch: &Epoch, style: &Style) -> Result<(), CoreError> {
+        self.bin_and_place(epoch, style, false)
+    }
+
+    fn bin_and_place(
+        &mut self,
+        epoch: &Epoch,
+        style: &Style,
+        advance_scale: bool,
+    ) -> Result<(), CoreError> {
         if epoch.extent().map(f64::to_bits) != self.viewport.extent().map(f64::to_bits) {
             return Err(CoreError::LayoutMismatch {
                 buffer: "density layer",
@@ -146,13 +209,19 @@ impl DensityLayer {
                 ),
             });
         }
-        // The bins change below: the texture shows them again only once
-        // rebuilt.
-        self.built = None;
         let bins = density_bins(&self.viewport);
+        let key = binned_key(epoch, style.mapping, bins);
+        if !advance_scale && self.binned == Some(key) && self.bins == bins {
+            return self.place(style);
+        }
+        // The bins change below: the texture and provenance match again only
+        // once rebuilt.
+        self.built = None;
+        self.binned = None;
         let [columns, rows] = bins.map(|n| n as usize);
         let cells = columns * rows;
-        let base_scale = if bins != self.bins {
+        let grid_changed = bins != self.bins;
+        let base_scale = if grid_changed {
             // Reset `self.bins` before clearing so an allocation failure never
             // leaves a nonzero grid size pointing at empty buffers.
             self.bins = [0; 2];
@@ -195,9 +264,17 @@ impl DensityLayer {
             sum[2] += color.b;
         });
         let fullest = self.counts.iter().copied().max().unwrap_or(0);
-        let next_scale = f64::from(fullest).max(base_scale * SCALE_DECAY);
+        let next_scale = if advance_scale {
+            f64::from(fullest).max(base_scale * SCALE_DECAY)
+        } else if grid_changed || base_scale == 0.0 {
+            f64::from(fullest)
+        } else {
+            base_scale
+        };
         self.bins = bins;
-        self.place_binned_at(next_scale, style)
+        self.place_binned_at(next_scale, style)?;
+        self.binned = Some(key);
+        Ok(())
     }
 
     /// Re-place the last binned epoch in the layer at the current viewport

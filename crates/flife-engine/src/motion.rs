@@ -215,10 +215,11 @@ impl Motion {
                 }
             }
         }
-        Ok(clamp_radius(
+        clamp_radius(
+            "chemical acceleration",
             [uptake_ratio * sum0, uptake_ratio * sum1],
             self.maximum_acceleration,
-        ))
+        )
     }
 
     /// `V2-05` (`so2-motor`) SO(2)-equivariant neural acceleration: splits
@@ -367,15 +368,15 @@ impl Motion {
             * motor.heading_propulsion;
         let ax = grad_x + prop_mag * hx;
         let ay = grad_y + prop_mag * hy;
-        Ok(clamp_radius([ax, ay], self.maximum_acceleration))
+        clamp_radius("chemical acceleration", [ax, ay], self.maximum_acceleration)
     }
 
     /// The proposed velocity `v* = e^(−γΔt) v + coefficient · f`, clamped to
     /// the speed limit.
     ///
     /// # Errors
-    /// [`CoreError::NumericalInvalid`] for a nonfinite velocity or
-    /// acceleration.
+    /// [`CoreError::NumericalInvalid`] for a nonfinite velocity, acceleration,
+    /// or proposed velocity.
     pub fn propose(
         &self,
         velocity: [f64; 2],
@@ -391,7 +392,7 @@ impl Motion {
             self.decay * velocity[0] + self.force_coefficient * acceleration[0],
             self.decay * velocity[1] + self.force_coefficient * acceleration[1],
         ];
-        Ok(clamp_radius(proposed, self.maximum_speed))
+        clamp_radius("proposed velocity", proposed, self.maximum_speed)
     }
 
     /// Pay for `proposed` from `budget`, scaling the whole velocity when the
@@ -410,8 +411,17 @@ impl Motion {
                 detail: format!("{proposed:?} is not finite"),
             });
         }
-        let requested =
-            self.cost * (proposed[0] * proposed[0] + proposed[1] * proposed[1]) * self.step_seconds;
+        let requested = if self.cost == 0.0 {
+            0.0
+        } else {
+            self.cost * (proposed[0] * proposed[0] + proposed[1] * proposed[1]) * self.step_seconds
+        };
+        if requested.is_nan() || requested < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "motion cost",
+                detail: format!("{requested} is not nonnegative"),
+            });
+        }
         let available = budget.remaining();
         if requested <= available {
             let cost = budget.pay(requested)?;
@@ -475,7 +485,21 @@ impl MotionResponse {
             squared += coefficient * coefficient;
         }
         let limit = motion.response_norm_limit;
-        if squared > limit * limit {
+        let bound = limit * limit;
+        let exceeds = if squared.is_finite() && bound.is_finite() {
+            squared > bound
+        } else {
+            let s_limit = limit * CLAMP_DOWN_SCALE;
+            let s_squared: f64 = coefficients
+                .iter()
+                .map(|&c| {
+                    let sc = c * CLAMP_DOWN_SCALE;
+                    sc * sc
+                })
+                .sum();
+            s_squared > s_limit * s_limit
+        };
+        if exceeds {
             return Err(CoreError::NumericalInvalid {
                 quantity: "motion response",
                 detail: format!("||χ||² = {squared} exceeds the limit {limit}²"),
@@ -540,18 +564,61 @@ pub fn uptake_ratio(
     Ok((absorbed / (step.seconds_per_tick() * capacity_per_second)).min(1.0))
 }
 
+/// Exact IEEE-754 power-of-two factor (`2^-520`) that scales any finite `f64`
+/// below `2^504` so sums of squares never overflow `f64::MAX`, with zero
+/// mantissa rounding error.
+const CLAMP_DOWN_SCALE: f64 = f64::from_bits((1023_u64 - 520) << 52);
+
 /// `v` clamped radially so that `v·v ≤ limit²` as computed in F64.
-fn clamp_radius(v: [f64; 2], limit: f64) -> [f64; 2] {
+///
+/// The finite-square fast path executes the exact arithmetic of
+/// `motion.metal`'s `clamp_radius` for 0-ulp CPU/Metal parity. When `v` is
+/// finite but `v·v` or `limit²` overflows `f64::MAX`, falls back to exact
+/// power-of-two scaling rather than collapsing to `[0, 0]`, bypassing the
+/// clamp, or leaking `NaN`.
+fn clamp_radius(quantity: &'static str, v: [f64; 2], limit: f64) -> Result<[f64; 2], CoreError> {
+    if !v[0].is_finite() || !v[1].is_finite() {
+        return Err(CoreError::NumericalInvalid {
+            quantity,
+            detail: format!("{v:?} is not finite"),
+        });
+    }
     let bound = limit * limit;
     let squared = v[0] * v[0] + v[1] * v[1];
-    if squared <= bound {
-        return v;
-    }
-    let scale = limit / squared.sqrt();
-    let mut clamped = [v[0] * scale, v[1] * scale];
     let shrink = 1.0 - f64::EPSILON / 2.0;
-    while clamped[0] * clamped[0] + clamped[1] * clamped[1] > bound {
+    if squared.is_finite() && bound.is_finite() {
+        if squared <= bound {
+            return Ok(v);
+        }
+        let scale = limit / squared.sqrt();
+        let mut clamped = [v[0] * scale, v[1] * scale];
+        while clamped[0] * clamped[0] + clamped[1] * clamped[1] > bound {
+            clamped = [clamped[0] * shrink, clamped[1] * shrink];
+        }
+        return Ok(clamped);
+    }
+    let sv = [v[0] * CLAMP_DOWN_SCALE, v[1] * CLAMP_DOWN_SCALE];
+    let s_squared = sv[0] * sv[0] + sv[1] * sv[1];
+    if bound.is_finite() {
+        let s_norm = s_squared.sqrt();
+        let mut clamped = [(sv[0] / s_norm) * limit, (sv[1] / s_norm) * limit];
+        while clamped[0] * clamped[0] + clamped[1] * clamped[1] > bound {
+            clamped = [clamped[0] * shrink, clamped[1] * shrink];
+        }
+        return Ok(clamped);
+    }
+    let s_limit = limit * CLAMP_DOWN_SCALE;
+    let s_bound = s_limit * s_limit;
+    if s_squared <= s_bound {
+        return Ok(v);
+    }
+    let s_norm = s_squared.sqrt();
+    let mut clamped = [(sv[0] / s_norm) * limit, (sv[1] / s_norm) * limit];
+    while {
+        let sc = [clamped[0] * CLAMP_DOWN_SCALE, clamped[1] * CLAMP_DOWN_SCALE];
+        sc[0] * sc[0] + sc[1] * sc[1] > s_bound
+    } {
         clamped = [clamped[0] * shrink, clamped[1] * shrink];
     }
-    clamped
+    Ok(clamped)
 }

@@ -1001,3 +1001,82 @@ fn the_organism_phase_does_not_depend_on_presentation_order() {
     assert_eq!(digest(&forward), 0x770d_6440_241c_d51e);
     assert_eq!(forward.deaths, [(OrganismId::new(42), 29)]);
 }
+
+#[test]
+fn motion_clamping_and_settle_guard_overflow_and_nonfinite_intermediates() {
+    let dt = step(1, 1);
+    let motion = Motion::new(dt, 0.0, 4.0, 4.0, 1.0, 2.0).expect("motion");
+    let mut unit_e = [0.0; RESPONSE_TERMS];
+    unit_e[0] = 1.0;
+    let resp_single = MotionResponse::new(unit_e, &motion).expect("single response");
+
+    // Huge finite vector whose square overflows f64::MAX must clamp radially along
+    // its direction rather than collapsing to [0, 0] or NaN.
+    let mut huge_grad = [[0.0; 2]; RESPONSE_TERMS];
+    huge_grad[0] = [3.0e200, 4.0e200];
+    let acc = motion
+        .acceleration(1.0, &resp_single, &huge_grad)
+        .expect("finite huge gradient clamps cleanly");
+    assert!(acc[0].is_finite() && acc[1].is_finite());
+    assert!(squared(acc) <= 16.0);
+    assert!((acc[0] - 2.4).abs() < 1.0e-12 && (acc[1] - 3.2).abs() < 1.0e-12);
+
+    // Overflowing intermediate dot product (+inf) must be refused as NumericalInvalid
+    // at both uptake_ratio = 1.0 (+inf) and uptake_ratio = 0.0 (0 * inf = NaN).
+    let mut two_terms = [0.0; RESPONSE_TERMS];
+    two_terms[0] = 1.0;
+    two_terms[1] = 1.0;
+    let resp_pair = MotionResponse::new(two_terms, &motion).expect("pair response");
+    let mut overflow_grad = [[0.0; 2]; RESPONSE_TERMS];
+    overflow_grad[0] = [1.0e308, 0.0];
+    overflow_grad[1] = [1.0e308, 0.0];
+    for ratio in [1.0, 0.0] {
+        assert!(
+            matches!(
+                motion.acceleration(ratio, &resp_pair, &overflow_grad),
+                Err(CoreError::NumericalInvalid { .. })
+            ),
+            "overflowing acceleration at ratio={ratio} must return NumericalInvalid"
+        );
+    }
+
+    // Propose with finite huge components clamps along direction; overflowing sum
+    // returns NumericalInvalid instead of NaN.
+    let huge_proposed = motion
+        .propose([3.0e200, 4.0e200], [0.0, 0.0])
+        .expect("finite huge velocity clamps cleanly");
+    assert!(squared(huge_proposed) <= 16.0);
+    assert!((huge_proposed[0] - 2.4).abs() < 1.0e-12 && (huge_proposed[1] - 3.2).abs() < 1.0e-12);
+    assert!(matches!(
+        motion.propose([1.0e308, 0.0], [1.0e308, 0.0]),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+
+    // Huge speed/response limits whose square overflows f64::MAX must still enforce
+    // the radial limit rather than passing `inf <= inf`.
+    let huge_limit_motion = Motion::new(dt, 0.0, 1.0e200, 1.0e200, 1.0, 1.0e200).expect("motion");
+    let clamped_huge = huge_limit_motion
+        .propose([3.0e250, 4.0e250], [0.0, 0.0])
+        .expect("clamps to huge speed limit");
+    assert!((clamped_huge[0] / 1.0e200 - 0.6).abs() < 1.0e-12);
+    assert!((clamped_huge[1] / 1.0e200 - 0.8).abs() < 1.0e-12);
+    let mut over_huge_resp = [0.0; RESPONSE_TERMS];
+    over_huge_resp[0] = 1.0e250;
+    assert!(matches!(
+        MotionResponse::new(over_huge_resp, &huge_limit_motion),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+
+    // Free motion (cost == 0) on a finite huge velocity whose square overflows
+    // f64::MAX must cost 0 without computing 0 * inf = NaN or draining the budget.
+    let free_motion = Motion::new(dt, 0.0, 1.0e200, 1.0e200, 0.0, 1.0).expect("free motion");
+    let mut organism = budget(1.25);
+    let settled = free_motion
+        .settle([1.0e200, 0.0], &mut organism)
+        .expect("free motion settles cleanly");
+    assert_eq!(settled.velocity, [1.0e200, 0.0]);
+    assert_eq!(settled.cost.requested, 0.0);
+    assert_eq!(settled.cost.paid, 0.0);
+    assert!(!settled.scaled);
+    assert_eq!(organism.remaining(), 1.25);
+}

@@ -715,7 +715,7 @@ impl WorldView {
         let style = self.style;
         let motion = self.lower(prior, current, fraction)?;
         if style.particles == Particles::Density {
-            self.density.place(&style)?;
+            self.density.place_epoch(current, &style)?;
         }
         if style.field_drawn() {
             self.field
@@ -817,8 +817,7 @@ impl WorldView {
                     .update_styled(current, &self.viewport, &self.style)?;
             }
         }
-        self.placed_viewport = Some(self.viewport);
-        self.motion = pair.map(|(prior, gap)| Motion {
+        let next_motion = pair.map(|(prior, gap)| Motion {
             prior: Prior {
                 id: prior.id(),
                 tick: prior.tick(),
@@ -828,13 +827,16 @@ impl WorldView {
             fading: self.between.fading.len(),
         });
         self.remember(current)?;
+        self.placed_viewport = Some(self.viewport);
+        self.motion = next_motion;
         Ok(self.motion)
     }
 
     /// Draw `epoch` again at the current viewport and style without moving
-    /// the field's or density's display scale: what a pan or zoom redraws
-    /// for the epoch already shown. The density layer re-places the epoch
-    /// it last binned.
+    /// the field's or density's display scale: what a pan, zoom, or style
+    /// change redraws for the epoch already shown. The density layer reuses
+    /// its bins when the epoch, colour mapping, and bin grid are unchanged,
+    /// and re-bins otherwise without advancing scale decay.
     ///
     /// # Errors
     /// As [`WorldView::show`].

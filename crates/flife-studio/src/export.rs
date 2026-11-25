@@ -753,6 +753,13 @@ pub fn export_cinema(
         },
     )?;
 
+    if frames.len() != planned.len() {
+        return Err(conflict(format!(
+            "replay emitted {} frames, expected {}",
+            frames.len(),
+            planned.len()
+        )));
+    }
     let video = video
         .map(|video| video.finish(options.frames_per_second, &counts))
         .transpose()?;

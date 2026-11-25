@@ -1529,3 +1529,87 @@ fn mix_non_finite_and_density_sphere_reuse_and_zero_population() {
             .all(|t| t.r == 0.0 && t.g == 0.0 && t.b == 0.0 && t.a == 1.0)
     );
 }
+
+#[test]
+fn density_place_handles_mode_switch_mapping_change_resize_and_epoch_change() {
+    let config = common::small();
+    let mut world = common::found(&config);
+    common::advance(&mut world, 24);
+    let epoch = common::epoch(&world);
+    common::advance(&mut world, 8);
+    let later = common::epoch(&world);
+    assert!(!epoch.is_empty() && !later.is_empty());
+
+    let texel_bits = |view: &WorldView| -> Vec<[u64; 4]> {
+        let texture = view.density().texture().expect("density texture");
+        texels(texture)
+            .iter()
+            .map(|t| [t.r, t.g, t.b, t.a].map(f64::to_bits))
+            .collect()
+    };
+
+    // 1. Points -> Density via place() must bin and produce a non-empty texture
+    //    matching a fresh show() in Density mode, never a blank frame.
+    let mut view = WorldView::for_epoch(&epoch, [192, 160], [0, 0, 0]).expect("view");
+    view.show(&epoch).expect("show in Points mode");
+    assert_eq!(view.density().bins(), [0, 0]);
+    assert!(view.density().texture().is_none());
+
+    let density_lineage = Style {
+        particles: Particles::Density,
+        mapping: ColorMapping::Lineage,
+        look: Look::Glow,
+        ..Style::default()
+    };
+    view.set_style(density_lineage);
+    view.place(&epoch).expect("place after Points -> Density");
+    assert_ne!(view.density().bins(), [0, 0]);
+    assert!(view.density().scale() > 0.0);
+
+    let mut fresh_lineage = WorldView::for_epoch(&epoch, [192, 160], [0, 0, 0]).expect("fresh");
+    fresh_lineage.set_style(density_lineage);
+    fresh_lineage.show(&epoch).expect("fresh show");
+    assert_eq!(texel_bits(&view), texel_bits(&fresh_lineage));
+    assert_eq!(
+        view.density().scale().to_bits(),
+        fresh_lineage.density().scale().to_bits()
+    );
+
+    // 2. Switching ColorMapping in Density mode via place() must re-bin colors
+    //    without decaying or moving the display scale.
+    let scale_before = view.density().scale();
+    let lineage_texels = texel_bits(&view);
+    let density_energy = Style {
+        mapping: ColorMapping::Energy,
+        ..density_lineage
+    };
+    view.set_style(density_energy);
+    view.place(&epoch)
+        .expect("place after Lineage -> Energy in Density");
+    assert_eq!(
+        view.density().scale().to_bits(),
+        scale_before.to_bits(),
+        "place() must not move the density display scale on a mapping change"
+    );
+    let mut fresh_energy = WorldView::for_epoch(&epoch, [192, 160], [0, 0, 0]).expect("fresh");
+    fresh_energy.set_style(density_energy);
+    fresh_energy.show(&epoch).expect("fresh energy show");
+    assert_eq!(texel_bits(&view), texel_bits(&fresh_energy));
+    assert_ne!(texel_bits(&view), lineage_texels);
+
+    // 3. Resizing the drawable in Density mode and calling place() must update
+    //    the bin grid and texture to the new viewport resolution.
+    view.resize([384, 320]).expect("resize");
+    view.place(&epoch).expect("place after resize");
+    assert_eq!(view.density().bins(), density_bins(view.viewport()));
+    let mut fresh_resized = WorldView::for_epoch(&epoch, [384, 320], [0, 0, 0]).expect("fresh");
+    fresh_resized.set_style(density_energy);
+    fresh_resized.show(&epoch).expect("fresh resized show");
+    assert_eq!(view.density().bins(), fresh_resized.density().bins());
+    assert_eq!(texel_bits(&view), texel_bits(&fresh_resized));
+
+    // 4. Placing a different epoch in Density mode must re-bin the new epoch.
+    let before_later = texel_bits(&view);
+    view.place(&later).expect("place later epoch");
+    assert_ne!(texel_bits(&view), before_later);
+}

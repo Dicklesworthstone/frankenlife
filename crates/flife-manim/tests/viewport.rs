@@ -720,6 +720,14 @@ fn extreme_extents_and_non_finite_logical_points_are_refused() {
         tiny.with_view([0.0, 0.0], MAXIMUM_ZOOM),
         Err(CoreError::NumericalInvalid { .. })
     ));
+    let zoomed_tiny = Viewport::fit([1e-306, 1e-306], [1, 1])
+        .expect("finite at 1x")
+        .with_view([0.0, 0.0], 100.0)
+        .expect("finite at 100x");
+    assert!(matches!(
+        zoomed_tiny.resized([100, 100]),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
 
     let viewport = fit([128.0, 128.0], [1600, 900]);
     for bad_point in [

@@ -330,8 +330,7 @@ fn kept_session_resumes(durability: &str) {
             &dir,
             InspectOptions {
                 at: Some(tick.get()),
-                field: false,
-                weights: Vec::new(),
+                ..InspectOptions::default()
             },
         )
         .unwrap_or_else(|error| panic!("{durability}: tick {tick:?}: {error}"));

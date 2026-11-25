@@ -343,8 +343,9 @@ enum Command {
     },
     /// Print a run directory's committed state at one of its checkpoints
     /// as NDJSON: a header, every live organism in identity order, with
-    /// `--field` the field's energy plane, and with `--weights` an
-    /// organism's whole controller.
+    /// `--field` the field's energy plane, with `--weights` an organism's
+    /// whole controller, and with `--diagnostics` read-only V2 tissue
+    /// geometry and `so2-motor` neural-agency diagnostics.
     Inspect {
         /// The run directory.
         run_dir: PathBuf,
@@ -360,6 +361,14 @@ enum Command {
         /// given.
         #[arg(long = "weights", value_name = "ORGANISM")]
         weights: Vec<u64>,
+        /// Also print read-only `V2-10` / `V2-17` periodic tissue geometry
+        /// and `so2-motor` neural-agency diagnostics from the restored world.
+        #[arg(long)]
+        diagnostics: bool,
+        /// Override body diameter `D` (world units) for periodic geometry
+        /// diagnostics (defaults to `[contact] diameter` when configured).
+        #[arg(long, value_name = "WORLD_UNITS", requires = "diagnostics")]
+        diameter: Option<f64>,
     },
     /// Save a discovery (plan §14.5) of a run directory's checkpoint into a
     /// new bundle directory: `discovery.json` (source reference,
@@ -898,7 +907,18 @@ fn main() -> ExitCode {
             at,
             field,
             weights,
-        } => match flife_cli::inspect(&run_dir, InspectOptions { at, field, weights }) {
+            diagnostics,
+            diameter,
+        } => match flife_cli::inspect(
+            &run_dir,
+            InspectOptions {
+                at,
+                field,
+                weights,
+                diagnostics,
+                diameter,
+            },
+        ) {
             Ok(inspection) => {
                 print(&inspection.inspected);
                 for organism in &inspection.organisms {
@@ -909,6 +929,9 @@ fn main() -> ExitCode {
                 }
                 for controller in &inspection.weights {
                     print(controller);
+                }
+                if let Some(diagnostics) = &inspection.diagnostics {
+                    print(diagnostics);
                 }
                 ExitCode::SUCCESS
             }

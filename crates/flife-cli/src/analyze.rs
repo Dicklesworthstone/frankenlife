@@ -60,6 +60,14 @@ struct Design {
     measures: Vec<String>,
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires &bool"
+)]
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// A condition as an experiment's design resolved it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DesignedCondition {
@@ -69,6 +77,15 @@ pub struct DesignedCondition {
     pub ablation: Option<String>,
     /// Every key it sets, the shared overrides included, as TOML values.
     pub set: BTreeMap<String, String>,
+    /// Whether all 21 `field-ecology-v2` features are disabled first (`--v1-compat`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub v1_compat: bool,
+    /// Per-condition disabled `field-ecology-v2` feature slugs or aliases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disable: Vec<String>,
+    /// Per-condition enabled `field-ecology-v2` feature slugs or aliases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enable: Vec<String>,
 }
 
 /// One experiment analyzed.

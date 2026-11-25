@@ -47,12 +47,14 @@ use flife_core::{
     ConfigIssue, CoreError, FeatureOverride, ModelDescriptor, RunConfig, Sha256Digest,
     ValidatedConfig,
 };
+use flife_engine::World;
 use flife_store::{CatalogedRun, ExperimentCatalog};
 use serde::{Deserialize, Serialize};
 
 use crate::metrics::Metrics;
 use crate::observe::{Survey, Tally};
 use crate::run::{ControllerSummary, Finished, Record, RunOptions, Stop};
+use crate::v2_diagnostics::{self, V2Diagnostics};
 
 /// The schema of an experiment specification and of the records
 /// `flife experiment` prints.
@@ -224,6 +226,14 @@ pub struct Seeds {
     pub held_out: Vec<u64>,
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires &bool"
+)]
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// One condition, as specified.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -237,6 +247,19 @@ pub struct ConditionSpec {
     /// its key.
     #[serde(default)]
     pub set: BTreeMap<String, toml::Value>,
+    /// Disable all 21 `field-ecology-v2` features before applying `disable`
+    /// and `enable` (equivalent to `--v1-compat`; refused on `field-ecology-v1*`).
+    #[serde(default)]
+    pub v1_compat: bool,
+    /// `field-ecology-v2` feature slugs or aliases (`all-v2`, `bundle-a`,
+    /// `bundle-b`) disabled for this condition (applied after `v1_compat` and
+    /// before `enable`).
+    #[serde(default)]
+    pub disable: Vec<String>,
+    /// `field-ecology-v2` feature slugs or aliases enabled for this condition
+    /// (applied after `v1_compat` and `disable`).
+    #[serde(default)]
+    pub enable: Vec<String>,
 }
 
 /// A selection rule (§15.5).
@@ -249,7 +272,8 @@ pub struct Select {
     pub rule: String,
 }
 
-/// A condition resolved: its ablation and every override it applies.
+/// A condition resolved: its ablation, key overrides, and any per-condition
+/// `field-ecology-v2` feature toggles.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Condition {
     /// Its name.
@@ -258,6 +282,37 @@ pub struct Condition {
     pub ablation: Option<&'static str>,
     /// Every key it sets, the shared overrides included, as TOML values.
     pub set: BTreeMap<String, String>,
+    /// Whether all 21 `field-ecology-v2` features are disabled first (`--v1-compat`).
+    #[serde(skip_serializing_if = "is_false")]
+    pub v1_compat: bool,
+    /// Per-condition disabled `field-ecology-v2` feature slugs or aliases.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub disable: Vec<String>,
+    /// Per-condition enabled `field-ecology-v2` feature slugs or aliases.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub enable: Vec<String>,
+}
+
+impl Condition {
+    fn has_feature_overrides(&self) -> bool {
+        self.v1_compat || !self.disable.is_empty() || !self.enable.is_empty()
+    }
+
+    fn feature_overrides(&self) -> Vec<FeatureOverride> {
+        let mut overrides = Vec::with_capacity(
+            usize::from(self.v1_compat) + self.disable.len() + self.enable.len(),
+        );
+        if self.v1_compat {
+            overrides.push(FeatureOverride::V1Compat);
+        }
+        for slug in &self.disable {
+            overrides.push(FeatureOverride::Disable(slug.clone()));
+        }
+        for slug in &self.enable {
+            overrides.push(FeatureOverride::Enable(slug.clone()));
+        }
+        overrides
+    }
 }
 
 /// An experiment ready to run: its specification resolved against its
@@ -434,6 +489,9 @@ impl Experiment {
                 &condition.name,
                 condition.ablation.as_deref(),
                 &condition.set,
+                condition.v1_compat,
+                &condition.disable,
+                &condition.enable,
             )?);
         }
         for combination in Self::combinations(&spec.sweep)? {
@@ -446,7 +504,16 @@ impl Experiment {
             for (key, value) in combination {
                 set.insert(key, parse_literal(&value)?);
             }
-            conditions.push(Self::resolve(&base_model, &spec.set, &name, None, &set)?);
+            conditions.push(Self::resolve(
+                &base_model,
+                &spec.set,
+                &name,
+                None,
+                &set,
+                false,
+                &[],
+                &[],
+            )?);
         }
         let mut names = BTreeSet::new();
         for condition in &conditions {
@@ -563,14 +630,22 @@ impl Experiment {
     }
 
     /// One condition: the shared overrides, replaced key by key by its own,
-    /// then its ablation's. An ablation's keys are its definition, so a
-    /// condition that also sets one is refused.
+    /// then its ablation's, plus any per-condition `field-ecology-v2` feature
+    /// toggles. An ablation's keys are its definition, so a condition that
+    /// also sets one is refused.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors ConditionSpec fields cleanly without a wrapper struct"
+    )]
     fn resolve(
         base_model: &str,
         shared: &BTreeMap<String, toml::Value>,
         name: &str,
         ablation_name: Option<&str>,
         own: &BTreeMap<String, toml::Value>,
+        v1_compat: bool,
+        disable: &[String],
+        enable: &[String],
     ) -> Result<Condition, CoreError> {
         let ablation = ablation_name.map(ablation).transpose()?;
         let mut set = BTreeMap::new();
@@ -594,6 +669,9 @@ impl Experiment {
             name: name.to_owned(),
             ablation: ablation.map(|ablation| ablation.name),
             set,
+            v1_compat,
+            disable: disable.to_vec(),
+            enable: enable.to_vec(),
         })
     }
 
@@ -674,6 +752,12 @@ impl Experiment {
         let seed = i64::try_from(seed)
             .map_err(|_| spec_error("seeds", format!("{seed} is not a TOML integer")))?;
         table.insert("seed".to_owned(), toml::Value::Integer(seed));
+        if condition.has_feature_overrides() {
+            let text = toml::to_string(&table)
+                .map_err(|error| spec_error("toml", error.to_string().trim().to_owned()))?;
+            let overrides = condition.feature_overrides();
+            return ValidatedConfig::from_toml_with_overrides(&text, &overrides);
+        }
         let config: RunConfig =
             toml::Value::Table(table)
                 .try_into()
@@ -762,6 +846,87 @@ pub struct Measures {
     /// from the render epoch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last: Option<LastRecord>,
+    /// Complete end-state `V2-10` / `V2-17` periodic tissue geometry and
+    /// `so2-motor` neural-agency diagnostics from the committed world; omitted
+    /// when neither `[contact]` nor `so2-motor` is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v2: Option<V2Measures>,
+}
+
+/// Complete end-state `V2-10` / `V2-17` periodic tissue geometry and
+/// `so2-motor` neural-agency measures from the committed world (`INV-09`).
+///
+/// Any measure whose mechanism is inactive, whose population is extinct
+/// (`count == 0`), or whose sample variance is zero is `None` (excluded from
+/// paired differences with explicit `undefined_seeds`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct V2Measures {
+    /// Median periodic nearest-neighbor separation divided by body diameter `D`
+    /// (`None` without `[contact]` or with fewer than 2 live organisms).
+    pub median_d1_over_d: Option<f64>,
+    /// Mean count of neighbors strictly inside `d < D` (`None` without
+    /// `[contact]` or when extinct).
+    pub mean_overlaps_within_1d: Option<f64>,
+    /// Chain / filament fraction `P(z = 1) + P(z = 2)` within `1.3 D`
+    /// (`None` without `[contact]` or when extinct).
+    pub chain_fraction_z1_z2: Option<f64>,
+    /// Local hexatic order `mean_i |ψ_6(i)|` (`None` without `[contact]` or
+    /// when extinct).
+    pub mean_abs_psi6: Option<f64>,
+    /// Global hexatic order `|mean_i ψ_6(i)|` (`None` without `[contact]` or
+    /// when extinct).
+    pub global_abs_mean_psi6: Option<f64>,
+    /// Mean decoded `so2-motor` energy-gradient modulation `m_e` (`None` when
+    /// disabled or no live organism has been evaluated).
+    pub mean_me: Option<f64>,
+    /// Population standard deviation of `m_e` (`None` when disabled or fewer
+    /// than 2 evaluated).
+    pub std_me: Option<f64>,
+    /// Pearson `corr(m_e, dE/dt)` (`None` when disabled, `< 2` samples, or
+    /// zero variance).
+    pub corr_me_dedt: Option<f64>,
+    /// Pearson `corr(m_e, E)` (`None` when disabled, `< 2` samples, or zero
+    /// variance).
+    pub corr_me_energy: Option<f64>,
+}
+
+impl V2Measures {
+    /// Extract [`V2Measures`] from [`V2Diagnostics`], returning `None` when
+    /// neither `[contact]` geometry nor `so2-motor` is active.
+    #[must_use]
+    pub fn of_diagnostics(diagnostics: &V2Diagnostics) -> Option<Self> {
+        if diagnostics.geometry.is_none() && !diagnostics.motor_agency.so2_motor_enabled {
+            return None;
+        }
+        let geom = diagnostics.geometry.as_ref().filter(|g| g.count > 0);
+        let motor = &diagnostics.motor_agency;
+        Some(Self {
+            median_d1_over_d: geom.and_then(|g| g.median_d1_over_d),
+            mean_overlaps_within_1d: geom.map(|g| g.mean_overlaps_within_1d),
+            chain_fraction_z1_z2: geom.map(|g| g.chain_fraction_z1_z2),
+            mean_abs_psi6: geom.map(|g| g.mean_abs_psi6),
+            global_abs_mean_psi6: geom.map(|g| g.global_abs_mean_psi6),
+            mean_me: motor.mean_me,
+            std_me: motor.std_me,
+            corr_me_dedt: motor.corr_me_dedt,
+            corr_me_energy: motor.corr_me_energy,
+        })
+    }
+
+    /// Compute [`V2Measures`] directly from a committed [`World`], returning
+    /// `Ok(None)` without scanning when neither `[contact]` nor `so2-motor` is
+    /// configured.
+    ///
+    /// # Errors
+    /// As [`v2_diagnostics::of_world`].
+    pub fn of_world(world: &World) -> Result<Option<Self>, CoreError> {
+        if world.config().config().contact.is_none()
+            && world.v2_rules().actions().so2_motor().is_none()
+        {
+            return Ok(None);
+        }
+        v2_diagnostics::of_world(world).map(|diagnostics| Self::of_diagnostics(&diagnostics))
+    }
 }
 
 /// What a run's last metrics record says of its end (§15.2).
@@ -842,7 +1007,24 @@ impl Measures {
             last: last
                 .filter(|metrics| metrics.tick == survey.tick)
                 .map(LastRecord::of),
+            v2: None,
         }
+    }
+
+    /// As [`Measures::of`], also computing end-state [`V2Measures`] from the
+    /// committed `world` when `[contact]` or `so2-motor` is configured.
+    ///
+    /// # Errors
+    /// As [`V2Measures::of_world`].
+    pub fn of_world(
+        tally: &Tally,
+        survey: &Survey,
+        last: Option<&Metrics>,
+        world: &World,
+    ) -> Result<Self, CoreError> {
+        let mut measures = Self::of(tally, survey, last);
+        measures.v2 = V2Measures::of_world(world)?;
+        Ok(measures)
     }
 }
 
@@ -901,7 +1083,7 @@ const fn sample(name: &'static str, read: Read) -> Measure {
 }
 
 /// Every measure the report compares, by name, with its basis.
-pub const MEASURES: [Measure; 24] = [
+pub const MEASURES: [Measure; 33] = [
     end("survived", |m| Some(real(m.survived))),
     end("final_live", |m| Some(real(m.final_live))),
     tally("peak_live", |m| Some(real(m.peak_live))),
@@ -938,6 +1120,21 @@ pub const MEASURES: [Measure; 24] = [
     sample("moving_fraction", |m| {
         m.last.and_then(|l| l.moving_fraction)
     }),
+    end("median_d1_over_d", |m| m.v2.and_then(|v| v.median_d1_over_d)),
+    end("mean_overlaps_within_1d", |m| {
+        m.v2.and_then(|v| v.mean_overlaps_within_1d)
+    }),
+    end("chain_fraction_z1_z2", |m| {
+        m.v2.and_then(|v| v.chain_fraction_z1_z2)
+    }),
+    end("mean_abs_psi6", |m| m.v2.and_then(|v| v.mean_abs_psi6)),
+    end("global_abs_mean_psi6", |m| {
+        m.v2.and_then(|v| v.global_abs_mean_psi6)
+    }),
+    end("mean_me", |m| m.v2.and_then(|v| v.mean_me)),
+    end("std_me", |m| m.v2.and_then(|v| v.std_me)),
+    end("corr_me_dedt", |m| m.v2.and_then(|v| v.corr_me_dedt)),
+    end("corr_me_energy", |m| m.v2.and_then(|v| v.corr_me_energy)),
 ];
 
 /// A run's scientific result, as cataloged.
@@ -969,20 +1166,26 @@ impl RunResult {
         self.status == "reached"
     }
 
-    fn of(finished: &Finished, last: Option<&Metrics>) -> Self {
+    fn of(finished: &Finished, last: Option<&Metrics>) -> Result<Self, CoreError> {
         let (status, detail) = match &finished.stop {
             Stop::Reached => ("reached", None),
             Stop::CapacityPaused { detail } => ("capacity-paused", Some(detail.clone())),
             Stop::Failed { kind, detail, .. } => ("failed", Some(format!("{kind}: {detail}"))),
         };
-        Self {
+        let measures = Measures::of_world(
+            &finished.tally,
+            &finished.survey,
+            last,
+            &finished.closed.world,
+        )?;
+        Ok(Self {
             status: status.to_owned(),
             detail,
             tick: finished.closed.boundary.tick.get(),
             digest: Some(finished.closed.world.digest().to_hex()),
             extinct: finished.survey.live == 0,
-            measures: Some(Measures::of(&finished.tally, &finished.survey, last)),
-        }
+            measures: Some(measures),
+        })
     }
 
     fn error(error: &CoreError) -> Self {
@@ -1554,13 +1757,16 @@ fn run_one(
     });
     let wall_seconds = clock.elapsed().as_secs_f64();
     let result = match &finished {
-        Ok(finished) => RunResult::of(
+        Ok(finished) => match RunResult::of(
             finished,
             last_metrics
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .as_ref(),
-        ),
+        ) {
+            Ok(result) => result,
+            Err(error) => RunResult::error(&error),
+        },
         Err(error) => RunResult::error(error),
     };
     let mut records = std::mem::take(&mut *lines.lock().unwrap_or_else(PoisonError::into_inner));

@@ -37,12 +37,13 @@ use flife_store::{ChunkStore, Durability};
 use serde::Serialize;
 
 use crate::persist::{STORE_DIR, read_config, restorable, run_identity};
+use crate::v2_diagnostics::{self, V2Diagnostics};
 
 /// The inspection records' schema.
 pub const INSPECT_SCHEMA: &str = "frankenlife.inspect.v1";
 
 /// What to inspect.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct InspectOptions {
     /// The committed tick of the checkpoint; the newest that restores if
     /// `None`.
@@ -51,6 +52,14 @@ pub struct InspectOptions {
     pub field: bool,
     /// The organisms whose whole controller to report, in this order.
     pub weights: Vec<u64>,
+    /// Whether to compute read-only `V2-10` / `V2-17` periodic tissue geometry
+    /// and `so2-motor` neural-agency diagnostics directly from the restored
+    /// committed world (`INV-09`).
+    pub diagnostics: bool,
+    /// Optional explicit body diameter `D` override for periodic geometry
+    /// diagnostics (defaults to `[contact] diameter` when configured).
+    /// Requires `diagnostics = true`.
+    pub diameter: Option<f64>,
 }
 
 /// The checkpoint an inspection restored.
@@ -256,8 +265,19 @@ pub struct InspectedLayer {
     pub biases: Vec<f32>,
 }
 
-/// An inspection: the header, the organisms, the field and the controllers
-/// asked for.
+/// Read-only `V2-10` / `V2-17` tissue geometry and `so2-motor` neural-agency
+/// diagnostics computed directly from the restored committed world (`INV-09`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InspectedDiagnostics {
+    /// `diagnostics`.
+    pub record: &'static str,
+    /// Periodic tissue geometry and `so2-motor` neural-agency diagnostics.
+    #[serde(flatten)]
+    pub diagnostics: V2Diagnostics,
+}
+
+/// An inspection: the header, the organisms, the field, the controllers, and
+/// the diagnostics asked for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Inspection {
     /// The header.
@@ -268,6 +288,8 @@ pub struct Inspection {
     pub field: Option<InspectedField>,
     /// The controllers [`InspectOptions::weights`] names, in its order.
     pub weights: Vec<InspectedWeights>,
+    /// Read-only `V2-10` / `V2-17` diagnostics, with [`InspectOptions::diagnostics`].
+    pub diagnostics: Option<InspectedDiagnostics>,
 }
 
 fn conflict(detail: String) -> CoreError {
@@ -281,11 +303,27 @@ fn conflict(detail: String) -> CoreError {
 ///
 /// # Errors
 /// As [`read_config`] and the catalog for a directory that holds no run;
+/// [`CoreError::NumericalInvalid`] when `options.diameter` is given without
+/// `options.diagnostics` or is nonfinite/non-positive;
 /// [`CoreError::StateConflict`] when no checkpoint restores (at the
 /// requested tick, if one is given), another process holds the run, or an
 /// organism whose weights are asked for is not in the restored world; the
 /// store's errors.
 pub fn inspect(run_dir: &Path, options: InspectOptions) -> Result<Inspection, CoreError> {
+    if let Some(diameter) = options.diameter {
+        if !options.diagnostics {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "inspect diameter",
+                detail: "body diameter override requires diagnostics = true".to_owned(),
+            });
+        }
+        if !diameter.is_finite() || diameter <= 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "body diameter",
+                detail: format!("diameter {diameter} must be finite and positive"),
+            });
+        }
+    }
     let config = read_config(run_dir)?;
     let revision = config.config_hash();
     let (session, _) = run_identity(run_dir, revision)?;
@@ -538,10 +576,29 @@ fn of(
         .iter()
         .map(|&id| weights(world, id))
         .collect::<Result<_, _>>()?;
+    let diagnostics = if options.diagnostics {
+        let geometry = match options.diameter {
+            Some(diameter) => Some(v2_diagnostics::geometry_of_world_with_diameter(
+                world, diameter,
+            )?),
+            None => v2_diagnostics::geometry_of_world(world)?,
+        };
+        let motor_agency = v2_diagnostics::motor_agency_of_world(world)?;
+        Some(InspectedDiagnostics {
+            record: "diagnostics",
+            diagnostics: V2Diagnostics {
+                geometry,
+                motor_agency,
+            },
+        })
+    } else {
+        None
+    };
     Ok(Inspection {
         inspected,
         organisms,
         field,
         weights,
+        diagnostics,
     })
 }

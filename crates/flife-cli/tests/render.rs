@@ -731,3 +731,49 @@ fn studio_luma(pixel: &[u8; 4], kr: f64, kb: f64) -> f64 {
     let [r, g, b, _] = pixel.map(f64::from);
     16.0 + 219.0 * (kr * r + (1.0 - kr - kb) * g + kb * b) / 255.0
 }
+
+#[test]
+fn render_threads_multi_matches_single_thread_png_bytes() {
+    let config = ValidatedConfig::from_toml(PRESET).expect("the preset validates");
+    let base = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let mut outputs = Vec::new();
+    for threads in [1_usize, 4_usize] {
+        let out = base.join(format!("flife-render-prep-threads-{threads}"));
+        std::fs::create_dir_all(&out).expect("a scratch directory");
+        let options = RenderOptions {
+            ticks: 4,
+            every: 2,
+            size: [128, 96],
+            out: out.clone(),
+            cpu_workers: NonZeroUsize::new(2),
+            controllers: ControllerChoice::Cpu,
+            render_threads: NonZeroUsize::new(threads).expect("non-zero threads"),
+            video: None,
+            fps: 30,
+            style: Style::default(),
+            camera: None,
+        };
+        let mut records = Vec::new();
+        render(&config, &options, |record| records.push(record.clone())).expect("renders");
+        let digest = match records.last() {
+            Some(RenderRecord::End { digest, .. }) => digest.clone(),
+            other => panic!("expected End record, got {other:?}"),
+        };
+        let pngs: Vec<Vec<u8>> = records
+            .iter()
+            .filter_map(|record| match record {
+                RenderRecord::Frame { path, .. } => Some(std::fs::read(path).expect("frame png")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pngs.len(), 3, "frames at ticks 0, 2, 4");
+        outputs.push((digest, pngs));
+    }
+    assert_eq!(outputs[0].0, outputs[1].0, "world digest must match");
+    for (idx, (one, four)) in outputs[0].1.iter().zip(&outputs[1].1).enumerate() {
+        assert_eq!(
+            one, four,
+            "frame {idx} PNG bytes must match identically across render_threads=1 vs 4"
+        );
+    }
+}

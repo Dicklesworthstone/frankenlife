@@ -655,6 +655,7 @@ fn draw(
         })?;
     let mut view = WorldView::for_epoch(epoch, options.size, background)?;
     view.set_style(options.style);
+    view.set_preparation_threads(options.render_threads);
     let bloom = model
         .presentation
         .bloom_enabled

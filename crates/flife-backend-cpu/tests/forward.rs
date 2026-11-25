@@ -1547,3 +1547,158 @@ fn cpu_backend_parallel_bulk_pack_and_tanh_f32_4_match_serial_and_reference_bit_
     }
     Ok(())
 }
+
+/// Fused shard packing handles sparse slot gaps (`p.offset > cur_len`),
+/// back-filling earlier gaps (`p.end <= cur_len`), live slot overwrites, and
+/// `release_slots` shard reclamation identically across `evaluate` and
+/// `evaluate_flat_f32` versus `ReferenceController`.
+#[test]
+fn fused_pack_handles_sparse_gaps_backfill_overwrites_and_release() -> Result<(), CoreError> {
+    let topo = DenseTopology::new(&[32])?;
+    let mut draws = Draws(0x5A17_F05E_D00D_1234);
+    let make_case = |slot: u64, generation: u32, genome: u64, draws: &mut Draws| {
+        let params = parameters(&topo, Regime::Typical, draws);
+        let ins = inputs(Regime::Typical, draws);
+        (
+            ArenaSlot::new(0, slot, generation),
+            GenomeId::new(genome),
+            params,
+            ins,
+        )
+    };
+
+    // Wave 1: sparse gaps across 4 shards (shard_slots = 8, slots up to 31).
+    let wave1: Vec<_> = [0_u64, 5, 7, 10, 15, 17, 23, 28, 31]
+        .into_iter()
+        .enumerate()
+        .map(|(i, slot)| make_case(slot, 1, 100 + i as u64, &mut draws))
+        .collect();
+    // Wave 2: backfill gaps below existing `shard.values.len()`, plus overwrite
+    // slots 0 and 15 with higher generations and new genomes.
+    let wave2: Vec<_> = [
+        (2_u64, 1_u32, 200_u64),
+        (4, 1, 201),
+        (9, 1, 202),
+        (13, 1, 203),
+        (0, 2, 204),
+        (15, 2, 205),
+        (20, 1, 206),
+        (24, 1, 207),
+    ]
+    .into_iter()
+    .map(|(slot, gen_id, gid)| make_case(slot, gen_id, gid, &mut draws))
+    .collect();
+    // Wave 3: fresh slots after releasing every occupant of shard 1 (slots 8..16).
+    let wave3: Vec<_> = [(11_u64, 3_u32, 300_u64), (14, 3, 301), (0, 2, 204)]
+        .into_iter()
+        .map(|(slot, gen_id, gid)| {
+            if slot == 0 {
+                wave2[4].clone()
+            } else {
+                make_case(slot, gen_id, gid, &mut draws)
+            }
+        })
+        .collect();
+
+    let mut legacy = CpuBackend::with_shard_slots(lanes(4), 8);
+    let mut flat = CpuBackend::with_shard_slots(lanes(4), 8);
+    let mut ref_scratch = ControllerScratch::new(&topo)?;
+
+    let check_wave = |label: &str,
+                      cases: &[(ArenaSlot, GenomeId, Vec<f32>, [f64; SENSOR_WIDTH])],
+                      legacy: &mut CpuBackend,
+                      flat: &mut CpuBackend,
+                      ref_scratch: &mut ControllerScratch|
+     -> Result<(), CoreError> {
+        let jobs: Vec<ControllerJob<'_>> = cases
+            .iter()
+            .map(|(slot, genome, params, ins)| {
+                Ok(ControllerJob {
+                    genome: *genome,
+                    slot: *slot,
+                    controller: ReferenceController::new(&topo, params, BOUND)?,
+                    inputs: ins,
+                })
+            })
+            .collect::<Result<_, CoreError>>()?;
+        let mut legacy_out = Vec::new();
+        legacy.evaluate(&jobs, &mut legacy_out)?;
+
+        let mut in_f32 = Vec::with_capacity(cases.len() * SENSOR_WIDTH);
+        let mut in_fin = Vec::with_capacity(cases.len());
+        for (_, _, _, ins) in cases {
+            let mut ok = true;
+            for &v in ins {
+                let f = v as f32;
+                ok &= f.is_finite();
+                in_f32.push(f);
+            }
+            in_fin.push(u8::from(ok));
+        }
+        let flat_jobs: Vec<FlatControllerJob<'_>> = jobs
+            .iter()
+            .map(|j| FlatControllerJob {
+                genome: j.genome,
+                slot: j.slot,
+                controller: j.controller,
+            })
+            .collect();
+        let mut flat_out = FlatOutputs::default();
+        flat.evaluate_flat_f32(&flat_jobs, SENSOR_WIDTH, &in_f32, &in_fin, &mut flat_out)?;
+        assert_flat_matches_legacy(label, &legacy_out, &flat_out);
+
+        for (i, (job, got)) in jobs.iter().zip(&legacy_out).enumerate() {
+            let got = got.as_ref().expect("supported topology evaluates");
+            let want = job.controller.evaluate_raw(job.inputs, ref_scratch)?;
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{label} case {i} matches ReferenceController bit-for-bit"
+            );
+        }
+        Ok(())
+    };
+
+    check_wave(
+        "wave1 sparse",
+        &wave1,
+        &mut legacy,
+        &mut flat,
+        &mut ref_scratch,
+    )?;
+    assert_eq!(legacy.shards(), 4);
+    assert_eq!(flat.shards(), 4);
+
+    check_wave(
+        "wave2 backfill+overwrite",
+        &wave2,
+        &mut legacy,
+        &mut flat,
+        &mut ref_scratch,
+    )?;
+    assert_eq!(legacy.shards(), 4);
+    assert_eq!(flat.shards(), 4);
+
+    // Release every occupant in shard 1 (slots 9, 10, 13, 15).
+    let shard1_slots = [
+        ArenaSlot::new(0, 9, 1),
+        ArenaSlot::new(0, 10, 1),
+        ArenaSlot::new(0, 13, 1),
+        ArenaSlot::new(0, 15, 2),
+    ];
+    legacy.release_slots(&shard1_slots);
+    flat.release_slots(&shard1_slots);
+    assert_eq!(legacy.shards(), 3, "emptied shard 1 reclaimed");
+    assert_eq!(flat.shards(), 3, "emptied shard 1 reclaimed");
+
+    check_wave(
+        "wave3 re-admit",
+        &wave3,
+        &mut legacy,
+        &mut flat,
+        &mut ref_scratch,
+    )?;
+    assert_eq!(legacy.shards(), 4, "shard 1 recreated on re-admit");
+    assert_eq!(flat.shards(), 4, "shard 1 recreated on re-admit");
+    Ok(())
+}

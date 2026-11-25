@@ -48,21 +48,23 @@ fn in_worker_dispatch() -> bool {
 }
 
 /// RAII guard marking the calling thread as inside an active parallel scope
-/// and restoring the flag on normal exit or panic unwind.
-struct DispatchGuard;
+/// and restoring the previous flag on normal exit or panic unwind.
+struct DispatchGuard {
+    prev: bool,
+}
 
 impl DispatchGuard {
     #[inline]
     fn enter() -> Self {
-        IN_SCOPE_DISPATCH.set(true);
-        Self
+        let prev = IN_SCOPE_DISPATCH.replace(true);
+        Self { prev }
     }
 }
 
 impl Drop for DispatchGuard {
     #[inline]
     fn drop(&mut self) {
-        IN_SCOPE_DISPATCH.set(false);
+        IN_SCOPE_DISPATCH.set(self.prev);
     }
 }
 

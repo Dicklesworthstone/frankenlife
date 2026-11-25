@@ -611,14 +611,14 @@ pub fn observe_for_controller_f32_into(
         finite_acc += gx + gy;
     }
     if !finite_acc.is_finite() {
-        return check_finite_single_from_raw_slow(
+        check_finite_single_from_raw_slow(
             raw,
             intrinsic,
             scales,
             energy_norm,
             age_norm,
             out_gradients,
-        );
+        )?;
     }
     own.copy_from_slice(&[energy_norm as f32, age_norm as f32, vx, vy, de]);
     Ok(())
@@ -1166,7 +1166,7 @@ pub fn observe_dual_for_controller_f32_into(
         acc += gx + gy;
     }
     if !acc.is_finite() {
-        return check_finite_dual_from_raw_slow(raw, intrinsic, scales, trail_energy_density_scale);
+        check_finite_dual_from_raw_slow(raw, intrinsic, scales, trail_energy_density_scale)?;
     }
     own.copy_from_slice(&[
         scalars.energy_norm as f32,

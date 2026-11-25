@@ -1532,6 +1532,12 @@ impl World {
             .as_deref()
             .is_some_and(|backend| !backend.supports_flat_f32());
         let capacity = capacity_of(&self.rules)?;
+        let old_use_tiles = uses_settle_tiles(
+            old_workers.get(),
+            &self.rules,
+            capacity,
+            self.settle.backend.is_some(),
+        );
         let use_tiles =
             uses_settle_tiles(target, &self.rules, capacity, self.settle.backend.is_some());
         self.scratch.field.set_workers(workers)?;
@@ -1557,10 +1563,18 @@ impl World {
             )
         {
             let _ = self.scratch.field.set_workers(old_workers);
+            let _ = fit_settle_tiles(
+                &mut self.scratch.settle_tiles,
+                old_workers.get(),
+                &self.rules,
+                capacity,
+                self.settle.backend.is_some(),
+            );
             return Err(error);
         }
         let lanes = &mut self.scratch.lanes;
-        if target > lanes.len() && lanes.try_reserve_exact(target - lanes.len()).is_err() {
+        let old_len = lanes.len();
+        if target > old_len && lanes.try_reserve_exact(target - old_len).is_err() {
             let _ = self.scratch.field.set_workers(old_workers);
             let _ = fit_settle_tiles(
                 &mut self.scratch.settle_tiles,
@@ -1574,23 +1588,47 @@ impl World {
                 bytes: bytes_for::<DecisionLane>(target),
             });
         }
-        lanes.extend(added);
-        lanes.truncate(target);
-        lanes.shrink_to(target);
+        // Hold any trimmed lanes until `fit_lanes` succeeds so an OOM while
+        // resizing per-lane buffers restores `lanes`, `field`, and
+        // `settle_tiles` without shrinking `lanes` capacity or losing workers.
+        let removed = if target < old_len {
+            lanes.split_off(target)
+        } else {
+            lanes.extend(added);
+            Vec::new()
+        };
         // A lane's share of the rows follows the count (FL-043). Only legacy
         // non-flat-F32 backends use per-lane `observed` / `controller_inputs`.
-        if use_tiles {
-            fit_lanes(lanes, &self.rules, capacity, legacy_batched, false)
-        } else {
-            fit_lanes(lanes, &self.rules, capacity, legacy_batched, true)?;
+        if let Err(error) = fit_lanes(lanes, &self.rules, capacity, legacy_batched, !use_tiles) {
+            if target < old_len {
+                lanes.extend(removed);
+            } else {
+                lanes.truncate(old_len);
+                lanes.shrink_to(old_len);
+            }
+            let _ = fit_lanes(lanes, &self.rules, capacity, legacy_batched, !old_use_tiles);
+            let _ = self.scratch.field.set_workers(old_workers);
+            let _ = fit_settle_tiles(
+                &mut self.scratch.settle_tiles,
+                old_workers.get(),
+                &self.rules,
+                capacity,
+                self.settle.backend.is_some(),
+            );
+            return Err(error);
+        }
+        drop(removed);
+        lanes.shrink_to(target);
+        if !use_tiles {
             fit_settle_tiles(
                 &mut self.scratch.settle_tiles,
                 target,
                 &self.rules,
                 capacity,
                 self.settle.backend.is_some(),
-            )
+            )?;
         }
+        Ok(())
     }
 
     /// Evaluate due controllers in one batch on `backend` from the next
@@ -5612,7 +5650,6 @@ fn encode_dual_for_controller(
     )
 }
 
-/// Direct F32 sensor encoding for flat-F32 controller backends, returning exact
 /// Direct F32 sensor encoding into `out_inputs_f32` and `out_gradients` with
 /// zero intermediate `[f64; 104]` or 528-byte gradient return copies.
 #[inline]

@@ -580,6 +580,7 @@ struct ShardPackWork<'a> {
     end: usize,
     succeeded: u64,
     failed_indices: Vec<usize>,
+    failed_overflow: bool,
     first_err: Option<(usize, CoreError)>,
 }
 
@@ -980,6 +981,7 @@ impl CpuBackend {
         let mut shard_work: Vec<ShardPackWork<'_>> = Vec::new();
         if let Err(error) =
             visit_touched_shards_mut(&mut self.buckets, pending, |layers, shard, start, end| {
+                reserve(&mut shard_work, 1, "cpu controller pack tasks")?;
                 shard_work.push(ShardPackWork {
                     layers,
                     values: &mut shard.values,
@@ -987,6 +989,7 @@ impl CpuBackend {
                     end,
                     succeeded: 0,
                     failed_indices: Vec::new(),
+                    failed_overflow: false,
                     first_err: None,
                 });
                 Ok(())
@@ -1059,15 +1062,27 @@ impl CpuBackend {
             }
         }
         if let Some((_, error)) = first_err {
+            let any_overflow = shard_work.iter().any(|work| work.failed_overflow);
+            let failed_count: usize = shard_work
+                .iter()
+                .map(|work| work.failed_indices.len())
+                .sum();
             let mut failed: Vec<PendingPack> = Vec::new();
-            for work in &shard_work {
-                for &pending_idx in &work.failed_indices {
-                    failed.push(pending[pending_idx]);
+            if !any_overflow
+                && reserve(&mut failed, failed_count, "cpu controller rollback").is_ok()
+            {
+                for work in &shard_work {
+                    for &pending_idx in &work.failed_indices {
+                        failed.push(pending[pending_idx]);
+                    }
                 }
+                drop(shard_work);
+                self.packs = self.packs.saturating_add(succeeded);
+                rollback_pending(&mut self.buckets, &mut self.held, &failed);
+            } else {
+                drop(shard_work);
+                rollback_pending(&mut self.buckets, &mut self.held, pending);
             }
-            drop(shard_work);
-            self.packs = self.packs.saturating_add(succeeded);
-            rollback_pending(&mut self.buckets, &mut self.held, &failed);
             return Err(error);
         }
         drop(shard_work);
@@ -1375,7 +1390,11 @@ fn pack_shard_work<J: JobView>(
     slot_buf: &mut [f32],
 ) {
     let mut record_err = |pending_idx: usize, job_idx: usize, error: CoreError| {
-        work.failed_indices.push(pending_idx);
+        if work.failed_indices.try_reserve(1).is_ok() {
+            work.failed_indices.push(pending_idx);
+        } else {
+            work.failed_overflow = true;
+        }
         if work
             .first_err
             .as_ref()

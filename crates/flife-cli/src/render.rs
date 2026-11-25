@@ -383,6 +383,7 @@ fn draw(
     let founding = viewer.latest()?;
     let mut view = WorldView::for_epoch(&founding, options.size, background)?;
     view.set_style(options.style);
+    view.set_preparation_threads(options.render_threads);
     let presentation = &model.presentation;
     view.set_bloom(
         presentation

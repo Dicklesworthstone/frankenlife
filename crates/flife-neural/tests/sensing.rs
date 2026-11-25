@@ -1185,3 +1185,141 @@ fn observe_and_observe_dual_refuse_denominator_overflow_instead_of_returning_zer
         Err(CoreError::NumericalInvalid { .. })
     ));
 }
+
+#[test]
+fn observe_for_controller_f32_into_writes_own_and_trail_when_finite_acc_overflows() {
+    use flife_field::{
+        CARRIER1_ENERGY_PLANE, CARRIER1_FIRST_MOMENT_PLANE, DUAL_CARRIER_PLANES, DualRawSample,
+    };
+    use flife_neural::{
+        observe_dual_for_controller, observe_dual_for_controller_f32_into, observe_for_controller,
+        observe_for_controller_f32_into,
+    };
+
+    let scales = SensorScales::new([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 1.0, 1.0).expect("scales");
+    let intrinsic = Intrinsic {
+        energy: 0.75,
+        age_seconds: 12.5,
+        velocity: [0.6, -0.4],
+        energy_change_per_second: 0.3,
+    };
+
+    // 1. Single-carrier: two individually finite large moments overflow `finite_acc`
+    // to `+inf`. Slow validation returns `Ok(())` and must still write `own[99..104]`.
+    for (case, mutate) in [
+        (
+            "moment_sum_overflow",
+            (|raw: &mut RawSample| {
+                raw.values[1] = 1.0e308;
+                raw.values[2] = 1.0e308;
+            }) as fn(&mut RawSample),
+        ),
+        (
+            "gradient_sum_overflow",
+            (|raw: &mut RawSample| {
+                raw.dx[1] = 1.0e308;
+                raw.dx[2] = 1.0e308;
+            }) as fn(&mut RawSample),
+        ),
+    ] {
+        let mut raw = RawSample {
+            values: [0.0; PLANES],
+            dx: [0.0; PLANES],
+            dy: [0.0; PLANES],
+        };
+        raw.values[0] = 0.0;
+        raw.values[3] = 0.25;
+        raw.dy[3] = -0.5;
+        mutate(&mut raw);
+
+        let expected = observe_for_controller(&raw, &intrinsic, &scales).expect(case);
+        let mut out_inputs_f32 = [-999.0_f32; SENSOR_WIDTH];
+        let mut out_gradients = [[-999.0_f64; 2]; PLANES];
+        observe_for_controller_f32_into(
+            &raw,
+            &intrinsic,
+            &scales,
+            &mut out_inputs_f32,
+            &mut out_gradients,
+        )
+        .expect(case);
+        for k in 0..SENSOR_WIDTH {
+            assert_eq!(
+                out_inputs_f32[k].to_bits(),
+                (expected.inputs[k] as f32).to_bits(),
+                "{case}: input[{k}] mismatch"
+            );
+        }
+        for p in 0..PLANES {
+            assert_eq!(
+                out_gradients[p][0].to_bits(),
+                expected.gradients[p][0].to_bits(),
+                "{case}: gradient[{p}][0] mismatch"
+            );
+            assert_eq!(
+                out_gradients[p][1].to_bits(),
+                expected.gradients[p][1].to_bits(),
+                "{case}: gradient[{p}][1] mismatch"
+            );
+        }
+    }
+
+    // 2. Dual-carrier: Carrier-0 moments overflow `acc` to `+inf` while Carrier-1
+    // has normal non-zero trail signals. Must write BOTH `own[99..104]` AND `out_trail_f32`.
+    let mut dual = DualRawSample {
+        values: [0.0; DUAL_CARRIER_PLANES as usize],
+        dx: [0.0; DUAL_CARRIER_PLANES as usize],
+        dy: [0.0; DUAL_CARRIER_PLANES as usize],
+    };
+    dual.values[1] = 1.0e308;
+    dual.values[2] = 1.0e308;
+    let c1_e = CARRIER1_ENERGY_PLANE as usize;
+    let c1_m = CARRIER1_FIRST_MOMENT_PLANE as usize;
+    dual.values[c1_e] = 0.4;
+    dual.dx[c1_e] = 0.2;
+    dual.dy[c1_e] = -0.15;
+    dual.values[c1_m] = 0.1;
+
+    let trail_scale = 0.5;
+    let expected =
+        observe_dual_for_controller(&dual, &intrinsic, &scales, trail_scale).expect("dual");
+    let mut out_inputs_f32 = [-999.0_f32; SENSOR_WIDTH];
+    let mut out_trail_f32 = [-999.0_f32; 4];
+    let mut out_gradients = [[-999.0_f64; 2]; PLANES];
+    observe_dual_for_controller_f32_into(
+        &dual,
+        &intrinsic,
+        &scales,
+        trail_scale,
+        &mut out_inputs_f32,
+        &mut out_trail_f32,
+        &mut out_gradients,
+    )
+    .expect("dual f32 into");
+    for k in 0..SENSOR_WIDTH {
+        assert_eq!(
+            out_inputs_f32[k].to_bits(),
+            (expected.base.inputs[k] as f32).to_bits(),
+            "dual input[{k}] mismatch"
+        );
+    }
+    for k in 0..4 {
+        assert_eq!(
+            out_trail_f32[k].to_bits(),
+            (expected.trail_inputs[k] as f32).to_bits(),
+            "dual trail[{k}] mismatch"
+        );
+    }
+    for p in 0..PLANES {
+        assert_eq!(
+            out_gradients[p][0].to_bits(),
+            expected.base.gradients[p][0].to_bits(),
+            "dual gradient[{p}][0] mismatch"
+        );
+        assert_eq!(
+            out_gradients[p][1].to_bits(),
+            expected.base.gradients[p][1].to_bits(),
+            "dual gradient[{p}][1] mismatch"
+        );
+    }
+}

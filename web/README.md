@@ -145,11 +145,12 @@ keyframe every second so a seek lands quickly, written to `media-r2/` (outside g
 `worker.ts`; Cloudflare's 25 MiB limit applies only to static assets, which the films no longer are.
 `--small HEIGHT` also encodes the same frames scaled to that height, `<id>-small-<hash>.mp4`, at
 `--small-crf` (default `--crf`): the player's `<source media>` gives it to screens at most 640 CSS pixels
-wide or tall, so phones either way up (`components/film.tsx`, `PHONE`), where the 4K film's extra pixels would be downscaled away and its
-H.264 level 5.2 is more than some phones decode (the 1080 encode is level 4.2). At 1080, CRF 30 smeared
-single bodies that the 4K encode keeps when scaled down; CRF 26 matched it, at about 56% of the 4K
-film's bytes. `--master-out PATH` (outside
-`public/media/`) also encodes one archival MP4 from the same PNG frames.
+wide or tall (`components/film.tsx`, `PHONE`). That is phones either way up, since the 4K film's H.264
+level 5.2 is more than some phones decode (the 1080 encode is level 4.2) and an upright phone would
+scale most of its pixels away, and short windows, where the hero film is drawn small. At 1080, CRF 30
+smeared single bodies that the 4K encode keeps when scaled down; CRF 26 matched it, at about 56% of the
+4K film's bytes. `--master-out PATH` (outside `public/media/`) also encodes one archival MP4 from the
+same PNG frames.
 
 `presets/confluent-world.toml` was chosen by outer searches and by eye, under the registered contact model;
 `../experiments/showcase/README.md` states how (stages C and E).
@@ -176,8 +177,9 @@ they are not what runs. It renders into `--work`. Run it again with the same `--
 frames without rendering them, for example at another `--crf`. The poster, card and stills are copied into
 `public/media/` and the video into `media-r2/`, each under a content-hashed name. The frames
 are reproducible on any machine; the video's bytes only for the same frames, arguments, ffmpeg build and
-thread count (x264 is deterministic unless told otherwise, but its thread count shapes the stream), so
-re-encoding on this machine gives the same names, and on another machine new ones. The script never deletes anything, so move the
+thread count (x264 is deterministic unless told otherwise, but its thread count, by default set from the
+machine's cores, shapes the stream), so re-encoding on this machine gives the same names, and another machine
+may give new ones. The script never deletes anything, so move the
 previous render's files out of `public/media/` before building; `bun run build` names any it finds.
 
 The same configuration, seed and starting checkpoint give the same frames on any machine. The world's

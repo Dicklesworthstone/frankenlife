@@ -142,8 +142,11 @@ function pulse(now: number): number {
 /**
  * Where the phone encode (manifest `video.small`, 1080 pixels square) plays instead of the 4K film: a screen at most
  * 640 CSS pixels wide, where the film spans about 1,300 device pixels at most (a 430-pixel phone at 3×), or at most
- * 640 tall, which is a phone held sideways (the source is chosen once, so turning it later changes nothing) or a
- * window too short to show more than 1080 rows of the film. It is H.264 level 4.2, which phones decode, where 2160²
+ * 640 tall: a short window, where the hero film is drawn smaller (measured in Chrome: 464 device pixels across at
+ * 1366 × 640, 848 at 1440 × 600 at 2×, against 1,448 at 1440 × 900 at 2×), or a phone held sideways (the source is
+ * chosen once, so turning it later changes nothing). Sideways, a phone draws the film across its whole width, about
+ * 2,500 device pixels, so there this encode is softer than the 4K film would be: it is chosen for what a phone can
+ * decode and download, not for its pixels. It is H.264 level 4.2, which phones decode, where 2160²
  * at 60 fps needs level 5.2, which not every phone does; and about 56% of the bytes. A browser that ignores `media`
  * on a video's source (Chrome and Firefox before 120) takes the first source, this one, wherever it is.
  */

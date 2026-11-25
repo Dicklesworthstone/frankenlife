@@ -266,10 +266,13 @@ camera changed. Each film was one `media:4k60` process, one at a time:
 
 Each film is one MP4 at CRF 30, 55 to 58 Mbit/s, that `web/worker.ts` serves
 from R2 by byte range. That is H.264 High at level 5.2, which not every phone
-decodes, and on a phone screen most of its pixels are scaled away. So
+decodes, and on an upright phone most of its pixels are scaled away. So
 `--small 1080` also encodes the same frames at 1,080 × 1,080 (level 4.2, about
-32 Mbit/s), which screens at most 640 CSS pixels wide or tall (phones either way
-up) play instead.
+32 Mbit/s), which screens at most 640 CSS pixels wide or tall play instead:
+phones either way up, and short windows, where the page draws the film small
+(464 device pixels across at 1366 × 640). A phone held sideways draws the film
+about 2,500 device pixels across, so there the phone encode is softer than the
+4K film; it is chosen for decoding and download.
 
 The phone encode's CRF was chosen on a 3 s clip of the confluent film (frames
 1,050 to 1,229, its ×3 shot), compared at 1:1 against the 4K encode scaled to

@@ -184,8 +184,9 @@ between voids, and the veins' labyrinths were lost, so it was not filmed.
 Each film's world is committed here as a configuration:
 `confluent-veins.toml` and `confluent-polarity.toml`. Each is the run
 directory's own `config.toml` (config_hash `93b03ef6…` and `01eb3276…`) under a
-header that says how it was founded. A 16-tick run from each file reaches the
-same digest as one founded with the switches.
+header that says how it was founded. Run from tick 0, each file reaches its
+film's first digest at tick 2,400, as the site's "Make it yourself" says
+(veins in 1,327 s, polarity in 1,068 s, on 14 workers, 2026-11-25).
 
 Each film was made in three passes, one process at a time, each peaking near
 19 GiB:

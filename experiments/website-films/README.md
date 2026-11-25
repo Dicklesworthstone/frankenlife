@@ -169,5 +169,64 @@ film does. The veins world drawn with `--look glow --field-mapping
 vascular-conductance` (founded again with `v2-visual-mappings`, since render
 refuses switches on a run dir; same digest) shows a nearly uniform pale field
 with no network, so its veins read better through the organisms. These are
-visual judgements on one seed and a 128-tick window, not measured effects. No
-film has been rendered from them yet; the choice is the user's.
+visual judgements on one seed and a 128-tick window, not measured effects. Round 4
+records the two films made from them.
+
+
+# Round 4: the veins and polarity films (2026-11-24)
+
+The user chose veins (`vascular-field`) for a film and polarity
+(`pcp-polarity`) for a second. One more preview first tried veins with blooming
+food (`--enable vascular-field --enable oases`; digest `c460f4bc…` at tick
+2,400, motion 9.8%). It looked like the oases world, big rounded colonies
+between voids, and the veins' labyrinths were lost, so it was not filmed.
+
+Each film's world is committed here as a configuration:
+`confluent-veins.toml` and `confluent-polarity.toml`. Each is the run
+directory's own `config.toml` (config_hash `93b03ef6…` and `01eb3276…`) under a
+header that says how it was founded. A 16-tick run from each file reaches the
+same digest as one founded with the switches.
+
+Each film was made in three passes, one process at a time, each peaking near
+19 GiB:
+
+1. The camera's preview: the whole torus at 512 px, 801 frames.
+2. The whole film at 1,080 px along the camera that the site's rule chose from
+   that preview, with the confluent film's zooms. At the middle of every shot
+   four consecutive frames were looked at, whole and at 1:1, with their
+   differences, beside the confluent film's. The motion was measured too.
+3. Only then, the film at 4K60 (`media:4k60 --preview-from`, the same camera).
+
+Motion in each shot of the 1,080 px pass:
+
+| shot | confluent film | veins | polarity |
+|---|---:|---:|---:|
+| whole torus, opening | 6.9% | 8.2% | 7.9% |
+| ×1.6 | 11.1% | 19.8% | 13.9% |
+| ×3 | 13.8% | 17.6% | 14.4% |
+| ×2.2 | 16.9% | 25.3% | 18.8% |
+| whole torus, closing | 8.2% | 10.5% | 9.5% |
+
+The confluent film's figures come from its web video, which reads about a
+sixth lower than PNG frames of the same world: 7.0% against 8.3% for
+`--v1-compat`. The veins camera drifts 4.4 and 5.6 units through its ×1.6 and
+×2.2 shots, where the confluent film's drifts 1.25 and 1.9 and polarity's
+1.25. That pan adds motion the world does not make. By eye, both films keep
+legible shapes from frame to frame in every shot.
+
+| film | digest at 2,400 | digest at 5,600 | alive | 4K pass | web files |
+|---|---|---|---|---|---|
+| `confluent-veins` | `684e4559…` | `2a620955…` | 262,144 in all 801 frames | 1,802 s, peak 19.2 GiB | 6 segments, 102.2 MiB, CRF 30 |
+| `confluent-polarity` | `49a1ef81…` | `d4ce6e6a…` | 262,144 in all 801 frames | 1,820 s, peak 19.2 GiB | 6 segments, 104.3 MiB, CRF 30 |
+
+The veins film's first web encode used `media:4k60`'s own CRF 19: 26 segments,
+370.5 MiB, about 233 Mbit/s, three times the confluent film's 70. Those files
+are in `web/media-retired/`. The film was encoded again at CRF 30 from the same
+frames.
+
+Both films are on the site beside the confluent film. The record panel names
+each film's configuration. The Version 2 chapter's presets each point to the
+film of one of their mechanisms: polarity is in the tissue preset, veins in
+the supercolony. The films stay visual choices on one seed, and the site says
+so. What each mechanism does, measured, is in the Stage-2 campaign
+(`experiments/v2-emergence/README.md`).

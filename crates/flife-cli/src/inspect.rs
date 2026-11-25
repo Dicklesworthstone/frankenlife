@@ -352,7 +352,10 @@ impl InspectedWeights {
                 detail: format!("organism {id}'s layer {index} is not in its parameters"),
             };
             let (weights, biases) = dump.layer(index).ok_or_else(missing)?;
-            if shape.inputs == 0 {
+            if shape.inputs == 0
+                || shape.outputs.checked_mul(shape.inputs) != Some(weights.len())
+                || biases.len() != shape.outputs
+            {
                 return Err(missing());
             }
             layers.push(InspectedLayer {

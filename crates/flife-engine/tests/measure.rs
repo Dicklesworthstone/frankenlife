@@ -339,3 +339,48 @@ fn an_empty_disk_measures_no_organism() {
     );
     assert_measures(&measurement, &oracle(&world, empty, 0.75));
 }
+
+#[test]
+fn disk_membership_guards_extreme_world_radii() {
+    // Exact powers of two so `center + radius - center == radius` with zero
+    // decimal rounding, covering squared-radius overflow (`2^657`) as well as
+    // normal (`2^-663`) and subnormal (`2^-1023`) squared-radius underflow.
+    for (extent, radius) in [
+        (2.0_f64.powi(660), 2.0_f64.powi(657)),
+        (2.0_f64.powi(-660), 2.0_f64.powi(-663)),
+        (2.0_f64.powi(-1020), 2.0_f64.powi(-1023)),
+    ] {
+        let grid = flife_field::FieldGrid::new(4, 4, extent, extent).expect("grid");
+        let center = [0.5 * extent, 0.5 * extent];
+        let disk = Intervention::RemoveOrganisms {
+            center,
+            radius,
+            disposition: Disposition::Remove,
+        };
+        assert!(
+            disk.removes_at(&grid, [center[0] + 0.5 * radius, center[1] + 0.75 * radius])
+                .expect("inside"),
+            "interior point must lie in disk for radius={radius:e}"
+        );
+        assert!(
+            disk.removes_at(&grid, [center[0] + radius, center[1]])
+                .expect("boundary"),
+            "axis boundary point must lie in disk for radius={radius:e}"
+        );
+        assert!(
+            !disk
+                .removes_at(
+                    &grid,
+                    [center[0] + 0.75 * radius, center[1] + 0.75 * radius]
+                )
+                .expect("outside diagonal"),
+            "diagonal outside point must not match disk for radius={radius:e}"
+        );
+        assert!(
+            !disk
+                .removes_at(&grid, [center[0] + 2.0 * radius, center[1]])
+                .expect("outside far"),
+            "far point must not match disk for radius={radius:e}"
+        );
+    }
+}

@@ -183,7 +183,17 @@ impl MaintenanceCosts {
             });
         }
         let factor = if self.sensor_scale_exponent.to_bits() == 1.0_f64.to_bits() {
-            sensing_scale / self.sensor_unit_scale
+            let ratio = sensing_scale / self.sensor_unit_scale;
+            if !ratio.is_finite() {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "sensor cost",
+                    detail: format!(
+                        "({sensing_scale} / {}) is not finite",
+                        self.sensor_unit_scale
+                    ),
+                });
+            }
+            ratio
         } else if self.sensor_scale_exponent == 0.0 {
             1.0
         } else {
@@ -224,15 +234,36 @@ impl MaintenanceCosts {
                 detail: format!("{basal} is not finite and nonnegative"),
             });
         }
-        Ok(MaintenanceBill {
+        let sensor = seconds * (self.sensor * factor);
+        if !sensor.is_finite() || sensor < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "sensor cost",
+                detail: format!("{sensor} is not finite and nonnegative"),
+            });
+        }
+        let controller = if evaluated {
+            self.neural * f64::from(parameters)
+        } else {
+            0.0
+        };
+        if !controller.is_finite() || controller < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "controller maintenance",
+                detail: format!("{controller} is not finite and nonnegative"),
+            });
+        }
+        let bill = MaintenanceBill {
             basal,
-            sensor: seconds * (self.sensor * factor),
-            controller: if evaluated {
-                self.neural * f64::from(parameters)
-            } else {
-                0.0
-            },
-        })
+            sensor,
+            controller,
+        };
+        if !bill.total().is_finite() {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "maintenance",
+                detail: format!("total {} is not finite", bill.total()),
+            });
+        }
+        Ok(bill)
     }
 }
 

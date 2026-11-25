@@ -364,8 +364,9 @@ fn c11_drag_uses_a_stable_expm1_with_an_exact_zero_rate_limit() {
     assert!(motion.decay() < 1.0);
     assert!((1.0 - motion.decay() - 7.812_5e-9).abs() < 2.5e-16);
 
-    // γ = 0 is the exact limit, and a vanishing γ reaches it continuously.
-    for drag in [0.0, 1.0e-300] {
+    // γ = 0 is the exact limit, and vanishing/subnormal γ (including where
+    // γ·Δt underflows to 0) reaches it continuously without collapsing forces.
+    for drag in [0.0, 1.0e-300, 1.0e-322] {
         let motion = Motion::new(dt, drag, 4.0, 4.0, 0.002, 1.0).expect("motion");
         assert_eq!(motion.force_coefficient(), 1.0 / 128.0, "γ = {drag}");
         assert_eq!(motion.decay(), 1.0, "γ = {drag}");
@@ -656,6 +657,30 @@ fn maintenance_charges_canonical_model_work_only() {
             Err(CoreError::NumericalInvalid { .. })
         ));
     }
+
+    // Overflowing sensor ratio (`exponent == 1.0`, even when `sensor == 0.0`
+    // where `0.0 * inf` would produce `NaN`), overflowing sensor/controller
+    // components, and overflowing totals must all be refused.
+    let zero_sensor = MaintenanceCosts::new(0.0, 0.0, 1.0e-200, 1.0, 0.0).expect("costs");
+    assert!(matches!(
+        zero_sensor.bill(dt, 1.0e200, 0, false),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    let huge_sensor = MaintenanceCosts::new(0.0, 1.0e308, 1.0, 1.0, 0.0).expect("costs");
+    assert!(matches!(
+        huge_sensor.bill(step(1, 1), 10.0, 0, false),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    let huge_neural = MaintenanceCosts::new(0.0, 0.0, 1.0, 1.0, 1.0e305).expect("costs");
+    assert!(matches!(
+        huge_neural.bill(dt, 1.0, 10_000, true),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    let huge_sum = MaintenanceCosts::new(1.0e308, 1.0e308, 1.0, 1.0, 0.0).expect("costs");
+    assert!(matches!(
+        huge_sum.bill(step(1, 1), 1.0, 0, false),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
 
     // The Appendix A chemistry matches the constructor.
     let chemistry = Chemistry::from_config(&config).expect("chemistry");
@@ -1079,4 +1104,57 @@ fn motion_clamping_and_settle_guard_overflow_and_nonfinite_intermediates() {
     assert_eq!(settled.cost.paid, 0.0);
     assert!(!settled.scaled);
     assert_eq!(organism.remaining(), 1.25);
+
+    // Tiny limits whose squares underflow below `f64::MIN_POSITIVE` (both
+    // normal and subnormal) must still enforce MotionResponse, Affinity, and
+    // radial clamping without bypassing via `0.0 <= 0.0`.
+    for tiny in [1.0e-200, 1.0e-310] {
+        let tiny_motion = Motion::new(dt, 0.0, tiny, tiny, 1.0, tiny).expect("tiny motion");
+        let mut ok_resp = [0.0; RESPONSE_TERMS];
+        ok_resp[0] = 0.5 * tiny;
+        ok_resp[1] = 0.75 * tiny;
+        assert!(MotionResponse::new(ok_resp, &tiny_motion).is_ok());
+        let mut exact_resp = [0.0; RESPONSE_TERMS];
+        exact_resp[0] = tiny;
+        assert!(MotionResponse::new(exact_resp, &tiny_motion).is_ok());
+        let mut diag_over_resp = [0.0; RESPONSE_TERMS];
+        diag_over_resp[0] = 0.8 * tiny;
+        diag_over_resp[1] = 0.8 * tiny;
+        assert!(matches!(
+            MotionResponse::new(diag_over_resp, &tiny_motion),
+            Err(CoreError::NumericalInvalid { .. })
+        ));
+        let mut big_over_resp = [0.0; RESPONSE_TERMS];
+        big_over_resp[0] = 2.0 * tiny;
+        assert!(matches!(
+            MotionResponse::new(big_over_resp, &tiny_motion),
+            Err(CoreError::NumericalInvalid { .. })
+        ));
+
+        for candidate in [[3.0 * tiny, 4.0 * tiny], [3.0, 4.0], [3.0e200, 4.0e200]] {
+            let clamped = tiny_motion
+                .propose(candidate, [0.0, 0.0])
+                .expect("clamps to tiny speed limit");
+            assert!(clamped[0].is_finite() && clamped[1].is_finite());
+            assert!(clamped[0].hypot(clamped[1]) <= tiny * (1.0 + 4.0 * f64::EPSILON));
+            assert!((clamped[0] / tiny - 0.6).abs() < 1.0e-12);
+            assert!((clamped[1] / tiny - 0.8).abs() < 1.0e-12);
+        }
+
+        let tiny_chem = Chemistry::new(0.8, 4.0, 0.15, 0.2, tiny).expect("tiny chem");
+        let mut ok_aff = [0.0; CHANNELS];
+        ok_aff[0] = 0.5 * tiny;
+        ok_aff[1] = 0.75 * tiny;
+        assert!(Affinity::new(ok_aff, &tiny_chem).is_ok());
+        let mut exact_aff = [0.0; CHANNELS];
+        exact_aff[0] = tiny;
+        assert!(Affinity::new(exact_aff, &tiny_chem).is_ok());
+        let mut diag_over_aff = [0.0; CHANNELS];
+        diag_over_aff[0] = 0.8 * tiny;
+        diag_over_aff[1] = 0.8 * tiny;
+        assert!(matches!(
+            Affinity::new(diag_over_aff, &tiny_chem),
+            Err(CoreError::NumericalInvalid { .. })
+        ));
+    }
 }

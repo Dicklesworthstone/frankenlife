@@ -438,7 +438,26 @@ impl Affinity {
             squared += component * component;
         }
         let limit = chemistry.affinity_norm_limit;
-        if squared > limit * limit {
+        let bound = limit * limit;
+        let exceeds = if bound >= f64::MIN_POSITIVE {
+            squared > bound
+        } else if direction.iter().any(|&c| c.abs() > limit) {
+            true
+        } else {
+            const UP_MID: f64 = f64::from_bits((1023_u64 + 530) << 52);
+            const UP_TINY: f64 = f64::from_bits((1023_u64 + 1020) << 52);
+            let up = if limit >= 1.0e-300 { UP_MID } else { UP_TINY };
+            let s_limit = limit * up;
+            let s_squared: f64 = direction
+                .iter()
+                .map(|&c| {
+                    let sc = c * up;
+                    sc * sc
+                })
+                .sum();
+            s_squared > s_limit * s_limit
+        };
+        if exceeds {
             return Err(CoreError::NumericalInvalid {
                 quantity: "affinity direction",
                 detail: format!("||a||² = {squared} exceeds the limit {limit}²"),

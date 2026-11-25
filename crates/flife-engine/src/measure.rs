@@ -68,7 +68,7 @@ pub(crate) fn cell_in_disk(
         (f64::from(y) + 0.5) * grid.cell_height(),
     ];
     let [dx, dy] = grid.displacement(center, at)?;
-    Ok(dx * dx + dy * dy <= radius * radius)
+    Ok(crate::intervention::within_radius(dx, dy, radius))
 }
 
 /// Measure the disk of `radius` about `center` in the committed world at

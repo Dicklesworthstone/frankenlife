@@ -609,16 +609,36 @@ fn the_metal_uptake_refuses_what_the_reference_refuses() {
         ));
     }
     // A cell whose packets' sum overflows: softfloat64 makes its demand a
-    // NaN, which the device refuses.
+    // NaN, which the device refuses and leaves the outputs empty even when
+    // earlier cells succeeded.
     assert!(matches!(
         device.resolve(
-            &[cell(0, 2)],
-            &[f64::MAX, f64::MAX],
+            &[cell(0, 1), cell(1, 2)],
+            &[0.5, f64::MAX, f64::MAX],
             &mut demanded,
             &mut quanta
         ),
         Err(CoreError::StateConflict { .. })
     ));
+    assert!(demanded.is_empty() && quanta.is_empty());
+    // A request batch where an earlier stencil succeeds and a later stencil
+    // hits an infinite cell must also leave both output vectors empty on refusal.
+    let mut inf_field = field.clone();
+    inf_field.energy_mut()[0] = f32::INFINITY;
+    let good_stencil = ExchangeStencil::at(&grid, [8.5, 8.5]).expect("good stencil");
+    let bad_stencil = ExchangeStencil::at(&grid, [0.5, 0.5]).expect("bad stencil");
+    let (mut partial_densities, mut partial_requests) = (Vec::new(), Vec::new());
+    assert!(matches!(
+        device.request(
+            &inf_field,
+            &step,
+            &[good_stencil, bad_stencil],
+            &mut partial_densities,
+            &mut partial_requests,
+        ),
+        Err(CoreError::StateConflict { .. })
+    ));
+    assert!(partial_densities.is_empty() && partial_requests.is_empty());
     // A request that overflows: the reference's is an infinity and
     // softfloat64's a NaN, so the device refuses it rather than return
     // another value.

@@ -206,10 +206,23 @@ pub fn geometry(
     let r_coord = COORDINATION_RADIUS_MULTIPLIER * diameter;
     let r_coord_sq = r_coord * r_coord;
     let r_overlap_sq = diameter * diameter;
-    if !r_coord.is_finite() || !r_coord_sq.is_finite() || !r_overlap_sq.is_finite() {
+    if !r_coord.is_finite()
+        || !r_coord_sq.is_finite()
+        || !r_overlap_sq.is_finite()
+        || r_overlap_sq <= 0.0
+        || r_coord_sq <= 0.0
+    {
         return Err(CoreError::NumericalInvalid {
             quantity: "body diameter",
-            detail: format!("diameter {diameter} overflows squared radius"),
+            detail: format!("diameter {diameter} overflows or underflows squared radius"),
+        });
+    }
+    let half_w = 0.5 * width;
+    let half_h = 0.5 * height;
+    if !(half_w * half_w + half_h * half_h).is_finite() {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "world extent",
+            detail: format!("extent [{width}, {height}] overflows squared periodic distance"),
         });
     }
 
@@ -463,7 +476,13 @@ pub fn motor_agency(
     }
 
     let mean_me = sum_me / evaluated_count as f64;
-    let std_me = (evaluated_count >= 2).then(|| {
+    if !mean_me.is_finite() {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "motor sample m_e",
+            detail: format!("mean m_e is not finite ({mean_me})"),
+        });
+    }
+    let std_me = if evaluated_count >= 2 {
         let var = me_all
             .iter()
             .map(|&v| {
@@ -472,8 +491,16 @@ pub fn motor_agency(
             })
             .sum::<f64>()
             / evaluated_count as f64;
-        var.max(0.0).sqrt()
-    });
+        if !var.is_finite() {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "motor sample m_e",
+                detail: format!("variance of m_e is not finite ({var})"),
+            });
+        }
+        Some(var.max(0.0).sqrt())
+    } else {
+        None
+    };
 
     Ok(MotorAgencyDiagnostics {
         so2_motor_enabled: true,
@@ -1127,6 +1154,8 @@ mod tests {
         assert!(geometry(&[], [10.0, 10.0], 0.0).is_err());
         assert!(geometry(&[], [10.0, 10.0], -1.0).is_err());
         assert!(geometry(&[], [10.0, 10.0], 1e200).is_err());
+        assert!(geometry(&[], [10.0, 10.0], 1e-200).is_err());
+        assert!(geometry(&[], [1e200, 1e200], 1.0).is_err());
         assert!(geometry(&[[f64::INFINITY, 1.0]], [10.0, 10.0], 1.0).is_err());
     }
 
@@ -1202,5 +1231,39 @@ mod tests {
         assert_eq!(off.evaluated_count, 0);
         assert_eq!(off.corr_me_dedt, None);
         assert_eq!(off.corr_me_energy, None);
+
+        // Overflowing mean or variance on extreme finite samples must be refused.
+        let overflow_mean = [
+            MotorSample {
+                m_e: 1.0e308,
+                energy: 1.0,
+                energy_change_rate: None,
+            },
+            MotorSample {
+                m_e: 1.0e308,
+                energy: 2.0,
+                energy_change_rate: None,
+            },
+        ];
+        assert!(matches!(
+            motor_agency(true, 2, &overflow_mean),
+            Err(CoreError::NumericalInvalid { .. })
+        ));
+        let overflow_var = [
+            MotorSample {
+                m_e: 1.0e308,
+                energy: 1.0,
+                energy_change_rate: None,
+            },
+            MotorSample {
+                m_e: -1.0e308,
+                energy: 2.0,
+                energy_change_rate: None,
+            },
+        ];
+        assert!(matches!(
+            motor_agency(true, 2, &overflow_var),
+            Err(CoreError::NumericalInvalid { .. })
+        ));
     }
 }

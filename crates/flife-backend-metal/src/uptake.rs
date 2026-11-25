@@ -301,6 +301,8 @@ impl UptakeBackend for MetalUptake {
         for block in host.out.as_chunks::<REQUEST_OUT>().0 {
             let (density, request) = (value(&block[..2]), value(&block[2..]));
             if !density.is_finite() || !request.is_finite() {
+                densities.clear();
+                requests.clear();
                 return Err(refuse(format!(
                     "a non-finite density ({density}) or request ({request}); the reference decides this tick"
                 )));
@@ -415,6 +417,8 @@ impl UptakeBackend for MetalUptake {
         for block in host.resolved.as_chunks::<RESOLVED>().0 {
             let demand = value(&block[..2]);
             if !demand.is_finite() {
+                demanded.clear();
+                quanta.clear();
                 return Err(refuse(format!(
                     "a non-finite cell demand ({demand}); the reference decides this tick"
                 )));

@@ -243,10 +243,47 @@ impl Intervention {
             | Self::IntroduceOrganisms { .. } => Ok(false),
             Self::RemoveOrganisms { center, radius, .. } => {
                 let [dx, dy] = grid.displacement(center, position)?;
-                Ok(dx * dx + dy * dy <= radius * radius)
+                Ok(within_radius(dx, dy, radius))
             }
         }
     }
+}
+
+/// Exact IEEE-754 power-of-two scaling constants for extreme disk radii.
+const DISK_DOWN_SCALE: f64 = f64::from_bits((1023_u64 - 520) << 52);
+const DISK_UP_MID: f64 = f64::from_bits((1023_u64 + 530) << 52);
+const DISK_UP_TINY: f64 = f64::from_bits((1023_u64 + 1020) << 52);
+
+/// Whether `dx² + dy² <= radius²` without overflow or underflow on extreme
+/// finite world dimensions, preserving exact `dx * dx + dy * dy <= radius * radius`
+/// whenever squares remain finite and normal.
+pub(crate) fn within_radius(dx: f64, dy: f64, radius: f64) -> bool {
+    if radius < 0.0 {
+        return false;
+    }
+    let dist_sq = dx * dx + dy * dy;
+    let bound = radius * radius;
+    if dist_sq.is_finite() && bound.is_finite() && bound >= f64::MIN_POSITIVE {
+        return dist_sq <= bound;
+    }
+    if !dist_sq.is_finite() || !bound.is_finite() {
+        let sdx = dx * DISK_DOWN_SCALE;
+        let sdy = dy * DISK_DOWN_SCALE;
+        let sr = radius * DISK_DOWN_SCALE;
+        return sdx * sdx + sdy * sdy <= sr * sr;
+    }
+    if dx.abs() > radius || dy.abs() > radius {
+        return false;
+    }
+    let up = if radius >= 1.0e-300 {
+        DISK_UP_MID
+    } else {
+        DISK_UP_TINY
+    };
+    let sdx = dx * up;
+    let sdy = dy * up;
+    let sr = radius * up;
+    sdx * sdx + sdy * sdy <= sr * sr
 }
 
 /// One intervention as a published tick applied it.

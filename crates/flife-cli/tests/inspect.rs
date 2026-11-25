@@ -670,3 +670,44 @@ fn v2_cadherin_inspect_reports_tag_and_cohesiveness_when_enabled() {
         assert!(record.get("cohesiveness").is_none(), "{record}");
     }
 }
+
+#[test]
+fn inspected_weights_refuses_inconsistent_layer_shapes() {
+    let validated = ValidatedConfig::from_toml(&ecology_text()).expect("valid ecology config");
+    let world = flife_cli::found(&validated).expect("founds ecology world");
+    let first = world
+        .population()
+        .iter()
+        .next()
+        .expect("at least one organism");
+    let valid = world
+        .organism_weights(first.id)
+        .expect("organism weights")
+        .expect("live organism");
+    assert!(flife_cli::inspect::InspectedWeights::of(&valid).is_ok());
+
+    // Extra weight in `weights..biases` (trailing weight not matching `outputs * inputs`)
+    // must be refused instead of silently dropped by `chunks_exact`.
+    let mut extra_weight = valid.clone();
+    extra_weight.layers[0].biases += 1;
+    assert!(matches!(
+        flife_cli::inspect::InspectedWeights::of(&extra_weight),
+        Err(flife_core::CoreError::StateConflict { .. })
+    ));
+
+    // Zero inputs must still be refused.
+    let mut zero_inputs = valid.clone();
+    zero_inputs.layers[0].inputs = 0;
+    assert!(matches!(
+        flife_cli::inspect::InspectedWeights::of(&zero_inputs),
+        Err(flife_core::CoreError::StateConflict { .. })
+    ));
+
+    // Mismatched `outputs` (more rows than weight rows) must be refused.
+    let mut wrong_outputs = valid;
+    wrong_outputs.layers[0].outputs += 1;
+    assert!(matches!(
+        flife_cli::inspect::InspectedWeights::of(&wrong_outputs),
+        Err(flife_core::CoreError::StateConflict { .. })
+    ));
+}

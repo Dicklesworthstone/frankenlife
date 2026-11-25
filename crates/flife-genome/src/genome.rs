@@ -1050,8 +1050,15 @@ impl Traits {
 /// bounds without mantissa rounding when `Σ vᵢ²` or `limit²` overflows `f64`.
 const NORM_DOWN_SCALE: f64 = f64::from_bits((1023_u64 - 530) << 52);
 
+/// Exact IEEE-754 powers of two (`2^530`, `2^1020`) that lift tiny vectors and
+/// bounds into normal range without mantissa rounding when `limit²` or `Σ vᵢ²`
+/// underflows below `f64::MIN_POSITIVE`.
+const NORM_UP_MID: f64 = f64::from_bits((1023_u64 + 530) << 52);
+const NORM_UP_TINY: f64 = f64::from_bits((1023_u64 + 1020) << 52);
+
 /// `Σ vᵢ²` in index order. Every norm bound in this crate is checked with
-/// exactly this sum against `limit²` whenever both squares are finite.
+/// exactly this sum against `limit²` whenever both squares are finite and
+/// normal.
 pub(crate) fn squared_norm(values: &[f64]) -> f64 {
     values
         .iter()
@@ -1069,22 +1076,35 @@ fn scaled_squared_norm(values: &[f64], scale: f64) -> f64 {
 /// Whether `||values||₂ > limit` for finite `values` and finite `limit >= 0`.
 ///
 /// Runs the exact `squared_norm(values) > limit * limit` comparison whenever
-/// both squares stay finite, and falls back to exact power-of-two down-scaling
-/// when either square overflows `f64`.
+/// both squares stay finite and `limit²` stays normal, and falls back to exact
+/// power-of-two down-scaling on overflow or up-scaling on underflow.
 pub(crate) fn exceeds_norm(values: &[f64], limit: f64) -> bool {
     let squared = squared_norm(values);
     let bound = limit * limit;
-    if squared.is_finite() && bound.is_finite() {
+    if squared.is_finite() && bound.is_finite() && bound >= f64::MIN_POSITIVE {
         return squared > bound;
     }
-    let scaled_limit = limit * NORM_DOWN_SCALE;
-    scaled_squared_norm(values, NORM_DOWN_SCALE) > scaled_limit * scaled_limit
+    if !squared.is_finite() || !bound.is_finite() {
+        let scaled_limit = limit * NORM_DOWN_SCALE;
+        return scaled_squared_norm(values, NORM_DOWN_SCALE) > scaled_limit * scaled_limit;
+    }
+    if values.iter().any(|&value| value.abs() > limit) {
+        return true;
+    }
+    let up = if limit >= 1.0e-300 {
+        NORM_UP_MID
+    } else {
+        NORM_UP_TINY
+    };
+    let scaled_limit = limit * up;
+    scaled_squared_norm(values, up) > scaled_limit * scaled_limit
 }
 
 /// Scale `values` onto the sphere of `radius`: `vᵢ / ||v||₂ · radius`. While
 /// rounding leaves the norm above `radius`, every component is multiplied by
-/// `1 − 2^-53`, so the result always passes the bound it is checked against.
-/// One pass almost always suffices.
+/// `1 − 2^-53` (or stepped one ULP toward zero in the subnormal range), so the
+/// result always passes the bound it is checked against. One pass almost
+/// always suffices.
 ///
 /// # Errors
 /// [`CoreError::NumericalInvalid`] for a nonpositive/nonfinite radius, or a
@@ -1107,7 +1127,7 @@ pub(crate) fn rescale(
         });
     }
     let squared = squared_norm(values);
-    if squared.is_finite() {
+    if squared.is_finite() && squared >= f64::MIN_POSITIVE {
         let norm = squared.sqrt();
         if !norm.is_finite() || norm <= 0.0 {
             return Err(CoreError::NumericalInvalid {
@@ -1118,7 +1138,7 @@ pub(crate) fn rescale(
         for value in values.iter_mut() {
             *value = *value / norm * radius;
         }
-    } else {
+    } else if !squared.is_finite() {
         let scaled_norm = scaled_squared_norm(values, NORM_DOWN_SCALE).sqrt();
         if !scaled_norm.is_finite() || scaled_norm <= 0.0 {
             return Err(CoreError::NumericalInvalid {
@@ -1129,6 +1149,29 @@ pub(crate) fn rescale(
         for value in values.iter_mut() {
             *value = (*value * NORM_DOWN_SCALE) / scaled_norm * radius;
         }
+    } else {
+        let max_abs = values.iter().fold(0.0_f64, |m, &value| m.max(value.abs()));
+        if max_abs <= 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity,
+                detail: "a vector of norm 0.0 has no direction".to_owned(),
+            });
+        }
+        let up = if max_abs >= 1.0e-300 {
+            NORM_UP_MID
+        } else {
+            NORM_UP_TINY
+        };
+        let scaled_norm = scaled_squared_norm(values, up).sqrt();
+        if !scaled_norm.is_finite() || scaled_norm <= 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity,
+                detail: format!("a vector of norm {scaled_norm:?} has no direction"),
+            });
+        }
+        for value in values.iter_mut() {
+            *value = (*value * up) / scaled_norm * radius;
+        }
     }
     let shrink = 1.0 - f64::EPSILON / 2.0;
     for _ in 0..64 {
@@ -1136,7 +1179,14 @@ pub(crate) fn rescale(
             return Ok(());
         }
         for value in values.iter_mut() {
-            *value *= shrink;
+            if *value != 0.0 {
+                let next = *value * shrink;
+                *value = if next == *value {
+                    f64::from_bits(value.to_bits() - 1)
+                } else {
+                    next
+                };
+            }
         }
     }
     Err(CoreError::NumericalInvalid {
@@ -1484,5 +1534,27 @@ mod unit_affinity_tests {
         for (got, exp) in with_v2.unit_affinity().iter().zip(&expected) {
             assert_eq!(got.to_bits(), exp.to_bits());
         }
+    }
+
+    #[test]
+    fn rescale_handles_tiny_and_subnormal_vectors_and_radii() {
+        for (input, radius) in [
+            ([3.0e-200, 4.0e-200], 1.0e-200),
+            ([3.0e-310, 4.0e-310], 1.0e-310),
+            ([3.0e-200, 4.0e-200], 1.0),
+            ([3.0e200, 4.0e200], 1.0e-200),
+        ] {
+            let mut v = input;
+            rescale("tiny test", &mut v, radius).expect("rescale succeeds");
+            assert!(v[0].is_finite() && v[1].is_finite());
+            assert!(!exceeds_norm(&v, radius), "{v:?} exceeds {radius:e}");
+            assert!((v[0] / radius - 0.6).abs() < 1.0e-12, "{v:?} / {radius:e}");
+            assert!((v[1] / radius - 0.8).abs() < 1.0e-12, "{v:?} / {radius:e}");
+        }
+        let mut zero = [0.0, 0.0];
+        assert!(matches!(
+            rescale("zero test", &mut zero, 1.0e-200),
+            Err(CoreError::NumericalInvalid { .. })
+        ));
     }
 }

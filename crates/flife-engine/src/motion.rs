@@ -106,7 +106,7 @@ impl Motion {
             detail: format!("γΔt = {exponent} is out of range"),
         };
         let decay = exp_neg(exponent).ok_or_else(invalid)?;
-        let force_coefficient = if drag == 0.0 {
+        let force_coefficient = if drag == 0.0 || exponent == 0.0 {
             step_seconds
         } else {
             expm1_neg(exponent).ok_or_else(invalid)? / drag
@@ -486,14 +486,31 @@ impl MotionResponse {
         }
         let limit = motion.response_norm_limit;
         let bound = limit * limit;
-        let exceeds = if squared.is_finite() && bound.is_finite() {
+        let exceeds = if squared.is_finite() && bound.is_finite() && bound >= f64::MIN_POSITIVE {
             squared > bound
-        } else {
+        } else if !squared.is_finite() || !bound.is_finite() {
             let s_limit = limit * CLAMP_DOWN_SCALE;
             let s_squared: f64 = coefficients
                 .iter()
                 .map(|&c| {
                     let sc = c * CLAMP_DOWN_SCALE;
+                    sc * sc
+                })
+                .sum();
+            s_squared > s_limit * s_limit
+        } else if coefficients.iter().any(|&c| c.abs() > limit) {
+            true
+        } else {
+            let up = if limit >= 1.0e-300 {
+                CLAMP_UP_MID
+            } else {
+                CLAMP_UP_TINY
+            };
+            let s_limit = limit * up;
+            let s_squared: f64 = coefficients
+                .iter()
+                .map(|&c| {
+                    let sc = c * up;
                     sc * sc
                 })
                 .sum();
@@ -569,11 +586,31 @@ pub fn uptake_ratio(
 /// mantissa rounding error.
 const CLAMP_DOWN_SCALE: f64 = f64::from_bits((1023_u64 - 520) << 52);
 
+/// Exact IEEE-754 powers of two (`2^530`, `2^1020`) that lift tiny limits and
+/// vectors into normal range when `limit²` underflows below `f64::MIN_POSITIVE`.
+const CLAMP_UP_MID: f64 = f64::from_bits((1023_u64 + 530) << 52);
+const CLAMP_UP_TINY: f64 = f64::from_bits((1023_u64 + 1020) << 52);
+
+/// Step `value` toward zero by `shrink`, guaranteeing progress by 1 ULP even
+/// in the subnormal range where `value * shrink == value`.
+fn step_toward_zero(value: f64, shrink: f64) -> f64 {
+    if value == 0.0 {
+        return value;
+    }
+    let next = value * shrink;
+    if next == value {
+        f64::from_bits(value.to_bits() - 1)
+    } else {
+        next
+    }
+}
+
 /// `v` clamped radially so that `v·v ≤ limit²` as computed in F64.
 ///
 /// The finite-square fast path executes the exact arithmetic of
-/// `motion.metal`'s `clamp_radius` for 0-ulp CPU/Metal parity. When `v` is
-/// finite but `v·v` or `limit²` overflows `f64::MAX`, falls back to exact
+/// `motion.metal`'s `clamp_radius` for 0-ulp CPU/Metal parity whenever
+/// `limit²` stays normal. When `v·v` or `limit²` overflows `f64::MAX` or
+/// `limit²` underflows below `f64::MIN_POSITIVE`, falls back to exact
 /// power-of-two scaling rather than collapsing to `[0, 0]`, bypassing the
 /// clamp, or leaking `NaN`.
 fn clamp_radius(quantity: &'static str, v: [f64; 2], limit: f64) -> Result<[f64; 2], CoreError> {
@@ -586,7 +623,7 @@ fn clamp_radius(quantity: &'static str, v: [f64; 2], limit: f64) -> Result<[f64;
     let bound = limit * limit;
     let squared = v[0] * v[0] + v[1] * v[1];
     let shrink = 1.0 - f64::EPSILON / 2.0;
-    if squared.is_finite() && bound.is_finite() {
+    if squared.is_finite() && bound.is_finite() && bound >= f64::MIN_POSITIVE {
         if squared <= bound {
             return Ok(v);
         }
@@ -594,6 +631,49 @@ fn clamp_radius(quantity: &'static str, v: [f64; 2], limit: f64) -> Result<[f64;
         let mut clamped = [v[0] * scale, v[1] * scale];
         while clamped[0] * clamped[0] + clamped[1] * clamped[1] > bound {
             clamped = [clamped[0] * shrink, clamped[1] * shrink];
+        }
+        return Ok(clamped);
+    }
+    if bound < f64::MIN_POSITIVE {
+        let max_v = v[0].abs().max(v[1].abs());
+        if max_v == 0.0 {
+            return Ok(v);
+        }
+        let up_limit = if limit >= 1.0e-300 {
+            CLAMP_UP_MID
+        } else {
+            CLAMP_UP_TINY
+        };
+        let s_limit = limit * up_limit;
+        let s_bound = s_limit * s_limit;
+        if max_v <= limit {
+            let sv = [v[0] * up_limit, v[1] * up_limit];
+            if sv[0] * sv[0] + sv[1] * sv[1] <= s_bound {
+                return Ok(v);
+            }
+        }
+        let v_scale = if max_v > 1.0e150 {
+            CLAMP_DOWN_SCALE
+        } else if max_v < 1.0e-150 {
+            if max_v >= 1.0e-300 {
+                CLAMP_UP_MID
+            } else {
+                CLAMP_UP_TINY
+            }
+        } else {
+            1.0
+        };
+        let sv = [v[0] * v_scale, v[1] * v_scale];
+        let s_norm = (sv[0] * sv[0] + sv[1] * sv[1]).sqrt();
+        let mut clamped = [(sv[0] / s_norm) * limit, (sv[1] / s_norm) * limit];
+        while {
+            let sc = [clamped[0] * up_limit, clamped[1] * up_limit];
+            sc[0] * sc[0] + sc[1] * sc[1] > s_bound
+        } {
+            clamped = [
+                step_toward_zero(clamped[0], shrink),
+                step_toward_zero(clamped[1], shrink),
+            ];
         }
         return Ok(clamped);
     }

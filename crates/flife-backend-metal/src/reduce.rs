@@ -20,6 +20,7 @@
 //! world reduces the tick on the reference.
 
 use flife_core::CoreError;
+use flife_core::memory::bytes_for;
 use flife_field::grid::{CarrierLayout, DUAL_CARRIER_PLANES, FIELD_PLANES};
 use flife_field::{DepositReduction, DepositSummary, Deposits, FieldState, Grants};
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
@@ -703,8 +704,13 @@ fn set_words(
     }
     let items = offsets.last().map_or(0, |&end| end as usize);
     set.packets.clear();
+    let packet_words = items.checked_mul(PACKET).ok_or_else(overflow)?;
     set.packets
-        .reserve(items.checked_mul(PACKET).ok_or_else(overflow)?);
+        .try_reserve(packet_words)
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer: "metal reduction packets",
+            bytes: bytes_for::<u32>(packet_words),
+        })?;
     for at in 0..items {
         let (amount, deposit) = reduction.packet(at).ok_or_else(overflow)?;
         set.packets.extend_from_slice(&words(amount));
@@ -712,12 +718,16 @@ fn set_words(
     }
     set.directions.clear();
     if items > 0 {
-        set.directions.reserve(
-            reduction
-                .deposits()
-                .checked_mul(DIRECTION)
-                .ok_or_else(overflow)?,
-        );
+        let direction_words = reduction
+            .deposits()
+            .checked_mul(DIRECTION)
+            .ok_or_else(overflow)?;
+        set.directions
+            .try_reserve(direction_words)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "metal reduction directions",
+                bytes: bytes_for::<u32>(direction_words),
+            })?;
         for index in 0..reduction.deposits() {
             let direction = reduction.direction(index).ok_or_else(overflow)?;
             for &component in direction {

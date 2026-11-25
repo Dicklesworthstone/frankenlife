@@ -833,6 +833,40 @@ fn traits_are_bounded() {
         ),
         "vector of norm 1e250 must not bypass limit 1e200"
     );
+
+    // Tiny finite norm bounds whose squares underflow below `f64::MIN_POSITIVE`
+    // (including subnormal bounds) must still enforce `||v||₂ <= limit` rather
+    // than bypassing via `0.0 > 0.0 == false`.
+    for tiny in [1.0e-200, 1.0e-310] {
+        let tiny_limits = TraitLimits::new(tiny, tiny, [1.0, 16.0], 4.0).expect("tiny limits");
+        let mut ok_aff = [0.0; 32];
+        ok_aff[0] = 0.5 * tiny;
+        ok_aff[1] = 0.75 * tiny;
+        let mut ok_resp = [0.0; 33];
+        ok_resp[0] = tiny;
+        assert!(Traits::new(ok_aff, ok_resp, 1.0, &tiny_limits).is_ok());
+
+        let mut diag_over_aff = [0.0; 32];
+        diag_over_aff[0] = 0.8 * tiny;
+        diag_over_aff[1] = 0.8 * tiny;
+        assert!(
+            matches!(
+                Traits::new(diag_over_aff, ok_resp, 1.0, &tiny_limits),
+                Err(CoreError::NumericalInvalid { .. })
+            ),
+            "diagonal affinity exceeding tiny limit {tiny:e} must be refused"
+        );
+
+        let mut over_resp = [0.0; 33];
+        over_resp[0] = 2.0 * tiny;
+        assert!(
+            matches!(
+                Traits::new(ok_aff, over_resp, 1.0, &tiny_limits),
+                Err(CoreError::NumericalInvalid { .. })
+            ),
+            "motion response exceeding tiny limit {tiny:e} must be refused"
+        );
+    }
 }
 
 #[test]

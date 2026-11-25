@@ -138,3 +138,36 @@ says so beside the films, as it does for the confluent film.
 Both films start from a tick chosen by eye once the world fills the frame:
 1,024 for the tissue and 768 for the supercolony. The frames that chose the
 supercolony variant were its tick-512 frames, the fullest of the variants'.
+
+# Round 3: one v2 switch on the confluent world (previews only, 2026-11-24)
+
+After the dense films came down, each candidate was the confluent world itself
+(`presets/confluent-world.toml` with `model = "field-ecology-v2"`), founded with
+`--disable all-v2 --enable SWITCH` and the engine's default parameters for that
+switch, run to tick 2,400 and drawn as the film is (`--look sphere --no-field
+--color lineage-energy`, 1,080 px, a frame every 4 ticks) for 33 consecutive
+frames. With every switch off (`--v1-compat`) the world's tick-2,400 digest is
+the v1 film's own, `3f279f51…`, so each difference is that one switch's. Runs
+and renders went one process at a time, each run 10 to 19 minutes and each peak
+18.7 to 19.5 GiB.
+
+Motion is the share of pixels whose brightness moves by more than 32 of 255
+between consecutive frames, at 540 px. On that measure the v1 film scores 7.0%
+and the rejected tissue film 10.8%; the number alone did not predict what looked
+bad, so every preview was also judged by eye, still and in motion.
+
+| switch | digest at 2,400 | motion | by eye |
+|---|---|---:|---|
+| none (`--v1-compat`) | 3f279f51… | 8.3% | the film's world; a little darker at 1,080 px |
+| `vascular-field` | 684e4559… | 8.2% | v1's labyrinths sharper and more numerous: the best |
+| `oases` | e9627874… | 10.9% | big rounded colonies between black voids; v1's shapes kept inside |
+| `pcp-polarity` | 49a1ef81… | 7.9% | v1's layout, shapes stretched into bands and tubes |
+| `cadherin-4d` | cd6ae289… | 2.8% | lineages merge into smooth single-colour sheets, close to the rejected look |
+
+Every world sat at its ceiling of 262,144 in all 33 frames, as the confluent
+film does. The veins world drawn with `--look glow --field-mapping
+vascular-conductance` (founded again with `v2-visual-mappings`, since render
+refuses switches on a run dir; same digest) shows a nearly uniform pale field
+with no network, so its veins read better through the organisms. These are
+visual judgements on one seed and a 128-tick window, not measured effects. No
+film has been rendered from them yet; the choice is the user's.

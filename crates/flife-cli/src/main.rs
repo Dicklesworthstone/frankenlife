@@ -619,6 +619,12 @@ fn main() -> ExitCode {
         Err(error) => error.exit(),
     };
     if cli.list_features {
+        if cli.command.is_some() {
+            return fail(
+                "usage",
+                "`--list-features` cannot be combined with a subcommand".to_owned(),
+            );
+        }
         print(&flife_cli::list_features());
         return ExitCode::SUCCESS;
     }

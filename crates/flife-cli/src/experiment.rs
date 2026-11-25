@@ -602,7 +602,11 @@ impl Experiment {
     fn combinations(
         sweep: &BTreeMap<String, Vec<toml::Value>>,
     ) -> Result<Vec<Vec<(String, String)>>, CoreError> {
-        let mut combinations = vec![Vec::new()];
+        const MAXIMUM_SWEEP_COMBINATIONS: usize = 65_536;
+        if sweep.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut total_combinations = 1_usize;
         for (key, values) in sweep {
             if values.is_empty() {
                 return Err(spec_error(
@@ -610,7 +614,37 @@ impl Experiment {
                     "needs at least one value",
                 ));
             }
-            let mut next = Vec::with_capacity(combinations.len() * values.len());
+            total_combinations =
+                total_combinations
+                    .checked_mul(values.len())
+                    .ok_or(CoreError::Overflow {
+                        quantity: "experiment sweep combinations",
+                    })?;
+        }
+        if total_combinations > MAXIMUM_SWEEP_COMBINATIONS {
+            return Err(spec_error(
+                "sweep",
+                format!(
+                    "produces {total_combinations} combinations, at most \
+                     {MAXIMUM_SWEEP_COMBINATIONS} are admitted"
+                ),
+            ));
+        }
+        let mut combinations = vec![Vec::new()];
+        for (key, values) in sweep {
+            let next_len =
+                combinations
+                    .len()
+                    .checked_mul(values.len())
+                    .ok_or(CoreError::Overflow {
+                        quantity: "experiment sweep combinations",
+                    })?;
+            let mut next = Vec::new();
+            next.try_reserve_exact(next_len)
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "experiment sweep combinations",
+                    bytes: flife_core::memory::bytes_for::<Vec<(String, String)>>(next_len),
+                })?;
             for combination in &combinations {
                 for value in values {
                     let mut extended: Vec<(String, String)> = combination.clone();
@@ -619,9 +653,6 @@ impl Experiment {
                 }
             }
             combinations = next;
-        }
-        if sweep.is_empty() {
-            return Ok(Vec::new());
         }
         Ok(combinations)
     }

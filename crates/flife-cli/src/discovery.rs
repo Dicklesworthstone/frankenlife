@@ -434,6 +434,11 @@ pub fn discover(
     vacant_bundle(out)?;
 
     let config = read_config(run_dir)?;
+    crate::render::validate_v2_visual_style(
+        &config,
+        options.style.mapping,
+        options.style.field_mapping,
+    )?;
     let revision = config.config_hash();
     let (session, _) = run_identity(run_dir, revision)?;
     let profile = NumericalProfile::reference_f32()?;

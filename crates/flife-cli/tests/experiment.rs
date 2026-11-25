@@ -1302,3 +1302,72 @@ fn analysis_pools_experiments_into_the_pairs_their_reports_compare() {
     assert!(out.is_empty(), "nothing analyzed");
     assert!(String::from_utf8_lossy(&err).contains("given twice"));
 }
+
+#[test]
+fn sweep_combination_count_overflow_is_refused_without_panicking() {
+    let dir = scratch("sweep_overflow");
+    fs::write(dir.join("base.toml"), appendix_a()).expect("writes base");
+    let mut spec = String::from(
+        r#"
+schema = "frankenlife.experiment.v1"
+name = "overflow-sweep"
+hypothesis = "overflowing cartesian sweep is refused cleanly"
+base = "base.toml"
+ticks = 1
+control = "control"
+selection = "none"
+
+[seeds]
+discovery = [1]
+
+[[conditions]]
+name = "control"
+
+[sweep]
+"#,
+    );
+    // 65 independent 2-value sweep keys => 2^65 combinations, overflowing usize.
+    for i in 0..65 {
+        spec.push_str(&format!("\"synthetic.key_{i}\" = [0, 1]\n"));
+    }
+    let path = dir.join("experiment.toml");
+    fs::write(&path, spec).expect("writes spec");
+    let err = Experiment::load(&path).expect_err("2^65 sweep must refuse with overflow");
+    assert!(
+        matches!(err, CoreError::Overflow { .. }),
+        "expected CoreError::Overflow, got {err:?}"
+    );
+
+    // 20 independent 2-value sweep keys => 1_048_576 combinations (fits usize,
+    // exceeds the combination cap without allocating gigabytes).
+    let mut huge = String::from(
+        r#"
+schema = "frankenlife.experiment.v1"
+name = "huge-sweep"
+hypothesis = "oversized cartesian sweep is refused before allocation"
+base = "base.toml"
+ticks = 1
+control = "control"
+selection = "none"
+
+[seeds]
+discovery = [1]
+
+[[conditions]]
+name = "control"
+
+[sweep]
+"#,
+    );
+    for i in 0..20 {
+        huge.push_str(&format!("\"synthetic.key_{i}\" = [0, 1]\n"));
+    }
+    let huge_path = dir.join("huge.toml");
+    fs::write(&huge_path, huge).expect("writes huge spec");
+    let huge_err = Experiment::load(&huge_path).expect_err("2^20 sweep must refuse before OOM");
+    assert!(
+        matches!(huge_err, CoreError::InvalidConfig(_)),
+        "expected CoreError::InvalidConfig, got {huge_err:?}"
+    );
+    assert!(huge_err.to_string().contains("combinations"), "{huge_err}");
+}

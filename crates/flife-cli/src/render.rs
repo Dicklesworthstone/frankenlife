@@ -312,6 +312,13 @@ pub fn render_run(
     if options.video.is_some() {
         video_encoder()?;
     }
+    let preview_config = crate::persist::read_config(run_dir)?;
+    validate_v2_visual_style(
+        &preview_config,
+        options.style.mapping,
+        options.style.field_mapping,
+    )?;
+    background(&preview_config)?;
     let Recovered {
         config,
         limits,

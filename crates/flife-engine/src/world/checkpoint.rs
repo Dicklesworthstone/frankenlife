@@ -697,11 +697,23 @@ impl World {
                         buffer: "checkpoint vascular edges",
                         bytes: flife_core::memory::bytes_for::<f32>(cells),
                     })?;
-                for _ in 0..cells {
-                    gx.push(input.f32()?);
+                for cell in 0..cells {
+                    let conductance = input.f32()?;
+                    if !conductance.is_finite() || !(0.0..=1.0).contains(&conductance) {
+                        return Err(refuse(format!(
+                            "vascular edge_x conductance {conductance:?} at cell {cell} is outside [0, 1]"
+                        )));
+                    }
+                    gx.push(conductance);
                 }
-                for _ in 0..cells {
-                    gy.push(input.f32()?);
+                for cell in 0..cells {
+                    let conductance = input.f32()?;
+                    if !conductance.is_finite() || !(0.0..=1.0).contains(&conductance) {
+                        return Err(refuse(format!(
+                            "vascular edge_y conductance {conductance:?} at cell {cell} is outside [0, 1]"
+                        )));
+                    }
+                    gy.push(conductance);
                 }
                 field
                     .current_mut()

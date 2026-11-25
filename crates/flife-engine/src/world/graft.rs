@@ -168,6 +168,24 @@ impl World {
                 "the package's genomes are of another topology catalog or parameter type",
             ));
         }
+        if self.rules.v2.abi() != package.rules.v2.abi() {
+            return Err(refuse(format!(
+                "the package's controller/field ABI ({:?}) does not match the host ({:?})",
+                package.rules.v2.abi(),
+                self.rules.v2.abi(),
+            )));
+        }
+        if self.rules.limits.polarity_enabled() != package.rules.limits.polarity_enabled()
+            || self.rules.limits.cadherin_enabled() != package.rules.limits.cadherin_enabled()
+        {
+            return Err(refuse(format!(
+                "the package's v2 heritable traits (polarity={}, cadherin={}) do not match the host (polarity={}, cadherin={})",
+                package.rules.limits.polarity_enabled(),
+                package.rules.limits.cadherin_enabled(),
+                self.rules.limits.polarity_enabled(),
+                self.rules.limits.cadherin_enabled(),
+            )));
+        }
         if self.field.current().planes() != package.field.current().planes()
             || self.field.current().has_vascular() != package.field.current().has_vascular()
         {

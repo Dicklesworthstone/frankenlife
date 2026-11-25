@@ -499,3 +499,150 @@ fn a_refused_graft_leaves_the_host_as_it_was() {
         "live population budget exhausted",
     );
 }
+
+fn v2_ecology(tail: &str) -> ValidatedConfig {
+    let appendix = PLAN.find("## Appendix A").map_or("", |at| &PLAN[at..]);
+    let start = appendix
+        .find("```toml\n")
+        .map_or(0, |at| at + "```toml\n".len());
+    let length = appendix[start..].find("```").unwrap_or(0);
+    let mut lines: Vec<String> = appendix[start..start + length]
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    for (section, key, value) in [
+        ("", "model", "\"field-ecology-v2\""),
+        ("world", "width", "32.0"),
+        ("world", "height", "32.0"),
+        ("world", "grid_width", "32"),
+        ("world", "grid_height", "32"),
+        ("population", "initial_count", "32"),
+        ("population", "maximum_count", "512"),
+        ("population", "initial_energy", "3.0"),
+        ("sources", "count", "4"),
+        ("sources", "power_per_source", "120.0"),
+        ("sources", "sigma_world_units", "3.0"),
+        ("sources", "path_direction_interval_seconds", "2.0"),
+        ("chemistry", "uptake_capacity_per_second", "8.0"),
+        ("costs", "basal_energy_per_second", "0.6"),
+        (
+            "reproduction",
+            "minimum_parent_energy_before_attempt",
+            "2.2",
+        ),
+        ("reproduction", "maximum_attempt_rate_per_second", "4.0"),
+        ("reproduction", "cooldown_seconds", "0.25"),
+    ] {
+        let first = if section.is_empty() {
+            0
+        } else {
+            let header = format!("[{section}]");
+            lines
+                .iter()
+                .position(|line| line.trim() == header)
+                .expect("a section")
+                + 1
+        };
+        let line = lines[first..]
+            .iter()
+            .take_while(|line| !line.starts_with('['))
+            .position(|line| line.split('=').next().map(str::trim) == Some(key))
+            .map(|offset| first + offset)
+            .expect("a key");
+        lines[line] = format!("{key} = {value}");
+    }
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text.push_str(tail);
+    ValidatedConfig::from_toml(&text).expect("valid v2 configuration")
+}
+
+/// Grafting across mismatched `pcp-polarity` or `cadherin-4d` heritable trait
+/// schemas, or across equal-width but semantically distinct controller ABIs
+/// (e.g., `emt-gate` `+1 action` vs `wake-offset` neural polarized pump
+/// `+1 action`), must fail atomically before mutating the host or producing a
+/// world whose checkpoint fails or loses traits on round-trip.
+#[test]
+fn v2_graft_refuses_polarity_cadherin_and_abi_mismatches_atomically() {
+    let contact = r#"
+[contact]
+diameter = 0.5
+stiffness = 0.75
+adhesion = 0.35
+adhesion_range = 2.0
+sweeps = 1
+
+[v2]
+profile = "minimal"
+"#;
+    let base_cfg = v2_ecology(contact);
+    let pcp_cfg = v2_ecology(&format!("{contact}\n[v2.polarity]\nenabled = true\n"));
+    let cad_cfg = v2_ecology(&format!(
+        "{contact}\n[v2.contact.cadherin]\nenabled = true\n"
+    ));
+    let emt_cfg = v2_ecology(
+        r#"
+[contact]
+diameter = 0.5
+stiffness = 0.75
+adhesion = 0.35
+adhesion_range = 2.0
+sweeps = 1
+
+[v2]
+profile = "minimal"
+enabled_features = ["emt-gate"]
+"#,
+    );
+    let pump_cfg = v2_ecology(&format!(
+        "{contact}\n[v2.emission.offset]\nenabled = true\nmode = \"polarized-pump-v1\"\npump_direction_mode = \"neural-output-v1\"\n"
+    ));
+    // Confirm the ABI collision hazard: both topologies have identical
+    // `(input_width, raw_output_width)` = `(104, 37)` yet different `V2Abi`.
+    assert_eq!(emt_cfg.v2_abi().input_width, pump_cfg.v2_abi().input_width);
+    assert_eq!(
+        emt_cfg.v2_abi().raw_output_width,
+        pump_cfg.v2_abi().raw_output_width
+    );
+    assert_ne!(emt_cfg.v2_abi(), pump_cfg.v2_abi());
+
+    let crop_of = |cfg: &ValidatedConfig| {
+        let world = world_at(cfg, 4);
+        world.cropped([16.0, 16.0], 6.0).expect("crop").0
+    };
+    let base_pkg = crop_of(&base_cfg);
+    let pcp_pkg = crop_of(&pcp_cfg);
+    let cad_pkg = crop_of(&cad_cfg);
+    let emt_pkg = crop_of(&emt_cfg);
+
+    let assert_refused = |host_cfg: &ValidatedConfig, pkg: &World, why: &str| {
+        let mut host = found(host_cfg);
+        let digest = host.digest();
+        let holdings = host.ledger().holdings().total().to_bits();
+        let rows: Vec<Organism> = host.population().iter().collect();
+        let err = host
+            .graft(pkg, [16.0, 16.0], 6.0, [0, 0])
+            .expect_err("mismatched v2 graft must be refused");
+        assert_eq!(err.kind(), "state-conflict", "{why}: {err}");
+        assert!(err.to_string().contains(why), "{why}: {err}");
+        assert_eq!(host.digest(), digest, "host unchanged on refusal");
+        assert_eq!(host.ledger().holdings().total().to_bits(), holdings);
+        assert_eq!(host.population().iter().collect::<Vec<_>>(), rows);
+    };
+
+    assert_refused(&pcp_cfg, &base_pkg, "v2 heritable traits");
+    assert_refused(&base_cfg, &pcp_pkg, "v2 heritable traits");
+    assert_refused(&cad_cfg, &base_pkg, "v2 heritable traits");
+    assert_refused(&base_cfg, &cad_pkg, "v2 heritable traits");
+    assert_refused(&pump_cfg, &emt_pkg, "controller/field ABI");
+
+    // Matching polarity/cadherin schemas still graft cleanly and round-trip
+    // bit-identically through checkpoints.
+    for (cfg, pkg) in [(&pcp_cfg, &pcp_pkg), (&cad_cfg, &cad_pkg)] {
+        let mut host = found(cfg);
+        host.graft(pkg, [16.0, 16.0], 6.0, [0, 0])
+            .expect("matching v2 graft succeeds");
+        let restored = round_trip(&host);
+        assert_eq!(restored.digest(), host.digest());
+    }
+}

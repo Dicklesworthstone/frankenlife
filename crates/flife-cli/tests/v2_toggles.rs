@@ -11,10 +11,15 @@
 )]
 
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use flife_cli::{ERROR_SCHEMA, Experiment, FEATURES_SCHEMA, INSPECT_SCHEMA};
+use flife_cli::{
+    ColorMapping, ControllerChoice, DiscoverOptions, ERROR_SCHEMA, Experiment, FEATURES_SCHEMA,
+    FieldMapping, INSPECT_SCHEMA, RenderOptions, Selection, StoreDurability, Style, discover,
+    render_run,
+};
 use flife_core::V2Feature;
 use serde_json::Value;
 
@@ -135,6 +140,19 @@ fn e2e_cli_toggle_boundary_and_checkpoint_provenance() {
             feature.slug()
         );
     }
+
+    // 1b. `--list-features` combined with a subcommand is refused rather than
+    //     silently swallowing the subcommand.
+    let (status, out, err) = flife(&["--list-features", "validate", text(&v2_path)]);
+    assert_eq!(status, Some(2), "{out:?} {err:?}");
+    assert!(out.is_empty());
+    assert_eq!(err[0]["schema"], ERROR_SCHEMA);
+    assert!(
+        err[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("--list-features")),
+        "{err:?}"
+    );
 
     // 2. Toggles on v1 configs are explicitly refused.
     let (status, _, err) = flife(&["validate", text(&v1_path), "--v1-compat"]);
@@ -820,6 +838,104 @@ fn v2_17_render_visual_mappings_gate_and_v1_compat_fallback() {
         .find(|record| record["record"] == "end")
         .expect("end record");
     assert_eq!(end["mapping"], "cell-state");
+
+    // 5. Library entrypoints `flife_cli::discover` and `flife_cli::render_run`
+    //    enforce the same `v2-visual-mappings` gate directly (not only through
+    //    `flife` binary argument parsing) and refuse without creating outputs.
+    let compat_run = dir.join("compat_run_dir");
+    let (status, _, err) = flife(&[
+        "run",
+        text(&bundle_a_small),
+        "--v1-compat",
+        "--ticks",
+        "2",
+        "--every",
+        "0",
+        "--controllers",
+        "cpu",
+        "--run-dir",
+        text(&compat_run),
+        "--checkpoint-every",
+        "2",
+        "--checkpoint-durability",
+        "process-crash",
+    ]);
+    assert_eq!(status, Some(0), "compat run failed: {err:?}");
+
+    let forbidden_styles = [
+        Style {
+            mapping: ColorMapping::CellState,
+            ..Style::default()
+        },
+        Style {
+            mapping: ColorMapping::Polarity,
+            ..Style::default()
+        },
+        Style {
+            field_mapping: FieldMapping::TrailCarrier,
+            ..Style::default()
+        },
+        Style {
+            field_mapping: FieldMapping::VascularConductance,
+            ..Style::default()
+        },
+    ];
+    for (idx, style) in forbidden_styles.iter().enumerate() {
+        let bundle_out = dir.join(format!("refused_discover_{idx}"));
+        let discover_err = discover(
+            &compat_run,
+            &bundle_out,
+            &DiscoverOptions {
+                at: None,
+                name: Some(format!("bad-{idx}")),
+                description: "must refuse v2 visual style on v1-compat run".into(),
+                selection: Selection::World,
+                size: [32, 32],
+                style: *style,
+                render_threads: NonZeroUsize::MIN,
+                full_world: false,
+                package: false,
+                durability: StoreDurability::ProcessCrash,
+            },
+        )
+        .expect_err("discover must refuse v2 visual styles when v2-visual-mappings is disabled");
+        assert!(
+            discover_err.to_string().contains("v2-visual-mappings"),
+            "discover refusal should cite v2-visual-mappings: {discover_err}"
+        );
+        assert!(
+            !bundle_out.exists(),
+            "refused discover must leave no bundle"
+        );
+
+        let frames_out = dir.join(format!("refused_render_run_{idx}"));
+        let render_err = render_run(
+            &compat_run,
+            &RenderOptions {
+                ticks: 0,
+                every: 1,
+                size: [32, 32],
+                out: frames_out.clone(),
+                cpu_workers: None,
+                controllers: ControllerChoice::Cpu,
+                render_threads: NonZeroUsize::MIN,
+                video: None,
+                fps: 30,
+                style: *style,
+                camera: None,
+            },
+            |_| {},
+        )
+        .expect_err("render_run must refuse v2 visual styles when v2-visual-mappings is disabled");
+        assert!(
+            render_err.to_string().contains("v2-visual-mappings"),
+            "render_run refusal should cite v2-visual-mappings: {render_err}"
+        );
+        assert!(
+            !frames_out.exists(),
+            "refused render_run must leave no frames dir"
+        );
+    }
 }
 
 /// Fast `V2-17` modular CLI toggle E2E matrix: validates unmodified Bundle A

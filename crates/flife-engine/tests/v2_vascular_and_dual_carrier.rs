@@ -20,8 +20,8 @@
 
 use std::num::NonZeroUsize;
 
-use flife_core::checkpoint::{CheckpointReader, CheckpointWriter};
-use flife_core::{FeatureOverride, Flow, Transfer, V2Feature, ValidatedConfig};
+use flife_core::checkpoint::{CheckpointManifest, CheckpointReader, CheckpointWriter, ChunkFamily};
+use flife_core::{CoreError, FeatureOverride, Flow, Transfer, V2Feature, ValidatedConfig};
 use flife_engine::{
     Arrangement, Disposition, Intervention, NumericalProfile, Stepped, WORLD_CHECKPOINT_CHUNKS,
     World,
@@ -721,4 +721,65 @@ trail_emission_share = 0.25
         separated.3,
         matched.3
     );
+}
+
+#[test]
+fn v2_14_checkpoint_restore_rejects_corrupt_vascular_conductances() {
+    let profile = NumericalProfile::reference_f32().expect("profile");
+    let toml = ecology_toml(
+        "field-ecology-v2",
+        small_overrides(),
+        r#"
+[v2]
+profile = "minimal"
+
+[v2.vascular]
+enabled = true
+"#,
+    );
+    let cfg = ValidatedConfig::from_toml(&toml).expect("valid vascular config");
+    let mut world = World::found(&cfg, Arrangement::Compact, profile).expect("found");
+    let _ = world.step().expect("step");
+
+    let mut writer = CheckpointWriter::new(cfg.config().model.as_str());
+    world.write_checkpoint(&mut writer).expect("write");
+    let valid_bytes = writer.finish().expect("finish");
+
+    let cells = usize::try_from(world.field().grid().cell_count()).expect("cells");
+    let manifest = CheckpointManifest::parse(&valid_bytes).expect("manifest");
+    let reader = CheckpointReader::parse(&valid_bytes, &WORLD_CHECKPOINT_CHUNKS).expect("parse");
+
+    let rebuild_with_edge = |is_y: bool, bad_value: f32| -> Vec<u8> {
+        let mut rebuilt = CheckpointWriter::new(cfg.config().model.as_str());
+        for entry in manifest.entries() {
+            let mut data = reader.chunk(entry.family).expect("chunk").bytes.to_vec();
+            if entry.family == ChunkFamily::Field {
+                let tail = data.len() - 2 * cells * 4;
+                let offset = if is_y { tail + cells * 4 } else { tail };
+                data[offset..offset + 4].copy_from_slice(&bad_value.to_le_bytes());
+            }
+            rebuilt
+                .chunk(entry.family, entry.version, entry.items, data, &[])
+                .expect("repack chunk");
+        }
+        rebuilt.finish().expect("finish rebuilt")
+    };
+
+    for (is_y, expected_axis) in [(false, "vascular edge_x"), (true, "vascular edge_y")] {
+        for bad in [f32::NAN, f32::INFINITY, -0.05_f32, 1.25_f32] {
+            let corrupt = rebuild_with_edge(is_y, bad);
+            let corrupt_reader =
+                CheckpointReader::parse(&corrupt, &WORLD_CHECKPOINT_CHUNKS).expect("parses");
+            let err = World::read_checkpoint(&corrupt_reader, profile)
+                .expect_err("corrupt vascular conductance must be refused");
+            assert!(
+                matches!(err, CoreError::IncompatibleCheckpoint { .. }),
+                "{expected_axis} {bad:?}: expected IncompatibleCheckpoint, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains(expected_axis),
+                "{expected_axis} {bad:?}: error should name axis, got {err}"
+            );
+        }
+    }
 }

@@ -1309,9 +1309,11 @@ pub(crate) fn replay_with<S>(
                         pending_scale = pixels_per_point.0;
                         geometry_dirty = true;
                     }
-                    TimelineRecord::Overlay { text, swatches } => {
-                        crate::host::lay_out_overlay(&mut view, &font, text, swatches)?;
-                    }
+                    // The recorded overlay is the live session's readout at its own
+                    // ticks and speeds (`running · tick 1,271 · 34.4 ticks/s`), so
+                    // over a frame sampled at another tick it would misstate it: a
+                    // simulation-time frame carries none (FL-024 G5 review).
+                    TimelineRecord::Overlay { .. } => {}
                     TimelineRecord::Style { style } => view.set_style(style.style()?),
                     TimelineRecord::View { center, zoom } if options.camera.is_none() => {
                         let viewport = view

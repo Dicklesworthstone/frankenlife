@@ -51,8 +51,8 @@ use flife_genome::{CADHERIN_TERMS, CadherinTraits, Traits};
 use flife_neural::{DecodedActions, LayerShape, Observation, WeightDtype};
 
 use crate::{
-    Capacity, Descendants, EmissionSettlement, MaintenanceSettlement, MotionSettlement, Organism,
-    Split, Unviable, UptakeSettlement,
+    Capacity, Descendants, EmissionSettlement, MATERIAL_CHANNELS, MaintenanceSettlement,
+    MotionSettlement, Organism, Split, Unviable, UptakeSettlement,
 };
 
 /// How many published steps of a watched organism's [`Transactions`] the
@@ -79,6 +79,17 @@ pub struct OrganismSnapshot {
     pub parameters: usize,
     /// Its heritable affinity direction, motion response and sensing scale.
     pub traits: Traits,
+    /// Secretory readiness `r_i ∈ [0, 1]` when `V2-04` `excitable-relay` is
+    /// enabled; `None` on `field-ecology-v1*` and whenever `excitable-relay`
+    /// is disabled.
+    pub secretory_readiness: Option<f64>,
+    /// Effective metabolic affinity `a_eff(h_0)` when `V2-12`
+    /// `epigenetic-recurrence` with `affinity_rotation_enabled` is active;
+    /// `None` otherwise.
+    pub effective_affinity: Option<[f64; MATERIAL_CHANNELS]>,
+    /// Persisted kin-weighted mean neighbor `h̄_0 ∈ [-1, 1]` when `V2-12`
+    /// `notch-delta` is enabled; `None` when disabled.
+    pub last_neighbor_h0: Option<f64>,
     /// What the committed field offers it where it stands, for its affinity.
     pub local: LocalChemistry,
     /// Its held controller output, decoded as the world decodes it for the

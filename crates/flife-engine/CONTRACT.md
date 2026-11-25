@@ -246,6 +246,10 @@ each runs and owns the field.
     organisms contend or quanta round;
   - `decoded`, its held output decoded as the world decodes it for the next tick unless it is evaluated again
     (from zero under `field-ecology-v1-chemistry-only`), or `None` while it holds no output;
+  - active `field-ecology-v2` organism state (`None` on `field-ecology-v1*` and whenever the governing feature is
+    disabled): `secretory_readiness` (`excitable-relay`), `effective_affinity` (`epigenetic-recurrence` with
+    `affinity_rotation_enabled`, matching `World::effective_affinity` bit for bit), and `last_neighbor_h0`
+    (`notch-delta`);
   - `sensed` (plan §14.2's Inputs), while the world watches it: a `Sensed` with the newest published step's start
     tick, its sensing scale (the source scale its sample blends at), the raw sample (`R, M_0, …, M_31` and their
     x and y derivatives), the encoded `Observation` (the 104 inputs in ABI order and the unsaturated gradients

@@ -524,3 +524,85 @@ fn a_weight_dump_is_the_organisms_own_controller() {
     assert_eq!(world.organism_weights(OrganismId::new(1 << 40)), Ok(None));
     assert_eq!(world.digest(), before);
 }
+
+#[test]
+fn v2_organism_snapshot_exposes_active_v2_fields_and_preserves_inv09() {
+    // Baseline v1 omits all three V2-only organism snapshot fields.
+    let v1_cfg = small(flife_core::model::FIELD_ECOLOGY_V1);
+    let mut v1_world = found(&v1_cfg);
+    step(&mut v1_world);
+    let v1_id = v1_world.population().ids().next().expect("v1 founder");
+    let v1_before = v1_world.digest();
+    let v1_snap = v1_world
+        .organism_snapshot(v1_id)
+        .expect("v1 inspects")
+        .expect("v1 live");
+    assert_eq!(v1_snap.secretory_readiness, None);
+    assert_eq!(v1_snap.effective_affinity, None);
+    assert_eq!(v1_snap.last_neighbor_h0, None);
+    assert_eq!(v1_world.digest(), v1_before);
+
+    // Bundle A (`morphogenesis-tissue-v2`): `effective_affinity` (matching
+    // `World::effective_affinity` bit for bit) and `last_neighbor_h0` are
+    // populated while `excitable-relay` stays `None`.
+    let bundle_a_toml = include_str!("../../../presets/morphogenesis-tissue-v2.toml")
+        .replacen("initial_count = 10954", "initial_count = 16", 1)
+        .replacen("maximum_count = 262144", "maximum_count = 64", 1);
+    let bundle_a_cfg = ValidatedConfig::from_toml(&bundle_a_toml).expect("Bundle A valid");
+    let mut bundle_a = found(&bundle_a_cfg);
+    for _ in 0..2 {
+        step(&mut bundle_a);
+    }
+    let a_id = bundle_a
+        .population()
+        .ids()
+        .next()
+        .expect("Bundle A founder");
+    let a_before = bundle_a.digest();
+    let a_snap = bundle_a
+        .organism_snapshot(a_id)
+        .expect("Bundle A inspects")
+        .expect("Bundle A live");
+    let a_expected_eff = bundle_a
+        .effective_affinity(a_id)
+        .expect("effective affinity")
+        .expect("Bundle A live");
+    assert_eq!(a_snap.secretory_readiness, None);
+    assert_eq!(
+        a_snap.effective_affinity.map(|v| v.map(f64::to_bits)),
+        Some(a_expected_eff.map(f64::to_bits))
+    );
+    assert_eq!(
+        a_snap.last_neighbor_h0.map(f64::to_bits),
+        Some(f64::from(a_snap.organism.last_neighbor_h0).to_bits())
+    );
+    assert_eq!(bundle_a.digest(), a_before);
+
+    // Bundle B (`supercolony-v2`): `secretory_readiness` is populated while
+    // `effective_affinity` and `last_neighbor_h0` stay `None`.
+    let bundle_b_toml = include_str!("../../../presets/supercolony-v2.toml")
+        .replacen("initial_count = 16384", "initial_count = 16", 1)
+        .replacen("maximum_count = 262144", "maximum_count = 64", 1);
+    let bundle_b_cfg = ValidatedConfig::from_toml(&bundle_b_toml).expect("Bundle B valid");
+    let mut bundle_b = found(&bundle_b_cfg);
+    for _ in 0..2 {
+        step(&mut bundle_b);
+    }
+    let b_id = bundle_b
+        .population()
+        .ids()
+        .next()
+        .expect("Bundle B founder");
+    let b_before = bundle_b.digest();
+    let b_snap = bundle_b
+        .organism_snapshot(b_id)
+        .expect("Bundle B inspects")
+        .expect("Bundle B live");
+    assert_eq!(
+        b_snap.secretory_readiness.map(f64::to_bits),
+        Some(f64::from(b_snap.organism.secretory_readiness).to_bits())
+    );
+    assert_eq!(b_snap.effective_affinity, None);
+    assert_eq!(b_snap.last_neighbor_h0, None);
+    assert_eq!(bundle_b.digest(), b_before);
+}

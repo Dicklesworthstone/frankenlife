@@ -868,6 +868,19 @@ struct Inspection {
     /// (FL-054); omitted for stateless controller families.
     #[serde(skip_serializing_if = "Option::is_none")]
     recurrent_state: Option<Vec<f32>>,
+    /// Secretory readiness `r_i ∈ [0, 1]` when `V2-04` `excitable-relay` is
+    /// enabled; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secretory_readiness: Option<f64>,
+    /// Effective metabolic affinity `a_eff(h_0)` when `V2-12`
+    /// `epigenetic-recurrence` with `affinity_rotation_enabled` is active;
+    /// omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_affinity: Option<Vec<f64>>,
+    /// Persisted kin-weighted mean neighbor `h̄_0 ∈ [-1, 1]` when `V2-12`
+    /// `notch-delta` is enabled; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_neighbor_h0: Option<f64>,
     /// Apical-basal unit polarity vector `p_i ∈ S^1` when `V2-08`
     /// `pcp-polarity` is enabled; omitted when disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1023,6 +1036,36 @@ struct Decoded {
     emission_gate: f64,
     emission_direction: Option<Vec<f64>>,
     emission_spend_fraction: Option<f64>,
+    /// Decoded `V2-05` `so2-motor` steering controls; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    motor: Option<DecodedMotor>,
+    /// Decoded `V2-06` `so2-budding` local-frame offset; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budding: Option<DecodedBudding>,
+    /// Decoded `V2-08` `emt-gate` sigmoid `σ(o_adh) ∈ [0, 1]`; omitted when
+    /// disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    emt_gate: Option<f64>,
+    /// Decoded `V2-04` `wake-offset` neural pump control `tanh(o_pump) ∈ [-1, 1]`;
+    /// omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wake_pump: Option<f64>,
+}
+
+/// Decoded `V2-05` `so2-motor` steering controls (`[-1, 1]`).
+#[derive(Serialize)]
+struct DecodedMotor {
+    energy_gradient: f64,
+    chemical_gradient: f64,
+    chiral_contour: f64,
+    heading_propulsion: f64,
+}
+
+/// Decoded `V2-06` `so2-budding` local-frame offset in the unit disk.
+#[derive(Serialize)]
+struct DecodedBudding {
+    radial: f64,
+    tangential: f64,
 }
 
 #[derive(Serialize)]
@@ -1858,9 +1901,26 @@ fn inspection(snapshot: &OrganismSnapshot) -> Inspection {
             emission_gate: decoded.emission_gate,
             emission_direction: decoded.emission.map(|emission| emission.direction.to_vec()),
             emission_spend_fraction: decoded.emission.map(|emission| emission.spend_fraction),
+            motor: decoded.motor.map(|motor| DecodedMotor {
+                energy_gradient: motor.energy_gradient,
+                chemical_gradient: motor.chemical_gradient,
+                chiral_contour: motor.chiral_contour,
+                heading_propulsion: motor.heading_propulsion,
+            }),
+            budding: decoded.budding.map(|budding| DecodedBudding {
+                radial: budding.radial,
+                tangential: budding.tangential,
+            }),
+            emt_gate: decoded.emt_gate,
+            wake_pump: decoded.wake_pump,
         }),
         recurrent_state: (!organism.held.recurrent_state().is_empty())
             .then(|| organism.held.recurrent_state().to_vec()),
+        secretory_readiness: snapshot.secretory_readiness,
+        effective_affinity: snapshot
+            .effective_affinity
+            .map(|affinity| affinity.to_vec()),
+        last_neighbor_h0: snapshot.last_neighbor_h0,
         polarity: snapshot
             .traits
             .polarity_strength()
@@ -3353,6 +3413,9 @@ mod tests {
             .expect("v1 snapshot object");
         for omitted in [
             "recurrent_state",
+            "secretory_readiness",
+            "effective_affinity",
+            "last_neighbor_h0",
             "polarity",
             "polarity_strength",
             "wedge_curvature",
@@ -3364,18 +3427,41 @@ mod tests {
                 "v1 inspection must omit {omitted}"
             );
         }
+        let v1_decoded = v1_record["snapshot"]["decoded"]
+            .as_object()
+            .expect("v1 decoded object");
+        for omitted in ["motor", "budding", "emt_gate", "wake_pump"] {
+            assert!(
+                !v1_decoded.contains_key(omitted),
+                "v1 decoded must omit {omitted}"
+            );
+        }
         let v1_tx = v1_record["snapshot"]["transactions"]
             .as_object()
             .expect("v1 transactions object");
         assert!(!v1_tx.contains_key("byproduct_staged"));
         assert!(!v1_tx.contains_key("trophallaxis"));
 
-        // Bundle A (`morphogenesis-tissue-v2.toml`) emits polarity, cadherin,
-        // recurrent state, and non-zero V2 transactions.
+        // Bundle A (`morphogenesis-tissue-v2.toml`) with `so2-budding`,
+        // `emt-gate`, and neural `wake-offset` pump enabled emits all four
+        // decoded V2 action families, `effective_affinity`, `last_neighbor_h0`,
+        // polarity, cadherin, recurrent state, and non-zero V2 transactions.
         let v2_toml = include_str!("../../../presets/morphogenesis-tissue-v2.toml")
             .replacen("initial_count = 10954", "initial_count = 16", 1)
-            .replacen("maximum_count = 262144", "maximum_count = 64", 1);
-        let v2_cfg = super::load_toml(&v2_toml, &[]).expect("Bundle A config loads");
+            .replacen("maximum_count = 262144", "maximum_count = 64", 1)
+            .replacen(
+                "pump_direction_mode = \"fixed-sign-v1\"",
+                "pump_direction_mode = \"neural-output-v1\"",
+                1,
+            );
+        let v2_cfg = super::load_toml(
+            &v2_toml,
+            &[
+                flife_core::FeatureOverride::Enable("so2-budding".to_owned()),
+                flife_core::FeatureOverride::Enable("emt-gate".to_owned()),
+            ],
+        )
+        .expect("Bundle A config loads");
         let mut v2_world = flife_engine::World::found(
             &v2_cfg,
             flife_engine::Arrangement::FreeList,
@@ -3397,6 +3483,18 @@ mod tests {
         v2_snap.transactions[0].trophallaxis_delta = 0.025;
         v2_snap.transactions[1].trophallaxis_delta = -0.150;
 
+        let expected_decoded = v2_snap.decoded.expect("v2 decoded");
+        let expected_motor = expected_decoded.motor.expect("so2-motor decoded");
+        let expected_budding = expected_decoded.budding.expect("so2-budding decoded");
+        let expected_emt = expected_decoded.emt_gate.expect("emt-gate decoded");
+        let expected_pump = expected_decoded.wake_pump.expect("wake-pump decoded");
+        let expected_eff_affinity = v2_snap
+            .effective_affinity
+            .expect("Bundle A has effective_affinity");
+        let expected_neighbor_h0 = v2_snap
+            .last_neighbor_h0
+            .expect("Bundle A has last_neighbor_h0");
+        assert_eq!(v2_snap.secretory_readiness, None);
         let expected_polarity = v2_snap.organism.polarity;
         let expected_strength = v2_snap
             .traits
@@ -3420,6 +3518,54 @@ mod tests {
         }))
         .expect("v2 serializes");
         let snap = &v2_record["snapshot"];
+        assert!(snap.get("secretory_readiness").is_none());
+        let eff: Vec<u64> = snap["effective_affinity"]
+            .as_array()
+            .expect("effective_affinity array")
+            .iter()
+            .filter_map(Value::as_f64)
+            .map(f64::to_bits)
+            .collect();
+        assert_eq!(eff, expected_eff_affinity.map(f64::to_bits).to_vec());
+        assert_eq!(
+            snap["last_neighbor_h0"].as_f64().map(f64::to_bits),
+            Some(expected_neighbor_h0.to_bits())
+        );
+        let dec = &snap["decoded"];
+        assert_eq!(
+            dec["motor"]["energy_gradient"].as_f64().map(f64::to_bits),
+            Some(expected_motor.energy_gradient.to_bits())
+        );
+        assert_eq!(
+            dec["motor"]["chemical_gradient"].as_f64().map(f64::to_bits),
+            Some(expected_motor.chemical_gradient.to_bits())
+        );
+        assert_eq!(
+            dec["motor"]["chiral_contour"].as_f64().map(f64::to_bits),
+            Some(expected_motor.chiral_contour.to_bits())
+        );
+        assert_eq!(
+            dec["motor"]["heading_propulsion"]
+                .as_f64()
+                .map(f64::to_bits),
+            Some(expected_motor.heading_propulsion.to_bits())
+        );
+        assert_eq!(
+            dec["budding"]["radial"].as_f64().map(f64::to_bits),
+            Some(expected_budding.radial.to_bits())
+        );
+        assert_eq!(
+            dec["budding"]["tangential"].as_f64().map(f64::to_bits),
+            Some(expected_budding.tangential.to_bits())
+        );
+        assert_eq!(
+            dec["emt_gate"].as_f64().map(f64::to_bits),
+            Some(expected_emt.to_bits())
+        );
+        assert_eq!(
+            dec["wake_pump"].as_f64().map(f64::to_bits),
+            Some(expected_pump.to_bits())
+        );
         let pol: Vec<u64> = snap["polarity"]
             .as_array()
             .expect("polarity array")
@@ -3461,5 +3607,58 @@ mod tests {
                 .map(f64::to_bits),
             Some((0.025_f64 - 0.150_f64).to_bits())
         );
+
+        // Bundle B (`supercolony-v2.toml`) emits `secretory_readiness` and
+        // `decoded.motor`, while omitting disabled Bundle A keys.
+        let bundle_b_toml = include_str!("../../../presets/supercolony-v2.toml")
+            .replacen("initial_count = 16384", "initial_count = 16", 1)
+            .replacen("maximum_count = 262144", "maximum_count = 64", 1);
+        let bundle_b_cfg = super::load_toml(&bundle_b_toml, &[]).expect("Bundle B loads");
+        let mut bundle_b = flife_engine::World::found(
+            &bundle_b_cfg,
+            flife_engine::Arrangement::FreeList,
+            flife_engine::NumericalProfile::reference_f32().expect("profile"),
+        )
+        .expect("Bundle B founds");
+        let b_id = bundle_b
+            .population()
+            .ids()
+            .next()
+            .expect("Bundle B founder");
+        bundle_b.step().expect("Bundle B step");
+        let b_snap = bundle_b
+            .organism_snapshot(b_id)
+            .expect("Bundle B inspect")
+            .expect("Bundle B lives");
+        let expected_readiness = b_snap
+            .secretory_readiness
+            .expect("Bundle B has secretory_readiness");
+        let b_record = serde_json::to_value(super::status_record(&Status::Inspected {
+            organism: b_id,
+            seen: Tick::new(1),
+            snapshot: Some(Box::new(b_snap)),
+        }))
+        .expect("Bundle B serializes");
+        let b_obj = b_record["snapshot"]
+            .as_object()
+            .expect("Bundle B snapshot object");
+        assert_eq!(
+            b_obj["secretory_readiness"].as_f64().map(f64::to_bits),
+            Some(expected_readiness.to_bits())
+        );
+        assert!(b_obj["decoded"]["motor"].is_object());
+        for omitted in [
+            "effective_affinity",
+            "last_neighbor_h0",
+            "polarity",
+            "cadherin_tag",
+            "cohesiveness",
+            "recurrent_state",
+        ] {
+            assert!(
+                !b_obj.contains_key(omitted),
+                "Bundle B inspection must omit {omitted}"
+            );
+        }
     }
 }

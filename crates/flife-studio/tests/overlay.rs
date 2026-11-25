@@ -1839,6 +1839,7 @@ fn v2_recent_transactions_sum_byproduct_and_trophallaxis_within_hud_cap() {
     assert_eq!(zero_recent.byproduct_staged, 0.0);
     assert_eq!(zero_recent.trophallaxis, 0.0);
     let baseline = inspector_lines(Inspected::Read(&snapshot));
+    assert!(!baseline.contains("waste"));
     assert!(!baseline.contains("trophallaxis"));
 
     // Positive net trophallaxis & non-zero symplectic byproduct staging.
@@ -1859,8 +1860,8 @@ fn v2_recent_transactions_sum_byproduct_and_trophallaxis_within_hud_cap() {
     );
     let positive_panel = inspector_lines(Inspected::Read(&snapshot));
     assert!(
-        positive_panel.contains(" · trophallaxis +0.180 · net "),
-        "expected positive trophallaxis clause in:\n{positive_panel}"
+        positive_panel.contains(" · waste 0.150 · trophallaxis +0.180 · net "),
+        "expected waste + positive trophallaxis clause in:\n{positive_panel}"
     );
 
     // Negative net trophallaxis prints with minus sign.
@@ -1868,11 +1869,14 @@ fn v2_recent_transactions_sum_byproduct_and_trophallaxis_within_hud_cap() {
     snapshot.transactions[1].trophallaxis_delta = 0.070;
     let negative_panel = inspector_lines(Inspected::Read(&snapshot));
     assert!(
-        negative_panel.contains(" · trophallaxis -0.180 · net "),
-        "expected negative trophallaxis clause in:\n{negative_panel}"
+        negative_panel.contains(" · waste 0.150 · trophallaxis -0.180 · net "),
+        "expected waste + negative trophallaxis clause in:\n{negative_panel}"
     );
 
-    // Worst-case V2 HUD text with widest negative trophallaxis still fits.
+    // Worst-case V2 HUD text with widest waste + negative trophallaxis still fits.
+    snapshot.transactions[0].byproduct_staged = 99_999.999_4;
+    snapshot.transactions[1].byproduct_staged = 0.0;
+    snapshot.transactions[2].byproduct_staged = 0.0;
     snapshot.transactions[0].trophallaxis_delta = -99_999.999_4;
     snapshot.transactions[1].trophallaxis_delta = 0.0;
     let font = HudFont::bundled().expect("bundled HUD font");
@@ -1929,6 +1933,188 @@ fn v2_recent_transactions_sum_byproduct_and_trophallaxis_within_hud_cap() {
                 if (scale - 2.0).abs() < f64::EPSILON {
                     assert!(laid.vertices().len() * 5 <= HUD_MAX_VERTICES * 4);
                     assert!(laid.triangles().len() * 5 <= HUD_MAX_TRIANGLES * 4);
+                }
+            }
+        }
+    }
+}
+
+/// Full `field-ecology-v2` inspector panel: surfaces decoded V2 actions
+/// (`motor`, `bud`, `emt`, `pump`), active V2 organism state (`polarity`,
+/// `cohesion`, `h0`, `notch`, `ready`), rotated `effective_affinity · Z`, and
+/// V2 transaction terms (`waste`, `trophallaxis`), while worst-case V2 overlay
+/// text stays within the 2× (80%) and 3× (100%) HUD vertex and triangle caps
+/// with zero refused or left-out glyphs.
+#[test]
+fn v2_inspector_panel_surfaces_v2_actions_and_state_within_hud_cap() {
+    use flife_core::FeatureOverride;
+
+    let bundle_a_toml = include_str!("../../../presets/morphogenesis-tissue-v2.toml")
+        .replacen("initial_count = 10954", "initial_count = 16", 1)
+        .replacen("maximum_count = 262144", "maximum_count = 64", 1)
+        .replacen(
+            "pump_direction_mode = \"fixed-sign-v1\"",
+            "pump_direction_mode = \"neural-output-v1\"",
+            1,
+        );
+    let v2_cfg = ValidatedConfig::from_toml_with_overrides(
+        &bundle_a_toml,
+        &[
+            FeatureOverride::Enable("so2-budding".to_owned()),
+            FeatureOverride::Enable("emt-gate".to_owned()),
+        ],
+    )
+    .expect("valid Bundle A");
+    let mut world = World::found(
+        &v2_cfg,
+        Arrangement::FreeList,
+        NumericalProfile::reference_f32().expect("profile"),
+    )
+    .expect("founds");
+    let id = world.population().ids().next().expect("founder");
+    world.watch(Some(id));
+    for _ in 0..3 {
+        assert!(matches!(
+            world.step().expect("steps"),
+            Stepped::Published(_)
+        ));
+    }
+    let mut snap = world
+        .organism_snapshot(id)
+        .expect("inspects")
+        .expect("live");
+
+    // Carry the full worst-case baseline descendants/ancestors lines too so
+    // the HUD budget test is strictly harder than `known()`.
+    let widest_baseline = known();
+    snap.tick = widest_baseline.tick;
+    snap.age_ticks = widest_baseline.age_ticks;
+    snap.hidden_widths = widest_baseline.hidden_widths;
+    snap.parameters = widest_baseline.parameters;
+    snap.descendants = widest_baseline.descendants;
+
+    // Set deterministic worst-case V2 values on top of the real V2 snapshot.
+    snap.organism.polarity = [-0.5, -0.866_025_403_784_438_6]; // 120° on screen (world y down)
+    snap.secretory_readiness = Some(0.99);
+    snap.last_neighbor_h0 = Some(-0.88);
+    let mut rotated = [0.0_f64; MATERIAL_CHANNELS];
+    rotated[0] = 1.0;
+    snap.effective_affinity = Some(rotated);
+    let sensed = snap.sensed.as_mut().expect("watched sensed");
+    sensed.observation.inputs[1..=MATERIAL_CHANNELS].fill(0.0);
+    sensed.observation.inputs[1] = -0.345;
+    let decoded = snap.decoded.as_mut().expect("decoded");
+    let motor = decoded.motor.as_mut().expect("so2-motor decoded");
+    motor.energy_gradient = -0.98;
+    motor.chemical_gradient = -0.87;
+    motor.chiral_contour = -0.76;
+    motor.heading_propulsion = -0.65;
+    let budding = decoded.budding.as_mut().expect("so2-budding decoded");
+    budding.radial = -0.60;
+    budding.tangential = -0.80;
+    assert!(decoded.emt_gate.is_some());
+    decoded.emt_gate = Some(0.88);
+    assert!(decoded.wake_pump.is_some());
+    decoded.wake_pump = Some(-0.77);
+    snap.transactions[0].byproduct_staged = 99_999.999_4;
+    snap.transactions[1].byproduct_staged = 0.0;
+    snap.transactions[2].byproduct_staged = 0.0;
+    snap.transactions[0].trophallaxis_delta = -99_999.999_4;
+    snap.transactions[1].trophallaxis_delta = 0.0;
+    snap.transactions[2].trophallaxis_delta = 0.0;
+
+    let panel = inspector_lines(Inspected::Read(&snap));
+    assert!(
+        panel
+            .contains(" · motor -0.98,-0.87,-0.76,-0.65 · bud -0.60,-0.80 · emt 0.88 · pump -0.77"),
+        "expected V2 decoded action clauses in:\n{panel}"
+    );
+    assert!(
+        panel.contains("polarity 120° · cohesion ")
+            && panel.contains(" · h0 ")
+            && panel.contains(" · notch -0.88 · ready 0.99"),
+        "expected V2 organism state line in:\n{panel}"
+    );
+    assert!(
+        panel.contains(" · affinity·Z -0.345"),
+        "expected effective_affinity·Z in:\n{panel}"
+    );
+    assert!(
+        panel.contains(" · waste 99999.999 · trophallaxis -99999.999 · net "),
+        "expected waste + trophallaxis in:\n{panel}"
+    );
+
+    let font = HudFont::bundled().expect("bundled HUD font");
+    let all_keys = legends(&v2_cfg).expect("legends");
+    let widest = metrics();
+    let memory = admission(999 * GIB, 999 * GIB, GIB);
+    let preview = widest_preview(Brush::Removal, BrushSettings::default());
+    for (mapping, legend) in all_keys.iter().filter(|(mapping, _)| mapping.is_v2()) {
+        for field_mapping in [
+            FieldMapping::TrailCarrier,
+            FieldMapping::VascularConductance,
+        ] {
+            let field = field_mapping.legend().expect("v2 overlay legend");
+            let text = overlay_text(&OverlayState {
+                paused: Some(true),
+                shown: Some(Tick::new(999_999_999_999)),
+                clock: Some(&READING),
+                legend,
+                field_key: Some(&field),
+                brush: Some(Brush::Removal),
+                preview: Some(preview),
+                measuring: None,
+                selected: Some(OrganismId::new(999_999_999_999)),
+                inspected: Some(Inspected::Read(&snap)),
+                telemetry: Some(Telemetry {
+                    metrics: &widest,
+                    model: "field-ecology-v2",
+                    seed: u64::MAX,
+                    evaluation_interval_ticks: u32::MAX,
+                    memory: &memory,
+                    capacity_pauses: 999_999_999_999,
+                    checkpoint: Some(Tick::new(999_999_999_999)),
+                }),
+            });
+            let colors: Vec<_> = legend
+                .swatches
+                .iter()
+                .chain(&field.swatches)
+                .map(|&rgb| linear(rgb))
+                .collect();
+            let glyphs = text.chars().filter(|c| !c.is_whitespace()).count();
+            for scale in [2.0_f64, 3.0_f64] {
+                let laid = font
+                    .text_with_swatches(&text, HUD_TEXT_POINTS * scale, &colors)
+                    .unwrap_or_else(|error| {
+                        panic!("{mapping:?} + {field_mapping:?} + full v2 @{scale}x: {error}")
+                    });
+                assert_eq!(laid.glyphs(), glyphs);
+                assert_eq!(laid.refused(), 0);
+                assert_eq!(laid.left_out(), 0);
+                assert!(
+                    laid.vertices().len() <= HUD_MAX_VERTICES,
+                    "{mapping:?} + {field_mapping:?} @{scale}x vertices {}",
+                    laid.vertices().len()
+                );
+                assert!(
+                    laid.triangles().len() <= HUD_MAX_TRIANGLES,
+                    "{mapping:?} + {field_mapping:?} @{scale}x triangles {}",
+                    laid.triangles().len()
+                );
+                if (scale - 2.0).abs() < f64::EPSILON {
+                    assert!(
+                        laid.vertices().len() * 5 <= HUD_MAX_VERTICES * 4,
+                        "{mapping:?} + {field_mapping:?} @2x vertices {} exceed 80% HUD cap ({})",
+                        laid.vertices().len(),
+                        HUD_MAX_VERTICES * 4 / 5
+                    );
+                    assert!(
+                        laid.triangles().len() * 5 <= HUD_MAX_TRIANGLES * 4,
+                        "{mapping:?} + {field_mapping:?} @2x triangles {} exceed 80% HUD cap ({})",
+                        laid.triangles().len(),
+                        HUD_MAX_TRIANGLES * 4 / 5
+                    );
                 }
             }
         }

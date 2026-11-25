@@ -419,12 +419,16 @@ directory, with its pending commands and its checkpoint chain.
     exchange footprint's `cells`, each with its `cell` index, `weight`, `energy` and `efficiency`; the footprint's
     `density`, A.1's `request` there, and the `gain` and `toxicity` per unit taken), and the decoded held output
     (attempt rate and probability, child
-    fraction, emission gate, emission direction and spend fraction) or null; `sensed` (its step's start `tick`,
+    fraction, emission gate, emission direction and spend fraction, plus optional `field-ecology-v2` `motor`,
+    `budding`, `emt_gate` and `wake_pump` when active) or null; optional active `field-ecology-v2` organism state
+    fields (`recurrent_state`, `secretory_readiness`, `effective_affinity`, `last_neighbor_h0`, `polarity`,
+    `polarity_strength`, `wedge_curvature`, `cadherin_tag` and `cohesiveness`, each omitted when inactive); `sensed` (its step's start `tick`,
     `scale`, `evaluated`, `raw` as the three planes `R, M_0, …, M_31`, x and y derivatives, the 104 `inputs` and
     the 33 `gradients`) and `activations` (the output's `tick` and each `hidden` layer's values) or null; and
     `transactions`, what its recorded steps add up to as the panel sums them (`flife_studio::recent`): `steps`, the
     first and newest steps' `ticks`, chemistry's net `uptake`, the `maintenance`, `motion` and `emission` paid,
-    `births` and what their splits debited (`endowed`), the `net` change, and the newest step's `reproduction`
+    `births` and what their splits debited (`endowed`), optional non-zero `field-ecology-v2` `byproduct_staged` and
+    signed `trophallaxis`, the `net` change, and the newest step's `reproduction`
     (`cooling-down`, `no-attempt`, `unviable`, `born` or `rejected`), or null; and `descendants`: the tick its
     counts run `since`, its `children_born` and `children_living`, its descendants `born` and `living`, the
     `ancestors` its line passes through, nearest first and at most `flife_engine::ANCESTRY_PATH` (8), each with

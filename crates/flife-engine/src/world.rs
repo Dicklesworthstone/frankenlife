@@ -2605,6 +2605,29 @@ impl World {
             }
             _ => None,
         };
+        let effective_affinity = if self.rules.v2.affinity_rotation_enabled() {
+            Some(effective_affinity(
+                genome.traits(),
+                organism.held.recurrent_state_array()[0],
+                &self.rules.v2,
+                self.rules.chemistry.affinity_norm_limit(),
+            )?)
+        } else {
+            None
+        };
+        let secretory_readiness = self
+            .rules
+            .v2
+            .emission()
+            .excitable
+            .is_some()
+            .then(|| f64::from(organism.secretory_readiness));
+        let last_neighbor_h0 = self
+            .rules
+            .v2
+            .notch_delta()
+            .is_some()
+            .then(|| f64::from(organism.last_neighbor_h0));
         let transactions = if watched {
             self.watch.recent.iter().copied().collect()
         } else {
@@ -2618,6 +2641,9 @@ impl World {
             hidden_widths: topology.hidden_widths().to_vec(),
             parameters: genome.parameters().len(),
             traits: *genome.traits(),
+            secretory_readiness,
+            effective_affinity,
+            last_neighbor_h0,
             local,
             decoded,
             sensed,

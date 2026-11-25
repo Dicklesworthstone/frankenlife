@@ -9,6 +9,8 @@
 //! do (FL-022's preview, plan §14.3), and while the measuring tool is, what
 //! its disk holds (plan §14.3's temporary measurement region).
 
+use std::fmt::Write as _;
+
 use flife_core::ids::OrganismId;
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, Tick, ValidatedConfig};
@@ -565,12 +567,16 @@ fn places(scale: f64) -> usize {
 /// - `hidden 64, 32 · 9,124 parameters`: its controller's hidden widths, in
 ///   evaluation order, and parameter count;
 /// - `reproduction 3.1% a tick · emission gate 0.72` from the output it
-///   holds, or `no controller output held`;
+///   holds (followed by active `field-ecology-v2` `motor`, `bud`, `emt`, and
+///   `pump` clauses when decoded), or `no controller output held`;
+/// - when any `field-ecology-v2` organism state (`polarity`, `cohesion`,
+///   `h0`, `notch`, `ready`) is present, one compact line listing only the
+///   active clauses (omitted on `field-ecology-v1*`);
 /// - `sensed at tick 5,119 · scale 1.50 · field 0.412` and `gradient 0.031
 ///   toward 45° · affinity·Z +0.112`: what it observed in the newest tick
 ///   the world recorded for it ([`Sensed`]), at its sensing scale: the
 ///   field input `q = R/(R + R_scale)`, the length of its unsaturated
-///   gradient and its direction as the heading's, and its affinity
+///   gradient and its direction as the heading's, and its effective affinity
 ///   direction's dot product with the composition inputs `Z`; or `sensed
 ///   from its next tick` before the world has recorded one;
 /// - `activations at tick 5,120 · max |a| 0.98, 0.97 · mean |a| 0.31, 0.44`:
@@ -618,16 +624,46 @@ pub fn inspector_lines(inspected: Inspected<'_>) -> String {
     let actions = snapshot.decoded.map_or_else(
         || "no controller output held".to_owned(),
         |decoded| {
-            format!(
+            let mut line = format!(
                 "reproduction {}% a tick · emission gate {}",
                 decimal(100.0 * decoded.attempt_probability, 1),
                 decimal(decoded.emission_gate, 2)
-            )
+            );
+            if let Some(motor) = decoded.motor {
+                let _ = write!(
+                    line,
+                    " · motor {},{},{},{}",
+                    signed(motor.energy_gradient, 2),
+                    signed(motor.chemical_gradient, 2),
+                    signed(motor.chiral_contour, 2),
+                    signed(motor.heading_propulsion, 2)
+                );
+            }
+            if let Some(budding) = decoded.budding {
+                let _ = write!(
+                    line,
+                    " · bud {},{}",
+                    signed(budding.radial, 2),
+                    signed(budding.tangential, 2)
+                );
+            }
+            if let Some(emt) = decoded.emt_gate {
+                let _ = write!(line, " · emt {}", decimal(emt, 2));
+            }
+            if let Some(pump) = decoded.wake_pump {
+                let _ = write!(line, " · pump {}", signed(pump, 2));
+            }
+            line
         },
     );
+    let v2_state = v2_state_line(snapshot).map_or_else(String::new, |line| format!("\n{line}"));
+    let active_affinity = snapshot
+        .effective_affinity
+        .as_ref()
+        .unwrap_or_else(|| snapshot.traits.affinity());
     let sensed = snapshot.sensed.as_ref().map_or_else(
         || "sensed from its next tick".to_owned(),
-        |sensed| sensed_lines(sensed, snapshot.traits.affinity()),
+        |sensed| sensed_lines(sensed, active_affinity),
     );
     let activations = snapshot.activations.as_ref().map_or_else(
         || "activations at its next evaluation".to_owned(),
@@ -647,7 +683,7 @@ pub fn inspector_lines(inspected: Inspected<'_>) -> String {
          {motion}\n\
          {local}\n\
          hidden {hidden} · {} parameters\n\
-         {actions}\n\
+         {actions}{v2_state}\n\
          {sensed}\n\
          {activations}\n\
          {transactions}\n\
@@ -660,6 +696,32 @@ pub fn inspector_lines(inspected: Inspected<'_>) -> String {
         grouped(snapshot.age_ticks),
         grouped(u64::try_from(snapshot.parameters).unwrap_or(u64::MAX)),
     )
+}
+
+/// Optional compact line of active `field-ecology-v2` organism state for
+/// [`inspector_lines`]; returns `None` on `field-ecology-v1*` snapshots so the
+/// baseline panel layout is unchanged.
+fn v2_state_line(snapshot: &OrganismSnapshot) -> Option<String> {
+    let mut parts = Vec::new();
+    if snapshot.traits.polarity_strength().is_some() {
+        let [px, py] = snapshot.organism.polarity;
+        if px.is_finite() && py.is_finite() && px.hypot(py) > 0.0 {
+            parts.push(format!("polarity {:.0}°", degrees([px, py])));
+        }
+    }
+    if let Some(cohesiveness) = snapshot.cohesiveness() {
+        parts.push(format!("cohesion {}", decimal(cohesiveness, 2)));
+    }
+    if let Some(&h0) = snapshot.organism.held.recurrent_state().first() {
+        parts.push(format!("h0 {}", signed(f64::from(h0), 2)));
+    }
+    if let Some(neighbor_h0) = snapshot.last_neighbor_h0 {
+        parts.push(format!("notch {}", signed(neighbor_h0, 2)));
+    }
+    if let Some(readiness) = snapshot.secretory_readiness {
+        parts.push(format!("ready {}", decimal(readiness, 2)));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// The most ancestors the inspector panel names; the Studio's record names
@@ -898,6 +960,11 @@ fn transaction_lines(recent: &Recent) -> String {
             grouped(u64::try_from(recent.steps).unwrap_or(u64::MAX))
         )
     };
+    let waste = if recent.byproduct_staged > 0.0 {
+        format!(" · waste {}", decimal(recent.byproduct_staged, 3))
+    } else {
+        String::new()
+    };
     let trophallaxis = if recent.trophallaxis != 0.0 {
         format!(" · trophallaxis {}", signed(recent.trophallaxis, 3))
     } else {
@@ -905,7 +972,7 @@ fn transaction_lines(recent: &Recent) -> String {
     };
     format!(
         "{steps}: uptake {} · maintenance {} · motion {}\n\
-         emission {} · {births}{trophallaxis} · net {} · {reproduction}",
+         emission {} · {births}{waste}{trophallaxis} · net {} · {reproduction}",
         signed(recent.uptake, 3),
         signed(-recent.maintenance, 3),
         signed(-recent.motion, 3),

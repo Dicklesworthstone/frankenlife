@@ -1,7 +1,7 @@
 # FrankenLife website
 
-The project's page: Next.js 16 as a static export, served by Cloudflare as an assets-only Worker
-(`wrangler.jsonc`). It shows films rendered by `flife render` from committed worlds (the v1 confluent
+The project's page: Next.js 16 as a static export, served by Cloudflare as Workers static assets behind a
+small Worker that streams the films from R2 (`wrangler.jsonc`, `worker.ts`). It shows films rendered by `flife render` from committed worlds (the v1 confluent
 world, and the same world as field-ecology-v2 with one mechanism on: veins, then polarity), with a readout of each
 frame's tick and live organisms taken from the render's own records. The Rust workspace does not
 build or read this directory (`.rchignore` keeps it out of remote builds too).
@@ -58,7 +58,8 @@ Bun only:
 ```bash
 cd web
 bun install
-bun run dev          # http://localhost:3000, once the media are in public/media/
+bun run dev          # http://localhost:3000 with the posters and stills in public/media/; no film plays (they are in R2)
+bun run preview      # build, then the Worker locally (wrangler dev), with the films from the real R2 bucket
 bun run typecheck
 bun test             # worker.ts's byte serving and share-image type, the director's camera and card frame,
                      # the controls' manifest against the record, the explainers' arithmetic against the
@@ -105,8 +106,9 @@ bun run media --film confluent --flife ../target/release/flife --run-dir ../RUN 
   --ticks 3200 --every 8 --field none --look sphere --color lineage --zooms 1.6,3,2.2,5,2.6 --cpu-workers 24
 
 # 4K at 60 fps (`bun run media:4k60` sets --ticks 3200 --every 2: 1,601 frames from tick 2,400 to
-# 5,600, 26.7 s, 2160 × 2160, CRF 30, one MP4 per film into media-r2/ for R2; later flags win, so
-# --width 3840 --height 2160 gives 16:9). --master-out adds an archival encode at CRF 16:
+# 5,600, 26.7 s, 2160 × 2160, CRF 30, one MP4 per film into media-r2/ for R2, and --small 1080
+# --small-crf 26, the same frames at 1080 × 1080 for phones; later flags win, so --width 3840
+# --height 2160 gives 16:9, with a 1920 × 1080 phone encode). --master-out adds an archival encode at CRF 16:
 bun run media:4k60 -- --film confluent --flife ../target/release/flife --run-dir ../RUN --work WORK-4K60 \
   --field none --look sphere --color lineage-energy \
   --zooms 1.6,3,2.2,5,2.6 --master-out ../exports/film-4k60-master.mp4 --cpu-workers 24
@@ -141,7 +143,13 @@ order with `--config` and refused with `--run-dir` per `INV-14`. Both `--size S`
 `--fps` (including `--fps 60`). Each film is one MP4, `<id>-<hash>.mp4`, encoded at its CRF alone with a
 keyframe every second so a seek lands quickly, written to `media-r2/` (outside git) and served from R2 by
 `worker.ts`; Cloudflare's 25 MiB limit applies only to static assets, which the films no longer are.
-`--master-out PATH` (outside `public/media/`) also encodes one archival MP4 from the same PNG frames.
+`--small HEIGHT` also encodes the same frames scaled to that height, `<id>-small-<hash>.mp4`, at
+`--small-crf` (default `--crf`): the player's `<source media>` gives it to screens at most 640 CSS pixels
+wide (`components/film.tsx`, `PHONE`), where the 4K film's extra pixels would be downscaled away and its
+H.264 level 5.2 is more than some phones decode (the 1080 encode is level 4.2). At 1080, CRF 30 smeared
+single bodies that the 4K encode keeps when scaled down; CRF 26 matched it, at about 56% of the 4K
+film's bytes. `--master-out PATH` (outside
+`public/media/`) also encodes one archival MP4 from the same PNG frames.
 
 `presets/confluent-world.toml` was chosen by outer searches and by eye, under the registered contact model;
 `../experiments/showcase/README.md` states how (stages C and E).
@@ -189,11 +197,14 @@ URL: a platform that cached the old card shows it until its own refresh tool fet
 ## Cloudflare
 
 `bun run deploy` uploads `out/` as the Worker's static assets, served at https://frankenlife.org, and each
-film's MP4 to the R2 bucket `frankenlife-media` (binding `MEDIA`, key `media/<id>-<hash>.mp4`), skipping a
-film the site already serves. `worker.ts` serves `/media/*.mp4` from R2: the whole file, or for a Range
+film's MP4 and its phone encode to the R2 bucket `frankenlife-media` (binding `MEDIA`, keys
+`media/<id>-<hash>.mp4` and `media/<id>-small-<hash>.mp4`), skipping a video the site already serves. `worker.ts` serves `/media/*.mp4` from R2: the whole file, or for a Range
 request only the bytes asked for as a 206 (Safari plays no video without it), sized from the manifests; a
-name R2 does not hold gets the site's 404 page. `bun run upload-media --check` then compares each live
-film's first and last bytes with `media-r2/`, asking again for a minute while the new Worker spreads. The static export
+name R2 does not hold gets the site's 404 page, uncached, and a film whose size in R2 differs from its
+manifest's, or an R2 failure, a 503. `bun run upload-media --check` then checks each live film: whole (its
+size, and R2's ETag against the MD5 of the copy in `media-r2/`) and its first and last bytes, asking again
+for a minute if an edge is slow to answer. Uploads go through `wrangler r2 object put`, one PUT of at most
+300 MiB per film; the build refuses a larger film (`scripts/media-verify.ts`). The static export
 writes the share images without an extension, so the Worker gives them their type, `image/jpeg`
 (`lib/share.ts`). It also sends www.frankenlife.org to frankenlife.org; every other request goes to the
 static assets unchanged. Both names are custom domains on the Worker

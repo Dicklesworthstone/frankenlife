@@ -57,24 +57,25 @@ describe("the film's pictures on the torus", () => {
     expect(cameraAt([{ tick: 0, center: [82, -4], zoom: 2 }], 10).center).toEqual([2, 76]);
   });
 
-  test("the card is frame 368 at tick 3,872, zoom 3, halfway between two keys: centre (27.8125, 67.5)", () => {
+  test("the card is frame 1,104 at tick 4,608, zoom 3, halfway between two keys: centre (14.4792, 68.0208)", () => {
     const card = cardPlacement(film);
-    expect(film.social.frame).toBe(368);
-    expect(card.tick).toBe(3872);
+    expect(film.social.frame).toBe(1104);
+    expect(card.tick).toBe(4608);
     expect(card.zoom).toBeCloseTo(3, 12);
-    expect(card.center[0]).toBeCloseTo(27.8125, 12);
-    expect(card.center[1]).toBeCloseTo(67.5, 12);
+    // The keys at ticks 4,352 and 4,864 hold zoom 3 at (17.8125, 64.6875) and (11.1458…, 71.3542…).
+    expect(card.center[0]).toBeCloseTo((17.8125 + 11.145833333333332) / 2, 12);
+    expect(card.center[1]).toBeCloseTo((64.6875 + 71.35416666666667) / 2, 12);
     // 80/3 units wide; 630/1200 of that tall: 14 units.
     expect(card.width).toBeCloseTo(80 / 3, 12);
     expect(card.height).toBeCloseTo(14, 12);
   });
 
-  test("the picked organism belongs to this card, and sits at (29.30, 70.39)", () => {
+  test("the picked organism belongs to this card, and sits at (10.35, 67.62)", () => {
     // A new film has a new card: pick a new organism (zoom-ladder-geometry.ts, PICK).
     expect(film.social.sha256).toBe(PICK.cardSha256);
     const [x, y] = cardPixelToWorld(cardPlacement(film), PICK.x, PICK.y);
-    expect(x).toBeCloseTo(29.3, 1);
-    expect(y).toBeCloseTo(70.39, 1);
+    expect(x).toBeCloseTo(10.35, 1);
+    expect(y).toBeCloseTo(67.62, 1);
   });
 });
 

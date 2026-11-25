@@ -11,18 +11,22 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { controls, films, stills } from "../lib/media";
-import { verifyFilmVideos, verifyMediaDirectory, videoName } from "./media-verify";
+import { checkFile, filmVideoFiles, verifyMediaDirectory } from "./media-verify";
 
 const PUBLIC = fileURLToPath(new URL("../public", import.meta.url));
 const FILMS = fileURLToPath(new URL("../media-r2", import.meta.url));
 const errors = verifyMediaDirectory(films, [controls, stills], PUBLIC);
-const local = films.filter((film) => existsSync(`${FILMS}/${videoName(film)}`));
-errors.push(...verifyFilmVideos(local, FILMS));
+const videos = films.flatMap(filmVideoFiles);
+const local = videos.filter(({ name }) => existsSync(`${FILMS}/${name}`));
+for (const { name, file } of local) {
+  const problem = checkFile(`${FILMS}/${name}`, file);
+  if (problem !== null) errors.push(problem);
+}
 if (errors.length > 0) {
   for (const error of errors) console.error(`check-media: ${error}`);
   process.exit(1);
 }
 console.error(
   `check-media: every static file the ${films.length === 1 ? "film" : `${films.length} films`} and the stills name ` +
-    `is present, byte for byte; ${local.length} of ${films.length} videos are in media-r2/ and match`,
+    `is present, byte for byte; ${local.length} of the ${videos.length} videos are in media-r2/ and match`,
 );

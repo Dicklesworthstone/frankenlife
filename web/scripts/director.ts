@@ -40,6 +40,24 @@ export const DIRECTOR_RULE =
   "activity |blur(L[t+1] − L[t−1])| of a whole-world raw preview, blurred to each shot's view; " +
   "each shot looks where that activity was greatest over the shot, discounting regions already shown";
 
+/**
+ * The site's films' pacing, as shares of the film: the whole torus for the first 35%, so the world is seen
+ * evolving before the camera moves in (9.3 s of a 1,601-frame film at 60 fps); each shot eases in over 5% and
+ * holds 16%; the whole torus again for at least the last 10%. A 1,601-frame film fits two shots.
+ */
+export const FILM_PACING = { opening: 0.35, transition: 0.05, dwell: 0.16, closing: 0.1 } as const;
+
+/** The director's options for a film of `frameCount` frames at the site's pacing, with these shot zooms. */
+export function pacedOptions(frameCount: number, zooms: number[]): DirectorOptions {
+  return {
+    opening: Math.round(frameCount * FILM_PACING.opening),
+    transition: Math.round(frameCount * FILM_PACING.transition),
+    dwell: Math.round(frameCount * FILM_PACING.dwell),
+    closing: Math.round(frameCount * FILM_PACING.closing),
+    zooms,
+  };
+}
+
 /** The rule `scripts/media.ts --camera fixed` records: no director, one key held. */
 export const FIXED_RULE = "fixed: the torus centre held at one zoom for the whole film";
 

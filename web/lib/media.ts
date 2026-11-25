@@ -21,11 +21,18 @@ export type MediaFile = {
 };
 
 export type MasterVideo = {
-  /** Path outside public/media/ where the unconstrained archival MP4 was written. */
+  /** Path outside the site (never uploaded) where the archival MP4, at a lower CRF than the web's, was written. */
   path: string;
   sha256: string;
   bytes: number;
   crf: number;
+  encode: string[];
+};
+
+export type SmallVideo = MediaFile & {
+  width: number;
+  height: number;
+  /** The ffmpeg arguments that encoded it from the film's PNG frames. */
   encode: string[];
 };
 
@@ -41,8 +48,13 @@ export type FilmManifest = {
     frames: number;
     /** The ffmpeg arguments that encoded it from flife's PNG frames. */
     encode: string[];
-    /** Optional unconstrained archival master (e.g. 4K60) written outside public/media/. */
+    /** The optional archival master of the same frames (scripts/media.ts --master-out), kept off the site. */
     master?: MasterVideo;
+    /**
+     * The same frames scaled down for a phone (scripts/media.ts --small), at the same CRF: what a narrow screen
+     * plays (components/film.tsx, PHONE), a fraction of the bytes. Served from R2 like the film.
+     */
+    small?: SmallVideo;
   };
   poster: MediaFile & { frame: number };
   /** The social card: a 1200 × 630 crop of film frame `frame` (scripts/media.ts). */
@@ -231,9 +243,13 @@ export const stills = stillsManifest as unknown as StillsManifest;
 /** Every static file the site serves from /media/ (public/media/), once each, as the manifests name them. */
 export const staticMedia: MediaFile[] = collectStaticMedia(films, [controls, stills]);
 
-/** Each film's one video, served from R2 at its `src` (worker.ts). */
-export const filmVideos: MediaFile[] = films.map((filmManifest) => ({
-  src: filmManifest.video.src,
-  sha256: filmManifest.video.sha256,
-  bytes: filmManifest.video.bytes,
-}));
+/** A film's videos: the film, then its phone encode if it has one, each as the site names it. */
+export function videosOf(filmManifest: FilmManifest): MediaFile[] {
+  const { video } = filmManifest;
+  const files = [{ src: video.src, sha256: video.sha256, bytes: video.bytes }];
+  if (video.small) files.push({ src: video.small.src, sha256: video.small.sha256, bytes: video.small.bytes });
+  return files;
+}
+
+/** Every film's videos, served from R2 at their `src` (worker.ts). */
+export const filmVideos: MediaFile[] = films.flatMap(videosOf);

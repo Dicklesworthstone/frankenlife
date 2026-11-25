@@ -2,7 +2,7 @@
 // is known.
 import { describe, expect, test } from "bun:test";
 
-import { type CameraKey, activities, cardFrame, direct } from "./director";
+import { type CameraKey, activities, cardFrame, direct, pacedOptions } from "./director";
 
 const GRID = 128;
 const EXTENT: [number, number] = [256, 256];
@@ -88,25 +88,20 @@ describe("direct", () => {
       expect(distance(firsts[i]!, firsts[i - 1]!)).toBeGreaterThan(64);
     }
   });
-  test("801-frame true-60fps cadence (ticks 2,400..5,600, every 4) keeps exact 3-shot wall-clock parity with 401f/30fps", () => {
-    const frameCount = 801;
-    const ticks = Array.from({ length: frameCount }, (_, f) => 2400 + 4 * f);
-    const frames = Array.from({ length: frameCount }, (_, t) => disc([(10 + Math.floor(t / 2)) % GRID, 64]));
-    const opts60 = {
-      opening: Math.round(frameCount * 0.08), // 64 frames = 1.07s at 60fps
-      transition: Math.round(frameCount * 0.07), // 56 frames = 0.93s
-      dwell: Math.round(frameCount * 0.16), // 128 frames = 2.13s
-      closing: Math.round(frameCount * 0.06), // 48 frames = 0.80s
-      zooms: [1.6, 3, 2.2, 5, 2.6],
-    };
-    const keys = direct(ticks, activities(frames), [80, 80], opts60);
-    // 10 keys: open(0..64), shot0(120..248), shot1(304..432), shot2(488..616), close(672..800).
-    expect(keys).toHaveLength(10);
-    expect(keys.map((k) => k.tick)).toEqual([2400, 2656, 2880, 3392, 3616, 4128, 4352, 4864, 5088, 5600]);
-    expect(keys.map((k) => k.zoom)).toEqual([1, 1, 1.6, 1.6, 3, 3, 2.2, 2.2, 1, 1]);
-    // Closest shot is zoom=3 across ticks 3616..4128 -> middle tick 3872 is frame 368 (exact match to 30fps frame 184!).
-    expect(cardFrame(keys, ticks)).toBe(368);
-    expect(ticks[cardFrame(keys, ticks)]).toBe(3872);
+  test("the site's films (1,601 frames, ticks 2,400..5,600, every 2): 9.3 s on the whole torus, two shots, then the torus", () => {
+    const frameCount = 1601;
+    const ticks = Array.from({ length: frameCount }, (_, f) => 2400 + 2 * f);
+    const frames = Array.from({ length: frameCount }, (_, t) => disc([(10 + Math.floor(t / 4)) % GRID, 64]));
+    const options = pacedOptions(frameCount, [1.6, 3, 2.2, 5, 2.6]);
+    expect(options).toEqual({ opening: 560, transition: 80, dwell: 256, closing: 160, zooms: [1.6, 3, 2.2, 5, 2.6] });
+    const keys = direct(ticks, activities(frames), [80, 80], options);
+    // Frames: the torus 0..560 (9.33 s at 60 fps), a 1.6× shot 640..896, a 3× shot 976..1232, the torus 1312..1600.
+    expect(keys.map((k) => k.tick)).toEqual([2400, 3520, 3680, 4192, 4352, 4864, 5024, 5600]);
+    expect(keys.map((k) => k.zoom)).toEqual([1, 1, 1.6, 1.6, 3, 3, 1, 1]);
+    expect((ticks.indexOf(keys[1]!.tick) / 60).toFixed(2)).toBe("9.33");
+    // The card is the middle of the closest shot: tick 4,608, frame 1,104 (the confluent film's).
+    expect(cardFrame(keys, ticks)).toBe(1104);
+    expect(ticks[cardFrame(keys, ticks)]).toBe(4608);
   });
 });
 

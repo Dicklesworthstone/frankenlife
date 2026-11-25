@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { v2Features } from "../lib/content";
-import { type ControlsManifest, type FilmManifest, collectStaticMedia } from "../lib/media";
+import { type ControlsManifest, type FilmManifest, collectStaticMedia, videosOf } from "../lib/media";
 import {
   ASSET_LIMIT,
   MEDIA_COLORS,
@@ -18,7 +18,15 @@ import {
   parseControlsArgs,
   parseMediaArgs,
 } from "./media-options";
-import { verifyFilmVideos, verifyMediaDirectory, videoName } from "./media-verify";
+import {
+  UPLOAD_LIMIT,
+  etagAgainstMd5,
+  filmVideoFiles,
+  siteOrigin,
+  verifyFilmVideos,
+  verifyMediaDirectory,
+  videoName,
+} from "./media-verify";
 
 const PUBLIC_MEDIA = resolve("/tmp/frankenlife-web/public/media");
 
@@ -227,13 +235,16 @@ describe("V2 feature slug registry parity", () => {
 });
 
 describe("one film, one file, served from R2", () => {
-  test("media:4k60's defaults make a 1,601-frame film at CRF 30, and later flags override them", () => {
+  test("media:4k60's defaults make a 1,601-frame film at CRF 30 with a 1080 phone encode; later flags win", () => {
     // package.json's `media:4k60` prepends these; media.ts takes the last value of a repeated flag.
-    const defaults = ["--ticks", "3200", "--every", "2", "--width", "2160", "--height", "2160", "--fps", "60", "--crf", "30"];
+    const script: string = JSON.parse(readFileSync(join(import.meta.dir, "..", "package.json"), "utf8")).scripts["media:4k60"];
+    expect(script.startsWith("bun scripts/media.ts ")).toBe(true);
+    const defaults = script.split(" ").slice(2);
     const media4k60 = parseMediaArgs([...defaults, "--flife", "flife", "--run-dir", "run", "--work", "w"]);
     expect(media4k60.ticks / media4k60.every + 1).toBe(1601);
-    expect(media4k60.fps).toBe(60);
-    expect(media4k60.crf).toBe(30);
+    expect([media4k60.width, media4k60.height, media4k60.fps, media4k60.crf]).toEqual([2160, 2160, 60, 30]);
+    expect(media4k60.small).toEqual([1080, 1080]);
+    expect(media4k60.smallCrf).toBe(26);
     const overridden = parseMediaArgs([
       ...defaults,
       "--flife",
@@ -250,6 +261,29 @@ describe("one film, one file, served from R2", () => {
     expect(overridden.width).toBe(3840);
     expect(overridden.height).toBe(2160);
     expect(overridden.crf).toBe(18);
+  });
+
+  test("--small keeps the film's aspect at an even width, and must be an even height below the film's", () => {
+    const base = ["--flife", "flife", "--run-dir", "run", "--work", "w", "--width", "3840", "--height", "2160"];
+    expect(parseMediaArgs(base).small).toBeNull();
+    expect(parseMediaArgs([...base, "--small", "0"]).small).toBeNull();
+    expect(parseMediaArgs([...base, "--small", "1080"]).small).toEqual([1920, 1080]);
+    expect(parseMediaArgs([...base, "--small", "720"]).small).toEqual([1280, 720]);
+    for (const bad of ["1081", "2160", "4320", "-2", "x"]) expect(() => parseMediaArgs([...base, "--small", bad])).toThrow(/--small/);
+    // Its CRF is the film's unless given, and only with --small.
+    expect(parseMediaArgs([...base, "--crf", "30", "--small", "1080"]).smallCrf).toBe(30);
+    expect(parseMediaArgs([...base, "--small", "1080", "--small-crf", "26"]).smallCrf).toBe(26);
+    expect(() => parseMediaArgs([...base, "--small-crf", "26"])).toThrow(/--small-crf requires --small/);
+    expect(() => parseMediaArgs([...base, "--small", "1080", "--small-crf", "52"])).toThrow(/--small-crf/);
+  });
+
+  test("the phone encode is the film's encode with the frames scaled first, in the same filter", () => {
+    const film = buildWebEncodeArgs(30, 60);
+    const phone = buildWebEncodeArgs(30, 60, [1080, 1080]);
+    expect(phone.length).toBe(film.length);
+    const vf = film.indexOf("-vf") + 1;
+    expect(phone[vf]).toBe(film[vf]!.replace("scale=", "scale=w=1080:h=1080:flags=lanczos:"));
+    expect(phone.filter((_, at) => at !== vf)).toEqual(film.filter((_, at) => at !== vf));
   });
 
   test("refuses the retired segment flags", () => {
@@ -351,9 +385,16 @@ describe("one film, one file, served from R2", () => {
       expect(verifyFilmVideos([otherBytes], store).some((e) => e.includes("not the file its manifest names"))).toBe(true);
       expect(verifyFilmVideos([filmManifest], join(temp, "nowhere")).some((e) => e.includes("is missing"))).toBe(true);
 
-      // A static file over Cloudflare's 25 MiB static-asset limit is refused.
+      // A static file over Cloudflare's 25 MiB static-asset limit is refused; one at it is not.
       const hugeCard: FilmManifest = { ...filmManifest, social: { ...filmManifest.social, bytes: ASSET_LIMIT + 1 } };
       expect(verifyMediaDirectory([hugeCard], [controls4k], temp).some((e) => e.includes("asset limit"))).toBe(true);
+      const fullCard: FilmManifest = { ...filmManifest, social: { ...filmManifest.social, bytes: ASSET_LIMIT } };
+      expect(verifyMediaDirectory([fullCard], [controls4k], temp).some((e) => e.includes("asset limit"))).toBe(false);
+
+      // A film too large for one upload to R2 is refused before the deploy reaches it; one at the limit is not.
+      const atLimit = (bytes: number): FilmManifest => ({ ...filmManifest, video: { ...filmManifest.video, bytes } });
+      expect(verifyMediaDirectory([atLimit(UPLOAD_LIMIT + 1)], [controls4k], temp).some((e) => e.includes("one upload to R2"))).toBe(true);
+      expect(verifyMediaDirectory([atLimit(UPLOAD_LIMIT)], [controls4k], temp).some((e) => e.includes("one upload to R2"))).toBe(false);
 
       // A second film shares public/media/: its poster and card are named by its own manifest, not strays.
       const tissue = writeVideo("tissue", "tissue-film");
@@ -377,11 +418,50 @@ describe("one film, one file, served from R2", () => {
         ),
       ).toBe(true);
 
+      // A phone encode is a second video of the film, named <id>-small-<hash>.mp4, checked in media-r2/ like it.
+      const phone = writeVideo("film-small", "the-phone-film");
+      const withPhone: FilmManifest = {
+        ...filmManifest,
+        video: { ...filmManifest.video, small: { ...phone, width: 1080, height: 1080, encode: buildWebEncodeArgs(30, 60, [1080, 1080]) } },
+      };
+      expect(filmVideoFiles(withPhone).map((video) => video.name)).toEqual([
+        video.src.replace("/media/", ""),
+        phone.src.replace("/media/", ""),
+      ]);
+      expect(videosOf(withPhone).map((file) => file.src)).toEqual([video.src, phone.src]);
+      expect(verifyMediaDirectory([withPhone, second], [controls4k], temp)).toEqual([]);
+      expect(verifyFilmVideos([withPhone, second], store)).toEqual([]);
+      const misnamedPhone: FilmManifest = {
+        ...withPhone,
+        video: { ...withPhone.video, small: { ...withPhone.video.small!, src: "/media/film-phone-111111111111.mp4" } },
+      };
+      expect(verifyMediaDirectory([misnamedPhone], [controls4k], temp).some((e) => e.includes("not /media/film-small-"))).toBe(true);
+      rmSync(join(store, phone.src.replace("/media/", "")));
+      expect(verifyFilmVideos([withPhone], store).some((e) => e.includes("is missing"))).toBe(true);
+
       // Defect 3: unlisted stray file in public/media/ caught.
       writeFileSync(join(mediaDir, "stray-old.mp4"), "junk");
       expect(verifyMediaDirectory([filmManifest], [controls4k], temp).some((e) => e.includes("stray-old.mp4"))).toBe(true);
     } finally {
       rmSync(temp, { recursive: true, force: true });
     }
+  });
+});
+
+describe("upload-media's checks", () => {
+  test("--site is an http(s) origin, its trailing slash dropped so paths join as /media/…", () => {
+    expect(siteOrigin("https://frankenlife.org/")).toBe("https://frankenlife.org");
+    expect(siteOrigin("http://localhost:8787")).toBe("http://localhost:8787");
+    for (const bad of [undefined, "", "frankenlife.org", "ftp://frankenlife.org"]) expect(siteOrigin(bad)).toBeNull();
+  });
+
+  test("R2's ETag is compared with a film's MD5 only when it is one (a single PUT's)", () => {
+    const md5 = "0123456789abcdef0123456789abcdef";
+    expect(etagAgainstMd5(`"${md5}"`, md5)).toBe("same");
+    expect(etagAgainstMd5(`W/"${md5.toUpperCase()}"`, md5)).toBe("same");
+    expect(etagAgainstMd5(`"${"f".repeat(32)}"`, md5)).toBe("different");
+    // An ETag of a multipart upload, or none, says nothing about the bytes.
+    expect(etagAgainstMd5(`"${md5}-12"`, md5)).toBe("unknown");
+    expect(etagAgainstMd5(null, md5)).toBe("unknown");
   });
 });

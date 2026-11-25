@@ -3,7 +3,7 @@
 //
 //   bun scripts/media.ts [--film ID] --flife PATH (--run-dir DIR | --config PATH) --work DIR
 //     [--ticks 9600] [--every 32] [--size 1080 | --width 3840 --height 2160]
-//     [--fps 30|60] [--crf 24]
+//     [--fps 30|60] [--crf 24] [--small HEIGHT [--small-crf CRF]]
 //     [--master-out PATH] [--master-crf 16]
 //     [--camera auto|none|fixed]
 //     [--field energy|composition|component-C|trail-carrier|vascular-conductance|none]
@@ -34,9 +34,16 @@
 //   and 16:9 4K (`--width 3840 --height 2160`) at `--fps 60` (or any positive
 //   fps). ffmpeg encodes the whole film as one web MP4 with flife's own
 //   BT.709 colour chain, its quality set by `--crf` alone: the site serves it
-//   from R2 (worker.ts), which has no per-file limit to fit. Pass
-//   `--master-out PATH` (outside `public/media/`) to also encode an
-//   unconstrained high-quality archival 4K60 MP4 from the same PNG frames.
+//   from R2 (worker.ts), which has no per-file limit to fit. `--small HEIGHT`
+//   also encodes the same frames scaled to that height for phones
+//   (<ID>-small-<hash>.mp4), at `--small-crf` (default `--crf`). `media:4k60`
+//   passes 1080 at CRF 26: at 1080 a 4K film's CRF 30 smears single bodies
+//   that the 4K encode, scaled to 1080, keeps; 26 matches it, at about 56% of
+//   its bytes, and at H.264 level 4.2, which phones decode, where 2160² at
+//   60 fps needs 5.2, which not every phone does
+//   (experiments/website-films/README.md, round 5).
+//   Pass `--master-out PATH` (outside `public/media/`) to also encode an
+//   archival MP4 at a lower CRF from the same PNG frames.
 //
 // - `--film ID` (default `film`) names the manifest, lib/films/<ID>.json, and
 //   prefixes every file the film publishes (<ID>-<hash>.mp4,
@@ -67,6 +74,7 @@ import {
   cardFrame,
   direct,
   luminance,
+  pacedOptions,
 } from "./director";
 import { ASSET_LIMIT, SOCIAL_CROP_VF, buildMasterEncodeArgs, buildWebEncodeArgs, parseMediaArgs } from "./media-options";
 import { sourceRevision } from "./source-revision";
@@ -143,6 +151,8 @@ const {
   height,
   fps,
   crf,
+  small,
+  smallCrf,
   masterOut,
   masterCrf,
   cameraMode,
@@ -274,16 +284,11 @@ if (existsSync(made)) {
     // same 51–102 world units on any torus of 128 units or more (a 128-unit torus zooms half as far); no zoom
     // goes below 1.25.
     const span = Math.min(...extent) / 256;
-    // The film holds the whole torus for its first 35%, so the world is seen evolving before the camera moves
-    // in (9.3 s of a 1,601-frame film at 60 fps), and for at least its last 10%; each shot eases in over 5%
-    // and holds 16%. A 1,601-frame film fits two shots.
-    const directorOptions: DirectorOptions = {
-      opening: Math.round(frameCount * 0.35),
-      transition: Math.round(frameCount * 0.05),
-      dwell: Math.round(frameCount * 0.16),
-      closing: Math.round(frameCount * 0.1),
-      zooms: zooms ?? [3, 4.5, 2.5, 5, 3.5].map((zoom) => Math.max(1.25, Math.round(zoom * span * 100) / 100)),
-    };
+    // The site's pacing (director.ts FILM_PACING): a long look at the whole torus first, then the shots.
+    const directorOptions: DirectorOptions = pacedOptions(
+      frameCount,
+      zooms ?? [3, 4.5, 2.5, 5, 3.5].map((zoom) => Math.max(1.25, Math.round(zoom * span * 100) / 100)),
+    );
     const keys = direct(
       shots.map((record) => record.tick ?? fail("a preview frame without a tick")),
       maps,
@@ -359,6 +364,16 @@ const encoded = join(work, "film.mp4");
 run("ffmpeg", ["-y", "-loglevel", "error", "-framerate", String(fps), "-i", join(frames, "frame-%06d.png"), ...encode, encoded]);
 const primaryVideo = publish(encoded, filmId, "mp4", FILM_STORE);
 
+// The phone encode: the same frames scaled down, at its own CRF; a narrow screen plays it (components/film.tsx).
+let smallVideo: { src: string; sha256: string; bytes: number; width: number; height: number; encode: string[] } | undefined;
+if (small !== null) {
+  const smallEncode = buildWebEncodeArgs(smallCrf, fps, small);
+  const smallEncoded = join(work, "film-small.mp4");
+  run("ffmpeg", ["-y", "-loglevel", "error", "-framerate", String(fps), "-i", join(frames, "frame-%06d.png"), ...smallEncode, smallEncoded]);
+  smallVideo = { ...publish(smallEncoded, `${filmId}-small`, "mp4", FILM_STORE), width: small[0], height: small[1], encode: smallEncode };
+  console.error(`media: phone encode ${small[0]}×${small[1]} at CRF ${smallCrf}, ${smallVideo.bytes} bytes`);
+}
+
 let master:
   | { path: string; sha256: string; bytes: number; crf: number; encode: string[] }
   | undefined;
@@ -411,6 +426,7 @@ const manifest = {
     frames: shown.length,
     encode,
     ...(master ? { master } : {}),
+    ...(smallVideo ? { small: smallVideo } : {}),
   },
   poster: { ...publish(poster, `${filmId}-poster`, "jpg"), frame: 0 },
   social: { ...publish(social, `${filmId}-social`, "jpg"), width: 1200, height: 630, frame: card },

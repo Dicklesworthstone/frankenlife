@@ -20,6 +20,8 @@ function Row({ label, value, mono }: { label: string; value: string; mono?: bool
   );
 }
 
+const mib = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1);
+
 /** The zooms the shots reached, in order (keys hold each zoom twice; the whole torus, 1, is not a shot). */
 function shotZooms(keys: { zoom: number }[]): string {
   const zooms: number[] = [];
@@ -33,8 +35,11 @@ export function FilmProvenance({ film }: { film: FilmManifest }) {
   const seconds = (ticks: number) => (ticks * world.timestep[0]) / world.timestep[1];
   const lowest = Math.min(...world.live);
   const highest = Math.max(...world.live);
-  const crfAt = video.encode.indexOf("-crf");
-  const crf = crfAt >= 0 ? video.encode[crfAt + 1] : undefined;
+  const crfOf = (encode: string[]) => {
+    const at = encode.indexOf("-crf");
+    return at >= 0 ? encode[at + 1] : undefined;
+  };
+  const crf = crfOf(video.encode);
   const reproduce = [
     "# flife is `cargo run --release -p flife-cli --` in the repository",
     `flife run ${world.preset ?? note?.config ?? "CONFIG"} --ticks ${world.from.tick} --run-dir RUN`,
@@ -73,8 +78,16 @@ export function FilmProvenance({ film }: { film: FilmManifest }) {
           <dl className="ruled mt-2 text-sm">
             <Row label="Ticks" value={`${grouped(world.from.tick)} → ${grouped(world.to.tick)}, a frame every ${world.every}`} />
             <Row label="Frames" value={`${video.frames} at ${video.fps} fps, ${video.width} × ${video.height}`} />
-            <Row label="File" value={`one MP4, ${(video.bytes / (1024 * 1024)).toFixed(1)} MiB, H.264 CRF ${crf}`} />
-            <Row label="Colour" value={render.meaning.split(":")[0]?.trim() ?? render.mapping} />
+            <Row
+              label="File"
+              value={
+                `one MP4, ${mib(video.bytes)} MiB, H.264 CRF ${crf}` +
+                (video.small
+                  ? `; phones play ${video.small.width} × ${video.small.height}, ${mib(video.small.bytes)} MiB, CRF ${crfOf(video.small.encode)}`
+                  : "")
+              }
+            />
+            <Row label="Colour" value={render.meaning.split(":")[0]?.trim() || render.mapping} />
             <Row label="Field" value={`${render.field_mapping === "none" ? "not drawn" : render.field_mapping}, ${render.look} look`} />
             <Row label="Camera" value={
                 !render.camera

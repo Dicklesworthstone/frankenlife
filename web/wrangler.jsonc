@@ -14,7 +14,9 @@
     { "pattern": "frankenlife.org", "custom_domain": true },
     { "pattern": "www.frankenlife.org", "custom_domain": true }
   ],
-  "r2_buckets": [{ "binding": "MEDIA", "bucket_name": "frankenlife-media" }],
+  // `remote`: `wrangler dev` (`bun run preview`) reads the films from the real bucket, which the Worker only
+  // reads; a local bucket would be empty. A deploy ignores it.
+  "r2_buckets": [{ "binding": "MEDIA", "bucket_name": "frankenlife-media", "remote": true }],
   "assets": {
     "directory": "./out",
     "binding": "ASSETS",

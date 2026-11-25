@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "next dev",
     "media": "bun scripts/media.ts",
-    "media:4k60": "bun scripts/media.ts --ticks 3200 --every 2 --width 2160 --height 2160 --fps 60 --crf 30",
+    "media:4k60": "bun scripts/media.ts --ticks 3200 --every 2 --width 2160 --height 2160 --fps 60 --crf 30 --small 1080 --small-crf 26",
     "upload-media": "bun scripts/upload-media.ts",
     "controls:4k": "bun scripts/controls.ts --size 2160",
     "check-media": "bun scripts/check-media.ts",

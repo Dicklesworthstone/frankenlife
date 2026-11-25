@@ -3,8 +3,8 @@
 **Outcome (2026-11-24): the films were taken off the site the day they went up.** In motion the dense
 worlds shimmer and are hard to read, nothing like the confluent film, though their single frames
 looked full. Every choice below was made from stills 256 ticks apart, so none of them judged motion.
-The page now shows the confluent film alone, and the v2 panels lead with the committed presets' own
-stills. The films' manifests and media are in `web/media-retired/rejected-dense-v2-2026-11-24/`
+The page then showed the confluent film alone, and the v2 panels lead with the committed presets' own
+stills; rounds 3 to 5 below made the two v2 films it now shows beside it. The films' manifests and media are in `web/media-retired/rejected-dense-v2-2026-11-24/`
 (not in git; commit 4d76075 has the manifests). A new film should start from a few dozen consecutive
 frames rendered small and looked at in motion beside the confluent film's.
 
@@ -237,3 +237,52 @@ the film and 0.25 in `supercolony-v2.toml`, and its `maximum_diffusion` is
 of the two tables is the same. The films stay visual choices on one seed, and
 the site says so. What each mechanism does, measured, is in the Stage-2 campaign
 (`experiments/v2-emergence/README.md`).
+
+
+# Round 5: longer on the whole torus, one MP4 each, and a phone encode (2026-11-25)
+
+The user found that the films left the whole torus too soon to see what it was
+doing, and asked that each film be one file in Cloudflare R2 instead of
+segments under the 25 MiB static-asset limit. All three films were made again
+from their committed worlds at a frame every 2 ticks instead of 4: 1,601 frames
+from tick 2,400 to 5,600, 26.7 s at 60 fps. The camera's pacing is now fixed in
+`web/scripts/director.ts` (`FILM_PACING`): 35% of the film on the whole torus
+before it moves (560 frames, 9.3 s), 5% for each move, 16% for each held shot
+and 10% on the whole torus at the end. Round 4's films held the whole torus
+for 64 frames, about 1 s, and then three shots (×1.6, ×3, ×2.2); each film now
+holds two (×1.6 and ×3). The site's tests hold every film to at least a third
+of its length, and 9 s, on the whole torus first.
+
+The worlds and their digests are round 4's; only the frames per tick and the
+camera changed. Each film was one `media:4k60` process, one at a time:
+
+| film | digest at 5,600 | alive | 4K pass | film | phone encode | archival master |
+|---|---|---|---|---:|---:|---:|
+| `confluent` | `7fa0cc68…` | 262,144 in all 1,601 frames | 1,600 s, peak 19.9 GiB | 185.9 MiB | 104.6 MiB | 1,045.8 MiB |
+| `confluent-veins` | `2a620955…` | 262,144 in all 1,601 frames | 1,820 s, peak 19.1 GiB | 175.4 MiB | 99.1 MiB | 970.3 MiB |
+| `confluent-polarity` | `d4ce6e6a…` | 262,144 in all 1,601 frames | 1,847 s, peak 19.4 GiB | 174.3 MiB | 97.5 MiB | 1,009.4 MiB |
+
+Each film is one MP4 at CRF 30, 55 to 58 Mbit/s, that `web/worker.ts` serves
+from R2 by byte range. That is H.264 High at level 5.2, which not every phone
+decodes, and on a phone screen most of its pixels are scaled away. So
+`--small 1080` also encodes the same frames at 1,080 × 1,080 (level 4.2, about
+32 Mbit/s), which screens at most 640 CSS pixels wide play instead.
+
+The phone encode's CRF was chosen on a 3 s clip of the confluent film (frames
+1,050 to 1,229, its ×3 shot), compared at 1:1 against the 4K encode scaled to
+1,080:
+
+| encode of the clip | bytes | by eye at 1,080 |
+|---|---:|---|
+| 4K, CRF 30 (the film) | 17,378,404 | the reference: single bodies distinct |
+| 1,080, CRF 30 | 5,873,044 | bodies smeared together in the dense colonies |
+| 1,080, CRF 28 | 7,827,153 | still softer than the reference |
+| 1,080, CRF 26 | 10,289,213 | the same as the reference |
+| 1,080, CRF 23 | 15,201,932 | no better than 26 |
+
+The first phone encodes, at CRF 30 (54 MiB for the confluent film), were
+replaced by CRF 26 (`--small-crf 26`, now in `media:4k60`). Those first
+encodes, the round-4 films' 801-frame single MP4s and their share cards are in
+`web/media-retired/films-801-and-phone-crf30-2026-11-25/`. Each 4K encode
+reran byte for byte when the phone encodes were added: x264's output is the
+same for the same frames and arguments.

@@ -1,7 +1,9 @@
 import type { NextConfig } from "next";
 
 // A static export: `next build` writes `out/`, which Cloudflare serves as a
-// Worker's static assets (wrangler.jsonc). Nothing runs on a server.
+// Worker's static assets (wrangler.jsonc). The page renders nothing on a
+// server; worker.ts only redirects www., types the share images and streams
+// the films from R2.
 const nextConfig: NextConfig = {
   output: "export",
   images: { unoptimized: true },

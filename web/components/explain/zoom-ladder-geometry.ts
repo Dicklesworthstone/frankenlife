@@ -96,14 +96,14 @@ export function cardPixelToWorld(card: Placement, x: number, y: number): [number
 }
 
 /**
- * The organism the zoom lands on, in the card's pixels: a bright lime sphere
+ * The organism the zoom lands on, in the card's pixels: a bright pale-cyan sphere
  * with darker space and other lineages around it, near the card's centre.
  * Chosen offline by scanning the card for a bright disc (radius 3 px) inside a
  * dark ring (radius 8–10 px), ranking by the contrast, and picking by eye
  * among the strongest. It belongs to the card with this SHA-256; a new film
  * needs a new pick (zoom-ladder-geometry.test.ts says so).
  */
-export const PICK = { x: 667, y: 445, cardSha256: "8f0b33d8b0b2b68c17ccdbe0a9dc10ff61d026e67cd6f325aa12d8f11b0edbf4" } as const;
+export const PICK = { x: 414, y: 297, cardSha256: "05f61667c12aba835837484bfeb3485882049dc0859e030fbe32022e474a8f2f" } as const;
 
 /** A camera over the torus: the centre of the view and its width in world units (the view is square). */
 export type View = { cx: number; cy: number; span: number };

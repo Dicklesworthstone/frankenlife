@@ -1,5 +1,6 @@
 # Cloudflare's static-asset headers (Workers assets read this file from out/).
-# The film and Next's build output are named by their content, so they never change in place.
+# The posters, cards, stills and Next's build output are named by their content, so they never change in
+# place. (The films are not static assets: worker.ts serves them from R2, with its own headers.)
 /media/*
   Cache-Control: public, max-age=31536000, immutable
 

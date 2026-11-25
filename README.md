@@ -744,8 +744,8 @@ sanitized `env -i` fresh-install environment, including explicit missing-encoder
 
 For the website's 60 fps 4K video pipeline (`web/`), `bun run media:4k60` renders square (`2160 × 2160`) or
 widescreen (`3840 × 2160`) 60 fps films, 1,601 frames opening on the whole torus for 35% of their length, each
-one MP4 served from Cloudflare R2 with byte ranges, and optionally writes one archival master outside
-`public/media/` (`web/README.md`).
+one MP4 served from Cloudflare R2 with byte ranges, plus a 1080 encode of the same frames that phones play,
+and optionally writes one archival master outside `public/media/` (`web/README.md`).
 
 Machine output is versioned JSON or NDJSON with stable identifiers and typed errors. Missing accelerator capability,
 budget exhaustion, schema mismatch, incompatible checkpoints, numerical invalidity and cancellation are distinct

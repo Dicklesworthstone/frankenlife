@@ -10,7 +10,10 @@ const PATH = `/${KEY}`;
 
 const worker = mediaWorker(new Map([[PATH, SIZE]]));
 
-/** R2 as the Worker uses it: head() and get() with an optional { offset, length } range, and every call counted. */
+/**
+ * R2 as the Worker uses it: head() and get() with an optional { offset, length } range, and every call counted.
+ * As R2 does, a range starting past the object's end throws, and one running past it is cut short.
+ */
 function bucket(objects: Record<string, Uint8Array>) {
   const calls: string[] = [];
   return {
@@ -24,6 +27,7 @@ function bucket(objects: Record<string, Uint8Array>) {
       calls.push(`get ${key}${options?.range ? ` ${options.range.offset}+${options.range.length}` : ""}`);
       const object = objects[key];
       if (!object) return null;
+      if (options?.range && options.range.offset >= object.length) throw new Error("InvalidRange (10039)");
       const from = options?.range?.offset ?? 0;
       const to = options?.range ? from + options.range.length : object.length;
       const slice = object.slice(from, to);
@@ -42,16 +46,22 @@ function bucket(objects: Record<string, Uint8Array>) {
   };
 }
 
-/** The static-asset binding: the page, a share image, and a 404 page for anything else. */
+const IMMUTABLE = "public, max-age=31536000, immutable";
+
+/**
+ * The static-asset binding: the page, a share image, and a 404 page for anything else. As public/_headers does,
+ * everything under /media/ is marked immutable, the 404 page included.
+ */
 const ASSETS = {
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
+    const headers: Record<string, string> = path.startsWith("/media/") ? { "Cache-Control": IMMUTABLE } : {};
     // The static export's share images, which have no extension to type them by.
     if (path === "/opengraph-image") {
       return new Response("card", { headers: { "Content-Type": "application/octet-stream" } });
     }
-    if (path === "/media/poster-0123456789ab.jpg") return new Response("jpeg", { headers: { "Content-Type": "image/jpeg" } });
-    return new Response(path === "/" ? "page" : "not found", { status: path === "/" ? 200 : 404 });
+    if (path === "/media/poster-0123456789ab.jpg") return new Response("jpeg", { headers: { ...headers, "Content-Type": "image/jpeg" } });
+    return new Response(path === "/" ? "page" : "not found", { status: path === "/" ? 200 : 404, headers });
   },
 };
 
@@ -77,6 +87,16 @@ describe("parseRange", () => {
     expect(parseRange("bytes=0-1,5-9", SIZE)).toBeNull();
     expect(parseRange("items=0-1", SIZE)).toBeNull();
     expect(parseRange("bytes=-", SIZE)).toBeNull();
+  });
+  test("reads the unit in any case, around whitespace, and one byte at either end", () => {
+    expect(parseRange("Bytes=0-1", SIZE)).toEqual([0, 1]);
+    expect(parseRange("BYTES=-500", SIZE)).toEqual([SIZE - 500, SIZE - 1]);
+    expect(parseRange("  bytes=0-1 ", SIZE)).toEqual([0, 1]);
+    expect(parseRange("bytes=0-0", SIZE)).toEqual([0, 0]);
+    expect(parseRange(`bytes=${SIZE - 1}-`, SIZE)).toEqual([SIZE - 1, SIZE - 1]);
+    expect(parseRange("bytes=0-99999999999999999999999", SIZE)).toEqual([0, SIZE - 1]);
+    expect(parseRange("bytes=0-", 0)).toBe("unsatisfiable");
+    expect(parseRange("bytes=-1", 0)).toBe("unsatisfiable");
   });
 });
 
@@ -121,26 +141,48 @@ describe("the films from R2", () => {
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
   });
 
-  test("refuses an unsatisfiable range with 416 and the size, without reading R2", async () => {
+  test("refuses an unsatisfiable range with an uncached 416 and the size, without reading R2", async () => {
     const at = env();
     const response = await get(`bytes=${SIZE}-`, "GET", at);
     expect(response.status).toBe(416);
     expect(response.headers.get("Content-Range")).toBe(`bytes */${SIZE}`);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Content-Type")).toBeNull();
     expect(at.MEDIA.calls).toEqual([]);
   });
 
-  test("answers HEAD from R2's record of the film, with no body", async () => {
+  test("answers HEAD from R2's record of the whole film, with no body, a Range or not (RFC 9110 §14.2)", async () => {
     const at = env();
-    const ranged = await get("bytes=10-19", "HEAD", at);
-    expect(ranged.status).toBe(206);
-    expect(ranged.headers.get("Content-Length")).toBe("10");
-    expect(ranged.body).toBeNull();
-    const whole = await get(undefined, "HEAD", at);
-    expect(whole.status).toBe(200);
-    expect(whole.headers.get("Content-Length")).toBe(String(SIZE));
-    expect(whole.headers.get("ETag")).toBe(`"etag-${KEY}"`);
-    expect(whole.body).toBeNull();
-    expect(at.MEDIA.calls).toEqual([`head ${KEY}`, `head ${KEY}`]);
+    for (const range of ["bytes=10-19", `bytes=${SIZE}-`, undefined]) {
+      const response = await get(range, "HEAD", at);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("Content-Length")).toBe(String(SIZE));
+      expect(response.headers.get("Content-Range")).toBeNull();
+      expect(response.headers.get("ETag")).toBe(`"etag-${KEY}"`);
+      expect(response.body).toBeNull();
+    }
+    expect(at.MEDIA.calls).toEqual([`head ${KEY}`, `head ${KEY}`, `head ${KEY}`]);
+  });
+
+  test("refuses with an uncached 503 when R2 and the manifest disagree on the size, or R2 fails", async () => {
+    // The manifest says one byte more than R2 holds: a range past R2's end, a whole GET and a HEAD.
+    const oversized = mediaWorker(new Map([[PATH, SIZE + 1]]));
+    for (const [method, range] of [
+      ["GET", `bytes=${SIZE}-`],
+      ["GET", undefined],
+      ["HEAD", undefined],
+    ] as const) {
+      const response = await oversized.fetch(
+        new Request(`https://site.test${PATH}`, { method, headers: range ? { Range: range } : {} }),
+        env(),
+      );
+      expect(response.status).toBe(503);
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+    }
+    const broken = { ...env(), MEDIA: { ...bucket({}), get: async () => Promise.reject(new Error("R2 down")) } };
+    const failed = await worker.fetch(new Request(`https://site.test${PATH}`), broken);
+    expect(failed.status).toBe(503);
+    expect(failed.headers.get("Retry-After")).toBe("30");
   });
 
   test("measures in R2 a film no manifest sizes, and serves its range", async () => {
@@ -153,13 +195,16 @@ describe("the films from R2", () => {
     expect(at.MEDIA.calls).toEqual([`head ${KEY}`, `get ${KEY} 5+5`]);
   });
 
-  test("answers a film R2 does not hold with the site's 404 page", async () => {
-    const response = await worker.fetch(
-      new Request("https://site.test/media/nothing-0123456789ab.mp4", { headers: { Range: "bytes=0-1" } }),
-      env(),
-    );
-    expect(response.status).toBe(404);
-    expect(await response.text()).toBe("not found");
+  test("answers a film R2 does not hold with the site's 404 page, never cached (it may be uploaded next)", async () => {
+    for (const method of ["GET", "HEAD"]) {
+      const response = await worker.fetch(
+        new Request("https://site.test/media/nothing-0123456789ab.mp4", { method, headers: { Range: "bytes=0-1" } }),
+        env(),
+      );
+      expect(response.status).toBe(404);
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+      if (method === "GET") expect(await response.text()).toBe("not found");
+    }
   });
 });
 

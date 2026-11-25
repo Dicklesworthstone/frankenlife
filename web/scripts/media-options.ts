@@ -113,6 +113,10 @@ export type MediaOptions = {
   height: number;
   fps: number;
   crf: number;
+  /** The phone encode's size, [width, height], from `--small HEIGHT` (the film's aspect kept); null for none. */
+  small: [number, number] | null;
+  /** The phone encode's CRF (`--small-crf`, default the film's): fewer pixels need a lower CRF to look the same. */
+  smallCrf: number;
   masterOut: string | null;
   masterCrf: number;
   cameraMode: CameraMode;
@@ -140,6 +144,8 @@ const MEDIA_VALUE_FLAGS = new Set([
   "height",
   "fps",
   "crf",
+  "small",
+  "small-crf",
   "master-out",
   "master-crf",
   "camera",
@@ -250,6 +256,18 @@ export function parseMediaArgs(argv: readonly string[], publicMediaDir?: string)
 
   const fps = parseIntInRange(single.get("fps") ?? "30", "fps", 1);
   const crf = parseIntInRange(single.get("crf") ?? "24", "crf", 0, 51);
+  // `--small 0` (the default) makes no phone encode.
+  const smallHeight = parseIntInRange(single.get("small") ?? "0", "small", 0);
+  let small: [number, number] | null = null;
+  if (smallHeight > 0) {
+    if (smallHeight % 2 !== 0 || smallHeight >= height) {
+      throw new Error(`--small must be an even height below the film's ${height}, or 0 for no phone encode`);
+    }
+    // The film's aspect, its width rounded to an even number for 4:2:0.
+    small = [Math.max(2, Math.round((width * smallHeight) / height / 2) * 2), smallHeight];
+  }
+  if (single.has("small-crf") && small === null) throw new Error("--small-crf requires --small HEIGHT");
+  const smallCrf = single.has("small-crf") ? parseIntInRange(single.get("small-crf") as string, "small-crf", 0, 51) : crf;
   const masterOut = single.has("master-out") ? resolve(single.get("master-out") as string) : null;
   if (single.has("master-crf") && masterOut === null) {
     throw new Error("--master-crf requires --master-out PATH");
@@ -316,6 +334,8 @@ export function parseMediaArgs(argv: readonly string[], publicMediaDir?: string)
     height,
     fps,
     crf,
+    small,
+    smallCrf,
     masterOut,
     masterCrf,
     cameraMode,
@@ -334,16 +354,17 @@ const BT709_VF =
   "setparams=range=tv:color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709";
 
 /**
- * ffmpeg arguments for a film's one web MP4, served from R2: quality set by the CRF alone, with no
+ * ffmpeg arguments for a film's web MP4, served from R2: quality set by the CRF alone, with no
  * bitrate cap. A keyframe every second (closed GOP, no scene-cut keyframes) keeps a seek anywhere in
- * the film to at most a second of decoding.
+ * the film to at most a second of decoding. With `size`, the frames are first scaled to it (Lanczos,
+ * in the same scale filter as the colour conversion): the phone encode.
  */
-export function buildWebEncodeArgs(crf: number, fps: number): string[] {
+export function buildWebEncodeArgs(crf: number, fps: number, size?: readonly [number, number]): string[] {
   if (!Number.isFinite(fps) || fps <= 0) throw new Error("fps must be a positive number");
   const gop = String(Math.max(1, Math.round(fps)));
   return [
     "-vf",
-    BT709_VF,
+    size ? BT709_VF.replace("scale=", `scale=w=${size[0]}:h=${size[1]}:flags=lanczos:`) : BT709_VF,
     "-c:v",
     "libx264",
     "-preset",
@@ -366,7 +387,7 @@ export function buildWebEncodeArgs(crf: number, fps: number): string[] {
   ];
 }
 
-/** ffmpeg arguments for an unconstrained high-quality archival master MP4 (e.g. 4K60 outside public/media/). */
+/** ffmpeg arguments for the archival master MP4 (a lower CRF than the web's), written outside the site. */
 export function buildMasterEncodeArgs(masterCrf: number): string[] {
   return [
     "-vf",

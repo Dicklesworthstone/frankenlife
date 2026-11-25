@@ -3,7 +3,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { film } from "@/lib/media";
+import { film, films } from "@/lib/media";
 
 import { cameraSpans } from "./camera-track";
 import { frameAt, scaleBarWidthCqw, zoomView } from "./film";
@@ -80,7 +80,7 @@ describe("cameraSpans", () => {
     { tick: 4192, zoom: 1.6 },
     { tick: 4352, zoom: 3 },
     { tick: 4864, zoom: 3 },
-    { tick: 5280, zoom: 1 },
+    { tick: 5024, zoom: 1 },
     { tick: 5600, zoom: 1 },
   ];
 
@@ -96,6 +96,20 @@ describe("cameraSpans", () => {
     // 1,120 ticks of whole torus at a frame every 2 ticks and 60 fps: 9.33 s.
     expect(spans[0]?.seconds).toBeCloseTo(1120 / 2 / 60, 12);
     expect(spans.reduce((sum, span) => sum + span.seconds, 0)).toBeCloseTo(3200 / 2 / 60, 12);
+  });
+
+  test("every film on the site opens on the whole torus for at least a third of its length before it moves in", () => {
+    for (const each of films) {
+      const { world, video, render } = each;
+      const spans = cameraSpans(render.camera?.keys ?? [], world.from.tick, world.to.tick, world.every, video.fps);
+      expect(spans[0]?.kind).toBe("hold");
+      expect(spans[0]?.zoom).toBe(1);
+      expect(spans[0]?.share ?? 0).toBeGreaterThanOrEqual(1 / 3);
+      expect(spans[0]?.seconds ?? 0).toBeGreaterThanOrEqual(9);
+      // And it ends there too.
+      expect(spans.at(-1)?.kind).toBe("hold");
+      expect(spans.at(-1)?.zoom).toBe(1);
+    }
   });
 
   test("a film with no path, or a bad range, has no spans; repeated keys add none", () => {

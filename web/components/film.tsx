@@ -139,6 +139,14 @@ function pulse(now: number): number {
   return 0.675 + 0.325 * Math.cos((2 * Math.PI * now) / 2200);
 }
 
+/**
+ * Where the phone encode (manifest `video.small`, 1080 pixels square) plays instead of the 4K film: a screen at most
+ * 640 CSS pixels wide, where the film spans about 1,300 device pixels at most (a 430-pixel phone at 3×). It is
+ * H.264 level 4.2, which phones decode, where 2160² at 60 fps needs level 5.2, which not every phone does; and
+ * about 56% of the bytes.
+ */
+export const PHONE = "(max-width: 640px)";
+
 /** How often the seek control's own value follows the film; nothing on screen reads it. */
 const SEEK_EVERY_MS = 250;
 
@@ -237,7 +245,7 @@ export function Film({
   useEffect(() => {
     const element = videoRef.current;
     if (!element) return;
-    // The film is one MP4 of a hundred MiB or more, streamed by range as it plays.
+    // The film is one MP4 (4K, or on a phone its smaller encode), streamed by range as it plays.
     const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const saving = (navigator as { connection?: { saveData?: boolean } }).connection?.saveData === true;
     if (!still && !saving) {
@@ -329,7 +337,6 @@ export function Film({
         <video
           ref={videoRef}
           className={cn("h-full w-full object-cover", feather && "specimen-feather")}
-          src={video.src}
           poster={poster.src}
           width={video.width}
           height={video.height}
@@ -344,7 +351,11 @@ export function Film({
             if (dotRef.current) dotRef.current.style.opacity = "";
           }}
           aria-label={label}
-        />
+        >
+          {/* The browser takes the first source whose media matches, once, when the film loads. */}
+          {video.small ? <source src={video.small.src} type="video/mp4" media={PHONE} /> : null}
+          <source src={video.src} type="video/mp4" />
+        </video>
         <Reticle inset={14} size={18} />
 
         {/* What this is, on its face. */}

@@ -656,7 +656,7 @@ export const v2BuildStatus: {
     claim: "Observed, not the G5 gate",
     tone: "partial",
     detail:
-      "The campaign's report records a visual review of raw and aesthetic renders of both presets on a discovery and a held-out seed. The plan's G5 gate, a human review against the reference screenshots, is still not run (README).",
+      "The campaign's report records a visual review of raw and aesthetic renders of both presets on a discovery and a held-out seed. The plan's G5 gate, a human review against the reference screenshots, has not run; it was decided instead by an agent's review of Studio frames on the owner's delegation (README).",
   },
   {
     stage: "Ecological",
@@ -848,8 +848,8 @@ export const gates: { id: string; name: string; state: GateState; detail: string
   {
     id: "G5",
     name: "Visual review",
-    state: "open",
-    detail: "Needs a human review against the reference screenshots. Not yet run. (The v2 campaign's report records a visual review of its own renders; that is not this gate.)",
+    state: "partial",
+    detail: "Decided on the owner's delegation by Claude's review (2026-11-25) of Studio frames, the small profile and the 262,144-organism confluent world from the whole torus to 32×, against the plan's account of the references: a pass with one limit (density bins do not refine with zoom). The human review against the screenshots that the gate names has not run.",
   },
   {
     id: "G6",

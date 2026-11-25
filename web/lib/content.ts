@@ -24,6 +24,7 @@ export const siteConfig = {
   fl048: "https://github.com/Dicklesworthstone/frankenlife/blob/main/experiments/fl048/README.md",
   showcase: "https://github.com/Dicklesworthstone/frankenlife/blob/main/experiments/showcase/README.md",
   v2Report: "https://github.com/Dicklesworthstone/frankenlife/blob/main/experiments/v2-emergence/README.md",
+  websiteFilms: "https://github.com/Dicklesworthstone/frankenlife/blob/main/experiments/website-films/README.md",
   license: "https://github.com/Dicklesworthstone/frankenlife/blob/main/LICENSE",
   agents: "https://github.com/Dicklesworthstone/frankenlife/blob/main/AGENTS.md",
 };
@@ -37,20 +38,48 @@ export const filmChoice = {
     "Nothing the search measured feeds back into a run. The organisms have no aesthetic fitness: they feed, emit, split and die by energy alone. The seed is the Desktop preset's 42, not a pick. On three seeds the search never saw, the world scores 0.81 to 1.57, against 1.92 to 2.68 for the coarser world on the same seeds.",
     "Emission, chosen by the neural networks, makes the structure, and contact shapes it at the scale of bodies. Organisms return about half of what they eat to the field, in a chemical composition their networks choose and kin choose alike, so each lineage paints its surroundings with its own chemistry. Adhesion then sorts lineages by that chemistry, as real tissues sort by adhesion, into domains of labyrinths, foam and packed spheres. With every controller's decisions zeroed, nothing is emitted and the bodies settle into a uniform mottled haze, with no domains, labyrinths or foam. With every newborn's genome drawn fresh instead of inherited, the population falls from its ceiling to about 1,200.",
   ],
+  // The two v2 films (experiments/website-films/README.md, round 3, and the configs beside it).
+  v2: [
+    "The two v2 films are the confluent world grown again from tick 0 as field-ecology-v2, each with one mechanism switched on at the engine's default parameters: the same founders, seed 42, food and population ceiling, drawn the same way over the same ticks, 2,400 to 5,600. With every mechanism off, field-ecology-v2 reaches the confluent film's world bit for bit, the same digest at tick 2,400, so what differs in each film comes from its one mechanism, on this one seed.",
+    "Four mechanisms were tried this way: veins (vascular-field), polarity (pcp-polarity), blooming food (oases) and tag sticking (cadherin-4d), and one pair, veins with blooming food. Each was previewed as 33 consecutive frames beside the confluent film's, and the two filmed were chosen by eye, as the ones that keep its legible shapes in motion: veins sharpen its labyrinths, and polarity stretches them into bands and tubes. Blooming food broke the world into domes and black voids that changed faster, with or without veins, and tag sticking merged lineages into smooth sheets. Each film was rendered whole at a quarter of its size and checked before the 4K render.",
+    "Like the confluent film's, both worlds sit at their population ceiling of 262,144 in every frame, where births are refused: a capacity limit, not an ecological result. The films show how one mechanism changes the look of one world; what each mechanism does, measured, is the Stage-2 campaign's, in the Version 2 chapter.",
+  ],
   camera:
     "Where the camera looks comes from the run; only each shot's zoom is given by hand. The same ticks are first rendered small, each shot then eases into the region where the organisms changed most during it, and the film opens and closes on the whole torus. The camera changes no result: the preview and the film end on the same digest.",
 };
 
 /**
  * What each film is, for its tab and the line beneath it (lib/films/index.ts
- * lists the films; each manifest records how it was made).
+ * lists the films; each manifest records how it was made). A world with no
+ * preset names the committed configuration it ran (`config`, whose
+ * config_hash is the manifest's) and the one v2 mechanism it switches on.
  */
-export const filmNotes: Record<string, { tab: string; chip: string; title: string; line: string }> = {
+export const filmNotes: Record<
+  string,
+  { tab: string; chip: string; title: string; line: string; config?: string; mechanism?: string }
+> = {
   confluent: {
     tab: "Confluent",
     chip: "v1 · contact",
     title: "Confluent world",
     line: "field-ecology-v1-contact at its population ceiling of 262,144, drawn as spheres coloured by lineage and lit by their own energy. No v2 mechanism is on.",
+  },
+  // The ceiling and the one mechanism are checked against each config by lib/film-configs.test.ts.
+  "confluent-veins": {
+    tab: "Veins",
+    chip: "v2 · vascular-field",
+    title: "Confluent world, with veins",
+    config: "experiments/website-films/confluent-veins.toml",
+    mechanism: "vascular-field",
+    line: "field-ecology-v2 with one mechanism on, vascular-field: faces of the field that keep carrying energy widen and the rest shrink back. The confluent world's founders, seed and food, grown from tick 0, at the population ceiling of 262,144 in every frame and drawn the same way.",
+  },
+  "confluent-polarity": {
+    tab: "Polarity",
+    chip: "v2 · pcp-polarity",
+    title: "Confluent world, with polarity",
+    config: "experiments/website-films/confluent-polarity.toml",
+    mechanism: "pcp-polarity",
+    line: "field-ecology-v2 with one mechanism on, pcp-polarity: each body's polarity turns toward its neighbours' and the local gradient, and daughters land beside the parent. The confluent world's founders, seed and food, grown from tick 0, at the population ceiling of 262,144 in every frame and drawn the same way.",
   },
 };
 
@@ -98,7 +127,7 @@ export const chapters: Chapter[] = [
     sections: [
       { id: "different", label: "Four forbidden shortcuts" },
       { id: "controls", label: "Remove a cause" },
-      { id: "film", label: "What the film is" },
+      { id: "film", label: "What the films are" },
     ],
   },
   {
@@ -660,6 +689,9 @@ export const v2Bundles = [
       { label: "Close neighbours", value: "½", note: "as many as with v2 off: 2.0 against 3.6; 4/4" },
       { label: "Energy passed to kin", value: "79,910", note: "units per run, in every window" },
     ],
+    // One of this preset's mechanisms, switched on alone in the confluent world (filmNotes, filmChoice.v2).
+    film: "confluent-polarity",
+    filmLine: "This preset's polarity, switched on alone in the confluent world, is one of the films at the top of the page.",
   },
   {
     id: "supercolony",
@@ -674,6 +706,8 @@ export const v2Bundles = [
       { label: "Alignment from veins", value: "+50%", note: "0.378 against 0.252 without; 4/4" },
       { label: "Alive from bursts", value: "+58%", note: "against no relay; 4/4" },
     ],
+    film: "confluent-veins",
+    filmLine: "This preset's veins, switched on alone in the confluent world, are one of the films at the top of the page.",
   },
 ] as const;
 

@@ -1,0 +1,338 @@
+# The veins film's world (web/lib/films/confluent-veins.json): presets/confluent-world.toml as
+# field-ecology-v2 with one v2 mechanism on, vascular-field, at the engine's default parameters. This is
+# the config.toml flife wrote into the run directory when it was founded with
+#   flife run confluent-v2-base.toml --disable all-v2 --enable vascular-field
+# where confluent-v2-base.toml is presets/confluent-world.toml with name = "confluent-v2-base" and
+# model = "field-ecology-v2". Its config_hash is 93b03ef6...; running it reaches digest 684e4559... at
+# tick 2,400, where the film starts:
+#   flife run experiments/website-films/confluent-veins.toml --ticks 2400 --run-dir RUN
+# With every v2 mechanism off (--v1-compat) the same world reaches the confluent film's own 3f279f51...
+
+schema = "frankenlife.config.v1"
+name = "confluent-v2-base"
+model = "field-ecology-v2"
+seed = 42
+
+[world]
+width = 80.0
+height = 80.0
+grid_width = 320
+grid_height = 320
+boundary = "periodic"
+moment_channels = 32
+field_dtype = "f32"
+tick_numerator = 1
+tick_denominator = 32
+transport_scheme = "positive-five-point-v1"
+diffusion = 0.0298717
+decay_per_second = 0.0818013
+stability_policy = "subcycle"
+exchange_kernel = "grid-cic-v1"
+tiny_energy_policy = "dissipate-and-record"
+tiny_energy_threshold = 1e-12
+
+[population]
+initial_count = 10954
+maximum_count = 262144
+initial_energy = 2.0
+initial_velocity = "zero"
+initial_positions = "uniform"
+capacity_policy = "refuse-excess-births-v1"
+automatic_reseed = false
+
+[field_initialization]
+energy_per_cell = 0.0
+composition = "zero"
+
+[sources]
+count = 25
+power_per_source = 37970.7
+sigma_world_units = 14.9683
+spatial_normalization = "fixed-total-power"
+kernel = "normalized-truncated-minimum-image-gaussian-v1"
+kernel_cutoff_sigma = 4.0
+chemical_directions = "seeded-unit-vectors"
+chemical_direction_policy = "fixed-per-source"
+path = "seeded-smooth-torus-v1"
+path_speed = 6.41031
+path_direction_interval_seconds = 30.0
+
+[chemistry]
+family = "bounded-affinity-v1"
+heritable_traits = ["affinity_direction", "motion_response", "sensing_scale"]
+maximum_efficiency = 0.777059
+affinity_norm_limit = 1.0
+affinity_gain = 14.5263
+discrimination_threshold = 0.265017
+uptake_capacity_per_second = 2.94923
+uptake_half_saturation_density = 0.805307
+toxicity_sensitivity = 0.0800432
+chemistry_evaluation = "per-granted-cell-packet"
+motion_response_norm_limit = 6.27875
+maximum_acceleration = 4.97403
+drag_per_second = 0.608376
+maximum_speed = 3.42612
+
+[sensors]
+schema = "energy-moment-gradient-104-v1"
+normalization = "fixed-local-scales-v1"
+energy_density_scale = 8.0
+gradient_length_scale_world_units = 0.25
+composition_energy_floor_density = 1e-6
+internal_energy_scale = 4.0
+age_scale_seconds = 60.0
+velocity_scale = 1.0
+energy_change_scale_per_second = 1.0
+initial_scale_world_units = 0.25
+minimum_scale_world_units = 0.25
+maximum_scale_world_units = 4.0
+pyramid_filter = "positive-box-v1"
+pyramid_scale_blend = "log-linear-v1"
+
+[controller]
+family = "independent-dense-mlp-v1"
+input_width = 104
+hidden_widths = [64, 32]
+output_width = 36
+hidden_activation = "tanh"
+output_activation = "linear"
+canonical_weight_dtype = "f16"
+accumulation_dtype = "f32"
+evaluation_interval_ticks = 1
+phase_policy = "stable-identity"
+autograd = false
+initializer = "fan-in-scaled-symmetric-v1"
+maximum_absolute_parameter = 4.0
+
+[architecture_mutation]
+enabled = true
+catalog = "dense-104-36-catalog-v1"
+maximum_parameters = 30000
+probability_per_birth = 0.01
+inheritance_map = "overlap-plus-zero-output-v1"
+depth_change_map = "prefix-and-identity-bridge-v1"
+target_selection = "uniform-other-catalog-member"
+
+[mutation]
+rng = "fnp-philox-semantic-v1"
+weight_probability = 0.002
+weight_standard_deviation = 0.02
+replacement_probability = 0.0001
+chemistry_standard_deviation = 0.01
+sensing_log_scale_standard_deviation = 0.02
+reject_effective_noop = true
+maximum_candidate_proposals_per_birth = 8
+exhausted_proposals_policy = "reject-birth-no-charge"
+meta_evolution = false
+
+[costs]
+basal_energy_per_second = 0.690777
+sensor_energy_per_second_at_unit_scale = 0.001
+sensor_unit_scale_world_units = 0.25
+sensor_scale_cost_exponent = 1.0
+neural_energy_per_parameter_evaluation = 2e-9
+motion_energy_per_speed_squared_second = 0.00722699
+birth_energy = 0.05
+
+[emission]
+gate_threshold = 0.355002
+maximum_fractional_rate_per_second = 0.97945
+transfer_efficiency = 0.95
+direction_zero_threshold = 1e-8
+zero_direction_policy = "no-emission-no-charge"
+position = "post-motion"
+visibility = "next-tick"
+
+[reproduction]
+maximum_attempt_rate_per_second = 1.81041
+minimum_parent_energy_before_attempt = 1.77835
+minimum_child_energy = 0.3
+minimum_parent_energy_after_split = 0.3
+minimum_child_fraction = 0.1
+maximum_child_fraction = 0.9
+cooldown_seconds = 0.0642813
+child_position_offset_radius = 2.5
+newborn_activation = "next-tick"
+
+[death]
+residual_energy_recycle_fraction = 0.525187
+corpse_direction = "genetic-affinity"
+numerical_fault_policy = "stop-and-preserve"
+
+[contact]
+diameter = 0.25
+stiffness = 0.5
+adhesion = 1.0
+adhesion_range = 1.5
+
+[execution]
+backend = "cpu-reference"
+determinism = "qualified-reference"
+math_mode = "specified"
+cpu_workers = 1
+command_queue_capacity = 256
+control_queue_capacity = 16
+command_durability = "volatile-in-memory"
+render_queue_capacity = 3
+maximum_logical_genome_bytes = 17179869184
+maximum_allocated_genome_bytes = 19327352832
+maximum_total_bytes = 68719476736
+checkpoint_retained_bytes = 134217728
+observer_pressure_policy = "drop-observer-or-pause-unchanged-world"
+
+[presentation]
+engine = "franken-manim"
+width = 1920
+height = 1080
+frames_per_second = 30
+color_mapping = "founder-lineage-v1"
+background = "#020308"
+point_radius_pixels = 0.8
+bloom_enabled = true
+bloom_strength = 0.15
+trails_enabled = false
+interpolation = "committed-states-one-epoch-late"
+show_clock_telemetry = true
+
+[recording]
+enabled = false
+clock = "simulation-time"
+include_provenance = true
+
+[persistence]
+catalog = "frankensqlite"
+checkpoint_mode = "pause-and-stream"
+checkpoint_interval_simulation_seconds = 30.0
+retain_recent_checkpoints = 4
+preserve_pinned_discoveries = true
+metrics_interval_ticks = 128
+
+[v2]
+profile = "auto"
+
+[v2.oases]
+enabled = false
+bloom_period_seconds = 24.0
+minimum_power_fraction = 0.0
+sigma_min_world_units = 14.9683
+sigma_max_world_units = 14.9683
+
+[v2.senescence]
+enabled = false
+scale_seconds = 30.0
+maximum_multiplier = 64.0
+
+[v2.emission.surplus_floor]
+enabled = false
+energy_floor = 0.4445875
+
+[v2.emission.excitable]
+enabled = false
+mode = "vesicle-readiness-v1"
+fire_readiness_threshold = 0.5
+depletion_fraction = 0.85
+burst_rate_multiplier = 5.0
+recovery_time_seconds = 1.0
+refractory_cooldown_ticks = 24
+
+[v2.emission.offset]
+enabled = false
+mode = "wake-velocity-v1"
+pump_direction_mode = "fixed-sign-v1"
+pump_sign = 1.0
+distance_world_units = 0.125
+
+[v2.motor]
+enabled = false
+energy_gradient_gain = 2.0
+chemical_gradient_gain = 2.0
+chiral_contour_gain = 1.0
+heading_propulsion_fraction = 0.5
+
+[v2.budding]
+enabled = false
+local_offset_radius = 0.25
+
+[v2.crowding]
+enabled = false
+mode = "local-neighbors-v1"
+radius_world_units = 0.375
+arrest_threshold = 4.5
+expose_sensor = false
+
+[v2.polarity]
+enabled = false
+torque_mobility = 2.0
+gradient_cue_strength = 0.25
+initial_polarity_strength_max = 0.3
+maximum_wedge_curvature = 0.35
+polarity_mutation_std = 0.05
+oriented_lateral_mitosis = true
+emt_gate_enabled = false
+
+[v2.barrier]
+enabled = false
+mode = "harmonic-v1"
+minimum_permeability = 0.04
+occupancy_impedance = 1.2
+
+[v2.metabolism.lysis]
+enabled = false
+viability_energy_floor = 0.1
+corpse_direction = "negated-affinity"
+
+[v2.metabolism.waste]
+enabled = false
+byproduct_recycle_fraction = 0.45
+
+[v2.differentiation]
+enabled = false
+state_width = 2
+epigenetic_gate_bias = 2.5
+state_inheritance = "symmetric-epigenetic-v1"
+inheritance_retention = 0.8
+inheritance_jitter = 0.05
+stem_asymmetry = -0.8
+affinity_rotation_enabled = true
+emt_adhesion_enabled = true
+
+[v2.differentiation.notch_delta]
+enabled = false
+mode = "sensor-neighbor-mean-v1"
+inhibition_gain = 0.2
+
+[v2.trophallaxis]
+enabled = false
+conductance_per_second = 2.0
+transfer_efficiency = 0.95
+reserve_energy = 0.25
+maximum_export_fraction = 0.25
+kin_cosine_exponent = 4
+kin_threshold = 0.5
+
+[v2.contact.cadherin]
+enabled = false
+mutation_std = 0.05
+
+[v2.contact.velocity_alignment]
+enabled = false
+strength = 0.2
+
+[v2.vascular]
+enabled = true
+minimum_conductance_ratio = 0.025
+maximum_diffusion = 0.298717
+reinforcement_rate_per_second = 0.5
+pruning_rate_per_second = 0.1
+flux_half_saturation = 0.1
+flux_exponent = 1.5
+
+[v2.carriers]
+enabled = false
+trail_diffusion = 0.000298717
+trail_decay_per_second = 0.0040900649999999995
+trail_emission_share = 0.2
+trail_energy_density_scale = 8.0
+
+[v2.visual]
+enabled = false

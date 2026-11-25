@@ -38,7 +38,7 @@ export function FilmProvenance({ film }: { film: FilmManifest }) {
   const crf = crfAt >= 0 ? video.encode[crfAt + 1] : undefined;
   const reproduce = [
     "# flife is `cargo run --release -p flife-cli --` in the repository",
-    `flife run ${world.preset ?? "CONFIG"} --ticks ${world.from.tick} --run-dir RUN`,
+    `flife run ${world.preset ?? note?.config ?? "CONFIG"} --ticks ${world.from.tick} --run-dir RUN`,
     render.command.replace("FRAMES", "frames"),
     ...(render.camera ? [`# CAMERA: lib/films/${film.id}.json's render.camera keys, as {"keys": [...]}`] : []),
   ];
@@ -54,8 +54,13 @@ export function FilmProvenance({ film }: { film: FilmManifest }) {
         <div>
           <MicroLabel>The world</MicroLabel>
           <dl className="ruled mt-2 text-sm">
-            <Row label="Preset" value={world.preset ?? world.name} mono />
+            {world.preset || !note?.config ? (
+              <Row label="Preset" value={world.preset ?? world.name} mono />
+            ) : (
+              <Row label="Configuration" value={note.config} mono />
+            )}
             {world.model ? <Row label="Model" value={world.model} mono /> : null}
+            {note?.mechanism ? <Row label="v2 mechanism on" value={note.mechanism} mono /> : null}
             <Row label="Seed" value={String(world.seed)} mono />
             <Row label="Founders" value={`${grouped(world.founders)} on a ${world.grid[0]} × ${world.grid[1]} field`} />
             <Row label="Evolved first" value={`${grouped(world.from.tick)} ticks (${seconds(world.from.tick).toFixed(0)} simulated seconds)`} />

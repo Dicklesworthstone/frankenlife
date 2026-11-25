@@ -9,7 +9,8 @@ import { useState } from "react";
 
 import { Reticle } from "@/components/franken";
 import { Reveal } from "@/components/reveal";
-import { type AblationRow, v2Ablations, v2Bundles, v2Residuals } from "@/lib/content";
+import { WatchFilm } from "@/components/watch-film";
+import { type AblationRow, filmNotes, v2Ablations, v2Bundles, v2Residuals } from "@/lib/content";
 import { type V2Still, stills } from "@/lib/media";
 import { cn, grouped } from "@/lib/utils";
 
@@ -19,7 +20,11 @@ const byId = (id: string): V2Still => {
   return found;
 };
 
-/** The two presets, side by side, each led by its own still from a Stage-2 treatment run. */
+/**
+ * The two presets, side by side, each led by its own still from a Stage-2
+ * treatment run, and ending with a button for the hero's film of one of its
+ * mechanisms alone in the confluent world.
+ */
 export function BundlePanels() {
   return (
     <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
@@ -72,6 +77,10 @@ export function BundlePanels() {
                     </div>
                   ))}
                 </dl>
+                <div className="mt-auto flex flex-wrap items-center gap-x-4 gap-y-2 pt-6">
+                  <WatchFilm id={bundle.film} label={`Watch the ${(filmNotes[bundle.film]?.tab ?? bundle.film).toLowerCase()} film`} />
+                  <p className="min-w-0 flex-1 basis-56 text-[12px] leading-snug text-slate-500">{bundle.filmLine}</p>
+                </div>
               </div>
             </article>
           </Reveal>

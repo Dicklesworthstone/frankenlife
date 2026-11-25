@@ -260,7 +260,10 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     and the ring, for the shown epoch only. `show` and `place` are these with no prior;
   - it keeps the shown epoch's identities and where each row is drawn, and whether it is yet (an
     `Interpolation`, reserved once at the ceiling): `shown_rows()` is the drawn rows at their drawn positions, so
-    `pick_in(viewport, at, radius)` picks among what is on screen, never the fading dead or the unborn;
+    `pick_in(viewport, at, radius)` picks among what is on screen, never the fading dead or the unborn, within
+    `radius` or the dot's drawn radius on `viewport`, whichever is larger, so a click anywhere on a body drawn wider
+    than the pick radius at deep zoom picks the organism whose centre is nearest (`tests/cloud.rs`
+    `a_click_anywhere_on_a_drawn_body_picks_it`); a negative or non-finite `radius` is still refused;
   - `select(organism)` holds at most one organism by identity, only if the shown epoch has it drawn; every
     lowering revalidates it and drops an identity the new epoch lacks, whatever now occupies its old slot;
     `selected()`, `selected_position()` (where it is drawn), and `selection_draw()`, the ring, which follows the

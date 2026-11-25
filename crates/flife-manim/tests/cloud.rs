@@ -465,6 +465,70 @@ fn a_declared_body_keeps_its_size_past_the_point_cap() -> Result<(), CoreError> 
     Ok(())
 }
 
+/// A click on a dot picks its organism wherever on the dot it lands, so a
+/// body drawn wider than the host's pick radius at deep zoom can still be
+/// selected by clicking it; a click beyond the dot picks nothing.
+#[test]
+fn a_click_anywhere_on_a_drawn_body_picks_it() -> Result<(), CoreError> {
+    let config = common::small();
+    let world = common::found(&config);
+    let epoch = common::epoch(&world);
+    let mut view = WorldView::for_epoch(&epoch, [640, 640], [0, 0, 0])?;
+    view.show(&epoch)?;
+    // The organism farthest from its nearest neighbour on the 32-unit torus.
+    let rows: Vec<(u64, [f64; 2])> = view.shown_rows().collect();
+    let wrapped = |d: f64| d.abs().min(32.0 - d.abs());
+    let lonely = |&(id, [x, y]): &(u64, [f64; 2])| {
+        let nearest = rows
+            .iter()
+            .filter(|&&(other, _)| other != id)
+            .map(|&(_, [u, v])| wrapped(u - x).hypot(wrapped(v - y)))
+            .fold(f64::INFINITY, f64::min);
+        (id, [x, y], nearest)
+    };
+    let (id, position, nearest) = rows
+        .iter()
+        .map(lonely)
+        .max_by(|a, b| a.2.total_cmp(&b.2))
+        .expect("organisms are shown");
+    assert!(nearest > 0.5, "{nearest}");
+
+    // 10x about it: 200 px per unit, so the host's 8 px pick radius is 0.04
+    // units and every other organism is more than 100 px away.
+    let anchor = view.viewport().world_to_drawable(position);
+    let deep = view.viewport().zoomed_about(anchor, 10.0)?;
+    view.set_view(deep)?;
+    view.show(&epoch)?;
+    let viewport = *view.viewport();
+    assert!(
+        (viewport.scale() - 200.0).abs() < 1e-12,
+        "{}",
+        viewport.scale()
+    );
+    let at = viewport.world_to_drawable(position);
+    let off = |pixels: f64| [at[0] + pixels, at[1]];
+
+    // A point organism's dot stops at 24 px: 20 px off its centre picks it,
+    // 30 px off does not.
+    let id = Some(OrganismId::new(id));
+    assert_eq!(view.pick_in(&viewport, at, 8.0), id);
+    assert_eq!(view.pick_in(&viewport, off(20.0), 8.0), id);
+    assert_eq!(view.pick_in(&viewport, off(30.0), 8.0), None);
+
+    // A 0.2-unit body is drawn 40 px wide in radius: 30 px off is on it.
+    view.set_body_radius(0.2)?;
+    assert_eq!(view.pick_in(&viewport, off(30.0), 8.0), id);
+    assert_eq!(view.pick_in(&viewport, off(39.0), 8.0), id);
+    assert_eq!(view.pick_in(&viewport, off(45.0), 8.0), None);
+    // A wider pick radius than the dot still reaches past it, and a refused
+    // radius is still refused.
+    assert_eq!(view.pick_in(&viewport, off(45.0), 50.0), id);
+    for refused in [-1.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(view.pick_in(&viewport, at, refused), None, "{refused}");
+    }
+    Ok(())
+}
+
 #[test]
 #[expect(clippy::float_cmp, reason = "radii are compared bit for bit")]
 fn a_body_radius_sizes_every_dot_and_the_sphere_look_lights_them() -> Result<(), CoreError> {

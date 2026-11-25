@@ -310,7 +310,8 @@ directory, with its pending commands and its checkpoint chain.
   5. applies the frame's camera moves in order to a copy of the viewport: a zoom about the pointer's drawable
      position, a pan by the drag times drawable pixels per point, a reset to the fit; a click picks among the shown
      epoch's organisms through the view as it stood at that click, within `PICK_RADIUS_POINTS = 8` logical points
-     (scaled to drawable pixels); then takes the view and the selection. A click that selects an organism offers
+     (scaled to drawable pixels) or within a dot as drawn, whichever is wider (`WorldView::pick_in`); then takes
+     the view and the selection. A click that selects an organism offers
      `Intent::Inspect` for it with the shown epoch's tick as `seen` (FL-021), counted with the frame's intents or
      refusals, and then `Intent::Follow` for it (plan §2.2), likewise counted; the host follows the line from
      that organism once the offer is taken, and a click that selects nothing, or whose follow is refused,

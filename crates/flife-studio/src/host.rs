@@ -85,7 +85,8 @@ use crate::{
 /// The session a Studio opens.
 pub const STUDIO_SESSION: SessionId = SessionId::new(1);
 
-/// How far from a click, in logical points, an organism is picked.
+/// How far from a click, in logical points, an organism is picked at least:
+/// a click on a dot drawn wider than this picks too (`WorldView::pick_in`).
 pub const PICK_RADIUS_POINTS: f64 = 8.0;
 
 /// How the window opens.

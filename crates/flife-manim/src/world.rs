@@ -957,9 +957,13 @@ impl WorldView {
     }
 
     /// The organism drawn nearest the drawable position `at`, within
-    /// `radius_pixels`, among the shown epoch's drawn rows, where they are
-    /// drawn, placed through `viewport` (this view's, or one a host is about
-    /// to set): see [`pick`]. A fading organism is dead and is never picked.
+    /// `radius_pixels` or within a dot's radius as drawn on `viewport`,
+    /// whichever is larger, among the shown epoch's drawn rows, where they
+    /// are drawn, placed through `viewport` (this view's, or one a host is
+    /// about to set): see [`pick`]. So a click anywhere on a dot picks an
+    /// organism, the one whose centre is nearest, even where a deep zoom
+    /// draws a body far wider than `radius_pixels`. A fading organism is
+    /// dead and is never picked.
     #[must_use]
     pub fn pick_in(
         &self,
@@ -967,7 +971,14 @@ impl WorldView {
         at: [f64; 2],
         radius_pixels: f64,
     ) -> Option<OrganismId> {
-        pick(viewport, self.shown_rows(), at, radius_pixels)
+        // `pick` refuses a negative or non-finite radius: keep that refusal
+        // rather than let the dot's radius stand in for it.
+        let reach = if radius_pixels.is_finite() && radius_pixels >= 0.0 {
+            radius_pixels.max(self.cloud.radius_on(viewport) * viewport.scale())
+        } else {
+            radius_pixels
+        };
+        pick(viewport, self.shown_rows(), at, reach)
     }
 
     /// The shown epoch's drawn rows: each drawn organism's identity and the

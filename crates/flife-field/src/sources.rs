@@ -511,14 +511,21 @@ fn axis_candidates(
     // Centers at (i + ½) h within `radius`: i ∈ [(x − r)/h − ½, (x + r)/h − ½].
     // Widen by one cell on each side against rounding; the exact distance
     // test decides membership.
+    const MAX_EXACT_AXIS_INDEX: f64 = (1_u64 << 52) as f64;
     let low = ((coordinate - radius) / cell - 0.5).floor() - 1.0;
     let high = ((coordinate + radius) / cell - 0.5).ceil() + 1.0;
     let span = high - low + 1.0;
-    if !span.is_finite() || span >= f64::from(cells) {
+    if !span.is_finite()
+        || !low.is_finite()
+        || !high.is_finite()
+        || low.abs() >= MAX_EXACT_AXIS_INDEX
+        || high.abs() >= MAX_EXACT_AXIS_INDEX
+        || span >= f64::from(cells)
+    {
         out.extend(0..cells);
         return true;
     }
-    // |low|, |high| < cells + radius / cell, which the span check bounds.
+    // |low|, |high| < 2^52 < i64::MAX, so both casts are exact and never saturate.
     let (low, high) = (low as i64, high as i64);
     let modulus = i64::from(cells);
     out.extend((low..=high).filter_map(|index| u32::try_from(index.rem_euclid(modulus)).ok()));

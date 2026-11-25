@@ -430,3 +430,54 @@ fn fixed_world_gaussian_uptake_and_deposits_conserve_and_match_across_workers() 
         "subnormal split overspent: {sum_packets:e} > {subnormal:e}"
     );
 }
+
+#[test]
+fn push_footprint_refuses_invalid_cells_or_weights_without_creating_energy() {
+    let grid = FieldGrid::new(8, 8, 8.0, 8.0).expect("grid");
+    let mut deposits = Deposits::with_capacity(&grid, 4, &BufferLimits::host()).expect("deposits");
+    let mut dir = [0.0; CHANNELS];
+    dir[0] = 1.0;
+
+    // Negative weight would previously compute `others = -offered` and stage
+    // `2 * offered` on cell 0 (free energy creation, INV-03/INV-05 violation).
+    for bad_weights in [
+        &[(0, 1.0), (1, -1.0)][..],
+        &[(0, f64::NAN)][..],
+        &[(0, f64::INFINITY)][..],
+        &[(0, f64::NEG_INFINITY)][..],
+    ] {
+        let err = deposits
+            .push_footprint(&grid, OrganismId::new(1), 10.0, 10.0, &dir, bad_weights)
+            .expect_err("invalid weight must be refused");
+        assert!(matches!(err, CoreError::NumericalInvalid { .. }), "{err:?}");
+        assert!(deposits.is_empty(), "refused push must stage nothing");
+    }
+
+    // Out-of-bounds, duplicate, and unsorted cell indices must be refused cleanly.
+    let oob = grid.cell_count() as usize;
+    for bad_cells in [
+        &[(oob, 1.0)][..],
+        &[(2, 0.5), (2, 0.5)][..],
+        &[(5, 0.5), (3, 0.5)][..],
+    ] {
+        let err = deposits
+            .push_footprint(&grid, OrganismId::new(2), 10.0, 10.0, &dir, bad_cells)
+            .expect_err("invalid cell ordering or bounds must be refused");
+        assert!(matches!(err, CoreError::StateConflict { .. }), "{err:?}");
+        assert!(deposits.is_empty(), "refused push must stage nothing");
+    }
+
+    // An all-zero-weight footprint distributes zero energy rather than assigning
+    // the full offer to cell 0.
+    deposits
+        .push_footprint(
+            &grid,
+            OrganismId::new(3),
+            10.0,
+            10.0,
+            &dir,
+            &[(0, 0.0), (1, 0.0)],
+        )
+        .expect("nonnegative zero weights are valid");
+    assert_eq!(deposits.entry_packets(0).count(), 0);
+}

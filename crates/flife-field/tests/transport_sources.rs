@@ -1283,6 +1283,27 @@ fn support_into_matches_scalar_weight_bit_for_bit_across_seams_and_wide_grids() 
             "unwrapped center {bad:?} refusal mismatch"
         );
     }
+
+    // Huge finite coordinates must not saturate `as i64` into a single bogus cell.
+    let mut huge_support = SourceSupport::new();
+    for huge in [[1.0e20, 4.0], [-1.0e20, 4.0], [4.0, 1.0e20], [4.0, -1.0e20]] {
+        k_large
+            .candidates_into(&g64, huge, &mut huge_support)
+            .expect("finite huge center produces candidates");
+        if huge[0].abs() > 1.0e18 {
+            assert_eq!(
+                huge_support.columns().len(),
+                g64.cells_x() as usize,
+                "huge x={huge:?} must cover all columns rather than saturating i64"
+            );
+        } else {
+            assert_eq!(
+                huge_support.rows().len(),
+                g64.cells_y() as usize,
+                "huge y={huge:?} must cover all rows rather than saturating i64"
+            );
+        }
+    }
 }
 
 #[test]

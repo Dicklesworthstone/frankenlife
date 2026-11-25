@@ -499,10 +499,17 @@ fn axis_candidates(
     if !coordinate.is_finite() {
         return false;
     }
+    const MAX_EXACT_AXIS_INDEX: f64 = (1_u64 << 52) as f64;
     let low = ((coordinate - radius) / cell - 0.5).floor() - 1.0;
     let high = ((coordinate + radius) / cell - 0.5).ceil() + 1.0;
     let span = high - low + 1.0;
-    if !span.is_finite() || span >= f64::from(cells) {
+    if !span.is_finite()
+        || !low.is_finite()
+        || !high.is_finite()
+        || low.abs() >= MAX_EXACT_AXIS_INDEX
+        || high.abs() >= MAX_EXACT_AXIS_INDEX
+        || span >= f64::from(cells)
+    {
         out.extend(0..cells);
         return true;
     }

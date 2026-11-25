@@ -304,13 +304,15 @@ fn vascular_extreme_flux_overflow_guard_and_substep_invariance() {
             let expected = (0.25_f64 + dt * (2.0 * (1.0 - 0.25) - 0.5 * (0.25 - 0.025))) as f32;
             assert_eq!(g_next.to_bits(), expected.to_bits(), "mu={mu} sat==1 exact");
         }
-        let g_zero = v.update_conductance(0.25, 0.0, dt);
-        let expected_zero = (0.25_f64 + dt * (-0.5 * (0.25 - 0.025))) as f32;
-        assert_eq!(
-            g_zero.to_bits(),
-            expected_zero.to_bits(),
-            "mu={mu} zero flux"
-        );
+        for zero_like in [0.0_f64, -1.0, f64::NEG_INFINITY, f64::NAN] {
+            let g_zero = v.update_conductance(0.25, zero_like, dt);
+            let expected_zero = (0.25_f64 + dt * (-0.5 * (0.25 - 0.025))) as f32;
+            assert_eq!(
+                g_zero.to_bits(),
+                expected_zero.to_bits(),
+                "mu={mu} non-positive/NaN flux {zero_like:?} must yield sat=0"
+            );
+        }
     }
 
     // Substep invariance: 1 substep with r_x = 0.20 vs 2 substeps with r_x = 0.10

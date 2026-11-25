@@ -461,7 +461,10 @@ impl Deposits {
     /// redundant Gaussian evaluations when multiple streams share a position.
     ///
     /// # Errors
-    /// As [`Deposits::push`]. Nothing is staged on error.
+    /// As [`Deposits::push`], [`CoreError::StateConflict`] for cells outside
+    /// `grid` or not in strictly ascending order, and
+    /// [`CoreError::NumericalInvalid`] for a nonfinite or negative weight.
+    /// Nothing is staged on error.
     pub fn push_footprint(
         &mut self,
         grid: &FieldGrid,
@@ -472,6 +475,24 @@ impl Deposits {
         footprint: &[(usize, f64)],
     ) -> Result<(), CoreError> {
         self.check_entry(grid, paid, offered, direction)?;
+        let mut previous = None;
+        for &(cell, weight) in footprint {
+            if u64::try_from(cell).map_or(true, |cell| cell >= grid.cell_count())
+                || previous.is_some_and(|previous| cell <= previous)
+            {
+                return Err(CoreError::StateConflict {
+                    operation: "stage a deposit footprint",
+                    detail: format!("cell {cell} out of order or outside the grid"),
+                });
+            }
+            if !weight.is_finite() || weight < 0.0 {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "deposit footprint weight",
+                    detail: format!("weight {weight:?} must be finite and nonnegative"),
+                });
+            }
+            previous = Some(cell);
+        }
         split_slice(footprint, offered, &mut self.shares);
         let entry = self.entries.len();
         self.grid = Some(*grid);
@@ -819,6 +840,9 @@ fn split_slice(cells: &[(usize, f64)], offered: f64, shares: &mut Vec<f64>) {
         if weight > cells[largest].1 {
             largest = index;
         }
+    }
+    if cells[largest].1 <= 0.0 {
+        return;
     }
     let mut others = 0.0;
     for (index, (&(_, weight), share)) in cells.iter().zip(shares.iter_mut()).enumerate() {

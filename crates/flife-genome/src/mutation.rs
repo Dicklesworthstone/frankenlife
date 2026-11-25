@@ -59,7 +59,7 @@ use crate::founder::{
 };
 use crate::genome::{
     AFFINITY_TERMS, CadherinTraits, Genome, MOTION_RESPONSE_TERMS, PolarityTraits, TraitLimits,
-    Traits, normalize_cadherin_tag, rescale, squared_norm,
+    Traits, exceeds_norm, normalize_cadherin_tag, rescale,
 };
 use crate::init::fan_in_draw;
 use crate::quota::{GenomeQuota, ParameterBuffer, ParameterValues, WeightsMut, allocate_values};
@@ -387,7 +387,8 @@ pub fn perturb_weight<W: Weight>(value: W, delta: f64) -> W {
 ///
 /// # Errors
 /// [`CoreError::NumericalInvalid`] for a nonpositive or nonfinite scale or
-/// bound, or a step that cannot be reflected inside.
+/// bound, an inverted range (`range[0] > range[1]`), a nonfinite step, or a
+/// step that cannot be reflected inside.
 pub fn reflect_log_scale(scale: f64, delta: f64, range: [f64; 2]) -> Result<f64, CoreError> {
     let [minimum, maximum] = range;
     let invalid = |detail: String| CoreError::NumericalInvalid {
@@ -397,10 +398,17 @@ pub fn reflect_log_scale(scale: f64, delta: f64, range: [f64; 2]) -> Result<f64,
     let logarithm =
         |value: f64| ln(value).ok_or_else(|| invalid(format!("ln {value} is undefined")));
     let (low, high) = (logarithm(minimum)?, logarithm(maximum)?);
-    if low >= high {
+    if minimum > maximum || low > high {
+        return Err(invalid(format!("range [{minimum}, {maximum}] is inverted")));
+    }
+    let scale_log = logarithm(scale)?;
+    if !delta.is_finite() {
+        return Err(invalid(format!("log step {delta} is not finite")));
+    }
+    if low == high {
         return Ok(minimum);
     }
-    let mut log = logarithm(scale)? + delta;
+    let mut log = scale_log + delta;
     if !log.is_finite() {
         return Err(invalid(format!("log scale {log} is not finite")));
     }
@@ -1352,7 +1360,7 @@ impl<'a> Mutator<'a> {
                 *value += deviation * normal;
             }
             let limit = self.limits.motion_response_norm();
-            if squared_norm(&motion_response) > limit * limit {
+            if exceeds_norm(&motion_response, limit) {
                 rescale("motion response", &mut motion_response, limit)?;
             }
         }

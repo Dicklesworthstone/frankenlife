@@ -817,6 +817,22 @@ fn traits_are_bounded() {
     assert!(TraitLimits::new(0.0, 1.0, [1.0, 16.0], 4.0).is_err());
     assert!(TraitLimits::new(1.0, 1.0, [16.0, 1.0], 4.0).is_err());
     assert!(TraitLimits::new(1.0, 1.0, [1.0, 16.0], f64::INFINITY).is_err());
+
+    // Huge finite norm bounds whose squares overflow `f64` must still enforce
+    // `||v||₂ <= limit` (no `+inf > +inf == false` bypass).
+    let huge_limits = TraitLimits::new(1.0, 1.0e200, [1.0, 16.0], 4.0).expect("huge limits");
+    let mut within_huge = [0.0; 33];
+    within_huge[0] = 0.5e200;
+    assert!(Traits::new(affinity, within_huge, 1.0, &huge_limits).is_ok());
+    let mut over_huge = [0.0; 33];
+    over_huge[0] = 1.0e250;
+    assert!(
+        matches!(
+            Traits::new(affinity, over_huge, 1.0, &huge_limits),
+            Err(CoreError::NumericalInvalid { .. })
+        ),
+        "vector of norm 1e250 must not bypass limit 1e200"
+    );
 }
 
 #[test]

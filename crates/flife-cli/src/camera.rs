@@ -119,11 +119,13 @@ impl CameraPath {
         let mut center = [0.0; 2];
         for axis in 0..2 {
             let length = extent[axis];
-            let mut step = wrap(to.center[axis] - from.center[axis], length);
+            let from_axis = wrap(from.center[axis], length);
+            let to_axis = wrap(to.center[axis], length);
+            let mut step = wrap(to_axis - from_axis, length);
             if step > length / 2.0 {
                 step -= length;
             }
-            center[axis] = from.center[axis] + eased * step;
+            center[axis] = from_axis + eased * step;
         }
         view(center, zoom)
     }
@@ -240,5 +242,21 @@ mod tests {
                 zoom: 3.0
             }
         );
+    }
+
+    #[test]
+    fn interpolates_huge_finite_centers_without_overflow() {
+        let camera = path(&[
+            (0, [-1.0e308, f64::MAX], 1.0),
+            (100, [1.0e308, -1.0e308], 2.0),
+        ]);
+        let mid = camera.at(50, EXTENT);
+        assert!(
+            mid.center.iter().all(|value| value.is_finite())
+                && (0.0..EXTENT[0]).contains(&mid.center[0])
+                && (0.0..EXTENT[1]).contains(&mid.center[1]),
+            "expected wrapped finite center, got {mid:?}"
+        );
+        assert!((mid.zoom - 2.0_f64.sqrt()).abs() < 1.0e-12);
     }
 }

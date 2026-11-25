@@ -969,13 +969,18 @@ fn sensing_scale_reflects_at_its_log_bounds() {
             assert!((1.0..=16.0).contains(&value), "{scale} {step} -> {value}");
         }
     }
-    // A single admitted scale admits only itself.
+    // A single admitted scale admits only itself, and still validates `scale` and `delta`.
     assert_eq!(reflect_log_scale(3.0, 0.4, [3.0, 3.0]), Ok(3.0));
-    // A step that cannot be reflected inside is refused, not clamped.
+    // Inverted ranges and invalid inputs on degenerate ranges are refused, not clamped.
     for refused in [
         reflect_log_scale(2.0, 1.0e6, range),
         reflect_log_scale(2.0, f64::NAN, range),
         reflect_log_scale(0.0, 0.1, range),
+        reflect_log_scale(2.0, 0.1, [4.0, 1.0]),
+        reflect_log_scale(f64::NAN, 0.0, [3.0, 3.0]),
+        reflect_log_scale(-1.0, 0.0, [3.0, 3.0]),
+        reflect_log_scale(3.0, f64::NAN, [3.0, 3.0]),
+        reflect_log_scale(3.0, f64::INFINITY, [3.0, 3.0]),
     ] {
         assert!(matches!(refused, Err(CoreError::NumericalInvalid { .. })));
     }

@@ -1046,40 +1046,93 @@ impl Traits {
     }
 }
 
+/// IEEE-754 exact power of two (`2^-530`) used to down-scale components and
+/// bounds without mantissa rounding when `Σ vᵢ²` or `limit²` overflows `f64`.
+const NORM_DOWN_SCALE: f64 = f64::from_bits((1023_u64 - 530) << 52);
+
 /// `Σ vᵢ²` in index order. Every norm bound in this crate is checked with
-/// exactly this sum against `limit²`.
+/// exactly this sum against `limit²` whenever both squares are finite.
 pub(crate) fn squared_norm(values: &[f64]) -> f64 {
     values
         .iter()
         .fold(0.0, |total, &value| total + value * value)
 }
 
+/// `Σ (vᵢ · scale)²` in index order.
+fn scaled_squared_norm(values: &[f64], scale: f64) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let scaled = value * scale;
+        total + scaled * scaled
+    })
+}
+
+/// Whether `||values||₂ > limit` for finite `values` and finite `limit >= 0`.
+///
+/// Runs the exact `squared_norm(values) > limit * limit` comparison whenever
+/// both squares stay finite, and falls back to exact power-of-two down-scaling
+/// when either square overflows `f64`.
+pub(crate) fn exceeds_norm(values: &[f64], limit: f64) -> bool {
+    let squared = squared_norm(values);
+    let bound = limit * limit;
+    if squared.is_finite() && bound.is_finite() {
+        return squared > bound;
+    }
+    let scaled_limit = limit * NORM_DOWN_SCALE;
+    scaled_squared_norm(values, NORM_DOWN_SCALE) > scaled_limit * scaled_limit
+}
+
 /// Scale `values` onto the sphere of `radius`: `vᵢ / ||v||₂ · radius`. While
-/// rounding leaves [`squared_norm`] above `radius²`, every component is
-/// multiplied by `1 − 2^-53`, so the result always passes the bound it is
-/// checked against. One pass almost always suffices.
+/// rounding leaves the norm above `radius`, every component is multiplied by
+/// `1 − 2^-53`, so the result always passes the bound it is checked against.
+/// One pass almost always suffices.
 ///
 /// # Errors
-/// [`CoreError::NumericalInvalid`] for a zero, nonfinite or unrecoverable
-/// norm.
+/// [`CoreError::NumericalInvalid`] for a nonpositive/nonfinite radius, or a
+/// zero, nonfinite or unrecoverable norm.
 pub(crate) fn rescale(
     quantity: &'static str,
     values: &mut [f64],
     radius: f64,
 ) -> Result<(), CoreError> {
-    let norm = squared_norm(values).sqrt();
-    if !norm.is_finite() || norm <= 0.0 {
+    if !radius.is_finite() || radius <= 0.0 {
         return Err(CoreError::NumericalInvalid {
             quantity,
-            detail: format!("a vector of norm {norm:?} has no direction"),
+            detail: format!("radius {radius:?} must be finite and positive"),
         });
     }
-    for value in values.iter_mut() {
-        *value = *value / norm * radius;
+    if let Some(value) = values.iter().find(|value| !value.is_finite()) {
+        return Err(CoreError::NumericalInvalid {
+            quantity,
+            detail: format!("component {value} is not finite"),
+        });
+    }
+    let squared = squared_norm(values);
+    if squared.is_finite() {
+        let norm = squared.sqrt();
+        if !norm.is_finite() || norm <= 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity,
+                detail: format!("a vector of norm {norm:?} has no direction"),
+            });
+        }
+        for value in values.iter_mut() {
+            *value = *value / norm * radius;
+        }
+    } else {
+        let scaled_norm = scaled_squared_norm(values, NORM_DOWN_SCALE).sqrt();
+        if !scaled_norm.is_finite() || scaled_norm <= 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity,
+                detail: format!("a vector of norm {scaled_norm:?} has no direction"),
+            });
+        }
+        for value in values.iter_mut() {
+            *value = (*value * NORM_DOWN_SCALE) / scaled_norm * radius;
+        }
     }
     let shrink = 1.0 - f64::EPSILON / 2.0;
     for _ in 0..64 {
-        if squared_norm(values) <= radius * radius {
+        if !exceeds_norm(values, radius) {
             return Ok(());
         }
         for value in values.iter_mut() {
@@ -1099,8 +1152,8 @@ fn check_norm(quantity: &'static str, values: &[f64], limit: f64) -> Result<(), 
             detail: format!("component {value} is not finite"),
         });
     }
-    let squared = squared_norm(values);
-    if squared > limit * limit {
+    if exceeds_norm(values, limit) {
+        let squared = squared_norm(values);
         return Err(CoreError::NumericalInvalid {
             quantity,
             detail: format!("the squared norm {squared} exceeds {limit}²"),

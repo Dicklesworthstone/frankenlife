@@ -738,8 +738,7 @@ fn decay(plane: &mut [f32], factor: f64) -> f64 {
     removed
 }
 
-/// `Σ values` in F64, in index order.
-/// `Σ values` in F64, in order: every energy total of the field step.
+/// `Σ values` in F64, in index order: every energy total of the field step.
 #[must_use]
 pub fn sum(values: &[f32]) -> f64 {
     values
@@ -1908,10 +1907,10 @@ impl VascularField {
     #[must_use]
     pub fn update_conductance(&self, prev: f32, flux_magnitude: f64, dt: f64) -> f32 {
         let ratio = flux_magnitude / self.flux_half_saturation;
-        let sat = if !ratio.is_finite() || ratio > 1.0e100 {
-            if ratio.is_nan() { 0.0 } else { 1.0 }
-        } else if ratio <= 0.0 {
+        let sat = if ratio.is_nan() || ratio <= 0.0 {
             0.0
+        } else if !ratio.is_finite() || ratio > 1.0e100 {
+            1.0
         } else if self.flux_exponent == 1.5 {
             let r_mu = ratio * ratio.sqrt();
             if r_mu.is_finite() {

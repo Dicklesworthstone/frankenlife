@@ -150,7 +150,7 @@ The camera (`--camera auto`, the default) is chosen from the run itself: `script
 same ticks small, as raw dots, and `scripts/director.ts` reads those frames' pixels to find where the organisms
 are changing most, then writes the path that `flife render --camera` follows. The film opens on the whole
 torus for 35% of its length, so the world can be seen evolving before the first zoom, and closes on it for
-10%; in between it eases into the most active region of each shot. Each shot spans 51–102 world
+at least 10%; in between it eases into the most active region of each shot. Each shot spans 51–102 world
 units on any torus of 128 units or more: the zooms are written for a 256-unit torus and scaled to the
 run's, never below 1.25. The rule is stated in
 `director.ts` and recorded in the manifest with every key. The camera is presentation only, and the script

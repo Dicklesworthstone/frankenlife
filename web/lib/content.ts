@@ -43,17 +43,17 @@ export const filmFacts = {
     {
       value: "Hue · light",
       label: "lineage · its own energy",
-      body: "A founder's descendants share a hue. Each is lit by its own energy: black with none, white when well fed.",
+      body: "A founder's descendants share a hue. Each is lit by its own energy: black with none, white at 1.8 times what it needs to divide.",
     },
     {
       value: "1 switch",
       label: "between the films",
-      body: "The v2 films regrow the confluent world from tick 0 with one mechanism on, veins or polarity. With it off they match bit for bit.",
+      body: "The v2 films regrow the confluent world from tick 0 with one mechanism on, veins or polarity, at the engine's defaults. With it off, the run reaches the confluent film's own digest.",
     },
     {
       value: "From the run",
       label: "where the camera looks",
-      body: "A small preview finds where organisms changed most, and each shot eases there. Only the zooms are set by hand.",
+      body: "A small preview of the same frames finds where organisms changed most, and each shot eases there. The zooms and timings are set by hand.",
     },
   ],
 };
@@ -644,7 +644,7 @@ export const v2Bundles = [
       { label: "Close neighbours", value: "½", note: "as many as with v2 off: 2.0 against 3.6; 4/4" },
       { label: "Energy passed to kin", value: "79,910", note: "units per run, in every window" },
     ],
-    // One of this preset's mechanisms, switched on alone in the confluent world (filmNotes, filmChoice.v2).
+    // One of this preset's mechanisms, switched on alone in the confluent world (filmNotes, filmFacts).
     // The film's is at the engine's defaults; this preset starts bodies more strongly polarised (0.88, not 0.3).
     film: "confluent-polarity",
     filmLine: "One of the films at the top of the page switches on polarity, one of this preset's mechanisms, alone in the confluent world, at the engine's default settings rather than this preset's.",

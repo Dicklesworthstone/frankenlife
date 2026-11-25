@@ -297,7 +297,7 @@ export function ScaleCalculator() {
             <p className="mt-3 text-xs leading-relaxed text-slate-400">
               Each organism this size pays at least{" "}
               <span className="font-mono text-slate-200">{trim(mandatoryCost(parameters), 4)}</span> energy a second just
-              to exist, so the starter&apos;s sources feed at most{" "}
+              to exist, so even with perfect uptake the starter&apos;s sources feed at most about{" "}
               <span className="font-mono text-slate-200">{grouped(Math.floor(ceiling))}</span>.
             </p>
           </div>
@@ -309,8 +309,8 @@ export function ScaleCalculator() {
             <BasisBadge basis="record" />
           </div>
           <p className="mt-2 text-sm leading-relaxed text-slate-300">
-            M5 Ultra, Metal: weights streamed at <span className="font-mono text-amber-200">426–748 GB/s</span>, bit for
-            bit the CPU&apos;s. Over four billion F32 parameters that is{" "}
+            M5 Ultra, Metal: weights streamed at <span className="font-mono text-amber-200">426–748 GB/s</span> in the
+            fastest rounds, every output bit for bit the CPU&apos;s. Over four billion F32 parameters that is{" "}
             <span className="font-mono text-amber-200">27–47</span> sweeps a second, for the brains alone. The G7 scale
             gate has not run.
           </p>

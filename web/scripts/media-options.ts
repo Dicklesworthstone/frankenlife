@@ -7,8 +7,6 @@
 
 import { relative, resolve } from "node:path";
 
-import type { CameraKey } from "./director";
-
 /**
  * Cloudflare Workers serves a static asset of at most 25 MiB: the posters, cards and stills in public/media/.
  * The films are not static assets; they are served from R2 (worker.ts), so no film is split or capped to fit.

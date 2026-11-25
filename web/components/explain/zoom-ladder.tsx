@@ -85,8 +85,8 @@ const COLOUR: Record<string, string> = {
   spend: "#fde68a",
 };
 
-/** The picked organism's lineage colour in the film (lime), for the rings drawn around it. */
-const PICKED = LINEAGE[5];
+/** The picked organism's lineage colour in the film (pale cyan), for the rings drawn around it. */
+const PICKED = LINEAGE[3];
 
 type Figure = { label: string; value: string; note: string };
 type Stop = {
@@ -147,8 +147,8 @@ const STOPS: Stop[] = [
     title: "One body, one [field cell] wide.",
     body: (
       <>
-        One sphere, one field cell wide. Bodies push apart and pull alike chemistry together; food and signals pass
-        only through the field.
+        Drawn at its body&apos;s size. Overlapping bodies push apart, and neighbours with alike chemistry pull
+        together; food and signals pass only through the field.
       </>
     ),
     figures: [
@@ -169,8 +169,8 @@ const STOPS: Stop[] = [
     title: "Its own network, [every tick].",
     body: (
       <>
-        What it senses goes in; when to split, what to emit and where to steer come out. A child may inherit a
-        different shape, but the weights are always its own.
+        What it senses goes in; when to split, the child&apos;s share, what to emit and how fast to spend come out. A
+        child may inherit a different shape, but the weights are always its own.
       </>
     ),
     figures: [

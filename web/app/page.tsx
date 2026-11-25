@@ -103,7 +103,7 @@ const FIRST_COMMANDS = 4;
 /** The hero's index of what the page shows, each a jump to it. */
 const heroChips = [
   { label: "One brain per organism", href: "#brains" },
-  { label: "One energy ledger", href: "#world" },
+  { label: "One shared field", href: "#world" },
   { label: "Replay and branch", href: "#replay" },
   { label: "21 v2 switches", href: "#ch-v2" },
   { label: "Controls that remove a cause", href: "#controls" },

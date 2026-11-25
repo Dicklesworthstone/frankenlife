@@ -2,9 +2,9 @@
   "schema": "frankenlife.website-media.v1",
   "id": "confluent-veins",
   "video": {
-    "src": "/media/confluent-veins-seg00-e3476f99c0c6.mp4",
-    "sha256": "e3476f99c0c691e5f5912b0f2093ac472bc0ac3d51c3bb8c166510b4e6fddfc3",
-    "bytes": 13378783,
+    "src": "/media/confluent-veins-seg00-fa783c2155ba.mp4",
+    "sha256": "fa783c2155ba2ba50b21af0d28e529aa78489034446bf652c0874bac18c7d01b",
+    "bytes": 21735907,
     "width": 2160,
     "height": 2160,
     "fps": 60,
@@ -17,7 +17,7 @@
       "-preset",
       "slow",
       "-crf",
-      "19",
+      "30",
       "-g",
       "60",
       "-keyint_min",
@@ -34,242 +34,62 @@
     ],
     "segments": [
       {
-        "src": "/media/confluent-veins-seg00-e3476f99c0c6.mp4",
-        "sha256": "e3476f99c0c691e5f5912b0f2093ac472bc0ac3d51c3bb8c166510b4e6fddfc3",
-        "bytes": 13378783,
+        "src": "/media/confluent-veins-seg00-fa783c2155ba.mp4",
+        "sha256": "fa783c2155ba2ba50b21af0d28e529aa78489034446bf652c0874bac18c7d01b",
+        "bytes": 21735907,
         "start_frame": 0,
-        "frames": 23,
+        "frames": 120,
         "start_tick": 2400,
-        "end_tick": 2488
-      },
-      {
-        "src": "/media/confluent-veins-seg01-5c7784d7fc0c.mp4",
-        "sha256": "5c7784d7fc0ccb0c6be4b47340ba2bc5396f43238269825ea182c112751b2867",
-        "bytes": 13834046,
-        "start_frame": 23,
-        "frames": 24,
-        "start_tick": 2492,
-        "end_tick": 2584
-      },
-      {
-        "src": "/media/confluent-veins-seg02-b1e3b175ec5c.mp4",
-        "sha256": "b1e3b175ec5cd98943f1169eb467df7ad584aed5a4920a3d298242c02fa8dc5a",
-        "bytes": 9653145,
-        "start_frame": 47,
-        "frames": 17,
-        "start_tick": 2588,
-        "end_tick": 2652
-      },
-      {
-        "src": "/media/confluent-veins-seg03-0df758830bdd.mp4",
-        "sha256": "0df758830bdda8c959494b2daf49d27cacf212715f77bd4f166c7fad2897e7e1",
-        "bytes": 9863201,
-        "start_frame": 64,
-        "frames": 15,
-        "start_tick": 2656,
-        "end_tick": 2712
-      },
-      {
-        "src": "/media/confluent-veins-seg04-7e539ed1f6e5.mp4",
-        "sha256": "7e539ed1f6e52df4110393e0476e98f2170ff7290172e9efdb042a808fc07132",
-        "bytes": 13784421,
-        "start_frame": 79,
-        "frames": 15,
-        "start_tick": 2716,
-        "end_tick": 2772
-      },
-      {
-        "src": "/media/confluent-veins-seg05-29310e9120de.mp4",
-        "sha256": "29310e9120dedecba3a99aabf31807230ba440430a2e59a36b6edda8ada31edc",
-        "bytes": 18895975,
-        "start_frame": 94,
-        "frames": 26,
-        "start_tick": 2776,
         "end_tick": 2876
       },
       {
-        "src": "/media/confluent-veins-seg06-311294cd3ad7.mp4",
-        "sha256": "311294cd3ad752f696a4177d1547165cf6c7424cc985315442a4f44348245740",
-        "bytes": 9078400,
+        "src": "/media/confluent-veins-seg01-35acfb090ea3.mp4",
+        "sha256": "35acfb090ea35682776963748329aacd2d1a5bf891616f09e9b6f8478d2dc88f",
+        "bytes": 21491630,
         "start_frame": 120,
-        "frames": 21,
+        "frames": 184,
         "start_tick": 2880,
-        "end_tick": 2960
+        "end_tick": 3612
       },
       {
-        "src": "/media/confluent-veins-seg07-60d79c1ae91c.mp4",
-        "sha256": "60d79c1ae91c86c74d0be450e925f9736902e2631093bf72f77230886bde10e4",
-        "bytes": 20114975,
-        "start_frame": 141,
-        "frames": 47,
-        "start_tick": 2964,
-        "end_tick": 3148
+        "src": "/media/confluent-veins-seg02-272b98663600.mp4",
+        "sha256": "272b98663600333ea04bbeda4562a68f0d9aef4df07ae0af6e50920caaadf519",
+        "bytes": 19871733,
+        "start_frame": 304,
+        "frames": 184,
+        "start_tick": 3616,
+        "end_tick": 4348
       },
       {
-        "src": "/media/confluent-veins-seg08-b0c36ce4a615.mp4",
-        "sha256": "b0c36ce4a6153b2d40d451815aab9a195cde5143854fe1eba1f6257b383cf6fa",
-        "bytes": 13057090,
-        "start_frame": 188,
-        "frames": 30,
-        "start_tick": 3152,
-        "end_tick": 3268
-      },
-      {
-        "src": "/media/confluent-veins-seg09-08072d57af6c.mp4",
-        "sha256": "08072d57af6cc208b618b73320a8fd272a3a19b2b4144c15e1f928abbc62d75b",
-        "bytes": 13359067,
-        "start_frame": 218,
-        "frames": 30,
-        "start_tick": 3272,
-        "end_tick": 3388
-      },
-      {
-        "src": "/media/confluent-veins-seg10-92fba9bf83e2.mp4",
-        "sha256": "92fba9bf83e2c03d5d1b2767f380dbace386bb9229872e5f8d292d7f217d59bf",
-        "bytes": 15238249,
-        "start_frame": 248,
-        "frames": 35,
-        "start_tick": 3392,
-        "end_tick": 3528
-      },
-      {
-        "src": "/media/confluent-veins-seg11-5c0bc4c6d3b9.mp4",
-        "sha256": "5c0bc4c6d3b978a2ab7c789730d4458b8aeae2a9423cf8cdef6d67fd4a38b079",
-        "bytes": 17464633,
-        "start_frame": 283,
-        "frames": 47,
-        "start_tick": 3532,
-        "end_tick": 3716
-      },
-      {
-        "src": "/media/confluent-veins-seg12-8b1a9fc9522e.mp4",
-        "sha256": "8b1a9fc9522e157a6bed1b6037bd8a77a6ea08cde8c3d1e5d399583b88fe1a77",
-        "bytes": 17327779,
-        "start_frame": 330,
-        "frames": 47,
-        "start_tick": 3720,
-        "end_tick": 3904
-      },
-      {
-        "src": "/media/confluent-veins-seg13-646d7f9c4aaf.mp4",
-        "sha256": "646d7f9c4aaf3c723926350aa54b860fd730322a3ee1f72f900c3536d509cb09",
-        "bytes": 14106948,
-        "start_frame": 377,
-        "frames": 55,
-        "start_tick": 3908,
-        "end_tick": 4124
-      },
-      {
-        "src": "/media/confluent-veins-seg14-af92d008e108.mp4",
-        "sha256": "af92d008e1080d5228105cd2b275a7a5f250b9fa680a2a018d1e482aaa9bfaa7",
-        "bytes": 14085605,
-        "start_frame": 432,
-        "frames": 39,
-        "start_tick": 4128,
-        "end_tick": 4280
-      },
-      {
-        "src": "/media/confluent-veins-seg15-c0efb38359f2.mp4",
-        "sha256": "c0efb38359f2c24f1a7cb26ee9c6f4b9a2e9533a3295b0f741f7fa5d50af1708",
-        "bytes": 20796775,
-        "start_frame": 471,
-        "frames": 47,
-        "start_tick": 4284,
-        "end_tick": 4468
-      },
-      {
-        "src": "/media/confluent-veins-seg16-ae71ba0eb5c3.mp4",
-        "sha256": "ae71ba0eb5c3721dfe2158420f50075beda8a2a0b5d6100653894ce1438a6a7d",
-        "bytes": 21186042,
-        "start_frame": 518,
-        "frames": 47,
-        "start_tick": 4472,
-        "end_tick": 4656
-      },
-      {
-        "src": "/media/confluent-veins-seg17-955620bb625a.mp4",
-        "sha256": "955620bb625a7f02f8e74523d8b9388f63aa3117ce052b54216752833f3ac693",
-        "bytes": 11517473,
-        "start_frame": 565,
-        "frames": 25,
-        "start_tick": 4660,
-        "end_tick": 4756
-      },
-      {
-        "src": "/media/confluent-veins-seg18-c87a29d61c63.mp4",
-        "sha256": "c87a29d61c6310869012b44b5d9d4439022a41eda2c491846fe2d412ea48205f",
-        "bytes": 11847053,
-        "start_frame": 590,
-        "frames": 26,
-        "start_tick": 4760,
+        "src": "/media/confluent-veins-seg03-e6c74d45c5ce.mp4",
+        "sha256": "e6c74d45c5cec80f24aa9e9993f65cb432e3bee2098390f09909df534c61b714",
+        "bytes": 16253052,
+        "start_frame": 488,
+        "frames": 128,
+        "start_tick": 4352,
         "end_tick": 4860
       },
       {
-        "src": "/media/confluent-veins-seg19-dd2c82789ea0.mp4",
-        "sha256": "dd2c82789ea0f715490650df4f0352092295a9fd3b4d017bb7f4b9cb8572ded0",
-        "bytes": 15497383,
+        "src": "/media/confluent-veins-seg04-3fd75b1dc09a.mp4",
+        "sha256": "3fd75b1dc09aaa5a2ef969a6aa25d735cde03948da37cf47a5a1697e8c2f6c9b",
+        "bytes": 10186339,
         "start_frame": 616,
-        "frames": 28,
+        "frames": 56,
         "start_tick": 4864,
-        "end_tick": 4972
-      },
-      {
-        "src": "/media/confluent-veins-seg20-69ec85de558d.mp4",
-        "sha256": "69ec85de558dc00f96d59f5de81ef2b7bccd85eccadcee8805288dd01129aefe",
-        "bytes": 19740324,
-        "start_frame": 644,
-        "frames": 28,
-        "start_tick": 4976,
         "end_tick": 5084
       },
       {
-        "src": "/media/confluent-veins-seg21-88b4852d7316.mp4",
-        "sha256": "88b4852d731698ac7267f8bff5e1a1a3f198527443eb9485902e38d098845e41",
-        "bytes": 20011289,
+        "src": "/media/confluent-veins-seg05-1d72a767a0cd.mp4",
+        "sha256": "1d72a767a0cdd6c99b214b1c5342a6a02e86f2f5713daae63b5e01256b7b979f",
+        "bytes": 17658496,
         "start_frame": 672,
-        "frames": 35,
+        "frames": 129,
         "start_tick": 5088,
-        "end_tick": 5224
-      },
-      {
-        "src": "/media/confluent-veins-seg22-c24cf029ebc5.mp4",
-        "sha256": "c24cf029ebc57d0b6280eaac40348622a668bc37faeb374fd233d02e4e691fc1",
-        "bytes": 13429093,
-        "start_frame": 707,
-        "frames": 23,
-        "start_tick": 5228,
-        "end_tick": 5316
-      },
-      {
-        "src": "/media/confluent-veins-seg23-2a0bec5a7d6c.mp4",
-        "sha256": "2a0bec5a7d6ce22f94fc7a7de97ba9d5d9863b05c428dbce8ee702e03c6a5d47",
-        "bytes": 13827756,
-        "start_frame": 730,
-        "frames": 24,
-        "start_tick": 5320,
-        "end_tick": 5412
-      },
-      {
-        "src": "/media/confluent-veins-seg24-f52ff5c75e57.mp4",
-        "sha256": "f52ff5c75e5728193064129c26b65d9ef7138f39de9ddae5dc9216d3b7e7787a",
-        "bytes": 13340425,
-        "start_frame": 754,
-        "frames": 23,
-        "start_tick": 5416,
-        "end_tick": 5504
-      },
-      {
-        "src": "/media/confluent-veins-seg25-92cf51dfd414.mp4",
-        "sha256": "92cf51dfd41411a1eaba0113790ec60a7a80425203872a3257104846f0fc48e2",
-        "bytes": 14066274,
-        "start_frame": 777,
-        "frames": 24,
-        "start_tick": 5508,
         "end_tick": 5600
       }
     ],
     "master": {
-      "path": "/Volumes/SANDISK_SSD/build/flife-4k60-master/confluent-veins-4k60-21904e6.mp4",
+      "path": "/Volumes/SANDISK_SSD/build/flife-4k60-master/confluent-veins-4k60-21904e6-crf30-web.mp4",
       "sha256": "1008ff620751c57aec9ffefa4d834078e893e1f67fd3110deb83304cca8200d1",
       "bytes": 532153184,
       "crf": 16,

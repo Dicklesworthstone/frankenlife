@@ -1,8 +1,8 @@
 # FrankenLife website
 
 The project's page: Next.js 16 as a static export, served by Cloudflare as an assets-only Worker
-(`wrangler.jsonc`). It shows films rendered by `flife render` from committed worlds (the two
-field-ecology-v2 presets fed more, the supercolony's veins, and the v1 confluent world), with a readout of each
+(`wrangler.jsonc`). It shows films rendered by `flife render` from committed worlds (the v1 confluent
+world, and the same world as field-ecology-v2 with one mechanism on: veins, then polarity), with a readout of each
 frame's tick and live organisms taken from the render's own records. The Rust workspace does not
 build or read this directory (`.rchignore` keeps it out of remote builds too).
 
@@ -74,9 +74,12 @@ film has a committed manifest, `lib/films/<id>.json`, written by `bun run media 
 each file by its SHA-256 and records how it was made: the world (preset, configuration hash, seed, torus,
 the starting tick and digest), every frame's tick and live count, the render command, flife's revision and
 binary hash, and the ffmpeg arguments. `lib/films/index.ts` lists the films the page shows, in the hero's
-order; the first opens the page and the share card is cut from it. The page shows one film, the confluent
-world, which the explainers are also cut from (the zoom ladder, the controls). To add a film, list its
-manifest in `lib/films/index.ts` and move the files of any film it replaces from `public/media` to
+order; the first opens the page and the share card is cut from it. The page shows three films: the
+confluent world, which opens it and which the explainers are also cut from (the zoom ladder, the controls),
+and the same world with one v2 mechanism on, `confluent-veins` (vascular-field) and `confluent-polarity`
+(pcp-polarity). A world without a preset names its committed configuration in `lib/content.ts`
+(`filmNotes`), and `lib/film-configs.test.ts` checks that configuration against the manifest. To add a film,
+list its manifest in `lib/films/index.ts` and move the files of any film it replaces from `public/media` to
 `media-retired/`.
 
 Three v2 films of denser worlds (`presets/morphogenesis-tissue-v2-dense.toml`,
@@ -105,10 +108,24 @@ bun run media --film confluent --flife ../target/release/flife --run-dir ../RUN 
 # the 30 fps film's 13.37 s pacing with zero frame duplication, 2160 × 2160, CRF 19,
 # --segments auto, --segment-max-mib 22 so every segment stays <= 25 MiB for Cloudflare Workers,
 # snapped at camera cuts, plus one unconstrained archival 4K60 master outside public/media/;
-# pass --width 3840 --height 2160 to override to 16:9 4K60):
+# pass --width 3840 --height 2160 to override to 16:9 4K60). The page's films are encoded at
+# CRF 30 (the last --crf given wins): 6 segments, about 110 MiB and 70 Mbit/s, where CRF 19
+# makes 26 segments and 370 MiB, too much to stream:
 bun run media:4k60 -- --film confluent --flife ../target/release/flife --run-dir ../RUN --work WORK-4K60 \
-  --field none --look sphere --color lineage-energy \
+  --field none --look sphere --color lineage-energy --crf 30 \
   --zooms 1.6,3,2.2,5,2.6 --master-out ../exports/film-4k60-master.mp4 --cpu-workers 24
+
+# The two v2 films: the confluent world as field-ecology-v2 with one mechanism on, at the engine's
+# defaults, from the configurations committed in experiments/website-films/ (its README, round 3,
+# says how they were chosen). From the repository root, run each to tick 2,400 (10 to 20 minutes;
+# a run or render of this world peaks near 19 GiB, so run one at a time):
+target/release/flife run experiments/website-films/confluent-veins.toml --ticks 2400 --cpu-workers 14 --run-dir RUN-VEINS
+# Then from web/, the confluent film's recipe. Each was first rendered whole at 1080 and looked at
+# shot by shot; the 4K pass took that pass's preview with --preview-from, which gives the same camera:
+bun run media:4k60 -- --film confluent-veins --flife ../target/release/flife --run-dir ../RUN-VEINS --work WORK-VEINS \
+  --field none --look sphere --color lineage-energy --crf 30 \
+  --zooms 1.6,3,2.2,5,2.6 --master-out ../exports/confluent-veins-4k60-master.mp4 --cpu-workers 14
+# confluent-polarity: the same, from experiments/website-films/confluent-polarity.toml.
 
 # Widescreen 16:9 4K60 from a fresh field-ecology-v2 preset with V2-16 overlays and founding toggles:
 bun run media:4k60 -- --film colony-wide --flife ../target/release/flife --config ../presets/supercolony-v2.toml --work WORK-V2 \

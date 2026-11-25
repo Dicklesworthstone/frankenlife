@@ -906,7 +906,7 @@ impl Studio {
                     snapshot: Some(snapshot),
                     ..
                 } => {
-                    self.material = Some((*organism, material_for(snapshot.traits.affinity())));
+                    self.material = Some((*organism, snapshot_material(snapshot)));
                 }
                 Status::Checkpointed {
                     tick,
@@ -1923,5 +1923,60 @@ fn conflict(operation: &'static str, error: impl std::fmt::Display) -> CoreError
     CoreError::StateConflict {
         operation,
         detail: error.to_string(),
+    }
+}
+
+/// Material brush composition for an inspected organism: its active rotated
+/// `effective_affinity` when `V2-12` affinity rotation is active, or its
+/// genetic `traits.affinity()` otherwise.
+fn snapshot_material(
+    snapshot: &flife_engine::OrganismSnapshot,
+) -> Option<[f64; flife_engine::MATERIAL_CHANNELS]> {
+    let affinity = snapshot
+        .effective_affinity
+        .as_ref()
+        .unwrap_or_else(|| snapshot.traits.affinity());
+    material_for(affinity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snapshot_material;
+    use flife_core::ValidatedConfig;
+    use flife_engine::{Arrangement, MATERIAL_CHANNELS, NumericalProfile, Stepped, World};
+
+    #[test]
+    fn snapshot_material_prefers_effective_affinity_when_present() {
+        let toml = include_str!("../../../presets/reference-small-world.toml").replacen(
+            "initial_count = 4096",
+            "initial_count = 16",
+            1,
+        );
+        let cfg = ValidatedConfig::from_toml(&toml).expect("v1 preset");
+        let mut world = World::found(
+            &cfg,
+            Arrangement::FreeList,
+            NumericalProfile::reference_f32().expect("profile"),
+        )
+        .expect("founds");
+        assert!(matches!(world.step().expect("step"), Stepped::Published(_)));
+        let id = world.population().ids().next().expect("founder");
+        let mut snap = world
+            .organism_snapshot(id)
+            .expect("inspects")
+            .expect("live");
+        assert_eq!(snap.effective_affinity, None);
+        assert_eq!(
+            snapshot_material(&snap).map(|v| v.map(f64::to_bits)),
+            crate::material_for(snap.traits.affinity()).map(|v| v.map(f64::to_bits))
+        );
+
+        let mut rotated = [0.0; MATERIAL_CHANNELS];
+        rotated[3] = -0.5;
+        snap.effective_affinity = Some(rotated);
+        assert_eq!(
+            snapshot_material(&snap).map(|v| v.map(f64::to_bits)),
+            crate::material_for(&rotated).map(|v| v.map(f64::to_bits))
+        );
     }
 }

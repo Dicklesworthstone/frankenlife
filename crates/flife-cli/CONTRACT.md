@@ -360,8 +360,10 @@ texel scratch) into `MemoryAdmission::render` before creating a run directory or
   - organism identities issued, live counts by topology, and distinct genomes: whole contents, `(topology,
     parameters)` sets and trait vectors, each counted separately;
   - `Heredity`. Live parent–child pairs are compared bit for bit over parameters and by distance over the trait
-    vector (affinity over `affinity_norm_limit`, motion response over `motion_response_norm_limit`, and ln sensing
-    scale: dimensionless, so it compares across motility gains), against consecutive live founders as the unrelated
+    vector (affinity over `affinity_norm_limit`, motion response over `motion_response_norm_limit`, ln sensing
+    scale, and when enabled on `field-ecology-v2`, `pcp-polarity` strength over 1 and wedge curvature over
+    `maximum_wedge_curvature` plus `cadherin-4d` unit tag and cohesiveness over 1: dimensionless, so it compares
+    across motility gains), against consecutive live founders as the unrelated
     baseline. Live grandparent–parent–child triples report how many of the parent's parameter variants the child
     carries, and the child's trait distance to its parent and to its grandparent.
 - `flife experiment` (`frankenlife.experiment.v1`): `experiment-start` (name, identity, conditions, and how many

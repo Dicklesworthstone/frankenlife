@@ -169,11 +169,29 @@ fn install_all_metal_on_one_owner(world: &mut World) -> Option<DeviceOwner> {
 fn same_genome(a: &Genome, b: &Genome) -> bool {
     let bits = |values: &[f64]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
     let (x, y) = (a.traits(), b.traits());
+    let same_polarity = match (x.polarity_traits(), y.polarity_traits()) {
+        (None, None) => true,
+        (Some(px), Some(py)) => {
+            px.polarity_strength().to_bits() == py.polarity_strength().to_bits()
+                && px.wedge_curvature().to_bits() == py.wedge_curvature().to_bits()
+        }
+        _ => false,
+    };
+    let same_cadherin = match (x.cadherin_traits(), y.cadherin_traits()) {
+        (None, None) => true,
+        (Some(cx), Some(cy)) => {
+            bits(cx.tag()) == bits(cy.tag())
+                && cx.cohesiveness().to_bits() == cy.cohesiveness().to_bits()
+        }
+        _ => false,
+    };
     a.topology() == b.topology()
         && a.parameters().same_bits(&b.parameters())
         && bits(x.affinity()) == bits(y.affinity())
         && bits(x.motion_response()) == bits(y.motion_response())
         && x.sensing_scale().to_bits() == y.sensing_scale().to_bits()
+        && same_polarity
+        && same_cadherin
 }
 
 fn summary_bits(summary: &FieldSummary) -> (u64, u64, Option<(u32, u32)>, u64) {

@@ -114,8 +114,11 @@ fn count(n: usize) -> u64 {
 /// Parameters are compared bit for bit: a child copies its parent's
 /// parameters and a birth perturbs or replaces a few of them. Traits are
 /// compared by distance, because every birth perturbs the whole affinity
-/// and motion-response vectors and the sensing scale a little. The trait
-/// vector is the affinity, the motion response and `ln(sensing scale)`.
+/// and motion-response vectors, the sensing scale, and any active
+/// `field-ecology-v2` heritable traits (`pcp-polarity` and `cadherin-4d`) a
+/// little. The trait vector is the affinity, the motion response,
+/// `ln(sensing scale)`, and (when present) polarity strength, wedge curvature,
+/// 4-D cadherin tag and cohesiveness.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Heredity {
     /// Live parent–child pairs with the same topology.
@@ -216,6 +219,7 @@ enum HeredityOutcome {
         compared: u64,
         identical: u64,
         distance: f64,
+        traits_differ: bool,
         triple: Option<(u64, u64, f64)>,
     },
 }
@@ -383,6 +387,7 @@ fn evaluate_heredity_task(task: &HeredityTask<'_>, limits: &TraitLimits) -> Here
         } => {
             let (compared, identical) = compare(parent, child);
             let distance = trait_distance(parent, child, limits);
+            let traits_differ = distance > 0.0 || parent.traits() != child.traits();
             let triple = grandparent.map(|gp| {
                 let (variants, carried_count) = carried(gp, parent, child);
                 (variants, carried_count, trait_distance(gp, child, limits))
@@ -391,6 +396,7 @@ fn evaluate_heredity_task(task: &HeredityTask<'_>, limits: &TraitLimits) -> Here
                 compared,
                 identical,
                 distance,
+                traits_differ,
                 triple,
             }
         }
@@ -499,12 +505,13 @@ fn heredity(rows: &[SurveyRow<'_>], limits: &TraitLimits, workers: usize) -> Her
                 compared,
                 identical,
                 distance,
+                traits_differ,
                 triple,
             } => {
                 heredity.pairs += 1;
                 heredity.pair_parameters += compared;
                 heredity.pair_parameters_identical += identical;
-                heredity.pairs_differing += u64::from(identical < compared || distance > 0.0);
+                heredity.pairs_differing += u64::from(identical < compared || traits_differ);
                 heredity.most_parameter_differences = heredity
                     .most_parameter_differences
                     .max(compared - identical);
@@ -601,10 +608,11 @@ fn carried(grandparent: &Genome, parent: &Genome, child: &Genome) -> (u64, u64) 
     }
 }
 
-/// The trait vector: affinity, motion response, then `ln(sensing scale)`
-/// by the host-independent [`numerics::ln`], so every survey is identical on
-/// every host.
-fn trait_vector(genome: &Genome) -> impl Iterator<Item = f64> + '_ {
+/// The baseline trait terms: affinity, motion response, then
+/// `ln(sensing scale)` by the host-independent [`numerics::ln`], so every
+/// survey is identical on every host. Active `field-ecology-v2` heritable
+/// traits (`pcp-polarity` and `cadherin-4d`) follow in canonical order.
+fn baseline_trait_vector(genome: &Genome) -> impl Iterator<Item = f64> + '_ {
     let traits = genome.traits();
     traits
         .affinity()
@@ -618,14 +626,16 @@ fn trait_vector(genome: &Genome) -> impl Iterator<Item = f64> + '_ {
 
 /// The Euclidean distance between two genomes' trait vectors, each block in
 /// units of its norm budget: affinity over `affinity_norm_limit`, motion
-/// response over `motion_response_norm_limit`, and `ln(sensing scale)` as
-/// is. It is dimensionless, so it compares across configurations whatever
-/// their motility gain. Summed in vector order.
+/// response over `motion_response_norm_limit`, `ln(sensing scale)` as is,
+/// optional `pcp-polarity` strength over `1` and wedge curvature over
+/// `maximum_wedge_curvature` (or `1` when zero), and optional `cadherin-4d`
+/// unit tag and cohesiveness over `1`. It is dimensionless, so it compares
+/// across configurations whatever their motility gain. Summed in vector order.
 fn trait_distance(a: &Genome, b: &Genome, limits: &TraitLimits) -> f64 {
     let affinity = AFFINITY_TERMS;
     let motion = affinity + MOTION_RESPONSE_TERMS;
-    trait_vector(a)
-        .zip(trait_vector(b))
+    let mut sum: f64 = baseline_trait_vector(a)
+        .zip(baseline_trait_vector(b))
         .enumerate()
         .map(|(index, (x, y))| {
             let budget = if index < affinity {
@@ -638,8 +648,27 @@ fn trait_distance(a: &Genome, b: &Genome, limits: &TraitLimits) -> f64 {
             let difference = (x - y) / budget;
             difference * difference
         })
-        .sum::<f64>()
-        .sqrt()
+        .sum();
+    if let (Some(pa), Some(pb)) = (a.traits().polarity_traits(), b.traits().polarity_traits()) {
+        let strength = pa.polarity_strength() - pb.polarity_strength();
+        sum += strength * strength;
+        let wedge_budget = if limits.maximum_wedge_curvature() > 0.0 {
+            limits.maximum_wedge_curvature()
+        } else {
+            1.0
+        };
+        let wedge = (pa.wedge_curvature() - pb.wedge_curvature()) / wedge_budget;
+        sum += wedge * wedge;
+    }
+    if let (Some(ca), Some(cb)) = (a.traits().cadherin_traits(), b.traits().cadherin_traits()) {
+        for (&x, &y) in ca.tag().iter().zip(cb.tag()) {
+            let diff = x - y;
+            sum += diff * diff;
+        }
+        let cohesion = ca.cohesiveness() - cb.cohesiveness();
+        sum += cohesion * cohesion;
+    }
+    sum.sqrt()
 }
 
 /// The SHA-256 of a genome's parameters' bits, each little-endian in the
@@ -668,8 +697,18 @@ fn parameter_digest_into(genome: &Genome, bytes: &mut Vec<u8>) -> Sha256Digest {
 fn trait_digest_into(genome: &Genome, bytes: &mut Vec<u8>) -> Sha256Digest {
     bytes.clear();
     bytes.reserve(8 * 80);
-    for value in trait_vector(genome) {
+    for value in baseline_trait_vector(genome) {
         bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
+    if let Some(polarity) = genome.traits().polarity_traits() {
+        bytes.extend_from_slice(&polarity.polarity_strength().to_bits().to_le_bytes());
+        bytes.extend_from_slice(&polarity.wedge_curvature().to_bits().to_le_bytes());
+    }
+    if let Some(cadherin) = genome.traits().cadherin_traits() {
+        for &component in cadherin.tag() {
+            bytes.extend_from_slice(&component.to_bits().to_le_bytes());
+        }
+        bytes.extend_from_slice(&cadherin.cohesiveness().to_bits().to_le_bytes());
     }
     Sha256Digest::of(bytes)
 }
@@ -814,6 +853,163 @@ mod tests {
                     opt_f64_bits(serial.heredity.triple_trait_distance_to_grandparent)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn v2_polarity_and_cadherin_traits_affect_digest_and_distance() {
+        use flife_core::ids::GenomeId;
+        use flife_genome::{CadherinTraits, GenomeQuota, PolarityTraits, TopologyCatalog, Traits};
+
+        let bundle_a = include_str!("../../../presets/morphogenesis-tissue-v2.toml")
+            .replacen("initial_count = 10954", "initial_count = 16", 1)
+            .replacen("maximum_count = 262144", "maximum_count = 64", 1);
+        let validated = ValidatedConfig::from_toml(&bundle_a).expect("Bundle A valid");
+        let catalog = TopologyCatalog::from_config(&validated).expect("catalog");
+        let limits = TraitLimits::from_config(&validated).expect("limits");
+        assert!(limits.polarity_enabled());
+        assert!(limits.cadherin_enabled());
+        let mut quota = GenomeQuota::from_config(&validated).expect("quota");
+        let topology = catalog.default_topology();
+
+        let mut affinity = [0.0; AFFINITY_TERMS];
+        affinity[0] = 0.5;
+        let motion = [0.0; MOTION_RESPONSE_TERMS];
+        let base_pol = PolarityTraits::new(0.4, 0.05, limits.maximum_wedge_curvature())
+            .expect("base polarity");
+        let base_cad = CadherinTraits::new([1.0, 0.0, 0.0, 0.0], 0.5).expect("base cadherin");
+
+        let mut seal = |id: u64, pol: PolarityTraits, cad: CadherinTraits| -> Genome {
+            let traits =
+                Traits::with_v2_traits(affinity, motion, 1.0, Some(pol), Some(cad), &limits)
+                    .expect("valid v2 traits");
+            let buf = quota.allocate(&catalog, topology).expect("alloc");
+            Genome::seal(buf, GenomeId::new(id), &catalog, traits, None, &limits)
+                .expect("seal genome")
+        };
+
+        let base = seal(1, base_pol, base_cad);
+        let pol_strength = seal(
+            2,
+            PolarityTraits::new(0.7, 0.05, limits.maximum_wedge_curvature()).expect("pol"),
+            base_cad,
+        );
+        let pol_wedge = seal(
+            3,
+            PolarityTraits::new(0.4, -0.05, limits.maximum_wedge_curvature()).expect("wedge"),
+            base_cad,
+        );
+        let cad_tag = seal(
+            4,
+            base_pol,
+            CadherinTraits::new([0.0, 1.0, 0.0, 0.0], 0.5).expect("cad tag"),
+        );
+        let cad_coh = seal(
+            5,
+            base_pol,
+            CadherinTraits::new([1.0, 0.0, 0.0, 0.0], 0.9).expect("cad coh"),
+        );
+
+        let mut scratch = Vec::new();
+        let d_base = trait_digest_into(&base, &mut scratch);
+        for (label, other, expected_dist) in [
+            ("polarity_strength", &pol_strength, 0.3),
+            (
+                "wedge_curvature",
+                &pol_wedge,
+                0.10 / limits.maximum_wedge_curvature(),
+            ),
+            ("cadherin_tag", &cad_tag, 2.0_f64.sqrt()),
+            ("cohesiveness", &cad_coh, 0.4),
+        ] {
+            assert_ne!(
+                trait_digest_into(other, &mut scratch),
+                d_base,
+                "{label} mutation must change trait digest"
+            );
+            let dist = trait_distance(&base, other, &limits);
+            assert!(
+                (dist - expected_dist).abs() < 1e-12,
+                "{label}: got {dist}, expected {expected_dist}"
+            );
+        }
+
+        // Zero `maximum_wedge_curvature` must never divide by zero or yield NaN.
+        let zero_wedge_limits = TraitLimits::new(
+            limits.affinity_norm(),
+            limits.motion_response_norm(),
+            limits.scale_range(),
+            4.0,
+        )
+        .expect("base limits")
+        .with_polarity(0.8, 0.0, 0.02)
+        .expect("zero-wedge polarity")
+        .with_cadherin(0.02)
+        .expect("cadherin");
+        let zw_pol = PolarityTraits::new(0.4, 0.0, 0.0).expect("zw pol");
+        let zw_a = seal(6, zw_pol, base_cad);
+        let zw_b = seal(7, zw_pol, base_cad);
+        assert_eq!(trait_distance(&zw_a, &zw_b, &zero_wedge_limits), 0.0);
+
+        for genome in [base, pol_strength, pol_wedge, cad_tag, cad_coh, zw_a, zw_b] {
+            quota.retire(genome).expect("retire");
+        }
+    }
+
+    #[test]
+    fn parallel_v2_bundle_a_survey_matches_serial_bit_for_bit() {
+        let mut toml = include_str!("../../../presets/morphogenesis-tissue-v2.toml").to_owned();
+        for (from, to) in [
+            ("initial_count = 10954\n", "initial_count = 128\n"),
+            ("maximum_count = 262144\n", "maximum_count = 1024\n"),
+            ("initial_energy = 2.0\n", "initial_energy = 4.0\n"),
+            (
+                "maximum_attempt_rate_per_second = 1.0\n",
+                "maximum_attempt_rate_per_second = 40.0\n",
+            ),
+            (
+                "minimum_parent_energy_before_attempt = 3.0\n",
+                "minimum_parent_energy_before_attempt = 1.2\n",
+            ),
+            ("cooldown_seconds = 0.5\n", "cooldown_seconds = 0.02\n"),
+        ] {
+            toml = toml.replace(from, to);
+        }
+        let validated = ValidatedConfig::from_toml(&toml).expect("valid Bundle A");
+        let mut world = World::found(
+            &validated,
+            Arrangement::Compact,
+            NumericalProfile::reference_f32().expect("profile"),
+        )
+        .expect("founded Bundle A");
+        for _ in 0..24 {
+            assert!(matches!(world.step().expect("step"), Stepped::Published(_)));
+        }
+        let serial = Survey::of_with_workers(&world, 1);
+        assert!(
+            serial.heredity.founder_pairs > 0 && serial.heredity.pairs > 0,
+            "Bundle A world should have founder and parent-child pairs: {:?}",
+            serial.heredity
+        );
+        for workers in [2_usize, 4, 8] {
+            let parallel = Survey::of_with_workers(&world, workers);
+            assert_eq!(parallel.distinct_genomes, serial.distinct_genomes);
+            assert_eq!(
+                parallel.distinct_trait_vectors,
+                serial.distinct_trait_vectors
+            );
+            assert_eq!(
+                parallel.heredity.pairs_differing,
+                serial.heredity.pairs_differing
+            );
+            assert_eq!(
+                opt_f64_bits(parallel.heredity.pair_trait_distance),
+                opt_f64_bits(serial.heredity.pair_trait_distance)
+            );
+            assert_eq!(
+                opt_f64_bits(parallel.heredity.founder_trait_distance),
+                opt_f64_bits(serial.heredity.founder_trait_distance)
+            );
         }
     }
 }

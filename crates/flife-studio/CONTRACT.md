@@ -271,8 +271,9 @@ directory, with its pending commands and its checkpoint chain.
     the measuring tool shares, and the host disposes it as the keys set;
   - material: `Stroke::Material { cell, amount, direction }` in the same cell, `direction` being
     `Supplies::material`, or no stroke without one; `Intervention::InjectMaterial`. The Studio supplies the selected
-    organism's `material_for(affinity)`: the unit direction `a / ‖a‖₂`, shrunk as source directions are until
-    `‖·‖₂² ≤ 1` holds as the engine sums it (`flife_field::sources::unit_direction`). Under `bounded-affinity-v1` a
+    organism's `material_for(affinity)` (using `snapshot.effective_affinity` when `V2-12` affinity rotation is
+    active, otherwise `snapshot.traits.affinity()`): the unit direction `a / ‖a‖₂`, shrunk as source directions are
+    until `‖·‖₂² ≤ 1` holds as the engine sums it (`flife_field::sources::unit_direction`). Under `bounded-affinity-v1` a
     packet of composition `z` converts at `η_max tanh(k a·z − b)`, which over `‖z‖₂ ≤ 1` is largest along `a`, so
     the brush adds the material that organism converts best; the cell's composition moves towards it;
   - introduction: `Stroke::Introduction { cell, count, energy }` in the same cell, `count` organisms (by default

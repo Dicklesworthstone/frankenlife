@@ -293,6 +293,7 @@ impl CompensatedSum {
     };
 
     /// Add `value`.
+    #[inline]
     pub fn add(&mut self, value: f64) {
         let total = self.sum + value;
         if self.sum.abs() >= value.abs() {
@@ -304,6 +305,7 @@ impl CompensatedSum {
     }
 
     /// The compensated total.
+    #[inline]
     #[must_use]
     pub fn value(&self) -> f64 {
         self.sum + self.compensation
@@ -313,6 +315,7 @@ impl CompensatedSum {
 /// `a + b` rounded so that it never exceeds the exact sum: the rounded sum
 /// when it is exact or below, otherwise the next float below it. For finite
 /// arguments whose sum does not overflow.
+#[inline]
 #[must_use]
 pub fn add_down(a: f64, b: f64) -> f64 {
     let sum = a + b;
@@ -324,6 +327,7 @@ pub fn add_down(a: f64, b: f64) -> f64 {
 }
 
 /// `a − b`, rounded so that it never exceeds the exact difference.
+#[inline]
 #[must_use]
 pub fn sub_down(a: f64, b: f64) -> f64 {
     add_down(a, -b)
@@ -676,12 +680,14 @@ impl LedgerLog {
 }
 
 impl Ledger for LedgerLog {
+    #[inline]
     fn record(&mut self, flow: Flow, amount: f64) -> Result<(), CoreError> {
         let amount = energy(flow.name(), amount)?;
         self.entries.push(Logged::Flow(flow, amount));
         Ok(())
     }
 
+    #[inline]
     fn transfer(
         &mut self,
         transfer: Transfer,
@@ -1238,6 +1244,7 @@ impl EnergyBudget {
     /// # Errors
     /// [`CoreError::NumericalInvalid`] unless `available` is finite and
     /// nonnegative.
+    #[inline]
     pub fn new(available: f64) -> Result<Self, CoreError> {
         let remaining = energy("energy budget", available)?;
         Ok(Self {
@@ -1247,12 +1254,14 @@ impl EnergyBudget {
     }
 
     /// The balance.
+    #[inline]
     #[must_use]
     pub const fn remaining(&self) -> f64 {
         self.remaining
     }
 
     /// Whether a payment has taken the balance to zero.
+    #[inline]
     #[must_use]
     pub const fn is_exhausted(&self) -> bool {
         self.exhausted
@@ -1264,20 +1273,18 @@ impl EnergyBudget {
     /// - [`CoreError::NumericalInvalid`] unless `amount` is finite and
     ///   nonnegative.
     /// - [`CoreError::StateConflict`] when the budget is exhausted.
+    #[inline]
     pub fn credit(&mut self, amount: f64) -> Result<(), CoreError> {
         let amount = energy("energy credit", amount)?;
         if self.exhausted {
-            return Err(CoreError::StateConflict {
-                operation: "energy credit",
-                detail: "the budget is exhausted; a dead organism cannot absorb energy".into(),
-            });
+            return Err(exhausted_budget_error(
+                "energy credit",
+                "the budget is exhausted; a dead organism cannot absorb energy",
+            ));
         }
         let remaining = add_down(self.remaining, amount);
         if !remaining.is_finite() {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "energy credit",
-                detail: format!("{} + {amount} overflows", self.remaining),
-            });
+            return Err(credit_overflow_error(self.remaining, amount));
         }
         self.remaining = remaining;
         Ok(())
@@ -1288,6 +1295,7 @@ impl EnergyBudget {
     /// # Errors
     /// [`CoreError::NumericalInvalid`] unless `requested` is finite and
     /// nonnegative.
+    #[inline]
     pub fn pay(&mut self, requested: f64) -> Result<Payment, CoreError> {
         let requested = energy("energy payment", requested)?;
         let paid = requested.min(self.remaining);
@@ -1308,6 +1316,7 @@ impl EnergyBudget {
     /// # Errors
     /// [`CoreError::NumericalInvalid`] unless `amount` is finite and
     /// nonnegative.
+    #[inline]
     pub fn spend(&mut self, amount: f64) -> Result<bool, CoreError> {
         let amount = energy("energy payment", amount)?;
         if amount > self.remaining {
@@ -1327,19 +1336,17 @@ impl EnergyBudget {
     /// - [`CoreError::NumericalInvalid`] unless `kept` is finite,
     ///   nonnegative and at most the balance.
     /// - [`CoreError::StateConflict`] when the budget is exhausted.
+    #[inline]
     pub fn retain(&mut self, kept: f64) -> Result<Payment, CoreError> {
         let kept = energy("retained energy", kept)?;
         if self.exhausted {
-            return Err(CoreError::StateConflict {
-                operation: "retain energy",
-                detail: "the budget is exhausted; a dead organism cannot reproduce".into(),
-            });
+            return Err(exhausted_budget_error(
+                "retain energy",
+                "the budget is exhausted; a dead organism cannot reproduce",
+            ));
         }
         if kept > self.remaining {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "retained energy",
-                detail: format!("{kept} exceeds the balance {}", self.remaining),
-            });
+            return Err(retain_exceeds_balance_error(kept, self.remaining));
         }
         let paid = self.remaining - kept;
         self.remaining = kept;
@@ -1353,20 +1360,66 @@ impl EnergyBudget {
     }
 }
 
+#[cold]
+#[inline(never)]
+fn invalid_energy_error(quantity: &'static str, value: f64) -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity,
+        detail: format!("{value} is not a finite nonnegative energy"),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn exhausted_budget_error(operation: &'static str, detail: &'static str) -> CoreError {
+    CoreError::StateConflict {
+        operation,
+        detail: detail.into(),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn credit_overflow_error(remaining: f64, amount: f64) -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity: "energy credit",
+        detail: format!("{remaining} + {amount} overflows"),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn retain_exceeds_balance_error(kept: f64, remaining: f64) -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity: "retained energy",
+        detail: format!("{kept} exceeds the balance {remaining}"),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn transfer_creates_energy_error(quantity: &'static str, credited: f64, debited: f64) -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity,
+        detail: format!(
+            "credits {credited} but debits only {debited}; an internal transfer cannot create energy"
+        ),
+    }
+}
+
 /// `value` as a finite nonnegative energy, with `-0.0` folded to `0.0`.
+#[inline]
 fn energy(quantity: &'static str, value: f64) -> Result<f64, CoreError> {
     if value.is_finite() && value >= 0.0 {
         Ok(value + 0.0)
     } else {
-        Err(CoreError::NumericalInvalid {
-            quantity,
-            detail: format!("{value} is not a finite nonnegative energy"),
-        })
+        Err(invalid_energy_error(quantity, value))
     }
 }
 
 /// A transfer's `debited` and `credited` amounts, if both are finite and
 /// nonnegative and it credits no more than it debits.
+#[inline]
 fn transfer_terms(
     transfer: Transfer,
     debited: f64,
@@ -1375,12 +1428,11 @@ fn transfer_terms(
     let debited = energy(transfer.name(), debited)?;
     let credited = energy(transfer.name(), credited)?;
     if credited > debited {
-        return Err(CoreError::NumericalInvalid {
-            quantity: transfer.name(),
-            detail: format!(
-                "credits {credited} but debits only {debited}; an internal transfer cannot create energy"
-            ),
-        });
+        return Err(transfer_creates_energy_error(
+            transfer.name(),
+            credited,
+            debited,
+        ));
     }
     Ok((debited, credited))
 }

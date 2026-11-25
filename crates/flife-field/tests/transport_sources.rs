@@ -1492,6 +1492,82 @@ fn pyramid_sample_batch_each_matches_scalar_and_preserves_canonical_error_order(
         );
     }
 
+    // Canonical first-error order when query 0 fails callback while query 1
+    // has an invalid scale: the pre-prep pass must not leapfrog query 0's error
+    // with query 1's scale error.
+    let mut mixed_err_queries = queries[..8].to_vec();
+    mixed_err_queries[1].scale = -1.0;
+    let err = view_single
+        .sample_batch_each(&mixed_err_queries, |qi, _| {
+            if qi == 0 {
+                Err(CoreError::StateConflict {
+                    operation: "test callback",
+                    detail: "query 0 failed first".to_owned(),
+                })
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("query 0 failed first"),
+        "expected query 0 callback error ahead of query 1 invalid scale, got: {err}"
+    );
+
+    // Non-power-of-two grid (`24x40`, non-unit cell spacing) exercises both
+    // the non-pow2 unmasked path and multi-chunk batching bit-for-bit.
+    let non_pow2 = FieldGrid::new(24, 40, 36.0, 60.0).expect("non-pow2 grid");
+    let mut np_field = FieldState::zeroed(non_pow2, &limits).expect("np field");
+    let np_cells = non_pow2.cell_count() as usize;
+    for (p, plane) in np_field
+        .as_mut_slice()
+        .chunks_exact_mut(np_cells)
+        .enumerate()
+    {
+        for (c, slot) in plane.iter_mut().enumerate() {
+            *slot = if p == 0 {
+                1.2 + ((c * 19 + 5) % 83) as f32 * 0.03
+            } else {
+                (((c * (p + 7)) % 31) as f32 - 15.0) * 0.003
+            };
+        }
+    }
+    let mut np_pyr = SensorPyramid::new(non_pow2, 2, &limits).expect("np pyr");
+    let np_view = np_pyr.build(&np_field).expect("np view");
+    let np_scales = [1.5, 2.1, 3.0, 4.2, 6.0];
+    let np_queries: Vec<SensorQuery> = (0..600_usize)
+        .map(|i| SensorQuery {
+            position: [((i * 29) % 360) as f64 * 0.1, ((i * 47) % 600) as f64 * 0.1],
+            scale: np_scales[i % np_scales.len()],
+        })
+        .collect();
+    let mut np_got = vec![None; np_queries.len()];
+    np_view
+        .sample_batch_each(&np_queries, |qi, sample| {
+            np_got[qi] = Some(*sample);
+            Ok(())
+        })
+        .expect("np sample_batch_each");
+    for (i, (q, got)) in np_queries.iter().zip(&np_got).enumerate() {
+        let want = np_view.sample(q.position, q.scale).expect("np scalar");
+        let got = got.expect("np slot filled");
+        assert_eq!(
+            got.values.map(f64::to_bits),
+            want.values.map(f64::to_bits),
+            "np values[{i}]"
+        );
+        assert_eq!(
+            got.dx.map(f64::to_bits),
+            want.dx.map(f64::to_bits),
+            "np dx[{i}]"
+        );
+        assert_eq!(
+            got.dy.map(f64::to_bits),
+            want.dy.map(f64::to_bits),
+            "np dy[{i}]"
+        );
+    }
+
     // Nonfinite field value triggers canonical fallback refusal rather than silent pass.
     single.as_mut_slice()[5 * cells + 17] = f32::NAN;
     let view_nan = pyr_single.build(&single).expect("rebuild nan");

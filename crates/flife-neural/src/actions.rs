@@ -25,7 +25,9 @@
 
 use std::ops::Range;
 
-use flife_core::numerics::{expm1_neg, shrink_to_left_fold_norm_limit, sigmoid, tanh};
+use flife_core::numerics::{
+    expm1_neg, shrink_to_left_fold_norm_limit, sigmoid, sigmoid_4, tanh, tanh_4,
+};
 use flife_core::{CoreError, TimeStep, V2Abi, ValidatedConfig};
 use flife_field::settle::{EmissionAction, MotorSteeringInputs};
 use flife_field::sources::unit_direction;
@@ -515,18 +517,30 @@ impl MotorSteering {
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] if any logit is nonfinite.
+    #[inline]
     pub fn decode(raw: [f64; SO2_MOTOR_OUTPUTS]) -> Result<Self, CoreError> {
-        let squash = |index: usize, value: f64| {
-            tanh(value).ok_or_else(|| CoreError::NumericalInvalid {
-                quantity: "so2-motor output",
-                detail: format!("motor output {index} is {value}"),
-            })
+        let values = match tanh_4(raw) {
+            Some(values) => values,
+            None => {
+                let squash = |index: usize, value: f64| {
+                    tanh(value).ok_or_else(|| CoreError::NumericalInvalid {
+                        quantity: "so2-motor output",
+                        detail: format!("motor output {index} is {value}"),
+                    })
+                };
+                [
+                    squash(0, raw[0])?,
+                    squash(1, raw[1])?,
+                    squash(2, raw[2])?,
+                    squash(3, raw[3])?,
+                ]
+            }
         };
         Ok(Self {
-            energy_gradient: squash(0, raw[0])?,
-            chemical_gradient: squash(1, raw[1])?,
-            chiral_contour: squash(2, raw[2])?,
-            heading_propulsion: squash(3, raw[3])?,
+            energy_gradient: values[0],
+            chemical_gradient: values[1],
+            chiral_contour: values[2],
+            heading_propulsion: values[3],
         })
     }
 
@@ -676,6 +690,60 @@ pub fn decode_slice(
     decode_with_layout(raw, step, decoding, &ActionLayout::v1())
 }
 
+#[cold]
+#[inline(never)]
+fn err_short_outputs(required: usize, got: usize) -> CoreError {
+    CoreError::LayoutMismatch {
+        buffer: "controller outputs",
+        detail: format!("expected at least {required} outputs, got {got}"),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn err_nonfinite_output(index: usize, value: f64) -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity: "controller output",
+        detail: format!("output {index} is {value}"),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn err_sigmoid_undefined(index: usize) -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity: "controller output",
+        detail: format!("σ(output {index}) is undefined"),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn err_rate_out_of_range(rate: f64) -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity: "decoded rate",
+        detail: format!("{rate} per second is out of range"),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn err_direction_overflow() -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity: "emission direction",
+        detail: "the raw direction's norm overflows".into(),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn err_wake_pump_undefined(slot: usize) -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity: "wake-offset pump output",
+        detail: format!("tanh(output {slot}) is undefined"),
+    }
+}
+
 /// Decode the baseline `0..36` actions plus any active `field-ecology-v2`
 /// action slots declared by `layout` from `raw`
 /// (`raw.len() >= layout.action_width()`), checking finiteness across every
@@ -685,6 +753,7 @@ pub fn decode_slice(
 /// [`CoreError::LayoutMismatch`] if `raw.len() < layout.action_width()`;
 /// [`CoreError::NumericalInvalid`] for any nonfinite output, or an emission
 /// direction whose norm overflows.
+#[inline]
 pub fn decode_with_layout(
     raw: &[f64],
     step: TimeStep,
@@ -693,39 +762,41 @@ pub fn decode_with_layout(
 ) -> Result<DecodedActions, CoreError> {
     let required = layout.action_width();
     if raw.len() < required {
-        return Err(CoreError::LayoutMismatch {
-            buffer: "controller outputs",
-            detail: format!("expected at least {required} outputs, got {}", raw.len()),
-        });
+        return Err(err_short_outputs(required, raw.len()));
     }
-    if let Some((index, value)) = raw.iter().enumerate().find(|(_, value)| !value.is_finite()) {
-        return Err(CoreError::NumericalInvalid {
-            quantity: "controller output",
-            detail: format!("output {index} is {value}"),
-        });
+    if let Some((index, &value)) = raw.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+        return Err(err_nonfinite_output(index, value));
     }
     let output = |index: usize| raw.get(index).copied().unwrap_or(0.0);
-    let squash = |index: usize| {
-        sigmoid(output(index)).ok_or_else(|| CoreError::NumericalInvalid {
-            quantity: "controller output",
-            detail: format!("σ(output {index}) is undefined"),
-        })
-    };
+    let squash = |index: usize| sigmoid(output(index)).ok_or_else(|| err_sigmoid_undefined(index));
     let interval = |rate: f64| {
-        expm1_neg(rate * step.seconds_per_tick()).ok_or_else(|| CoreError::NumericalInvalid {
-            quantity: "decoded rate",
-            detail: format!("{rate} per second is out of range"),
-        })
+        expm1_neg(rate * step.seconds_per_tick()).ok_or_else(|| err_rate_out_of_range(rate))
     };
 
-    let attempt_rate = decoding.maximum_attempt_rate * squash(REPRODUCTION)?;
+    // Vectorize the four baseline logistic gates through one bit-exact
+    // 4-lane `sigmoid_4` (all entries in `raw` are already verified finite).
+    let [sig_repro, sig_child, emission_gate, sig_spend] = match sigmoid_4([
+        output(REPRODUCTION),
+        output(CHILD_SHARE),
+        output(EMISSION_GATE),
+        output(EMISSION_SPEND),
+    ]) {
+        Some(gates) => gates,
+        None => [
+            squash(REPRODUCTION)?,
+            squash(CHILD_SHARE)?,
+            squash(EMISSION_GATE)?,
+            0.0,
+        ],
+    };
+
+    let attempt_rate = decoding.maximum_attempt_rate * sig_repro;
     let attempt_probability = interval(attempt_rate)?;
     let span = decoding.maximum_child_fraction - decoding.minimum_child_fraction;
-    let child_fraction = (decoding.minimum_child_fraction + span * squash(CHILD_SHARE)?).clamp(
+    let child_fraction = (decoding.minimum_child_fraction + span * sig_child).clamp(
         decoding.minimum_child_fraction,
         decoding.maximum_child_fraction,
     );
-    let emission_gate = squash(EMISSION_GATE)?;
 
     let mut direction = [0.0; CHANNELS];
     for (slot, index) in direction.iter_mut().zip(EMISSION_DIRECTION..) {
@@ -737,10 +808,7 @@ pub fn decode_with_layout(
     }
     let norm = squared.sqrt();
     if !norm.is_finite() {
-        return Err(CoreError::NumericalInvalid {
-            quantity: "emission direction",
-            detail: "the raw direction's norm overflows".into(),
-        });
+        return Err(err_direction_overflow());
     }
     let emission = if emission_gate > decoding.gate_threshold
         && norm > decoding.direction_zero_threshold
@@ -748,7 +816,7 @@ pub fn decode_with_layout(
     {
         Some(Emission {
             direction: unit_direction(&direction)?,
-            spend_fraction: interval(decoding.maximum_spend_rate * squash(EMISSION_SPEND)?)?,
+            spend_fraction: interval(decoding.maximum_spend_rate * sig_spend)?,
         })
     } else {
         None
@@ -778,12 +846,7 @@ pub fn decode_with_layout(
         None => None,
     };
     let wake_pump = match layout.pump_slot() {
-        Some(slot) => Some(
-            tanh(output(slot)).ok_or_else(|| CoreError::NumericalInvalid {
-                quantity: "wake-offset pump output",
-                detail: format!("tanh(output {slot}) is undefined"),
-            })?,
-        ),
+        Some(slot) => Some(tanh(output(slot)).ok_or_else(|| err_wake_pump_undefined(slot))?),
         None => None,
     };
 

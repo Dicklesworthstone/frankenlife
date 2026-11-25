@@ -8,6 +8,13 @@ use std::num::NonZeroUsize;
 
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, Footprint, NumericalProfile, Stepped, World};
+use flife_field::settle::{
+    ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionOrganism,
+    EmissionOutcome, MotionConstants, MotionOrganism, MotionOutcome, MutationBirth,
+    MutationConstants, MutationCounts, MutationValues, ProposalConstants, ProposalOrganism,
+    ProposalOutcome, SettleBackend,
+};
+use flife_field::{FieldGrid, FieldState};
 use flife_neural::{
     ControllerBackend, ControllerJob, ControllerScratch, FlatControllerJob, FlatOutputs, RawOutputs,
 };
@@ -291,4 +298,140 @@ fn flat_f32_multirate_streaming_sample_and_dedup_compositions_match_serial_bit_f
         "flat-F32 path must have executed batched evaluations: {:?}",
         batched.controller_report()
     );
+}
+
+#[derive(Debug)]
+struct AlwaysFailingSettleBackend;
+
+impl SettleBackend for AlwaysFailingSettleBackend {
+    fn describe(&self) -> String {
+        "always-failing-settle".to_owned()
+    }
+
+    fn chemistry(
+        &mut self,
+        _observed: &FieldState,
+        _constants: &ChemistryConstants,
+        _organisms: &[ChemistryOrganism],
+        _packets: &[ChemistryPacket],
+        _out: &mut Vec<ChemistryOutcome>,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::MissingCapability {
+            capability: "simulated device drop".into(),
+        })
+    }
+
+    fn motion(
+        &mut self,
+        _constants: &MotionConstants,
+        _organisms: &[MotionOrganism],
+        _out: &mut Vec<MotionOutcome>,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::MissingCapability {
+            capability: "simulated device drop".into(),
+        })
+    }
+
+    fn emission(
+        &mut self,
+        _grid: &FieldGrid,
+        _efficiency: f64,
+        _organisms: &[EmissionOrganism],
+        _out: &mut Vec<EmissionOutcome>,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::MissingCapability {
+            capability: "simulated device drop".into(),
+        })
+    }
+
+    fn proposal(
+        &mut self,
+        _constants: &ProposalConstants,
+        _organisms: &[ProposalOrganism],
+        _out: &mut Vec<ProposalOutcome>,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::MissingCapability {
+            capability: "simulated device drop".into(),
+        })
+    }
+
+    fn mutation(
+        &mut self,
+        _constants: &MutationConstants,
+        _births: &[MutationBirth],
+        _values: MutationValues<'_>,
+        _out: &mut Vec<MutationCounts>,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::MissingCapability {
+            capability: "simulated device drop".into(),
+        })
+    }
+}
+
+#[test]
+fn failing_settle_backend_drop_followed_by_controller_backend_keeps_fixed_scratch() {
+    // Regression test: on a large multi-worker world (`capacity >= 24,576`),
+    // installing a `SettleBackend` empties `settle_tiles` and fits `lanes`
+    // settle buffers. If that `SettleBackend` subsequently fails and drops
+    // itself, calling `set_controller_backend` must NOT wipe `lanes` settle
+    // buffers while `settle_tiles` is still empty.
+    let toml = PRESET
+        .replace("initial_count = 4096", "initial_count = 1024")
+        .replace("maximum_count = 16384", "maximum_count = 24576")
+        .replace(
+            "evaluation_interval_ticks = 1",
+            "evaluation_interval_ticks = 4",
+        )
+        .replace("hidden_widths = [64, 32]", "hidden_widths = [8]");
+    let cfg = ValidatedConfig::from_toml(&toml).expect("valid 24k config");
+
+    let mut serial = found(&cfg);
+    let mut world = found(&cfg);
+    world
+        .set_cpu_workers(NonZeroUsize::new(4).expect("4"))
+        .expect("4 workers");
+    world.set_settle_backend(Some(Box::new(AlwaysFailingSettleBackend)));
+
+    // Tick 1 triggers the failing settle backend, which drops itself and falls
+    // back to the CPU lane buffers.
+    assert!(matches!(
+        serial.step().expect("serial 1"),
+        Stepped::Published(_)
+    ));
+    assert!(matches!(
+        world.step().expect("world 1"),
+        Stepped::Published(_)
+    ));
+    assert!(
+        world.settle_report().failure.is_some(),
+        "settle backend should have recorded failure and dropped"
+    );
+    assert_eq!(world.digest(), serial.digest(), "tick 1 bit-exact");
+
+    // Installing a flat-F32 controller backend afterwards must keep lane settle
+    // buffers intact so subsequent ticks hold an invariant scratch footprint.
+    world.set_controller_backend(Some(Box::new(ExactFlatF32Backend)));
+    let after_ctrl = world.allocated();
+    assert_eq!(after_ctrl.scratch, world.footprint().scratch);
+
+    for tick in 2..=5 {
+        assert!(matches!(
+            serial.step().expect("serial"),
+            Stepped::Published(_)
+        ));
+        assert!(matches!(
+            world.step().expect("world"),
+            Stepped::Published(_)
+        ));
+        assert_eq!(
+            world.allocated().scratch,
+            after_ctrl.scratch,
+            "scratch grew at tick {tick} after settle backend drop + set_controller_backend"
+        );
+        assert_eq!(
+            world.digest(),
+            serial.digest(),
+            "digest diverged at tick {tick}"
+        );
+    }
 }

@@ -1197,7 +1197,22 @@ impl CpuBackend {
         )?;
         let lanes = self.prepare_lanes(jobs.len(), widest)?;
         let buckets = &self.buckets;
-        let length = jobs.len().div_ceil(lanes);
+        if lanes == 1 {
+            self.used = 1;
+            let mut chunk = FlatChunk {
+                jobs,
+                input_width,
+                output_width,
+                inputs_f32,
+                inputs_finite,
+                out_values: outputs.values.as_mut_slice(),
+                out_valid: outputs.valid.as_mut_slice(),
+            };
+            return run_flat_f32(buckets, &mut chunk, &mut self.scratch[0]);
+        }
+        let max_tiles = jobs.len().div_ceil(MINIMUM_JOBS_PER_LANE).max(1);
+        let tile_count = lanes.saturating_mul(4).min(64).min(max_tiles).max(lanes);
+        let length = jobs.len().div_ceil(tile_count);
         let in_chunk = length.checked_mul(input_width).ok_or(CoreError::Overflow {
             quantity: "flat controller input chunk",
         })?;
@@ -1206,59 +1221,36 @@ impl CpuBackend {
             .ok_or(CoreError::Overflow {
                 quantity: "flat controller output chunk",
             })?;
-        let mut runs = jobs
+        let mut tiles: Vec<FlatChunk<'_, '_>> = jobs
             .chunks(length)
             .zip(inputs_f32.chunks(in_chunk))
             .zip(inputs_finite.chunks(length))
             .zip(outputs.values.chunks_mut(out_chunk))
             .zip(outputs.valid.chunks_mut(length))
-            .zip(self.scratch.iter_mut())
             .map(
-                |(((((chunk_jobs, chunk_in), chunk_fin), chunk_out), chunk_valid), scratch)| {
-                    (
-                        FlatChunk {
-                            jobs: chunk_jobs,
-                            input_width,
-                            output_width,
-                            inputs_f32: chunk_in,
-                            inputs_finite: chunk_fin,
-                            out_values: chunk_out,
-                            out_valid: chunk_valid,
-                        },
-                        scratch,
-                    )
+                |((((chunk_jobs, chunk_in), chunk_fin), chunk_out), chunk_valid)| FlatChunk {
+                    jobs: chunk_jobs,
+                    input_width,
+                    output_width,
+                    inputs_f32: chunk_in,
+                    inputs_finite: chunk_fin,
+                    out_values: chunk_out,
+                    out_valid: chunk_valid,
                 },
-            );
-        let Some((head_chunk, head_scratch)) = runs.next() else {
-            return Ok(());
-        };
-        if lanes == 1 {
-            self.used = 1;
-            return run_flat_f32(buckets, head_chunk, head_scratch);
-        }
-        let tail_count = runs.len();
-        let used = 1 + tail_count;
-        let mut tail_results: Vec<Result<(), CoreError>> =
-            (0..tail_count).map(|_| Ok(())).collect();
-        let scoped = pool::scope_workers(self.lanes.get(), "cpu controller lanes", |scope| {
-            for ((chunk, scratch), slot) in runs.zip(tail_results.iter_mut()) {
-                scope.spawn(move || {
-                    *slot = run_flat_f32(buckets, chunk, scratch);
-                });
-            }
-            run_flat_f32(buckets, head_chunk, head_scratch)
-        });
+            )
+            .collect();
+        let used = lanes.min(tiles.len());
         self.used = used;
-        let mut result = match scoped {
-            Ok(head_result) => head_result,
-            Err(error) => Err(error),
-        };
-        for tail_result in tail_results {
-            if result.is_ok() {
-                result = tail_result;
-            }
-        }
-        result
+        // Dynamic work-stealing across ~4× tiles per worker eliminates
+        // P-core/E-core tail wait while bounding concurrency to `lanes`
+        // scratch buffers and `self.lanes.get()` cached private pool threads.
+        pool::try_parallel_tasks_with_lanes(
+            self.lanes.get(),
+            "cpu controller lanes",
+            &mut self.scratch[..used],
+            &mut tiles,
+            |_, chunk, scratch| run_flat_f32(buckets, chunk, scratch),
+        )
     }
 }
 
@@ -1652,7 +1644,7 @@ struct FlatChunk<'a, 'j> {
 /// `Option<RawOutputs>` allocation/copy.
 fn run_flat_f32(
     buckets: &[Option<Bucket>],
-    chunk: FlatChunk<'_, '_>,
+    chunk: &mut FlatChunk<'_, '_>,
     scratch: &mut Scratch,
 ) -> Result<(), CoreError> {
     let FlatChunk {
@@ -1664,14 +1656,16 @@ fn run_flat_f32(
         out_values,
         out_valid,
     } = chunk;
+    let input_width = *input_width;
+    let output_width = *output_width;
     let mut cached_topos = TopoPointerCache::new();
     let mut cached_ranges: [Option<(u64, u64, u64)>; TOPO_CACHE_SLOTS] = [None; TOPO_CACHE_SLOTS];
     for ((((job, input_row), &finite), out_row), valid) in jobs
         .iter()
         .zip(inputs_f32.chunks_exact(input_width))
-        .zip(inputs_finite)
+        .zip(inputs_finite.iter())
         .zip(out_values.chunks_exact_mut(output_width))
-        .zip(out_valid)
+        .zip(out_valid.iter_mut())
     {
         if finite == 0 {
             *valid = 0;
@@ -1830,49 +1824,35 @@ impl ControllerBackend for CpuBackend {
             }
         };
         let buckets = &self.buckets;
-        let length = jobs.len().div_ceil(lanes);
-        let mut runs = jobs
-            .chunks(length)
-            .zip(outputs.chunks_mut(length))
-            .zip(self.scratch.iter_mut());
-        let Some(((head_jobs, head_outputs), head_scratch)) = runs.next() else {
-            return Ok(());
-        };
         if lanes == 1 {
             self.used = 1;
-            let result = run(buckets, head_jobs, head_outputs, head_scratch);
+            let result = run(buckets, jobs, outputs, &mut self.scratch[0]);
             if result.is_err() {
                 outputs.clear();
             }
             return result;
         }
-        let tail_count = runs.len();
-        let used = 1 + tail_count;
-        let mut tail_results: Vec<Result<(), CoreError>> =
-            (0..tail_count).map(|_| Ok(())).collect();
+        let max_tiles = jobs.len().div_ceil(MINIMUM_JOBS_PER_LANE).max(1);
+        let tile_count = lanes.saturating_mul(4).min(64).min(max_tiles).max(lanes);
+        let length = jobs.len().div_ceil(tile_count);
+        let mut tiles: Vec<(&[ControllerJob<'_>], &mut [Option<RawOutputs>])> = jobs
+            .chunks(length)
+            .zip(outputs.chunks_mut(length))
+            .collect();
+        let used = lanes.min(tiles.len());
+        self.used = used;
         // Pass `self.lanes.get()` (the stable configured worker budget) so
         // `CpuBackend` shares the exact same cached private pool (`flife-w{W}-*`)
         // as every other phase without touching Rayon's global pool.
-        let scoped = pool::scope_workers(self.lanes.get(), "cpu controller lanes", |scope| {
-            for (((chunk_jobs, chunk_outputs), chunk_scratch), slot) in
-                runs.zip(tail_results.iter_mut())
-            {
-                scope.spawn(move || {
-                    *slot = run(buckets, chunk_jobs, chunk_outputs, chunk_scratch);
-                });
-            }
-            run(buckets, head_jobs, head_outputs, head_scratch)
-        });
-        self.used = used;
-        let mut result = match scoped {
-            Ok(head_result) => head_result,
-            Err(error) => Err(error),
-        };
-        for tail_result in tail_results {
-            if result.is_ok() {
-                result = tail_result;
-            }
-        }
+        let result = pool::try_parallel_tasks_with_lanes(
+            self.lanes.get(),
+            "cpu controller lanes",
+            &mut self.scratch[..used],
+            &mut tiles,
+            |_, (chunk_jobs, chunk_outputs), scratch| {
+                run(buckets, chunk_jobs, chunk_outputs, scratch)
+            },
+        );
         if result.is_err() {
             outputs.clear();
         }

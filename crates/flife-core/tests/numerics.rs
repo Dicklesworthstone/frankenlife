@@ -3,9 +3,9 @@
 //! `libm`, and the domain and symmetry each function promises.
 
 use flife_core::numerics::{
-    exp, exp_neg, expm1_neg, ln, log2, normalize_turns, pow_positive,
-    shrink_to_left_fold_norm_limit, sigmoid, sin_cos_turns, symplectic_rotate_channels, tanh,
-    tanh_f32, tanh_f64_as_f32, tanh_f64_as_f32_4,
+    exp, exp_neg, exp_neg_4, expm1_neg, expm1_neg_4, ln, log2, normalize_turns, pow_positive,
+    shrink_to_left_fold_norm_limit, sigmoid, sigmoid_4, sin_cos_turns, symplectic_rotate_channels,
+    tanh, tanh_4, tanh_f32, tanh_f32_4, tanh_f64_as_f32, tanh_f64_as_f32_4,
 };
 
 /// A total order on finite `f64` in which adjacent values differ by one.
@@ -998,5 +998,183 @@ fn tanh_f64_as_f32_and_batch_pade10_match_tanh_bit_for_bit() {
         [0.0, 0.0, 0.0, f64::NEG_INFINITY],
     ] {
         check_batch(batch);
+    }
+}
+
+#[test]
+fn simd_4_lane_exp_expm1_tanh_sigmoid_and_tanh_f32_4_match_scalar_bit_for_bit() {
+    let check_exp = |xs: [f64; 4]| {
+        let want = [
+            exp_neg(xs[0]),
+            exp_neg(xs[1]),
+            exp_neg(xs[2]),
+            exp_neg(xs[3]),
+        ];
+        let want_opt = if want.iter().all(Option::is_some) {
+            Some([
+                want[0].expect("some").to_bits(),
+                want[1].expect("some").to_bits(),
+                want[2].expect("some").to_bits(),
+                want[3].expect("some").to_bits(),
+            ])
+        } else {
+            None
+        };
+        assert_eq!(
+            exp_neg_4(xs).map(|v| v.map(f64::to_bits)),
+            want_opt,
+            "exp_neg_4({xs:?})"
+        );
+    };
+    let check_expm1 = |xs: [f64; 4]| {
+        let want = [
+            expm1_neg(xs[0]),
+            expm1_neg(xs[1]),
+            expm1_neg(xs[2]),
+            expm1_neg(xs[3]),
+        ];
+        let want_opt = if want.iter().all(Option::is_some) {
+            Some([
+                want[0].expect("some").to_bits(),
+                want[1].expect("some").to_bits(),
+                want[2].expect("some").to_bits(),
+                want[3].expect("some").to_bits(),
+            ])
+        } else {
+            None
+        };
+        assert_eq!(
+            expm1_neg_4(xs).map(|v| v.map(f64::to_bits)),
+            want_opt,
+            "expm1_neg_4({xs:?})"
+        );
+    };
+    let check_tanh = |xs: [f64; 4]| {
+        let want = [tanh(xs[0]), tanh(xs[1]), tanh(xs[2]), tanh(xs[3])];
+        let want_opt = if want.iter().all(Option::is_some) {
+            Some([
+                want[0].expect("some").to_bits(),
+                want[1].expect("some").to_bits(),
+                want[2].expect("some").to_bits(),
+                want[3].expect("some").to_bits(),
+            ])
+        } else {
+            None
+        };
+        assert_eq!(
+            tanh_4(xs).map(|v| v.map(f64::to_bits)),
+            want_opt,
+            "tanh_4({xs:?})"
+        );
+    };
+    let check_sigmoid = |xs: [f64; 4]| {
+        let want = [
+            sigmoid(xs[0]),
+            sigmoid(xs[1]),
+            sigmoid(xs[2]),
+            sigmoid(xs[3]),
+        ];
+        let want_opt = if want.iter().all(Option::is_some) {
+            Some([
+                want[0].expect("some").to_bits(),
+                want[1].expect("some").to_bits(),
+                want[2].expect("some").to_bits(),
+                want[3].expect("some").to_bits(),
+            ])
+        } else {
+            None
+        };
+        assert_eq!(
+            sigmoid_4(xs).map(|v| v.map(f64::to_bits)),
+            want_opt,
+            "sigmoid_4({xs:?})"
+        );
+    };
+    let check_tanh_f32_4 = |xs: [f32; 4]| {
+        let want = [
+            tanh_f32(xs[0]),
+            tanh_f32(xs[1]),
+            tanh_f32(xs[2]),
+            tanh_f32(xs[3]),
+        ];
+        let want_opt = if want.iter().all(Option::is_some) {
+            Some([
+                want[0].expect("some").to_bits(),
+                want[1].expect("some").to_bits(),
+                want[2].expect("some").to_bits(),
+                want[3].expect("some").to_bits(),
+            ])
+        } else {
+            None
+        };
+        assert_eq!(
+            tanh_f32_4(xs).map(|v| v.map(f32::to_bits)),
+            want_opt,
+            "tanh_f32_4({xs:?})"
+        );
+    };
+
+    // Mixed-regime tuples hitting every branch combination (zero, series,
+    // reduced, subnormal, underflow, saturation, sign flips, and refusals).
+    for xs in [
+        [0.0, -0.0, 746.0, 1.0e100],
+        [0.0, 0.01, 1.5, 745.1],
+        [0.0, 0.0625, 0.0625_f64.next_down(), 700.0],
+        [1.0e-12, 0.05, 1.0, 40.0],
+        [0.0, 39.999, 40.0, 100.0],
+        [0.1, 2.5, 10.0, 745.13],
+        [0.0, -1.0e-300, 1.0, 2.0],
+        [1.0, f64::NAN, 2.0, 3.0],
+        [f64::INFINITY, 0.0, 1.0, 2.0],
+    ] {
+        check_exp(xs);
+        check_expm1(xs);
+    }
+
+    for xs in [
+        [0.0, -0.0, 20.0, -20.0],
+        [1.0e-12, -1.0e-5, 0.03125_f64.next_down(), 0.03125],
+        [-0.03125_f64.next_up(), 0.5, -2.5, 19.999],
+        [0.0, -0.0, 746.0, -746.0],
+        [-700.0, -10.0, 10.0, 700.0],
+        [-1.0e300, -1.0e-20, 1.0e-20, 1.0e300],
+        [0.5, f64::NAN, -0.5, 1.0],
+        [f64::NEG_INFINITY, 0.0, 0.0, 0.0],
+    ] {
+        check_tanh(xs);
+        check_sigmoid(xs);
+    }
+
+    // Randomized broad sweep across all regimes for every 4-lane function.
+    let mut state = 0xA11C_E5ED_C0DE_7777_u64;
+    let mut next_u64 = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        state
+    };
+    for _ in 0..25_000 {
+        let mut nonneg = [0.0_f64; 4];
+        let mut signed = [0.0_f64; 4];
+        let mut f32s = [0.0_f32; 4];
+        for lane in 0..4 {
+            let r = next_u64();
+            let sign = if r & 1 == 0 { 1.0 } else { -1.0 };
+            let exp_idx = ((r >> 1) % 40) as i32 - 30; // 2^-30 .. 2^9 (~512)
+            let frac = ((r >> 11) as f64) / ((1_u64 << 53) as f64);
+            let mag = (1.0 + frac) * 2.0_f64.powi(exp_idx);
+            nonneg[lane] = if (r >> 7) & 15 == 0 { 0.0 } else { mag };
+            signed[lane] = if (r >> 7) & 15 == 0 {
+                sign * 0.0
+            } else {
+                sign * mag
+            };
+            f32s[lane] = signed[lane] as f32;
+        }
+        check_exp(nonneg);
+        check_expm1(nonneg);
+        check_tanh(signed);
+        check_sigmoid(signed);
+        check_tanh_f32_4(f32s);
     }
 }

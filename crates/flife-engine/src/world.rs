@@ -96,10 +96,10 @@ use flife_field::{
     CARRIER1_MOMENT_CHANNELS, ConeContractionSummary, ConeTolerance, Demand, DepositSummary,
     Deposits, DualRawSample, ExchangeKernel, ExchangeScratch, FieldBackend, FieldGrid, FieldPair,
     FieldState, FieldStepOptions, FieldStepPhase2, FieldStepReport, FieldSummary, FieldWork,
-    FluxEdges, GrantPacket, Grants, MAX_PLANES, PyramidView, RawSample, RequestRule,
-    SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, SensorBackend, SensorPyramid,
-    SensorQuery, SettleBackend, Source, SourceKernel, TransportPlan, UptakeBackend, UptakeSummary,
-    UptakeWork, advance_field_on, advance_field_v2_on, advance_field_wave2_on,
+    FluxEdges, GrantPacket, Grants, PyramidView, RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1,
+    SEEDED_UNIT_VECTORS, SeededPath, SensorBackend, SensorPyramid, SensorQuery, SettleBackend,
+    Source, SourceKernel, TransportPlan, UptakeBackend, UptakeSummary, UptakeWork,
+    advance_field_on, advance_field_v2_on, advance_field_wave2_on,
     apply_deposit_streams_to_carrier_on, apply_deposits_to_carrier_on, apply_grants_on,
     count_cell_occupancy, demand_with_scratch, demands_on, initial_source,
     reduce_dual_carrier_field_on, reduce_field_on, resolve_uptake_on,
@@ -951,8 +951,8 @@ impl Decision {
 }
 
 /// Queries sampled per spatial pyramid batch on a decision lane. Sized to
-/// match [`PyramidView::sample_batch`]'s 256-query 8x8 tile-sorted L1D block.
-const SAMPLE_BATCH: usize = 256;
+/// match [`PyramidView::sample_batch_each`]'s 512-query L1D block.
+const SAMPLE_BATCH: usize = 512;
 
 /// One CPU worker's scratch for phases 3 and 4, and 6 and 7.
 #[derive(Debug, Default)]
@@ -962,11 +962,6 @@ struct DecisionLane {
     /// under fixed-world exchange kernels (FL-053; empty / 0 bytes under
     /// `grid-cic-v1`).
     exchange: ExchangeScratch,
-    /// Reusable 256-query batch buffers for spatially-grouped pyramid sampling
-    /// (pre-reserved once per lane; unused single/dual buffer stays 0 bytes).
-    sample_queries: Vec<SensorQuery>,
-    raw_samples: Vec<RawSample>,
-    dual_raw_samples: Vec<DualRawSample>,
     /// Legacy batched path's observations of this lane's run.
     observed: Vec<Observation>,
     /// Expanded controller input vectors for legacy batched runs whose layout
@@ -1560,14 +1555,27 @@ impl World {
             capacity,
             self.settle.backend.is_some(),
         );
-        fit_lanes(lanes, &self.rules, capacity, legacy_batched, !use_tiles)?;
-        fit_settle_tiles(
-            &mut self.scratch.settle_tiles,
-            workers,
-            &self.rules,
-            capacity,
-            self.settle.backend.is_some(),
-        )
+        // Grow the newly active settle-staging store before shrinking the old
+        // one so an allocation refusal can never leave both stores empty.
+        if use_tiles {
+            fit_settle_tiles(
+                &mut self.scratch.settle_tiles,
+                workers,
+                &self.rules,
+                capacity,
+                self.settle.backend.is_some(),
+            )?;
+            fit_lanes(lanes, &self.rules, capacity, legacy_batched, false)
+        } else {
+            fit_lanes(lanes, &self.rules, capacity, legacy_batched, true)?;
+            fit_settle_tiles(
+                &mut self.scratch.settle_tiles,
+                workers,
+                &self.rules,
+                capacity,
+                self.settle.backend.is_some(),
+            )
+        }
     }
 
     /// Evaluate due controllers in one batch on `backend` from the next
@@ -1613,7 +1621,7 @@ impl World {
     /// flat-F32 staging/output buffers (`flat_f32 == true`, freeing legacy
     /// `outputs` and per-lane `observed` / `controller_inputs`) or legacy
     /// `RawOutputs` + per-lane observations (`flat_f32 == false`, freeing
-    /// flat-F32 buffers).
+    /// flat-F32 buffers). Never disturbs lane settle buffers or `settle_tiles`.
     fn reserve_batched(&mut self, rows: usize, flat_f32: bool) -> Result<(), CoreError> {
         if flat_f32 {
             let input_width = self.rules.v2.sensors().input_width();
@@ -1649,32 +1657,14 @@ impl World {
                 "flat controller valid flags",
             )?;
             controllers.flat_outputs.output_width = 0;
-            let use_tiles = uses_settle_tiles(
-                self.scratch.lanes.len(),
-                &self.rules,
-                rows,
-                self.settle.backend.is_some(),
-            );
-            fit_lanes(
-                &mut self.scratch.lanes,
-                &self.rules,
-                rows,
-                false,
-                !use_tiles,
-            )
+            fit_lane_batched(&mut self.scratch.lanes, &self.rules, rows, false)
         } else {
             let controllers = &mut self.controllers;
             controllers.flat_inputs_f32 = Vec::new();
             controllers.flat_inputs_finite = Vec::new();
             controllers.flat_outputs = FlatOutputs::default();
             fit(&mut controllers.outputs, rows, "controller outputs")?;
-            let use_tiles = uses_settle_tiles(
-                self.scratch.lanes.len(),
-                &self.rules,
-                rows,
-                self.settle.backend.is_some(),
-            );
-            fit_lanes(&mut self.scratch.lanes, &self.rules, rows, true, !use_tiles)
+            fit_lane_batched(&mut self.scratch.lanes, &self.rules, rows, true)
         }
     }
 
@@ -1881,13 +1871,23 @@ impl World {
             self.settle.work = settle::SettleWork::default();
             if let Ok(capacity) = capacity_of(&self.rules) {
                 let use_tiles = uses_settle_tiles(workers, &self.rules, capacity, false);
-                let _ = fit_lanes(
-                    &mut self.scratch.lanes,
+                if fit_settle_tiles(
+                    &mut self.scratch.settle_tiles,
+                    workers,
                     &self.rules,
                     capacity,
-                    legacy_batched,
-                    !use_tiles,
-                );
+                    false,
+                )
+                .is_ok()
+                {
+                    let _ = fit_lanes(
+                        &mut self.scratch.lanes,
+                        &self.rules,
+                        capacity,
+                        legacy_batched,
+                        !use_tiles,
+                    );
+                }
             }
             return;
         }
@@ -2184,9 +2184,6 @@ impl World {
             total([
                 lane.controller.allocated_bytes(),
                 lane.exchange.allocated_bytes(),
-                capacity_bytes(&lane.sample_queries),
-                capacity_bytes(&lane.raw_samples),
-                capacity_bytes(&lane.dual_raw_samples),
                 capacity_bytes(&lane.observed),
                 capacity_bytes(&lane.controller_inputs),
                 capacity_bytes(&lane.packets),
@@ -4767,54 +4764,19 @@ fn lanes(
 }
 
 /// An empty decision lane with its controller scratch for the catalog's
-/// widest member, its exchange-footprint scratch for the world's kernel,
-/// and its pre-reserved 256-query sampling batch buffers.
+/// widest member and its exchange-footprint scratch for the world's kernel.
 fn lane(rules: &Rules) -> Result<DecisionLane, CoreError> {
     let widest = rules
         .catalog
         .ids()
         .filter_map(|id| rules.catalog.topology(id))
         .max_by_key(|topology| topology.hidden_widths().iter().copied().max().unwrap_or(0));
-    let mut sample_queries = reserved(SAMPLE_BATCH, "sample queries")?;
-    sample_queries.resize(
-        SAMPLE_BATCH,
-        SensorQuery {
-            position: [0.0, 0.0],
-            scale: 1.0,
-        },
-    );
-    let (raw_samples, dual_raw_samples) = if rules.v2.dual_carrier().is_some() {
-        let mut dual = reserved(SAMPLE_BATCH, "dual raw samples")?;
-        dual.resize(
-            SAMPLE_BATCH,
-            DualRawSample {
-                values: [0.0; MAX_PLANES],
-                dx: [0.0; MAX_PLANES],
-                dy: [0.0; MAX_PLANES],
-            },
-        );
-        (Vec::new(), dual)
-    } else {
-        let mut single = reserved(SAMPLE_BATCH, "raw samples")?;
-        single.resize(
-            SAMPLE_BATCH,
-            RawSample {
-                values: [0.0; RESPONSE_TERMS],
-                dx: [0.0; RESPONSE_TERMS],
-                dy: [0.0; RESPONSE_TERMS],
-            },
-        );
-        (single, Vec::new())
-    };
     Ok(DecisionLane {
         controller: match widest {
             Some(topology) => ControllerScratch::new(topology)?,
             None => ControllerScratch::default(),
         },
         exchange: ExchangeScratch::for_kernel(rules.exchange, &rules.grid)?,
-        sample_queries,
-        raw_samples,
-        dual_raw_samples,
         ..DecisionLane::default()
     })
 }
@@ -4836,6 +4798,32 @@ fn lane_rows(organisms: usize, lanes: usize) -> usize {
         .min(organisms)
 }
 
+/// Reserve or release only each lane's legacy batched observation buffers
+/// (`observed` and `controller_inputs`), leaving its settle buffers intact.
+fn fit_lane_batched(
+    lanes: &mut [DecisionLane],
+    rules: &Rules,
+    organisms: usize,
+    batched: bool,
+) -> Result<(), CoreError> {
+    let rows = lane_rows(organisms, lanes.len());
+    let needs_expanded = rules.v2.sensors().input_width() > SENSOR_WIDTH;
+    for lane in lanes {
+        if batched {
+            fit(&mut lane.observed, rows, "observations")?;
+            if needs_expanded {
+                fit(&mut lane.controller_inputs, rows, "controller inputs")?;
+            } else {
+                lane.controller_inputs = Vec::new();
+            }
+        } else {
+            lane.observed = Vec::new();
+            lane.controller_inputs = Vec::new();
+        }
+    }
+    Ok(())
+}
+
 /// Reserve each lane's decisions, ledger flows and staged emissions (unless
 /// large-world `settle_tiles` owns staging), and with `batched` its
 /// observations, for the most rows it can take of `organisms`; without
@@ -4848,13 +4836,12 @@ fn fit_lanes(
     lane_settle_buffers: bool,
 ) -> Result<(), CoreError> {
     let rows = lane_rows(organisms, lanes.len());
-    let needs_expanded = rules.v2.sensors().input_width() > SENSOR_WIDTH;
     let packet_cap = if rules.exchange.is_grid_cic() {
         0
     } else {
         rules.max_exchange_cells
     };
-    for lane in lanes {
+    for lane in lanes.iter_mut() {
         fit(&mut lane.packets, packet_cap, "organism packets")?;
         if lane_settle_buffers {
             lane.flows.fit(rows.saturating_mul(FLOWS_PER_ORGANISM))?;
@@ -4879,19 +4866,8 @@ fn fit_lanes(
             lane.byproducts = None;
         }
         lane.transactions = None;
-        if batched {
-            fit(&mut lane.observed, rows, "observations")?;
-            if needs_expanded {
-                fit(&mut lane.controller_inputs, rows, "controller inputs")?;
-            } else {
-                lane.controller_inputs = Vec::new();
-            }
-        } else {
-            lane.observed = Vec::new();
-            lane.controller_inputs = Vec::new();
-        }
     }
-    Ok(())
+    fit_lane_batched(lanes, rules, organisms, batched)
 }
 
 /// An empty list with room for exactly `count` values.
@@ -5978,6 +5954,8 @@ fn held_from_raw(
 
 /// Phases 3 and 4 for one organism (§8.1): its already-sampled raw observation,
 /// encoded for the controller, then its due or forced evaluation, decoded.
+/// Skips all 69 controller-input `tanh` saturations when the organism is not
+/// due this tick while keeping identical gradients and validation errors.
 fn decide_from_raw(
     rules: &Rules,
     genome: &Genome,
@@ -5987,26 +5965,26 @@ fn decide_from_raw(
     [from, to]: [Tick; 2],
     controller: &mut ControllerScratch,
 ) -> Result<Decision, CoreError> {
+    if !due(rules, organism, to) {
+        let gradients = encode_gradients_only(rules, organism, raw, from)?;
+        return finish_from_gradients(rules, organism, organism.held, false, gradients);
+    }
     let observation = encode_for_controller(rules, organism, raw, from)?;
-    let due = due(rules, organism, to);
-    let held = if due {
-        evaluate_reference_held(
-            rules,
-            genome,
-            organism,
-            &observation,
-            None,
-            local_crowding,
-            to,
-            controller,
-        )?
-    } else {
-        organism.held
-    };
-    finish(rules, organism, held, due, &observation)
+    let held = evaluate_reference_held(
+        rules,
+        genome,
+        organism,
+        &observation,
+        None,
+        local_crowding,
+        to,
+        controller,
+    )?;
+    finish(rules, organism, held, true, &observation)
 }
 
 /// Phases 3 and 4 for one organism on a 34-plane dual-carrier field (`V2-15`).
+/// Skips all 71 controller-input `tanh` saturations when not due this tick.
 fn decide_from_dual_raw(
     rules: &Rules,
     genome: &Genome,
@@ -6016,23 +5994,22 @@ fn decide_from_dual_raw(
     [from, to]: [Tick; 2],
     controller: &mut ControllerScratch,
 ) -> Result<Decision, CoreError> {
+    if !due(rules, organism, to) {
+        let gradients = encode_dual_gradients_only(rules, organism, raw, from)?;
+        return finish_from_gradients(rules, organism, organism.held, false, gradients);
+    }
     let dual_obs = encode_dual_for_controller(rules, organism, raw, from)?;
-    let due = due(rules, organism, to);
-    let held = if due {
-        evaluate_reference_held(
-            rules,
-            genome,
-            organism,
-            &dual_obs.base,
-            Some(dual_obs.trail_inputs),
-            local_crowding,
-            to,
-            controller,
-        )?
-    } else {
-        organism.held
-    };
-    finish(rules, organism, held, due, &dual_obs.base)
+    let held = evaluate_reference_held(
+        rules,
+        genome,
+        organism,
+        &dual_obs.base,
+        Some(dual_obs.trail_inputs),
+        local_crowding,
+        to,
+        controller,
+    )?;
+    finish(rules, organism, held, true, &dual_obs.base)
 }
 
 /// Run `work` over `rows` on at most `lanes.len()` threads: this one and
@@ -6518,12 +6495,19 @@ fn compositions_into(
                     let comp_id = u32::try_from(occ_base + i).map_err(|_| CoreError::Overflow {
                         quantity: "packet compositions",
                     })?;
-                    if let (Some(rel_first), Some(rel_end)) =
-                        (first.checked_sub(pkt_base), end.checked_sub(pkt_base))
-                        && let Some(range_slice) = pkt_chunk.get_mut(rel_first..rel_end)
-                    {
-                        range_slice.fill(comp_id);
-                    }
+                    let pkt_chunk_len = pkt_chunk.len();
+                    let range_slice = first
+                        .checked_sub(pkt_base)
+                        .zip(end.checked_sub(pkt_base))
+                        .and_then(|(rel_first, rel_end)| pkt_chunk.get_mut(rel_first..rel_end))
+                        .ok_or_else(|| CoreError::StateConflict {
+                            operation: "compose packets",
+                            detail: format!(
+                                "cell {cell} bin range {first}..{end} outside tile slice {pkt_base}..{}",
+                                pkt_base + pkt_chunk_len
+                            ),
+                        })?;
+                    range_slice.fill(comp_id);
                     let e = f64::from(e_raw);
                     if e > 0.0 {
                         cells[count] = cell;
@@ -6696,13 +6680,7 @@ fn decide_all(
         |_, (start, run, dec_out), lane| {
             let start = *start;
             let run = *run;
-            let DecisionLane {
-                controller,
-                sample_queries,
-                raw_samples,
-                dual_raw_samples,
-                ..
-            } = lane;
+            let DecisionLane { controller, .. } = lane;
             let mut live = run.first().map(|first| population.ascending_from(first.id));
             if dual_carrier {
                 if let Some(Sampled::Dual(samples)) = sampled {
@@ -6732,18 +6710,18 @@ fn decide_all(
                     }
                     return Ok(());
                 }
-                let batch_cap = SAMPLE_BATCH
-                    .min(sample_queries.len())
-                    .min(dual_raw_samples.len())
-                    .max(1);
+                let mut queries = [SensorQuery {
+                    position: [0.0, 0.0],
+                    scale: 1.0,
+                }; SAMPLE_BATCH];
                 let mut batch_genomes: [Option<&Genome>; SAMPLE_BATCH] = [None; SAMPLE_BATCH];
                 for (chunk_idx, (chunk, dec_chunk)) in run
-                    .chunks(batch_cap)
-                    .zip(dec_out.chunks_mut(batch_cap))
+                    .chunks(SAMPLE_BATCH)
+                    .zip(dec_out.chunks_mut(SAMPLE_BATCH))
                     .enumerate()
                 {
                     let count = chunk.len();
-                    let base = start + chunk_idx * batch_cap;
+                    let base = start + chunk_idx * SAMPLE_BATCH;
                     for i in 0..count {
                         let organism = &chunk[i];
                         let genome = live
@@ -6754,29 +6732,26 @@ fn decide_all(
                                 detail: format!("{} has no genome", organism.id),
                             })?;
                         batch_genomes[i] = Some(genome);
-                        sample_queries[i] = SensorQuery {
+                        queries[i] = SensorQuery {
                             position: organism.position,
                             scale: genome.traits().sensing_scale(),
                         };
                     }
-                    view.sample_dual_batch(
-                        &sample_queries[..count],
-                        &mut dual_raw_samples[..count],
-                    )?;
-                    for i in 0..count {
+                    view.sample_dual_batch_each(&queries[..count], |i, raw| {
                         let Some(genome) = batch_genomes[i] else {
-                            continue;
+                            return Ok(());
                         };
                         dec_chunk[i] = decide_from_dual_raw(
                             rules,
                             genome,
                             &chunk[i],
-                            &dual_raw_samples[i],
+                            raw,
                             crowding_counts.get(base + i).copied(),
                             ticks,
                             controller,
                         )?;
-                    }
+                        Ok(())
+                    })?;
                 }
                 return Ok(());
             }
@@ -6805,18 +6780,18 @@ fn decide_all(
                 }
                 return Ok(());
             }
-            let batch_cap = SAMPLE_BATCH
-                .min(sample_queries.len())
-                .min(raw_samples.len())
-                .max(1);
+            let mut queries = [SensorQuery {
+                position: [0.0, 0.0],
+                scale: 1.0,
+            }; SAMPLE_BATCH];
             let mut batch_genomes: [Option<&Genome>; SAMPLE_BATCH] = [None; SAMPLE_BATCH];
             for (chunk_idx, (chunk, dec_chunk)) in run
-                .chunks(batch_cap)
-                .zip(dec_out.chunks_mut(batch_cap))
+                .chunks(SAMPLE_BATCH)
+                .zip(dec_out.chunks_mut(SAMPLE_BATCH))
                 .enumerate()
             {
                 let count = chunk.len();
-                let base = start + chunk_idx * batch_cap;
+                let base = start + chunk_idx * SAMPLE_BATCH;
                 for i in 0..count {
                     let organism = &chunk[i];
                     let genome = live
@@ -6827,26 +6802,26 @@ fn decide_all(
                             detail: format!("{} has no genome", organism.id),
                         })?;
                     batch_genomes[i] = Some(genome);
-                    sample_queries[i] = SensorQuery {
+                    queries[i] = SensorQuery {
                         position: organism.position,
                         scale: genome.traits().sensing_scale(),
                     };
                 }
-                view.sample_batch(&sample_queries[..count], &mut raw_samples[..count])?;
-                for i in 0..count {
+                view.sample_batch_each(&queries[..count], |i, raw| {
                     let Some(genome) = batch_genomes[i] else {
-                        continue;
+                        return Ok(());
                     };
                     dec_chunk[i] = decide_from_raw(
                         rules,
                         genome,
                         &chunk[i],
-                        &raw_samples[i],
+                        raw,
                         crowding_counts.get(base + i).copied(),
                         ticks,
                         controller,
                     )?;
-                }
+                    Ok(())
+                })?;
             }
             Ok(())
         },
@@ -7710,10 +7685,11 @@ fn decide_batched(
         lane.due_count = 0;
     }
     in_runs(rows, lanes, &|start, run, lane| {
+        const ZERO_OBS: Observation = Observation {
+            inputs: [0.0; SENSOR_WIDTH],
+            gradients: [[0.0; 2]; RESPONSE_TERMS],
+        };
         let DecisionLane {
-            sample_queries,
-            raw_samples,
-            dual_raw_samples,
             observed,
             controller_inputs,
             ..
@@ -7723,32 +7699,29 @@ fn decide_batched(
             reserve_for(controller_inputs, run.len(), "controller inputs")?;
         }
         let mut live = run.first().map(|first| population.ascending_from(first.id));
-        let mut push_obs = |organism: &Organism,
-                            obs: Observation,
-                            trail_inputs: Option<[f64; 4]>,
-                            local_crowding: Option<u32>| {
-            if needs_expanded {
-                let mut full = [0.0_f64; MAX_SENSOR_WIDTH];
-                full[..SENSOR_WIDTH].copy_from_slice(&obs.inputs);
-                fill_v2_extra_sensors(
-                    sensors,
-                    trail_inputs,
-                    local_crowding,
-                    Some(organism.last_neighbor_h0),
-                    &mut full,
-                );
-                if state_width > 0 {
-                    let prev = organism.held.recurrent_state_array();
-                    for (slot, &h) in full[obs_width..input_width]
-                        .iter_mut()
-                        .zip(&prev[..state_width])
-                    {
-                        *slot = f64::from(h);
-                    }
+        let build_full = |organism: &Organism,
+                          obs: &Observation,
+                          trail_inputs: Option<[f64; 4]>,
+                          local_crowding: Option<u32>| {
+            let mut full = [0.0_f64; MAX_SENSOR_WIDTH];
+            full[..SENSOR_WIDTH].copy_from_slice(&obs.inputs);
+            fill_v2_extra_sensors(
+                sensors,
+                trail_inputs,
+                local_crowding,
+                Some(organism.last_neighbor_h0),
+                &mut full,
+            );
+            if state_width > 0 {
+                let prev = organism.held.recurrent_state_array();
+                for (slot, &h) in full[obs_width..input_width]
+                    .iter_mut()
+                    .zip(&prev[..state_width])
+                {
+                    *slot = f64::from(h);
                 }
-                controller_inputs.push(full);
             }
-            observed.push(obs);
+            full
         };
         if dual_carrier {
             if let Some(Sampled::Dual(samples)) = sampled {
@@ -7767,23 +7740,26 @@ fn decide_batched(
                         }
                     };
                     let dual_obs = encode_dual_for_controller(rules, organism, &raw, from)?;
-                    push_obs(
-                        organism,
-                        dual_obs.base,
-                        Some(dual_obs.trail_inputs),
-                        crowding_counts.get(start + index).copied(),
-                    );
+                    if needs_expanded {
+                        controller_inputs.push(build_full(
+                            organism,
+                            &dual_obs.base,
+                            Some(dual_obs.trail_inputs),
+                            crowding_counts.get(start + index).copied(),
+                        ));
+                    }
+                    observed.push(dual_obs.base);
                 }
                 return Ok(());
             }
-            let batch_cap = SAMPLE_BATCH
-                .min(sample_queries.len())
-                .min(dual_raw_samples.len())
-                .max(1);
-            for (chunk_idx, chunk) in run.chunks(batch_cap).enumerate() {
+            let mut queries = [SensorQuery {
+                position: [0.0, 0.0],
+                scale: 1.0,
+            }; SAMPLE_BATCH];
+            for (chunk_idx, chunk) in run.chunks(SAMPLE_BATCH).enumerate() {
                 let count = chunk.len();
-                let base = start + chunk_idx * batch_cap;
-                for (query, organism) in sample_queries[..count].iter_mut().zip(chunk) {
+                let base = start + chunk_idx * SAMPLE_BATCH;
+                for (query, organism) in queries[..count].iter_mut().zip(chunk) {
                     let genome = live
                         .as_mut()
                         .and_then(|walk| walk.next(organism.id).0)
@@ -7796,16 +7772,31 @@ fn decide_batched(
                         scale: genome.traits().sensing_scale(),
                     };
                 }
-                view.sample_dual_batch(&sample_queries[..count], &mut dual_raw_samples[..count])?;
-                for (i, (organism, raw)) in chunk.iter().zip(&dual_raw_samples[..count]).enumerate()
-                {
-                    let dual_obs = encode_dual_for_controller(rules, organism, raw, from)?;
-                    push_obs(
-                        organism,
-                        dual_obs.base,
-                        Some(dual_obs.trail_inputs),
-                        crowding_counts.get(base + i).copied(),
-                    );
+                let obs_base = observed.len();
+                observed.resize(obs_base + count, ZERO_OBS);
+                let obs_slice = &mut observed[obs_base..obs_base + count];
+                if needs_expanded {
+                    let in_base = controller_inputs.len();
+                    controller_inputs.resize(in_base + count, [0.0_f64; MAX_SENSOR_WIDTH]);
+                    let in_slice = &mut controller_inputs[in_base..in_base + count];
+                    view.sample_dual_batch_each(&queries[..count], |i, raw| {
+                        let organism = &chunk[i];
+                        let dual_obs = encode_dual_for_controller(rules, organism, raw, from)?;
+                        in_slice[i] = build_full(
+                            organism,
+                            &dual_obs.base,
+                            Some(dual_obs.trail_inputs),
+                            crowding_counts.get(base + i).copied(),
+                        );
+                        obs_slice[i] = dual_obs.base;
+                        Ok(())
+                    })?;
+                } else {
+                    view.sample_dual_batch_each(&queries[..count], |i, raw| {
+                        let dual_obs = encode_dual_for_controller(rules, &chunk[i], raw, from)?;
+                        obs_slice[i] = dual_obs.base;
+                        Ok(())
+                    })?;
                 }
             }
             return Ok(());
@@ -7824,23 +7815,26 @@ fn decide_batched(
                     None => view.sample(organism.position, genome.traits().sensing_scale())?,
                 };
                 let obs = encode_for_controller(rules, organism, &raw, from)?;
-                push_obs(
-                    organism,
-                    obs,
-                    None,
-                    crowding_counts.get(start + index).copied(),
-                );
+                if needs_expanded {
+                    controller_inputs.push(build_full(
+                        organism,
+                        &obs,
+                        None,
+                        crowding_counts.get(start + index).copied(),
+                    ));
+                }
+                observed.push(obs);
             }
             return Ok(());
         }
-        let batch_cap = SAMPLE_BATCH
-            .min(sample_queries.len())
-            .min(raw_samples.len())
-            .max(1);
-        for (chunk_idx, chunk) in run.chunks(batch_cap).enumerate() {
+        let mut queries = [SensorQuery {
+            position: [0.0, 0.0],
+            scale: 1.0,
+        }; SAMPLE_BATCH];
+        for (chunk_idx, chunk) in run.chunks(SAMPLE_BATCH).enumerate() {
             let count = chunk.len();
-            let base = start + chunk_idx * batch_cap;
-            for (query, organism) in sample_queries[..count].iter_mut().zip(chunk) {
+            let base = start + chunk_idx * SAMPLE_BATCH;
+            for (query, organism) in queries[..count].iter_mut().zip(chunk) {
                 let genome = live
                     .as_mut()
                     .and_then(|walk| walk.next(organism.id).0)
@@ -7853,10 +7847,26 @@ fn decide_batched(
                     scale: genome.traits().sensing_scale(),
                 };
             }
-            view.sample_batch(&sample_queries[..count], &mut raw_samples[..count])?;
-            for (i, (organism, raw)) in chunk.iter().zip(&raw_samples[..count]).enumerate() {
-                let obs = encode_for_controller(rules, organism, raw, from)?;
-                push_obs(organism, obs, None, crowding_counts.get(base + i).copied());
+            let obs_base = observed.len();
+            observed.resize(obs_base + count, ZERO_OBS);
+            let obs_slice = &mut observed[obs_base..obs_base + count];
+            if needs_expanded {
+                let in_base = controller_inputs.len();
+                controller_inputs.resize(in_base + count, [0.0_f64; MAX_SENSOR_WIDTH]);
+                let in_slice = &mut controller_inputs[in_base..in_base + count];
+                view.sample_batch_each(&queries[..count], |i, raw| {
+                    let organism = &chunk[i];
+                    let obs = encode_for_controller(rules, organism, raw, from)?;
+                    in_slice[i] =
+                        build_full(organism, &obs, None, crowding_counts.get(base + i).copied());
+                    obs_slice[i] = obs;
+                    Ok(())
+                })?;
+            } else {
+                view.sample_batch_each(&queries[..count], |i, raw| {
+                    obs_slice[i] = encode_for_controller(rules, &chunk[i], raw, from)?;
+                    Ok(())
+                })?;
             }
         }
         Ok(())

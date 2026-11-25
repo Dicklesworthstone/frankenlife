@@ -49,6 +49,7 @@ const TRIG_TERMS: u32 = 9;
 /// factor (`x = 7.8125e-5`) and a source kernel's cutoff (`x = 8`). Returns
 /// `None` for a negative or nonfinite argument. Underflows to `0.0` for
 /// large `x`, as `exp` does.
+#[inline]
 #[must_use]
 pub fn exp_neg(x: f64) -> Option<f64> {
     if !x.is_finite() || x < 0.0 {
@@ -82,6 +83,7 @@ pub fn exp_neg(x: f64) -> Option<f64> {
 /// lockstep fixed-size arrays so LLVM auto-vectorizes across lanes (`fdiv.2d` /
 /// `fmul.2d` / `fsub.2d`) without FMA contraction or numerical drift. Returns
 /// `None` if any lane is negative or nonfinite.
+#[inline]
 #[must_use]
 pub fn exp_neg_4(xs: [f64; 4]) -> Option<[f64; 4]> {
     if !xs[0].is_finite()
@@ -95,15 +97,19 @@ pub fn exp_neg_4(xs: [f64; 4]) -> Option<[f64; 4]> {
     {
         return None;
     }
-    if xs[0] > REDUCED
-        && xs[0] < EXP_UNDERFLOWS
-        && xs[1] > REDUCED
-        && xs[1] < EXP_UNDERFLOWS
-        && xs[2] > REDUCED
-        && xs[2] < EXP_UNDERFLOWS
-        && xs[3] > REDUCED
-        && xs[3] < EXP_UNDERFLOWS
-    {
+    let is_small = [
+        xs[0] > 0.0 && xs[0] <= REDUCED,
+        xs[1] > 0.0 && xs[1] <= REDUCED,
+        xs[2] > 0.0 && xs[2] <= REDUCED,
+        xs[3] > 0.0 && xs[3] <= REDUCED,
+    ];
+    let is_mid = [
+        xs[0] > REDUCED && xs[0] < EXP_UNDERFLOWS,
+        xs[1] > REDUCED && xs[1] < EXP_UNDERFLOWS,
+        xs[2] > REDUCED && xs[2] < EXP_UNDERFLOWS,
+        xs[3] > REDUCED && xs[3] < EXP_UNDERFLOWS,
+    ];
+    if is_mid[0] && is_mid[1] && is_mid[2] && is_mid[3] {
         let n = [
             (xs[0] / core::f64::consts::LN_2).round(),
             (xs[1] / core::f64::consts::LN_2).round(),
@@ -129,16 +135,92 @@ pub fn exp_neg_4(xs: [f64; 4]) -> Option<[f64; 4]> {
             scale_lane(scaled[3], n[3]),
         ]);
     }
-    if xs[0] > 0.0
-        && xs[0] <= REDUCED
-        && xs[1] > 0.0
-        && xs[1] <= REDUCED
-        && xs[2] > 0.0
-        && xs[2] <= REDUCED
-        && xs[3] > 0.0
-        && xs[3] <= REDUCED
-    {
-        return Some(exp_series_12_4(xs));
+    if !(is_mid[0] | is_mid[1] | is_mid[2] | is_mid[3]) {
+        if !(is_small[0] | is_small[1] | is_small[2] | is_small[3]) {
+            return Some([
+                if xs[0] == 0.0 { 1.0 } else { 0.0 },
+                if xs[1] == 0.0 { 1.0 } else { 0.0 },
+                if xs[2] == 0.0 { 1.0 } else { 0.0 },
+                if xs[3] == 0.0 { 1.0 } else { 0.0 },
+            ]);
+        }
+        let y = [
+            if is_small[0] { xs[0] } else { 0.0 },
+            if is_small[1] { xs[1] } else { 0.0 },
+            if is_small[2] { xs[2] } else { 0.0 },
+            if is_small[3] { xs[3] } else { 0.0 },
+        ];
+        let s = exp_series_12_4(y);
+        return Some([
+            if is_small[0] {
+                s[0]
+            } else if xs[0] == 0.0 {
+                1.0
+            } else {
+                0.0
+            },
+            if is_small[1] {
+                s[1]
+            } else if xs[1] == 0.0 {
+                1.0
+            } else {
+                0.0
+            },
+            if is_small[2] {
+                s[2]
+            } else if xs[2] == 0.0 {
+                1.0
+            } else {
+                0.0
+            },
+            if is_small[3] {
+                s[3]
+            } else if xs[3] == 0.0 {
+                1.0
+            } else {
+                0.0
+            },
+        ]);
+    }
+    if !(is_small[0] | is_small[1] | is_small[2] | is_small[3]) {
+        // Only `mid`, `0.0`, and underflowing lanes: vectorize the mid lanes
+        // without scalar fallback.
+        let xm = [
+            if is_mid[0] { xs[0] } else { 1.0 },
+            if is_mid[1] { xs[1] } else { 1.0 },
+            if is_mid[2] { xs[2] } else { 1.0 },
+            if is_mid[3] { xs[3] } else { 1.0 },
+        ];
+        let n = [
+            (xm[0] / core::f64::consts::LN_2).round(),
+            (xm[1] / core::f64::consts::LN_2).round(),
+            (xm[2] / core::f64::consts::LN_2).round(),
+            (xm[3] / core::f64::consts::LN_2).round(),
+        ];
+        let r = [
+            (xm[0] - n[0] * LN2_HI) - n[0] * LN2_LO,
+            (xm[1] - n[1] * LN2_HI) - n[1] * LN2_LO,
+            (xm[2] - n[2] * LN2_HI) - n[2] * LN2_LO,
+            (xm[3] - n[3] * LN2_HI) - n[3] * LN2_LO,
+        ];
+        let scaled = exp_series_15_4(r);
+        let scale_lane = |s: f64, nf: f64, mid: bool, x: f64| {
+            if mid {
+                let ni = nf as i32;
+                let first = ni.min(1000);
+                s * power_of_two(-first) * power_of_two(first - ni)
+            } else if x == 0.0 {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        return Some([
+            scale_lane(scaled[0], n[0], is_mid[0], xs[0]),
+            scale_lane(scaled[1], n[1], is_mid[1], xs[1]),
+            scale_lane(scaled[2], n[2], is_mid[2], xs[2]),
+            scale_lane(scaled[3], n[3], is_mid[3], xs[3]),
+        ]);
     }
     Some([
         exp_neg(xs[0])?,
@@ -305,6 +387,7 @@ fn power_of_two(k: i32) -> f64 {
 /// doubling identity `1 − e^(−2y) = m(2 − m)` is applied `k` times; unlike
 /// squaring, doubling does not amplify relative error. Returns `None` for a
 /// negative or nonfinite argument.
+#[inline]
 #[must_use]
 pub fn expm1_neg(x: f64) -> Option<f64> {
     if !x.is_finite() || x < 0.0 {
@@ -355,6 +438,95 @@ pub fn expm1_neg(x: f64) -> Option<f64> {
     Some(m)
 }
 
+/// Four-lane batch [`expm1_neg`], bit-identical to
+/// `[expm1_neg(xs[0])?, expm1_neg(xs[1])?, expm1_neg(xs[2])?, expm1_neg(xs[3])?]`.
+///
+/// Executes the exact same IEEE-754 operations per lane in lockstep 4-lane
+/// arrays so LLVM emits 2-wide F64 NEON divisions and multiplies without FMA
+/// contraction or numerical drift. Returns `None` if any lane is negative or
+/// nonfinite.
+#[inline]
+#[must_use]
+pub fn expm1_neg_4(xs: [f64; 4]) -> Option<[f64; 4]> {
+    if !xs[0].is_finite()
+        || xs[0] < 0.0
+        || !xs[1].is_finite()
+        || xs[1] < 0.0
+        || !xs[2].is_finite()
+        || xs[2] < 0.0
+        || !xs[3].is_finite()
+        || xs[3] < 0.0
+    {
+        return None;
+    }
+    let ln2 = core::f64::consts::LN_2;
+    if xs[0] < ln2 && xs[1] < ln2 && xs[2] < ln2 && xs[3] < ln2 {
+        let (y0, h0) = reduce(xs[0]);
+        let (y1, h1) = reduce(xs[1]);
+        let (y2, h2) = reduce(xs[2]);
+        let (y3, h3) = reduce(xs[3]);
+        let y = [y0, y1, y2, y3];
+        let mut s = [
+            1.0 - y[0] / 14.0,
+            1.0 - y[1] / 14.0,
+            1.0 - y[2] / 14.0,
+            1.0 - y[3] / 14.0,
+        ];
+        for div in [13.0, 12.0, 11.0, 10.0, 9.0] {
+            for (si, &yi) in s.iter_mut().zip(&y) {
+                *si = 1.0 - (yi / div) * *si;
+            }
+        }
+        for (si, &yi) in s.iter_mut().zip(&y) {
+            *si = 1.0 - (yi * 0.125) * *si;
+        }
+        for div in [7.0, 6.0, 5.0] {
+            for (si, &yi) in s.iter_mut().zip(&y) {
+                *si = 1.0 - (yi / div) * *si;
+            }
+        }
+        for (si, &yi) in s.iter_mut().zip(&y) {
+            *si = 1.0 - (yi * 0.25) * *si;
+        }
+        for (si, &yi) in s.iter_mut().zip(&y) {
+            *si = 1.0 - (yi / 3.0) * *si;
+        }
+        for (si, &yi) in s.iter_mut().zip(&y) {
+            *si = 1.0 - (yi * 0.5) * *si;
+        }
+        let mut m = [y[0] * s[0], y[1] * s[1], y[2] * s[2], y[3] * s[3]];
+        let hs = [h0, h1, h2, h3];
+        for (mi, (&x, &h)) in m.iter_mut().zip(xs.iter().zip(&hs)) {
+            if x == 0.0 {
+                *mi = x;
+            } else {
+                for _ in 0..h {
+                    *mi *= 2.0 - *mi;
+                }
+            }
+        }
+        return Some(m);
+    }
+    if xs[0] >= ln2
+        && xs[0] < EXPM1_SATURATES
+        && xs[1] >= ln2
+        && xs[1] < EXPM1_SATURATES
+        && xs[2] >= ln2
+        && xs[2] < EXPM1_SATURATES
+        && xs[3] >= ln2
+        && xs[3] < EXPM1_SATURATES
+    {
+        let e = exp_neg_4(xs)?;
+        return Some([1.0 - e[0], 1.0 - e[1], 1.0 - e[2], 1.0 - e[3]]);
+    }
+    Some([
+        expm1_neg(xs[0])?,
+        expm1_neg(xs[1])?,
+        expm1_neg(xs[2])?,
+        expm1_neg(xs[3])?,
+    ])
+}
+
 /// `tanh(x)` for finite `x`, computed identically on every IEEE-754 host.
 ///
 /// For `0 ≤ x < 1`, `tanh x = m/(2 − m)` with `m = 1 − e^(−2x)` from
@@ -363,6 +535,7 @@ pub fn expm1_neg(x: f64) -> Option<f64> {
 /// below `1`. Odd symmetry gives negative arguments, and `tanh(±0) = ±0`.
 /// Within 2 ulp of the correctly rounded result (measured). Returns `None`
 /// for a nonfinite argument.
+#[inline]
 #[must_use]
 pub fn tanh(x: f64) -> Option<f64> {
     if !x.is_finite() {
@@ -388,192 +561,83 @@ pub fn tanh(x: f64) -> Option<f64> {
     Some(if x.is_sign_negative() { -value } else { value })
 }
 
+/// Four-lane batch [`tanh`], bit-identical to
+/// `[tanh(xs[0])?, tanh(xs[1])?, tanh(xs[2])?, tanh(xs[3])?]`.
+///
+/// Vectorizes both the `|x| < 1` ([`expm1_neg_4`]) and `1 ≤ |x| < 20`
+/// ([`exp_neg_4`]) regimes in lockstep 4-lane arrays with the exact same
+/// IEEE-754 operations and rounding per lane. Returns `None` if any lane is
+/// nonfinite.
+#[inline]
+#[must_use]
+pub fn tanh_4(xs: [f64; 4]) -> Option<[f64; 4]> {
+    if !xs[0].is_finite() || !xs[1].is_finite() || !xs[2].is_finite() || !xs[3].is_finite() {
+        return None;
+    }
+    let mags = [xs[0].abs(), xs[1].abs(), xs[2].abs(), xs[3].abs()];
+    if mags[0] < 1.0 && mags[1] < 1.0 && mags[2] < 1.0 && mags[3] < 1.0 {
+        let m = expm1_neg_4([2.0 * mags[0], 2.0 * mags[1], 2.0 * mags[2], 2.0 * mags[3]])?;
+        let mut out = [0.0_f64; 4];
+        for ((dst, &x), &mi) in out.iter_mut().zip(&xs).zip(&m) {
+            *dst = if x == 0.0 {
+                x
+            } else {
+                let v = mi / (2.0 - mi);
+                if x.is_sign_negative() { -v } else { v }
+            };
+        }
+        return Some(out);
+    }
+    if mags[0] >= 1.0
+        && mags[0] < TANH_SATURATES
+        && mags[1] >= 1.0
+        && mags[1] < TANH_SATURATES
+        && mags[2] >= 1.0
+        && mags[2] < TANH_SATURATES
+        && mags[3] >= 1.0
+        && mags[3] < TANH_SATURATES
+    {
+        let d = exp_neg_4([2.0 * mags[0], 2.0 * mags[1], 2.0 * mags[2], 2.0 * mags[3]])?;
+        let mut out = [0.0_f64; 4];
+        for ((dst, &x), &di) in out.iter_mut().zip(&xs).zip(&d) {
+            let v = 1.0 - 2.0 * di / (1.0 + di);
+            *dst = if x.is_sign_negative() { -v } else { v };
+        }
+        return Some(out);
+    }
+    Some([tanh(xs[0])?, tanh(xs[1])?, tanh(xs[2])?, tanh(xs[3])?])
+}
+
 /// [`tanh`] of an F32 argument, rounded once to F32: for every `f32` `z`,
 /// `tanh_f32(z)` is `tanh(f64::from(z)).map(|t| t as f32)`, bit for bit.
 /// This is the controllers' hidden activation (plan §6.2, C.16).
 ///
-/// It reaches those bits by a cheaper route than [`tanh`]'s divided series.
-/// For `s = 2|z|` below `1/16` it takes `m = 1 − e^(−s)` from a degree-8
-/// polynomial in `s` and returns `m/(2 − m)`. Otherwise it reduces
-/// `s = n ln 2 + r` with `|r| ≤ ln 2 / 2` (Cody–Waite, as [`exp_neg`]), takes
-/// `e^(−r)` from a degree-11 polynomial, and returns `(1 − d)/(1 + d)` with
-/// `d = 2^(−n) e^(−r)`. The polynomials are Taylor's, evaluated by Estrin's
-/// scheme, and the only division is the last. Their F64 value can differ
-/// from [`tanh`]'s in its last bits, but rounding to F32 erases the
-/// difference: `crates/flife-core/tests/numerics.rs` checks all 2^32 bit
-/// patterns. Like [`tanh`], it uses only IEEE-754 operations in a fixed
-/// order, so every conforming host computes the same bits. Returns `None`
-/// for a nonfinite argument.
+/// Evaluates the exact same branchless Level-10 Padé `[9/10]` / Cody–Waite
+/// Estrin path with double-rounding tie guard as [`tanh_f64_as_f32`].
+/// `crates/flife-core/tests/numerics.rs` checks all 2^32 bit patterns.
+/// Returns `None` for a nonfinite argument.
+#[inline]
 #[must_use]
 pub fn tanh_f32(z: f32) -> Option<f32> {
-    let x = f64::from(z);
-    if !x.is_finite() {
-        return None;
-    }
-    let magnitude = x.abs();
-    if magnitude == 0.0 {
-        // `tanh(±0) = ±0`.
-        return Some(z);
-    }
-    let value = if magnitude >= TANH_SATURATES {
-        1.0
-    } else {
-        // Rounding once to F32 is the declared arithmetic.
-        tanh_estrin(magnitude) as f32
-    };
-    Some(if z.is_sign_negative() { -value } else { value })
+    tanh_f64_as_f32(f64::from(z))
 }
 
 /// Four-lane batch [`tanh_f32`], bit-identical to
 /// `[tanh_f32(xs[0])?, tanh_f32(xs[1])?, tanh_f32(xs[2])?, tanh_f32(xs[3])?]`.
 ///
-/// Runs the exact same Estrin polynomial evaluation and Cody–Waite range
-/// reduction as [`tanh_f32`] in lockstep 4-lane arrays so LLVM auto-vectorizes
-/// across lanes (`fmul.2d` / `fadd.2d` / `fdiv.2d`) while preserving every F32
-/// bit across all finite inputs (including `±0.0`, subnormals, branch boundary
-/// `±1/32`, and saturation `|z| ≥ 20`). Returns `None` if any lane is nonfinite
-/// (`NaN` or `±Inf`), matching [`tanh_f32`].
+/// Uses [`tanh_f64_as_f32_4`]'s branchless 4-lane Padé `[9/10]` and Cody–Waite
+/// Estrin paths with exact tie and subnormal fallback so every finite `f32`
+/// bit pattern matches [`tanh_f32`] bit for bit. Returns `None` if any lane is
+/// nonfinite.
+#[inline]
 #[must_use]
 pub fn tanh_f32_4(xs: [f32; 4]) -> Option<[f32; 4]> {
-    let xf = [
+    tanh_f64_as_f32_4([
         f64::from(xs[0]),
         f64::from(xs[1]),
         f64::from(xs[2]),
         f64::from(xs[3]),
-    ];
-    if !xf[0].is_finite() || !xf[1].is_finite() || !xf[2].is_finite() || !xf[3].is_finite() {
-        return None;
-    }
-    let mags = [xf[0].abs(), xf[1].abs(), xf[2].abs(), xf[3].abs()];
-    let s = [2.0 * mags[0], 2.0 * mags[1], 2.0 * mags[2], 2.0 * mags[3]];
-
-    let is_small = [
-        mags[0] > 0.0 && s[0] < TANH_SERIES_BELOW,
-        mags[1] > 0.0 && s[1] < TANH_SERIES_BELOW,
-        mags[2] > 0.0 && s[2] < TANH_SERIES_BELOW,
-        mags[3] > 0.0 && s[3] < TANH_SERIES_BELOW,
-    ];
-    let any_small = is_small[0] | is_small[1] | is_small[2] | is_small[3];
-    let any_mid = (s[0] >= TANH_SERIES_BELOW && mags[0] < TANH_SATURATES)
-        | (s[1] >= TANH_SERIES_BELOW && mags[1] < TANH_SATURATES)
-        | (s[2] >= TANH_SERIES_BELOW && mags[2] < TANH_SATURATES)
-        | (s[3] >= TANH_SERIES_BELOW && mags[3] < TANH_SATURATES);
-
-    if !any_mid {
-        if !any_small {
-            // Every lane is either `±0.0` or saturated (`|z| ≥ 20`).
-            return Some([
-                if mags[0] == 0.0 {
-                    xs[0]
-                } else if xs[0].is_sign_negative() {
-                    -1.0
-                } else {
-                    1.0
-                },
-                if mags[1] == 0.0 {
-                    xs[1]
-                } else if xs[1].is_sign_negative() {
-                    -1.0
-                } else {
-                    1.0
-                },
-                if mags[2] == 0.0 {
-                    xs[2]
-                } else if xs[2].is_sign_negative() {
-                    -1.0
-                } else {
-                    1.0
-                },
-                if mags[3] == 0.0 {
-                    xs[3]
-                } else if xs[3].is_sign_negative() {
-                    -1.0
-                } else {
-                    1.0
-                },
-            ]);
-        }
-        let s_safe = [
-            if is_small[0] { s[0] } else { 0.0 },
-            if is_small[1] { s[1] } else { 0.0 },
-            if is_small[2] { s[2] } else { 0.0 },
-            if is_small[3] { s[3] } else { 0.0 },
-        ];
-        let poly = estrin8_4(
-            [-s_safe[0], -s_safe[1], -s_safe[2], -s_safe[3]],
-            &EXPM1_COEFFICIENTS,
-        );
-        let m = [
-            s_safe[0] * poly[0],
-            s_safe[1] * poly[1],
-            s_safe[2] * poly[2],
-            s_safe[3] * poly[3],
-        ];
-        let approx = [
-            m[0] / (2.0 - m[0]),
-            m[1] / (2.0 - m[1]),
-            m[2] / (2.0 - m[2]),
-            m[3] / (2.0 - m[3]),
-        ];
-        return Some(finalize_tanh_f32_4(xs, mags, approx));
-    }
-
-    let s_safe = [
-        if s[0] >= TANH_SERIES_BELOW && mags[0] < TANH_SATURATES {
-            s[0]
-        } else {
-            0.0
-        },
-        if s[1] >= TANH_SERIES_BELOW && mags[1] < TANH_SATURATES {
-            s[1]
-        } else {
-            0.0
-        },
-        if s[2] >= TANH_SERIES_BELOW && mags[2] < TANH_SATURATES {
-            s[2]
-        } else {
-            0.0
-        },
-        if s[3] >= TANH_SERIES_BELOW && mags[3] < TANH_SATURATES {
-            s[3]
-        } else {
-            0.0
-        },
-    ];
-    let n = [
-        (s_safe[0] * core::f64::consts::LOG2_E).round(),
-        (s_safe[1] * core::f64::consts::LOG2_E).round(),
-        (s_safe[2] * core::f64::consts::LOG2_E).round(),
-        (s_safe[3] * core::f64::consts::LOG2_E).round(),
-    ];
-    let neg_r = [
-        -((s_safe[0] - n[0] * LN2_HI) - n[0] * LN2_LO),
-        -((s_safe[1] - n[1] * LN2_HI) - n[1] * LN2_LO),
-        -((s_safe[2] - n[2] * LN2_HI) - n[2] * LN2_LO),
-        -((s_safe[3] - n[3] * LN2_HI) - n[3] * LN2_LO),
-    ];
-    let poly = estrin12_4(neg_r, &EXP_COEFFICIENTS);
-    let d = [
-        poly[0] * power_of_two_neg_small(n[0]),
-        poly[1] * power_of_two_neg_small(n[1]),
-        poly[2] * power_of_two_neg_small(n[2]),
-        poly[3] * power_of_two_neg_small(n[3]),
-    ];
-    let mut approx = [
-        (1.0 - d[0]) / (1.0 + d[0]),
-        (1.0 - d[1]) / (1.0 + d[1]),
-        (1.0 - d[2]) / (1.0 + d[2]),
-        (1.0 - d[3]) / (1.0 + d[3]),
-    ];
-    if any_small {
-        for ((ap, &small), &si) in approx.iter_mut().zip(&is_small).zip(&s) {
-            if small {
-                let m = si * estrin8(-si, &EXPM1_COEFFICIENTS);
-                *ap = m / (2.0 - m);
-            }
-        }
-    }
-    Some(finalize_tanh_f32_4(xs, mags, approx))
+    ])
 }
 
 /// Branchless `2^(−n)` for integer `n ∈ [0, 58]` (exact bits of `power_of_two(-(n as i32))`).
@@ -581,24 +645,6 @@ pub fn tanh_f32_4(xs: [f32; 4]) -> Option<[f32; 4]> {
 fn power_of_two_neg_small(nf: f64) -> f64 {
     let ni = nf as u32;
     f64::from_bits(u64::from(1023_u32.wrapping_sub(ni)) << 52)
-}
-
-#[inline]
-fn finalize_tanh_f32_4(xs: [f32; 4], mags: [f64; 4], approx: [f64; 4]) -> [f32; 4] {
-    let mut out = [0.0_f32; 4];
-    for ((dst, &z), (&mag, &ap)) in out.iter_mut().zip(&xs).zip(mags.iter().zip(&approx)) {
-        *dst = if mag == 0.0 {
-            z
-        } else {
-            let value = if mag >= TANH_SATURATES {
-                1.0
-            } else {
-                ap as f32
-            };
-            if z.is_sign_negative() { -value } else { value }
-        };
-    }
-    out
 }
 
 /// Upper magnitude bound for the branchless Level-10 Padé `[9/10]`
@@ -860,21 +906,6 @@ fn finalize_tanh_f64_as_f32_4(xs: [f64; 4], mags: [f64; 4], approx: [f64; 4]) ->
     Some(out)
 }
 
-/// Four-lane lockstep [`estrin8`], bit-identical per lane.
-#[inline]
-fn estrin8_4(u: [f64; 4], c: &[f64; 8]) -> [f64; 4] {
-    let [c0, c1, c2, c3, c4, c5, c6, c7] = *c;
-    let mut out = [0.0; 4];
-    for (dst, &ui) in out.iter_mut().zip(&u) {
-        let u2 = ui * ui;
-        let u4 = u2 * u2;
-        let low = (c0 + c1 * ui) + (c2 + c3 * ui) * u2;
-        let high = (c4 + c5 * ui) + (c6 + c7 * ui) * u2;
-        *dst = low + high * u4;
-    }
-    out
-}
-
 /// Four-lane lockstep [`estrin12`], bit-identical per lane.
 #[inline]
 fn estrin12_4(u: [f64; 4], c: &[f64; 12]) -> [f64; 4] {
@@ -891,10 +922,6 @@ fn estrin12_4(u: [f64; 4], c: &[f64; 12]) -> [f64; 4] {
     }
     out
 }
-
-/// Below this `2|x|`, [`tanh_estrin`] takes `1 − e^(−2|x|)` from its own
-/// series, where `1 − d` would cancel.
-const TANH_SERIES_BELOW: f64 = 1.0 / 16.0;
 
 /// `1/k!` for `k = 0..=11`, each a correctly rounded quotient: Taylor's
 /// coefficients of `e^u`.
@@ -913,18 +940,6 @@ const EXP_COEFFICIENTS: [f64; 12] = [
     1.0 / 39_916_800.0,
 ];
 
-/// `1/(k + 1)!` for `k = 0..=7`: Taylor's coefficients of `(e^u − 1)/u`.
-const EXPM1_COEFFICIENTS: [f64; 8] = [
-    1.0,
-    1.0 / 2.0,
-    1.0 / 6.0,
-    1.0 / 24.0,
-    1.0 / 120.0,
-    1.0 / 720.0,
-    1.0 / 5_040.0,
-    1.0 / 40_320.0,
-];
-
 /// `tanh(a)` for `2.25 < a < 20` via Cody–Waite range reduction and Estrin
 /// degree-11 `exp(-r)`, using branchless `2^(-n)`.
 #[inline]
@@ -936,39 +951,8 @@ fn tanh_estrin_large(a: f64) -> f64 {
     (1.0 - d) / (1.0 + d)
 }
 
-/// `tanh(a)` for `0 < a < 20` in F64, within a few ulp: close enough that
-/// its F32 rounding is [`tanh`]'s (checked for every F32 argument).
-#[inline]
-fn tanh_estrin(a: f64) -> f64 {
-    let s = 2.0 * a;
-    if s < TANH_SERIES_BELOW {
-        // `m = 1 − e^(−s) = s Σ (−s)^k/(k + 1)!`; with `s < 1/16` the first
-        // omitted term is below `(1/16)^8/9!`, relative to `m`.
-        let m = s * estrin8(-s, &EXPM1_COEFFICIENTS);
-        m / (2.0 - m)
-    } else {
-        // `s < 40`, so `n ≤ 58` and `n × LN2_HI` is exact.
-        let n = (s * core::f64::consts::LOG2_E).round();
-        let r = (s - n * LN2_HI) - n * LN2_LO;
-        // `|r| ≤ ln 2 / 2` plus rounding: the first omitted term of
-        // `e^(−r)` is below `0.35^12/12! ≈ 6e-15`.
-        let n = n as i32;
-        let d = estrin12(-r, &EXP_COEFFICIENTS) * power_of_two(-n);
-        (1.0 - d) / (1.0 + d)
-    }
-}
-
-/// `Σ_{k<8} c_k u^k` by Estrin's scheme.
-fn estrin8(u: f64, c: &[f64; 8]) -> f64 {
-    let [c0, c1, c2, c3, c4, c5, c6, c7] = *c;
-    let u2 = u * u;
-    let u4 = u2 * u2;
-    let low = (c0 + c1 * u) + (c2 + c3 * u) * u2;
-    let high = (c4 + c5 * u) + (c6 + c7 * u) * u2;
-    low + high * u4
-}
-
 /// `Σ_{k<12} c_k u^k` by Estrin's scheme.
+#[inline]
 fn estrin12(u: f64, c: &[f64; 12]) -> f64 {
     let [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11] = *c;
     let u2 = u * u;
@@ -985,6 +969,7 @@ fn estrin12(u: f64, c: &[f64; 12]) -> f64 {
 /// logit decays smoothly to zero instead of dividing by infinity. Within
 /// 2 ulp of the correctly rounded result (measured). Returns `None` for a
 /// nonfinite argument.
+#[inline]
 #[must_use]
 pub fn sigmoid(x: f64) -> Option<f64> {
     if !x.is_finite() {
@@ -996,6 +981,39 @@ pub fn sigmoid(x: f64) -> Option<f64> {
     } else {
         decay / (1.0 + decay)
     })
+}
+
+/// Four-lane batch [`sigmoid`], bit-identical to
+/// `[sigmoid(xs[0])?, sigmoid(xs[1])?, sigmoid(xs[2])?, sigmoid(xs[3])?]`.
+#[inline]
+#[must_use]
+pub fn sigmoid_4(xs: [f64; 4]) -> Option<[f64; 4]> {
+    if !xs[0].is_finite() || !xs[1].is_finite() || !xs[2].is_finite() || !xs[3].is_finite() {
+        return None;
+    }
+    let decay = exp_neg_4([xs[0].abs(), xs[1].abs(), xs[2].abs(), xs[3].abs()])?;
+    Some([
+        if xs[0] >= 0.0 {
+            1.0 / (1.0 + decay[0])
+        } else {
+            decay[0] / (1.0 + decay[0])
+        },
+        if xs[1] >= 0.0 {
+            1.0 / (1.0 + decay[1])
+        } else {
+            decay[1] / (1.0 + decay[1])
+        },
+        if xs[2] >= 0.0 {
+            1.0 / (1.0 + decay[2])
+        } else {
+            decay[2] / (1.0 + decay[2])
+        },
+        if xs[3] >= 0.0 {
+            1.0 / (1.0 + decay[3])
+        } else {
+            decay[3] / (1.0 + decay[3])
+        },
+    ])
 }
 
 /// Terms after the first of `atanh(z)/z = Σ z^(2k)/(2k + 1)`. For
@@ -1380,7 +1398,7 @@ mod batch_tests {
 
     #[test]
     fn tanh_f64_as_f32_4_matches_scalar_bit_for_bit() {
-        let cutoff = 0.5 * TANH_SERIES_BELOW;
+        let cutoff = 0.5 * REDUCED;
         let mut samples = vec![
             0.0,
             -0.0,
@@ -1470,7 +1488,7 @@ mod batch_tests {
 
     #[test]
     fn tanh_f32_4_matches_scalar_tanh_f32_bit_for_bit() {
-        let cutoff = (0.5 * TANH_SERIES_BELOW) as f32;
+        let cutoff = (0.5 * REDUCED) as f32;
         let sat = TANH_SATURATES as f32;
         let smallest_sub = f32::from_bits(1);
         let largest_sub = f32::from_bits(0x007f_ffff);

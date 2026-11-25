@@ -23,15 +23,70 @@
 //! `b > 0` it is mildly harmful.
 
 use flife_core::ledger::{CompensatedSum, EnergyBudget, Ledger, Payment};
+use flife_core::memory::bytes_for;
 use flife_core::numerics::symplectic_rotate_channels;
 use flife_core::{CoreError, Flow, Transfer, ValidatedConfig};
 use flife_field::FieldState;
-use flife_field::numerics::tanh;
+use flife_field::numerics::{tanh, tanh_4};
 use flife_field::settle::ChemistryConstants;
 use flife_field::state::CHANNELS;
 use flife_genome::Traits;
 
 use crate::world::{CorpseDirection, V2Rules};
+
+#[cold]
+#[inline(never)]
+fn err_nonfinite_dot(dot: f64) -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity: "packet composition",
+        detail: format!("a·z = {dot} is not finite"),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn err_comp_oob(comp_idx: u32, len: usize) -> CoreError {
+    CoreError::LayoutMismatch {
+        buffer: "packet compositions",
+        detail: format!("composition index {comp_idx} out of bounds for {len}"),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn err_scored_alloc(count: usize) -> CoreError {
+    CoreError::AllocationFailed {
+        buffer: "scored packets",
+        bytes: bytes_for::<(f64, f64)>(count),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn err_invalid_kappa(toxicity_sensitivity: f64) -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity: "chemistry.toxicity_sensitivity",
+        detail: format!("{toxicity_sensitivity} is out of range"),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn err_invalid_grant(granted: f64) -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity: "granted packet",
+        detail: format!("{granted} is not a finite nonnegative energy"),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn err_invalid_efficiency(efficiency: f64) -> CoreError {
+    CoreError::NumericalInvalid {
+        quantity: "packet efficiency",
+        detail: format!("{efficiency} is outside [−1, 1]"),
+    }
+}
 
 /// The chemistry family this module implements.
 pub const BOUNDED_AFFINITY_V1: &str = "bounded-affinity-v1";
@@ -160,6 +215,7 @@ impl Chemistry {
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] for a nonfinite composition.
+    #[inline]
     pub fn efficiency(
         &self,
         affinity: &Affinity,
@@ -170,10 +226,7 @@ impl Chemistry {
             dot += a * z;
         }
         let response =
-            tanh(self.gain * dot - self.threshold).ok_or_else(|| CoreError::NumericalInvalid {
-                quantity: "packet composition",
-                detail: format!("a·z = {dot} is not finite"),
-            })?;
+            tanh(self.gain * dot - self.threshold).ok_or_else(|| err_nonfinite_dot(dot))?;
         Ok(self.maximum_efficiency * response)
     }
 
@@ -182,7 +235,8 @@ impl Chemistry {
     /// [`settle_efficiencies`].
     ///
     /// # Errors
-    /// As [`Chemistry::efficiency`] and [`settle_efficiencies`].
+    /// As [`Chemistry::efficiency`] and [`settle_efficiencies`], or
+    /// [`CoreError::AllocationFailed`] if staging more than four packets fails.
     pub fn settle(
         &self,
         affinity: &Affinity,
@@ -191,7 +245,44 @@ impl Chemistry {
     ) -> Result<UptakeSettlement, CoreError> {
         let mut efficiencies = [(0.0, 0.0); 4];
         let mut scored = Vec::new();
-        let list: &mut [(f64, f64)] = if packets.len() <= efficiencies.len() {
+        let list: &mut [(f64, f64)] = if packets.len() == 4 {
+            let (mut d0, mut d1, mut d2, mut d3) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+            let aff = &affinity.0;
+            let c0 = &packets[0].composition;
+            let c1 = &packets[1].composition;
+            let c2 = &packets[2].composition;
+            let c3 = &packets[3].composition;
+            for ch in 0..CHANNELS {
+                let a = aff[ch];
+                d0 += a * c0[ch];
+                d1 += a * c1[ch];
+                d2 += a * c2[ch];
+                d3 += a * c3[ch];
+            }
+            let args = [
+                self.gain * d0 - self.threshold,
+                self.gain * d1 - self.threshold,
+                self.gain * d2 - self.threshold,
+                self.gain * d3 - self.threshold,
+            ];
+            let responses = match tanh_4(args) {
+                Some(r) => r,
+                None => [
+                    tanh(args[0]).ok_or_else(|| err_nonfinite_dot(d0))?,
+                    tanh(args[1]).ok_or_else(|| err_nonfinite_dot(d1))?,
+                    tanh(args[2]).ok_or_else(|| err_nonfinite_dot(d2))?,
+                    tanh(args[3]).ok_or_else(|| err_nonfinite_dot(d3))?,
+                ],
+            };
+            let max_eff = self.maximum_efficiency;
+            efficiencies = [
+                (packets[0].granted, max_eff * responses[0]),
+                (packets[1].granted, max_eff * responses[1]),
+                (packets[2].granted, max_eff * responses[2]),
+                (packets[3].granted, max_eff * responses[3]),
+            ];
+            &mut efficiencies
+        } else if packets.len() <= efficiencies.len() {
             for (slot, packet) in efficiencies.iter_mut().zip(packets) {
                 *slot = (
                     packet.granted,
@@ -200,6 +291,9 @@ impl Chemistry {
             }
             &mut efficiencies[..packets.len()]
         } else {
+            scored
+                .try_reserve_exact(packets.len())
+                .map_err(|_| err_scored_alloc(packets.len()))?;
             for packet in packets {
                 scored.push((
                     packet.granted,
@@ -219,6 +313,7 @@ impl Chemistry {
     /// # Errors
     /// [`CoreError::LayoutMismatch`] if any `composition_index` is out of bounds;
     /// otherwise as [`Chemistry::settle`].
+    #[inline]
     pub(crate) fn settle_indexed(
         &self,
         affinity: &Affinity,
@@ -228,32 +323,64 @@ impl Chemistry {
     ) -> Result<UptakeSettlement, CoreError> {
         let mut efficiencies = [(0.0, 0.0); 4];
         let mut scored = Vec::new();
-        let list: &mut [(f64, f64)] = if packets.len() <= efficiencies.len() {
+        let list: &mut [(f64, f64)] = if packets.len() == 4
+            && let (Some(c0), Some(c1), Some(c2), Some(c3)) = (
+                compositions.get(packets[0].1 as usize),
+                compositions.get(packets[1].1 as usize),
+                compositions.get(packets[2].1 as usize),
+                compositions.get(packets[3].1 as usize),
+            ) {
+            // Fused 4-packet channel-order dot product + 4-lane SIMD `tanh_4`:
+            // reads `affinity` once and computes bit-identical IEEE-754 sums
+            // and `tanh` evaluations as four sequential `efficiency` calls.
+            let (mut d0, mut d1, mut d2, mut d3) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+            let aff = &affinity.0;
+            for ch in 0..CHANNELS {
+                let a = aff[ch];
+                d0 += a * c0[ch];
+                d1 += a * c1[ch];
+                d2 += a * c2[ch];
+                d3 += a * c3[ch];
+            }
+            let args = [
+                self.gain * d0 - self.threshold,
+                self.gain * d1 - self.threshold,
+                self.gain * d2 - self.threshold,
+                self.gain * d3 - self.threshold,
+            ];
+            let responses = match tanh_4(args) {
+                Some(r) => r,
+                None => [
+                    tanh(args[0]).ok_or_else(|| err_nonfinite_dot(d0))?,
+                    tanh(args[1]).ok_or_else(|| err_nonfinite_dot(d1))?,
+                    tanh(args[2]).ok_or_else(|| err_nonfinite_dot(d2))?,
+                    tanh(args[3]).ok_or_else(|| err_nonfinite_dot(d3))?,
+                ],
+            };
+            let max_eff = self.maximum_efficiency;
+            efficiencies = [
+                (packets[0].0, max_eff * responses[0]),
+                (packets[1].0, max_eff * responses[1]),
+                (packets[2].0, max_eff * responses[2]),
+                (packets[3].0, max_eff * responses[3]),
+            ];
+            &mut efficiencies
+        } else if packets.len() <= efficiencies.len() {
             for (slot, &(granted, comp_idx)) in efficiencies.iter_mut().zip(packets) {
-                let comp = compositions.get(comp_idx as usize).ok_or_else(|| {
-                    CoreError::LayoutMismatch {
-                        buffer: "packet compositions",
-                        detail: format!(
-                            "composition index {comp_idx} out of bounds for {}",
-                            compositions.len()
-                        ),
-                    }
-                })?;
+                let comp = compositions
+                    .get(comp_idx as usize)
+                    .ok_or_else(|| err_comp_oob(comp_idx, compositions.len()))?;
                 *slot = (granted, self.efficiency(affinity, comp)?);
             }
             &mut efficiencies[..packets.len()]
         } else {
-            scored.reserve(packets.len());
+            scored
+                .try_reserve_exact(packets.len())
+                .map_err(|_| err_scored_alloc(packets.len()))?;
             for &(granted, comp_idx) in packets {
-                let comp = compositions.get(comp_idx as usize).ok_or_else(|| {
-                    CoreError::LayoutMismatch {
-                        buffer: "packet compositions",
-                        detail: format!(
-                            "composition index {comp_idx} out of bounds for {}",
-                            compositions.len()
-                        ),
-                    }
-                })?;
+                let comp = compositions
+                    .get(comp_idx as usize)
+                    .ok_or_else(|| err_comp_oob(comp_idx, compositions.len()))?;
                 scored.push((granted, self.efficiency(affinity, comp)?));
             }
             &mut scored
@@ -371,6 +498,7 @@ impl UptakeSettlement {
     ///
     /// # Errors
     /// As [`Ledger::transfer`] and [`Ledger::record`].
+    #[inline]
     pub fn record(&self, ledger: &mut impl Ledger) -> Result<(), CoreError> {
         ledger.transfer(Transfer::Uptake, self.absorbed, self.gain)?;
         ledger.record(Flow::Toxicity, self.toxicity.paid)
@@ -388,16 +516,14 @@ impl UptakeSettlement {
 ///   efficiency outside `[−1, 1]`, or a nonpositive or nonfinite `κ`.
 /// - [`CoreError::StateConflict`] when the budget is already exhausted and
 ///   there is a gain to credit.
+#[inline]
 pub fn settle_efficiencies(
     toxicity_sensitivity: f64,
     packets: &[(f64, f64)],
     budget: &mut EnergyBudget,
 ) -> Result<UptakeSettlement, CoreError> {
     if !toxicity_sensitivity.is_finite() || toxicity_sensitivity <= 0.0 {
-        return Err(CoreError::NumericalInvalid {
-            quantity: "chemistry.toxicity_sensitivity",
-            detail: format!("{toxicity_sensitivity} is out of range"),
-        });
+        return Err(err_invalid_kappa(toxicity_sensitivity));
     }
     let (mut absorbed, mut gain, mut harm) = (
         CompensatedSum::ZERO,
@@ -406,16 +532,10 @@ pub fn settle_efficiencies(
     );
     for &(granted, efficiency) in packets {
         if !granted.is_finite() || granted < 0.0 {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "granted packet",
-                detail: format!("{granted} is not a finite nonnegative energy"),
-            });
+            return Err(err_invalid_grant(granted));
         }
         if !(-1.0..=1.0).contains(&efficiency) {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "packet efficiency",
-                detail: format!("{efficiency} is outside [−1, 1]"),
-            });
+            return Err(err_invalid_efficiency(efficiency));
         }
         absorbed.add(granted);
         gain.add(efficiency.max(0.0) * granted);

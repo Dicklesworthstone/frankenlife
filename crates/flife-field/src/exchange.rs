@@ -538,6 +538,7 @@ impl ExchangeStencil {
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] for a nonfinite coordinate.
+    #[inline]
     pub fn at(grid: &FieldGrid, position: [f64; 2]) -> Result<Self, CoreError> {
         let [x, y] = grid.wrap_position(position)?;
         let (column, fx) = split(x / grid.cell_width() - 0.5);

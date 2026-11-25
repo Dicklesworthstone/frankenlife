@@ -1,25 +1,35 @@
 // The Worker in front of the site (wrangler.jsonc's `run_worker_first`). It
-// sends www.frankenlife.org to frankenlife.org, serves the media's byte
-// ranges, and hands everything else to the static assets unchanged.
+// sends www.frankenlife.org to frankenlife.org, serves the films from R2 with
+// byte ranges, and hands everything else to the static assets unchanged.
 //
-// Workers static assets answer a Range request with the whole file and a 200,
-// and Safari will not play a video from a server that does that: it asks for
-// `bytes=0-1` first and gives up without a 206. So for the media this Worker
-// fetches the asset whole and streams back only the bytes asked for, as RFC
-// 9110 byte serving. Everything else is the static export, served as it is.
+// Each film is one MP4 in the R2 bucket bound as MEDIA, at the key its path
+// names without the leading slash (`media/<id>-<hash>.mp4`), put there by
+// scripts/upload-media.ts. Safari plays no video from a server that answers a
+// Range request with the whole file: it asks for `bytes=0-1` first and gives
+// up without a 206. So the Worker answers ranges itself, as RFC 9110 byte
+// serving, reading only the bytes asked for from R2. A film's size comes from
+// its manifest (lib/films/*.json), or from R2 for a file no manifest names.
 //
-// An asset's Response from the binding carries no Content-Length, so each
-// file's size comes from its manifest (lib/films/*.json, lib/controls.json,
-// lib/stills.json),
-// which `bun run build` has checked against the file byte for byte
-// (scripts/check-media.ts).
+// The posters, cards and stills are static assets in public/media/, served as
+// they are (public/_headers marks them immutable).
 
-import { mediaFiles } from "./lib/media";
+import { filmVideos } from "./lib/media";
 import { SHARE_IMAGE_PATHS, SHARE_IMAGE_TYPE } from "./lib/share";
 
-type Env = { ASSETS: { fetch(request: Request): Promise<Response> } };
+/** What the Worker uses of an R2 object (workerd's R2Object and R2ObjectBody). */
+type R2Object = { size: number; httpEtag: string };
+type R2ObjectBody = R2Object & { body: ReadableStream<Uint8Array> };
+type R2Range = { offset: number; length: number };
+type R2Bucket = {
+  head(key: string): Promise<R2Object | null>;
+  get(key: string, options?: { range?: R2Range }): Promise<R2ObjectBody | null>;
+};
+type Env = { ASSETS: { fetch(request: Request): Promise<Response> }; MEDIA: R2Bucket };
 
 const IMMUTABLE = "public, max-age=31536000, immutable";
+
+/** A film's path: one MP4 directly under /media/, named by letters, digits, dots, dashes and underscores. */
+const FILM_PATH = /^\/media\/[A-Za-z0-9._-]+\.mp4$/;
 
 // workerd's stream of a declared length: a Response from a plain stream is sent
 // chunked, without the Content-Length a player expects of a 206. Absent elsewhere.
@@ -33,38 +43,6 @@ function sized(stream: ReadableStream<Uint8Array>, length: number): ReadableStre
   // Not awaited: the copy runs as the reader drains `readable`.
   stream.pipeTo(writable).catch(() => {});
   return readable;
-}
-
-/** The bytes [start, end] of `body`, read through in order and dropped outside the range. */
-function slice(body: ReadableStream<Uint8Array>, start: number, end: number): ReadableStream<Uint8Array> {
-  const reader = body.getReader();
-  let offset = 0;
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) {
-          controller.close();
-          return;
-        }
-        const first = offset;
-        offset += value.byteLength;
-        // An empty chunk enqueues nothing, and a pull that enqueues nothing is not called again: read on.
-        if (offset <= start || value.byteLength === 0) continue;
-        const from = Math.max(0, start - first);
-        const to = Math.min(value.byteLength, end + 1 - first);
-        if (to > from) controller.enqueue(value.subarray(from, to));
-        if (offset > end) {
-          controller.close();
-          await reader.cancel();
-        }
-        return;
-      }
-    },
-    cancel(reason) {
-      return reader.cancel(reason);
-    },
-  });
 }
 
 /** One `bytes=` range of a `size`-byte file as [start, end], `null` to serve it whole, or "unsatisfiable". */
@@ -85,10 +63,10 @@ export function parseRange(header: string, size: number): [number, number] | nul
   return [start, end];
 }
 
-/** Each medium's size in bytes, by its path on the site. */
-const SIZES = new Map(mediaFiles.map((file) => [file.src, file.bytes]));
+/** Each film's size in bytes, by its path on the site. */
+const SIZES = new Map(filmVideos.map((file) => [file.src, file.bytes]));
 
-/** A Worker serving the media with these sizes; a file it has no size for is served whole. */
+/** A Worker serving the films with these sizes; a film it has no size for is measured in R2. */
 export function mediaWorker(sizes: ReadonlyMap<string, number>) {
   return { fetch: (request: Request, env: Env) => serve(request, env, sizes) };
 }
@@ -113,44 +91,53 @@ async function serve(request: Request, env: Env, sizes: ReadonlyMap<string, numb
     headers.set("Content-Type", SHARE_IMAGE_TYPE);
     return new Response(image.body, { status: image.status, headers });
   }
-  if (!url.pathname.startsWith("/media/") || (request.method !== "GET" && request.method !== "HEAD")) {
-    return env.ASSETS.fetch(request);
+  if (FILM_PATH.test(url.pathname) && (request.method === "GET" || request.method === "HEAD")) {
+    return film(request, env, url.pathname, sizes.get(url.pathname));
   }
-  const headers = new Headers(request.headers);
-  const range = headers.get("Range");
-  headers.delete("Range");
-  headers.delete("If-Range");
-  const whole = await env.ASSETS.fetch(new Request(url, { method: "GET", headers }));
-  const size = sizes.get(url.pathname) ?? Number.NaN;
-  const out = new Headers(whole.headers);
-  out.set("Accept-Ranges", "bytes");
-  // The media are named by their SHA-256 (scripts/media.ts), so they never change in place.
-  if (whole.ok) out.set("Cache-Control", IMMUTABLE);
+  return env.ASSETS.fetch(request);
+}
 
+/** A film from R2: whole, or the one range asked for; a film R2 does not hold is the site's 404 page. */
+async function film(request: Request, env: Env, path: string, known: number | undefined): Promise<Response> {
+  const key = path.slice(1);
   const head = request.method === "HEAD";
-  const plain = !whole.ok || !whole.body || !Number.isFinite(size) || out.has("Content-Encoding");
-  const wanted = range === null || plain ? null : parseRange(range, size);
-  if (wanted === null) {
-    if (head) {
-      await whole.body?.cancel();
-      // A HEAD has no body to measure, so the size is said here (the edge measures a GET's).
-      if (!plain) out.set("Content-Length", String(size));
-    }
-    return new Response(head ? null : whole.body, { status: whole.status, headers: out });
+  let size = known;
+  let etag: string | null = null;
+  if (head || size === undefined) {
+    const stored = await env.MEDIA.head(key);
+    if (stored === null) return notFound(request, env);
+    size = stored.size;
+    etag = stored.httpEtag;
   }
+  const headers = new Headers({
+    "Content-Type": "video/mp4",
+    "Accept-Ranges": "bytes",
+    // The films are named by their SHA-256 (scripts/media.ts), so they never change in place.
+    "Cache-Control": IMMUTABLE,
+    "X-Content-Type-Options": "nosniff",
+  });
+  const range = request.headers.get("Range");
+  const wanted = range === null ? null : parseRange(range, size);
   if (wanted === "unsatisfiable") {
-    await whole.body?.cancel();
-    out.set("Content-Range", `bytes */${size}`);
-    out.delete("Content-Length");
-    return new Response(null, { status: 416, headers: out });
+    headers.set("Content-Range", `bytes */${size}`);
+    return new Response(null, { status: 416, headers });
   }
-  const [start, end] = wanted;
-  out.set("Content-Range", `bytes ${start}-${end}/${size}`);
-  out.set("Content-Length", String(end - start + 1));
+  const [start, end] = wanted ?? [0, size - 1];
+  const length = end - start + 1;
+  if (wanted !== null) headers.set("Content-Range", `bytes ${start}-${end}/${size}`);
+  headers.set("Content-Length", String(length));
+  const status = wanted === null ? 200 : 206;
   if (head) {
-    await whole.body?.cancel();
-    return new Response(null, { status: 206, headers: out });
+    if (etag !== null) headers.set("ETag", etag);
+    return new Response(null, { status, headers });
   }
-  const part = sized(slice(whole.body as ReadableStream<Uint8Array>, start, end), end - start + 1);
-  return new Response(part, { status: 206, headers: out });
+  const object = await env.MEDIA.get(key, wanted === null ? undefined : { range: { offset: start, length } });
+  if (object === null) return notFound(request, env);
+  headers.set("ETag", object.httpEtag);
+  return new Response(sized(object.body, length), { status, headers });
+}
+
+/** The static export's answer, its 404 page, for a path that names no film in R2. */
+function notFound(request: Request, env: Env): Promise<Response> {
+  return env.ASSETS.fetch(request);
 }

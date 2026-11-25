@@ -96,7 +96,6 @@ export function ControlsTrio() {
   }, []);
 
   if (stills.length === 0) return null;
-  const full = stills.find((still) => still.removed === null);
   const scale = Number(zoom);
   const span = (LOUPE / scale) * controls.torus[0];
   const pixels = width > 0 ? (scale * width) / (stills[0]?.width ?? 1080) : null;
@@ -113,16 +112,14 @@ export function ControlsTrio() {
           look). At tick {grouped(controls.tick)} each world&apos;s
           SHA-256 digest equals the one the record names for its trial (
           {stills.map((still) => still.record.trial).join(", ")} in {controls.record.json}), and the first is the film&apos;s
-          own first frame. Distances and the words in quotes: {controls.record.readme}. Rendered {controls.date} on{" "}
+          own first frame. The words in quotes: {controls.record.readme}. Rendered {controls.date} on{" "}
           {controls.host}, flife SHA-256 {controls.flife_sha256.slice(0, 12)}…; lib/controls.json records the rest.
         </>
       }
     >
       <p className="max-w-3xl text-sm leading-relaxed text-slate-300 sm:text-base">
-        One preset, one seed, the same {grouped(film.world.founders)} founders and the same food, run{" "}
-        {grouped(controls.tick)} ticks three times. Each control changes one rule and nothing else. flife drew all three
-        the same way: the whole {controls.torus[0]}-unit torus, each organism a lit sphere in its founder&apos;s colour.
-        Take away the networks&apos; decisions, or inheritance, and no tissue forms; the renderer does not add it.
+        Same preset, seed, {grouped(film.world.founders)} founders and food, {grouped(controls.tick)} ticks, drawn the
+        same way. Only one rule differs.
       </p>
 
       <div className="mt-5 flex flex-wrap items-center gap-x-4 gap-y-3">
@@ -233,9 +230,7 @@ export function ControlsTrio() {
       </div>
 
       <p className="mt-3 text-xs leading-relaxed text-slate-400">
-        <span className="font-bold text-slate-200">Colour:</span> {controls.render.meaning}. So the decision-free haze is
-        pale because its bodies hold much of the energy they would need to divide, and the scatter is dark because
-        there is almost nothing on the torus to draw.
+        <span className="font-bold text-slate-200">Colour:</span> {controls.render.meaning}.
       </p>
       <p className="mt-1.5 font-mono text-[11px] leading-relaxed text-slate-500 tabular-nums">
         {spot
@@ -245,44 +240,18 @@ export function ControlsTrio() {
           : `Each still is ${stills[0]?.width ?? 1080} × ${stills[0]?.height ?? 1080} pixels of the whole ${controls.torus[0]} × ${controls.torus[1]} torus.`}
       </p>
 
-      <div className="mt-6 grid grid-cols-1 gap-4 border-t border-white/5 pt-6 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)] lg:gap-8">
-        <div>
-          <div className="flex flex-wrap items-center gap-3">
-            <p className="text-[10px] font-black tracking-[0.2em] text-green-400/90 uppercase">What the record concludes</p>
-            <BasisBadge basis="record" />
-          </div>
-          <p className="mt-3 text-base leading-relaxed text-white sm:text-lg">
-            “The domains and their textures come from emission, chosen by the networks, and inheritance is necessary.”
-          </p>
-          <p className="mt-2 text-sm leading-relaxed text-slate-400">
-            And the decision-free haze fills the torus yet scores farther from the reference screenshots than the
-            film&apos;s world, “so the preset&apos;s distance is not only a filled frame.”{" "}
-            <a className="text-green-300 underline-offset-4 hover:underline" href={siteConfig.showcase}>
-              The showcase record
-            </a>
-            .
-          </p>
-        </div>
-        <div className="text-sm leading-relaxed text-slate-400">
-          <p>
-            <span className="font-bold text-slate-200">What it is not.</span> One seed and one tick per world: the
-            controls drawn, not a statistical test. The distance is the showcase search&apos;s image statistic against the
-            reference screenshots, lower being nearer; it chose the preset, so it is no evidence of evolution by
-            itself.{" "}
-            {full ? (
-              <>
-                From {grouped(film.world.founders)} founders the confluent world reaches its ceiling of{" "}
-                {grouped(controls.ceiling)}; without inheritance,{" "}
-                {grouped(stills.find((still) => still.id === "fresh-offspring")?.live ?? 0)} are alive at the same tick.{" "}
-              </>
-            ) : null}
-            The seeded experiments with declared rules are{" "}
-            <a className="text-green-300 underline-offset-4 hover:underline" href={siteConfig.fl048}>
-              FL-048
-            </a>
-            .
-          </p>
-        </div>
+      <div className="mt-6 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-white/5 pt-5">
+        <BasisBadge basis="record" />
+        <p className="text-base leading-relaxed text-white">
+          The domains come from emission, chosen by the networks, and inheritance is necessary.
+        </p>
+        <p className="text-xs text-slate-500">
+          One seed per world, drawn, not a statistical test; the seeded tests are{" "}
+          <a className="text-green-300 underline-offset-4 hover:underline" href={siteConfig.fl048}>
+            FL-048
+          </a>
+          .
+        </p>
       </div>
     </DemoFrame>
   );
@@ -425,24 +394,28 @@ function Panel({
               <span className="text-slate-500"> · the record, by eye</span>
             </span>
           </p>
-          <dl className="mt-auto grid grid-cols-2 gap-2 pt-4">
-            <div className="min-w-0 rounded-xl border border-white/10 bg-black/30 px-3 py-2.5">
-              <dt className="text-[9px] font-black tracking-[0.2em] text-slate-500 uppercase">Alive</dt>
-              <dd className="mt-1 font-mono text-base text-white tabular-nums sm:text-lg">{grouped(still.live)}</dd>
-              <dd className="mt-0.5 text-[11px] leading-snug text-slate-500">
-                {still.live === controls.ceiling
-                  ? "the ceiling"
-                  : `${share < 1 ? "fewer than" : `${fixed(share, 1)}×`} the ${grouped(founders)} founders`}
-              </dd>
+          {/* Alive against the ceiling, on one bar: the full world fills it, the controls do not. */}
+          <div className="mt-auto pt-4">
+            <div className="flex items-baseline justify-between gap-3">
+              <span className="text-[9px] font-black tracking-[0.2em] text-slate-500 uppercase">Alive</span>
+              <span className="font-mono text-base text-white tabular-nums sm:text-lg">{grouped(still.live)}</span>
             </div>
-            <div className="min-w-0 rounded-xl border border-white/10 bg-black/30 px-3 py-2.5">
-              <dt className="text-[9px] font-black tracking-[0.2em] text-slate-500 uppercase">Distance</dt>
-              <dd className="mt-1 font-mono text-base tabular-nums sm:text-lg" style={{ color: removed ? TONE.wrong : TONE.rule }}>
-                {still.record.distance.toFixed(2)}
-              </dd>
-              <dd className="mt-0.5 text-[11px] leading-snug text-slate-500">to the references; lower is nearer</dd>
+            <div
+              className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-white/[0.06]"
+              role="img"
+              aria-label={`${grouped(still.live)} of a ceiling of ${grouped(controls.ceiling)}`}
+            >
+              <div
+                className="h-full rounded-full"
+                style={{ width: `${Math.max(0.5, (still.live / controls.ceiling) * 100)}%`, backgroundColor: removed ? TONE.wrong : TONE.rule }}
+              />
             </div>
-          </dl>
+            <p className="mt-1 text-[11px] leading-snug text-slate-500">
+              {still.live === controls.ceiling
+                ? "the ceiling"
+                : `${share < 1 ? "fewer than" : `${fixed(share, 1)}×`} the ${grouped(founders)} founders`}
+            </p>
+          </div>
         </div>
       </article>
     </li>

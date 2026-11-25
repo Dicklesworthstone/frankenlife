@@ -473,10 +473,8 @@ export function BrainAnatomy() {
             </>
           ) : (
             <p className="text-sm leading-relaxed text-slate-300">
-              Every input reaches every neuron of the first hidden layer, and every layer the next: a dense network
-              with tanh hidden layers and a linear output. Point at a group, or tab to one, to see what it carries.
-              The colours pair what it reads with what it writes: the chemistry it senses and the chemistry it emits
-              are both cyan, and the energy it senses and the energy it spends are both gold.
+              Dense, tanh hidden layers, linear output. Point at a group to see what it carries; cyan is chemistry and
+              gold is energy, sensed and spent.
             </p>
           )}
         </div>
@@ -489,20 +487,15 @@ export function BrainAnatomy() {
               <span className="text-base text-green-300 tabular-nums">{grouped(parameters)}</span>
             </p>
             <p className="mt-2 text-xs leading-relaxed text-slate-400">
-              {shape(topology)}: {grouped(parameters * 4)} bytes of F32 weights and biases that belong to this organism
-              alone. Offspring move between the five networks by declared maps; a widened copy computes exactly what
-              its parent did (before the child&apos;s own mutations), while a change of depth claims no such thing (plan §6.4, fixture C.16).
+              {shape(topology)}: {grouped(parameters * 4)} bytes of F32 weights and biases, this organism&apos;s alone.
             </p>
           </div>
           <div className="rounded-2xl border border-amber-300/20 bg-amber-300/[0.04] p-4">
             <p className="text-[10px] font-black tracking-[0.2em] text-amber-200/80 uppercase">No motor output</p>
             <p className="mt-2 text-xs leading-relaxed text-slate-300">
-              In baseline FieldEcologyV1 nothing here steers: an organism moves by inherited responses to the same
-              energy and chemical gradients, scaled by how much it was just granted to eat (plan §5.4). The network
-              decides when to split, what to give the child, and what to write into the field. Optional neural steering
-              (<code className="text-amber-100">so2-motor</code>) and oriented budding (
-              <code className="text-amber-100">so2-budding</code>) live in modular{" "}
-              <code className="text-amber-100">field-ecology-v2</code> (§04.6).
+              In v1 an organism moves by inherited responses to gradients; the network decides splitting, the
+              child&apos;s share and emission. Neural steering is a v2 switch (
+              <code className="text-amber-100">so2-motor</code>).
             </p>
           </div>
         </div>

@@ -21,11 +21,10 @@ import {
   INPUT_GROUPS,
   OUTPUT_GROUPS,
   parameterCount,
-  parameterSum,
   seeded,
   widths,
 } from "@/components/explain/brain-math";
-import { type Basis, BasisBadge } from "@/components/explain/demo";
+import { type Basis, BasisBadge, SourceNote } from "@/components/explain/demo";
 import {
   BODY,
   cardPixelToWorld,
@@ -108,10 +107,8 @@ const STOPS: Stop[] = [
     title: `[${grouped(LIVE_POSTER)}] organisms, one world.`,
     body: (
       <>
-        The confluent film&apos;s first frame: the whole {TORUS} × {TORUS}-unit torus at tick {grouped(POSTER.tick)}, after{" "}
-        {fmt(seconds(POSTER.tick), 0)} simulated seconds of evolution. Every speck is one organism, with a body, a
-        metabolism and its own neural network. <code className="text-lime-200">flife render</code> drew it from the
-        committed world.
+        The whole torus after {fmt(seconds(POSTER.tick), 0)} simulated seconds of evolution. Every speck is one organism
+        with its own neural network.
       </>
     ),
     figures: [
@@ -128,11 +125,8 @@ const STOPS: Stop[] = [
     title: "Lineages become [tissue].",
     body: (
       <>
-        A {fmt(CARD_VIEW)} × {fmt(CARD_VIEW)}-unit patch of the confluent film&apos;s closest shot, at the same place on the
-        torus {grouped(CARD.tick - POSTER.tick)} ticks ({fmt(seconds(CARD.tick - POSTER.tick), 0)} simulated seconds)
-        later. Each founder&apos;s lineage wears one of {LINEAGE.length} colours, lighter where an organism holds more energy. The labyrinths,
-        rims and foam come from what the networks choose to emit: in the record&apos;s control without emission, this
-        world grows a uniform haze instead.
+        One colour per founder&apos;s lineage, lighter where an organism holds more energy. The labyrinths and foam come
+        from what the networks emit; without emission this world is a uniform haze.
       </>
     ),
     figures: [
@@ -153,10 +147,8 @@ const STOPS: Stop[] = [
     title: "One body, one [field cell] wide.",
     body: (
       <>
-        Each sphere is one organism, drawn at its body&apos;s size: {BODY} units across, the width of one cell of the{" "}
-        {FIELD_CELLS} × {FIELD_CELLS} field it feeds from and writes into. Overlapping bodies push apart, and near
-        neighbours pull together more strongly the more alike their chemistry is. Food and signals pass only through
-        the field.
+        One sphere, one field cell wide. Bodies push apart and pull alike chemistry together; food and signals pass
+        only through the field.
       </>
     ),
     figures: [
@@ -177,11 +169,8 @@ const STOPS: Stop[] = [
     title: "Its own network, [every tick].",
     body: (
       <>
-        The founders&apos; controller: {SHAPE[0]} numbers in, from the field around it and from itself; hidden layers of{" "}
-        {SHAPE[1]} and {SHAPE[2]} tanh units; {SHAPE[3]} numbers out: when to try to split, the child&apos;s share,
-        whether to emit, which chemistry and how much. A birth moves a child to another of the catalog&apos;s five
-        shapes with probability 0.01 in this world, so this one&apos;s may differ. In any shape, the weights are the
-        organism&apos;s own.
+        What it senses goes in; when to split, what to emit and where to steer come out. A child may inherit a
+        different shape, but the weights are always its own.
       </>
     ),
     figures: [
@@ -200,10 +189,7 @@ const STOPS: Stop[] = [
     title: `[${grouped(PARAMETERS)}] numbers of its own.`,
     body: (
       <>
-        In the founders&apos; shape, {parameterSum(SHAPE).replace(/ \+ /g, " + ")} = {grouped(PARAMETERS)} parameters. No other
-        organism shares them, and nothing trains them: there is no gradient. A child inherits a copy in which each weight changes with
-        probability {WEIGHT_PROBABILITY}, so about {CHANGED} of the {grouped(PARAMETERS)} differ, and the world keeps
-        whichever copies survive.
+        No gradient trains them. A child inherits a mutated copy, and the world keeps whichever copies survive.
       </>
     ),
     figures: [
@@ -1020,7 +1006,7 @@ export function ZoomLadder({ index }: { index?: string }) {
         ))}
       </ol>
 
-      <figcaption className="mt-8 border-t border-white/5 pt-4 font-mono text-[11px] leading-relaxed [overflow-wrap:anywhere] text-slate-500">
+      <SourceNote className="mt-8">
         Steps 1–3 are flife&apos;s pixels, from the confluent film&apos;s manifest (lib/films/confluent.json): the poster (frame {film.poster.frame}, tick{" "}
         {grouped(POSTER.tick)}, camera zoom 1, the whole torus) and the social card (frame {film.social.frame}, tick{" "}
         {grouped(CARD.tick)}, camera zoom {fmt(CARD.zoom, 2)} centred at ({fmt(CARD.center[0], 3)},{" "}
@@ -1030,7 +1016,7 @@ export function ZoomLadder({ index }: { index?: string }) {
         around it. Counts in view are the frame&apos;s live count spread evenly over the torus, an average, not a count.
         Steps 4–5 draw presets/{film.world.name}.toml&apos;s [controller], [mutation] and [architecture_mutation] and the
         sensor and action ABIs; their weights are illustrative, from a fixed seed, and are no organism&apos;s genome.
-      </figcaption>
+      </SourceNote>
     </figure>
   );
 }

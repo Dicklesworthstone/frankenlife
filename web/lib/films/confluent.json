@@ -2,9 +2,9 @@
   "schema": "frankenlife.website-media.v1",
   "id": "confluent",
   "video": {
-    "src": "/media/film-seg00-2a5343805b5b.mp4",
-    "sha256": "2a5343805b5b3683dda6734e737ccfc7af1d066de0c437d031c0e25b99cf3995",
-    "bytes": 23343921,
+    "src": "/media/confluent-aac82c06e8be.mp4",
+    "sha256": "aac82c06e8be0c78134832122ca83d52d0c0ca9a1794ef3ef5650d6dba83bfb4",
+    "bytes": 117045434,
     "width": 2160,
     "height": 2160,
     "fps": 60,
@@ -31,95 +31,16 @@
       "-movflags",
       "+faststart",
       "-an"
-    ],
-    "segments": [
-      {
-        "src": "/media/film-seg00-2a5343805b5b.mp4",
-        "sha256": "2a5343805b5b3683dda6734e737ccfc7af1d066de0c437d031c0e25b99cf3995",
-        "bytes": 23343921,
-        "start_frame": 0,
-        "frames": 120,
-        "start_tick": 2400,
-        "end_tick": 2876
-      },
-      {
-        "src": "/media/film-seg01-d1de71629d1c.mp4",
-        "sha256": "d1de71629d1c6f6aecba66d07919be07e4a82c89ab671af8f7ce94ef2a9b1168",
-        "bytes": 23761840,
-        "start_frame": 120,
-        "frames": 184,
-        "start_tick": 2880,
-        "end_tick": 3612
-      },
-      {
-        "src": "/media/film-seg02-c190e2507e68.mp4",
-        "sha256": "c190e2507e68e9c6514d0f04f2a53c72b0ab397038a21d2963f204cab79e2123",
-        "bytes": 20779192,
-        "start_frame": 304,
-        "frames": 184,
-        "start_tick": 3616,
-        "end_tick": 4348
-      },
-      {
-        "src": "/media/film-seg03-6d2a7db1adab.mp4",
-        "sha256": "6d2a7db1adabdef6121b4111b6fec2fd2bdad9e13c886521543f1e5d26f64536",
-        "bytes": 17152724,
-        "start_frame": 488,
-        "frames": 128,
-        "start_tick": 4352,
-        "end_tick": 4860
-      },
-      {
-        "src": "/media/film-seg04-e65db4cbe66a.mp4",
-        "sha256": "e65db4cbe66ab2b7c3493216303c7a550f0d75448e71f07888b481e069753710",
-        "bytes": 11495667,
-        "start_frame": 616,
-        "frames": 56,
-        "start_tick": 4864,
-        "end_tick": 5084
-      },
-      {
-        "src": "/media/film-seg05-4baf60d2d372.mp4",
-        "sha256": "4baf60d2d3726861abbd6e5d4fcedfb9caf95e678a28edd0776fa9cbdfeb287b",
-        "bytes": 20472734,
-        "start_frame": 672,
-        "frames": 129,
-        "start_tick": 5088,
-        "end_tick": 5600
-      }
-    ],
-    "master": {
-      "path": "/Volumes/SANDISK_SSD/build/flife-4k60-master/confluent-4k60-3eca801.mp4",
-      "sha256": "64f647619f8ee61f499c73b742b26fbb491c4cd7bca87b2b8b00b74977c778c7",
-      "bytes": 575308538,
-      "crf": 16,
-      "encode": [
-        "-vf",
-        "scale=out_color_matrix=bt709:out_range=tv:out_chroma_loc=left,format=yuv420p,setparams=range=tv:color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "slow",
-        "-crf",
-        "16",
-        "-pix_fmt",
-        "yuv420p",
-        "-chroma_sample_location",
-        "left",
-        "-movflags",
-        "+faststart",
-        "-an"
-      ]
-    }
+    ]
   },
   "poster": {
-    "src": "/media/poster-22ee4c761576.jpg",
+    "src": "/media/confluent-poster-22ee4c761576.jpg",
     "sha256": "22ee4c761576f91ee81465ced1cc068f3c24e7282c11357b03a3b029a9c955dc",
     "bytes": 3260590,
     "frame": 0
   },
   "social": {
-    "src": "/media/social-8f0b33d8b0b2.jpg",
+    "src": "/media/confluent-social-8f0b33d8b0b2.jpg",
     "sha256": "8f0b33d8b0b2b68c17ccdbe0a9dc10ff61d026e67cd6f325aa12d8f11b0edbf4",
     "bytes": 435173,
     "width": 1200,
@@ -1764,7 +1685,7 @@
   "render": {
     "command": "flife render --run-dir RUN --ticks 3200 --every 4 --width 2160 --height 2160 --no-field --look sphere --color lineage-energy --camera CAMERA --out FRAMES",
     "camera": {
-      "rule": "activity |blur(L[t+1] \u2212 L[t\u22121])| of a whole-world raw preview, blurred to each shot's view; each shot looks where that activity was greatest over the shot, discounting regions already shown",
+      "rule": "activity |blur(L[t+1] − L[t−1])| of a whole-world raw preview, blurred to each shot's view; each shot looks where that activity was greatest over the shot, discounting regions already shown",
       "options": {
         "opening": 64,
         "transition": 56,

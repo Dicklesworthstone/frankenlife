@@ -10,7 +10,7 @@ import { cn } from "@/lib/utils";
 
 /**
  * The page's films behind one set of tabs: one player at a time, so only the
- * chosen film's segments load. A film is the player's for its lifetime
+ * chosen film loads. A film is the player's for its lifetime
  * (`key`), so switching starts the new film at its first frame.
  */
 export function FilmReel({

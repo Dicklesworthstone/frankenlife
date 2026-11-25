@@ -743,10 +743,9 @@ stack notices, live `capabilities.json` and `features.json`, and SHA-256 `MANIFE
 sanitized `env -i` fresh-install environment, including explicit missing-encoder and typed-error refusals.
 
 For the website's 60 fps 4K video pipeline (`web/`), `bun run media:4k60` renders square (`2160 × 2160`) or
-widescreen (`3840 × 2160`) 60 fps films, splits automatically at camera shot boundaries into `<= 22 MiB` closed-GOP
-segments so Cloudflare Workers' 25 MiB per-asset limit never starves bitrate, plays them seamlessly through a
-preloaded dual-`<video>` player with a unified scrubber and tick readout, and optionally writes one unconstrained
-archival 4K60 master outside `public/media/` (`web/README.md`).
+widescreen (`3840 × 2160`) 60 fps films, 1,601 frames opening on the whole torus for 35% of their length, each
+one MP4 served from Cloudflare R2 with byte ranges, and optionally writes one archival master outside
+`public/media/` (`web/README.md`).
 
 Machine output is versioned JSON or NDJSON with stable identifiers and typed errors. Missing accelerator capability,
 budget exhaustion, schema mismatch, incompatible checkpoints, numerical invalidity and cancellation are distinct
@@ -807,7 +806,7 @@ scripts/                                              local macOS Studio launche
 crates/flife-genome/                                  FL-009 topology catalog, immutable genomes, genome quotas, width/depth transition maps; FL-010 founders and mutation; FL-026 arena slots
 crates/flife-neural/                                  FL-007 104-input sensor encoding and 36-output action decoding; FL-008 reference controller; FL-030 controller backend port
 crates/flife-probes/                                  FL-001 capability probes and the flife-probe binary
-web/                                                  the project's website (Next.js, Cloudflare), showing a film flife render drew, with 4K60 multi-segment <=25 MiB splitting & dual-<video> playback (web/README.md)
+web/                                                  the project's website (Next.js, Cloudflare), showing films flife render drew, each one 4K60 MP4 served from Cloudflare R2 (web/README.md)
 .beads/                                               the work graph: 61 beads (FL-001 … FL-058 plus 3 follow-on items; JSONL is truth)
 ```
 

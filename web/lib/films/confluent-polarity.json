@@ -2,9 +2,9 @@
   "schema": "frankenlife.website-media.v1",
   "id": "confluent-polarity",
   "video": {
-    "src": "/media/confluent-polarity-seg00-e985a656d495.mp4",
-    "sha256": "e985a656d4956b476f19a000d540da93cf28eebfe0d7b896bfcd75e633f983d4",
-    "bytes": 22553718,
+    "src": "/media/confluent-polarity-1d8590415c6b.mp4",
+    "sha256": "1d8590415c6b6134627855aefb7d8195e9e561adad5e53be0fa09017ba4109e8",
+    "bytes": 109402128,
     "width": 2160,
     "height": 2160,
     "fps": 60,
@@ -31,86 +31,7 @@
       "-movflags",
       "+faststart",
       "-an"
-    ],
-    "segments": [
-      {
-        "src": "/media/confluent-polarity-seg00-e985a656d495.mp4",
-        "sha256": "e985a656d4956b476f19a000d540da93cf28eebfe0d7b896bfcd75e633f983d4",
-        "bytes": 22553718,
-        "start_frame": 0,
-        "frames": 120,
-        "start_tick": 2400,
-        "end_tick": 2876
-      },
-      {
-        "src": "/media/confluent-polarity-seg01-10e71e9ee2a5.mp4",
-        "sha256": "10e71e9ee2a5e790c472c53f689b9e65889979f939f7bd9ee9fd782ddfaff8a5",
-        "bytes": 22639968,
-        "start_frame": 120,
-        "frames": 184,
-        "start_tick": 2880,
-        "end_tick": 3612
-      },
-      {
-        "src": "/media/confluent-polarity-seg02-5c79cfb9ddb7.mp4",
-        "sha256": "5c79cfb9ddb738ea83c24f3c36360fee372a781a09d36c5000690c4d05e5e722",
-        "bytes": 19984067,
-        "start_frame": 304,
-        "frames": 184,
-        "start_tick": 3616,
-        "end_tick": 4348
-      },
-      {
-        "src": "/media/confluent-polarity-seg03-d56e640fa28e.mp4",
-        "sha256": "d56e640fa28eb36a4b262b5a5167c8981ce96e582a50583bb762ec2f4ac1a051",
-        "bytes": 16606464,
-        "start_frame": 488,
-        "frames": 128,
-        "start_tick": 4352,
-        "end_tick": 4860
-      },
-      {
-        "src": "/media/confluent-polarity-seg04-9c981399ae8a.mp4",
-        "sha256": "9c981399ae8a8d393328e40a055b5686d7571e03a95e11ca9b60d6b35d26ac09",
-        "bytes": 8522065,
-        "start_frame": 616,
-        "frames": 56,
-        "start_tick": 4864,
-        "end_tick": 5084
-      },
-      {
-        "src": "/media/confluent-polarity-seg05-6d7757613601.mp4",
-        "sha256": "6d77576136011e2c51a5dbd2fa69ddbd95c0e37e96aa553f9f3e53fc07b6bacf",
-        "bytes": 19071514,
-        "start_frame": 672,
-        "frames": 129,
-        "start_tick": 5088,
-        "end_tick": 5600
-      }
-    ],
-    "master": {
-      "path": "/Volumes/SANDISK_SSD/build/flife-4k60-master/confluent-polarity-4k60-21904e6.mp4",
-      "sha256": "0ca5dd0bf35836f3ac6d86952b8b1c98132d64f07cc9d09b5fbae418ec466c9f",
-      "bytes": 562267452,
-      "crf": 16,
-      "encode": [
-        "-vf",
-        "scale=out_color_matrix=bt709:out_range=tv:out_chroma_loc=left,format=yuv420p,setparams=range=tv:color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "slow",
-        "-crf",
-        "16",
-        "-pix_fmt",
-        "yuv420p",
-        "-chroma_sample_location",
-        "left",
-        "-movflags",
-        "+faststart",
-        "-an"
-      ]
-    }
+    ]
   },
   "poster": {
     "src": "/media/confluent-polarity-poster-9fdaaeff0824.jpg",

@@ -738,10 +738,8 @@ export function Miniature() {
       }
     >
       <p className="max-w-3xl text-sm leading-relaxed text-slate-300 sm:text-base">
-        Every dot is an organism: a body with an energy store and its own network of {PARAMETERS} weights, which no
-        other organism shares. Each tick it senses the field around it, decides where to move, how much to eat and
-        whether to divide, and pays for all of it. Food enters only at four drifting sources, and wherever you brush.
-        A child inherits a mutated copy of its parent&apos;s weights; nothing is trained.
+        Every dot has its own {PARAMETERS}-weight network. Food enters at four drifting sources and wherever you brush; a
+        child inherits a mutated copy of its parent&apos;s weights.
       </p>
 
       <div
@@ -893,11 +891,9 @@ export function Miniature() {
               </div>
             </div>
             <p className="text-xs leading-relaxed text-slate-500">
-              <span className="text-slate-300">One shared</span> runs the first founder&apos;s network in every body, the
-              shortcut FrankenLife forbids. <span className="text-slate-300">Fresh weights</span> is one of its
-              controls: a child draws new weights instead of inheriting. A switch restarts the world from tick 0 with
-              the same seed, so you compare one changed rule; what the toy then does is not evidence about
-              FrankenLife.
+              <span className="text-slate-300">One shared</span>: every body runs one network, the forbidden shortcut.{" "}
+              <span className="text-slate-300">Fresh weights</span>: children don&apos;t inherit. Each restarts from the
+              same seed.
             </p>
           </div>
 

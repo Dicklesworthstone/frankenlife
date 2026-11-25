@@ -29,23 +29,33 @@ export const siteConfig = {
   agents: "https://github.com/Dicklesworthstone/frankenlife/blob/main/AGENTS.md",
 };
 
-// How the film's world and its camera were chosen (experiments/showcase/README.md,
-// web/scripts/director.ts). AGENTS.md: a selection procedure is stated, never implied.
-export const filmChoice = {
-  world: [
-    "The confluent film's world runs field-ecology-v1-contact, a registered variant of the baseline model with one added rule: every organism is a body, here 0.25 world units across, and after each tick overlapping bodies push apart while bodies within 1.5 diameters pull together by the square of how alike their inherited chemistry is. The rule moves organisms, never energy. It was added because the organisms in the reference screenshots look like packed spheres, which points cannot. Measured, the bodies stack two or three deep instead of packing, because the pull, summed over every neighbour, outweighs the push.",
-    "Its numbers were chosen by searches outside the simulation, in several stages, against 14 statistics of the reference screenshots that inspired the project. The last stage kept the rules and set the scale. The field is four times finer than in the stage before, so a field cell holds about 2.6 organisms rather than about ten, nearer the references' one. Food is plentiful, so the population sits at its ceiling of 262,144, as the references' counters show theirs do at a million. Children land up to 2.5 world units from their parent, so colonies fill the 80-unit torus instead of leaving most of it black. It scores 0.74 on the statistics' scale, against 1.93 for the same rules at the coarser scale and 1.03 for the same ecology without bodies, scored the same way; the nearest any world of the last stage came was 0.73. Every trial was scored coloured by chemical affinity; this world was chosen by eye, coloured by lineage. The film colours each organism by its lineage and lights it by its own energy: black with none, white with nearly twice what it needs to divide, so pale patches are well fed and dark ones starving. Coloured that way, the scored frame comes to 0.72, against 0.90 coloured by lineage alone. The confluent film shows the chosen world itself, from the tick where it was scored.",
-    "Nothing the search measured feeds back into a run. The organisms have no aesthetic fitness: they feed, emit, split and die by energy alone. The seed is the Desktop preset's 42, not a pick. On three seeds the search never saw, the world scores 0.81 to 1.57, against 1.92 to 2.68 for the coarser world on the same seeds.",
-    "Emission, chosen by the neural networks, makes the structure, and contact shapes it at the scale of bodies. Organisms return about half of what they eat to the field, in a chemical composition their networks choose and kin choose alike, so each lineage paints its surroundings with its own chemistry. Adhesion then sorts lineages by that chemistry, as real tissues sort by adhesion, into domains of labyrinths, foam and packed spheres. With every controller's decisions zeroed, nothing is emitted and the bodies settle into a uniform mottled haze, with no domains, labyrinths or foam. With every newborn's genome drawn fresh instead of inherited, the population falls from its ceiling to about 1,200.",
+// What the films show, in four tiles (the manifests in lib/films/, experiments/showcase/README.md,
+// experiments/website-films/README.md, web/scripts/director.ts). lib/film-configs.test.ts checks the
+// ceiling against every film's frames. How the worlds were chosen is in those READMEs (siteConfig links).
+export const filmFacts = {
+  ceiling: 262_144,
+  tiles: [
+    {
+      value: "262,144",
+      label: "alive in every frame",
+      body: "The world's population ceiling. Each organism is a body 0.25 units across on an 80-unit torus.",
+    },
+    {
+      value: "Hue · light",
+      label: "lineage · its own energy",
+      body: "A founder's descendants share a hue. Each is lit by its own energy: black with none, white when well fed.",
+    },
+    {
+      value: "1 switch",
+      label: "between the films",
+      body: "The v2 films regrow the confluent world from tick 0 with one mechanism on, veins or polarity. With it off they match bit for bit.",
+    },
+    {
+      value: "From the run",
+      label: "where the camera looks",
+      body: "A small preview finds where organisms changed most, and each shot eases there. Only the zooms are set by hand.",
+    },
   ],
-  // The two v2 films (experiments/website-films/README.md, round 3, and the configs beside it).
-  v2: [
-    "The two v2 films are the confluent world grown again from tick 0 as field-ecology-v2, each with one mechanism switched on at the engine's default parameters: the same founders, seed 42, food and population ceiling, drawn the same way over the same ticks, 2,400 to 5,600. With every mechanism off, field-ecology-v2 reaches the confluent film's world bit for bit, the same digest at tick 2,400, so what differs in each film comes from its one mechanism, on this one seed.",
-    "Four mechanisms were tried this way: veins (vascular-field), polarity (pcp-polarity), blooming food (oases) and tag sticking (cadherin-4d), and one pair, veins with blooming food. Each was previewed as 33 consecutive frames beside the confluent film's, and the two filmed were chosen by eye, as the ones that keep its legible shapes in motion: veins sharpen its labyrinths, and polarity stretches them into bands and tubes. Blooming food gathered the world into big rounded colonies between black voids that changed faster, with or without veins, and tag sticking merged lineages into smooth single-colour sheets. Each film was rendered whole at 1,080 px and looked at shot by shot before its 4K render.",
-    "Like the confluent film's, both worlds sit at their population ceiling of 262,144 in every frame, where births are refused: a capacity limit, not an ecological result. The films show how one mechanism changes the look of one world; what each mechanism does, measured, is the Stage-2 campaign's, in the Version 2 chapter.",
-  ],
-  camera:
-    "Where the camera looks comes from the run; only each shot's zoom is given by hand, the same in all three films. The same ticks are first rendered small, each shot then eases into the region where the organisms changed most during it, and each film opens and closes on the whole torus. The camera changes no result: each film ends on its preview's digest.",
 };
 
 /**
@@ -107,7 +117,7 @@ export const chapters: Chapter[] = [
     label: "The world",
     title: "Every speck is an [individual].",
     thesis:
-      `The confluent world shows ${filmAlive} organisms at once, and each is an individual: a body, an energy budget, offspring and its own neural network. Zoom in until you reach one, watch what it does in a tick, then run a small world of your own.`,
+      `${filmAlive} organisms at once, each with a body, an energy budget and its own neural network. Zoom in to one.`,
     colour: 0,
     sections: [
       { id: "zoom", label: "From the world to one brain" },
@@ -122,7 +132,7 @@ export const chapters: Chapter[] = [
     label: "Why it is different",
     title: "The structure is [earned].",
     thesis:
-      "Artificial-life imagery is easy to fake: one network copied into every body, energy from nowhere, a quiet cull, a renderer doing the work. FrankenLife forbids each shortcut, and its controls show the structure disappearing when a cause is taken away.",
+      "Artificial-life imagery is easy to fake. FrankenLife forbids the shortcuts, and its controls show the structure vanish when a cause is removed.",
     colour: 5,
     sections: [
       { id: "different", label: "Four forbidden shortcuts" },
@@ -153,7 +163,7 @@ export const chapters: Chapter[] = [
     label: "Version 2",
     title: "Tissue and [supercolonies].",
     thesis:
-      "Version 2 adds 21 mechanisms, each a switch fixed when a world is founded. Two presets combine them, into a tissue whose cells touch and a supercolony held together only by the field, and 104 Stage-2 runs measured what changes when one is taken away.",
+      "21 mechanisms, each a switch. Two presets combine them into a tissue and a supercolony; 104 runs measured each one's removal.",
     colour: 1,
     sections: [
       { id: "bundles", label: "Two worlds" },
@@ -172,12 +182,11 @@ export const chapters: Chapter[] = [
     label: "What it can show",
     title: "Claims, [kept apart].",
     thesis:
-      "Replays that land on the same digest, experiments whose rules were written before they ran, a scale argued in arithmetic, and a status that names what is not done.",
+      "Replays that land on the same digest, experiments declared before they ran, the scale in arithmetic, and what is not done.",
     colour: 4,
     sections: [
       { id: "replay", label: "Rewind and branch" },
       { id: "science", label: "What the experiments found" },
-      { id: "claims", label: "Four claims" },
       { id: "scale", label: "Why the scale is hard" },
       { id: "status", label: "Honest status" },
     ],
@@ -189,7 +198,7 @@ export const chapters: Chapter[] = [
     label: "Use it",
     title: "Your [laboratory].",
     thesis:
-      "Ten worlds to open (eight v1 profiles and showcase worlds, and two authored v2 presets), a native Studio to watch and touch them, and a command line that records everything it does.",
+      "Ten worlds to open, a native Studio to watch and touch them, and a command line that records everything.",
     colour: 7,
     sections: [
       { id: "worlds", label: "Ten worlds" },
@@ -328,15 +337,6 @@ export const composes = [
   { title: "Field-only interaction under an energy ledger", body: "Organisms touch each other only by eating and writing the shared field, and the books balance every tick." },
   { title: "A deterministic tick that survives cancellation and crashes", body: "Checkpoint, kill, resume and branch: the same commands reach the same world, bit for bit." },
   { title: "Live, inspectable, recordable animation of that same state", body: "FrankenManim draws committed epochs. Watching, zooming or recording never changes the world." },
-];
-
-// README "What FrankenLife is not".
-export const notThis = [
-  "Not a port of Neural-Kimchi-4B, and no claim of numerical parity with it.",
-  "Not a decorative particle animation: no shapes are painted in.",
-  "Not a shared-policy, distilled or low-rank shortcut presented as independent networks.",
-  "Not trained by gradient, and not scored by any aesthetic fitness function inside the world.",
-  "Not a claim about life: “species”, “colony” and “cooperation” are analysis labels with operational criteria.",
 ];
 
 // What this page observed when it checked its own branch commands: the reference preset kept for 512 ticks,
@@ -629,51 +629,6 @@ export const v2Features: V2FeatureEntry[] = [
   },
 ];
 
-// The field-ecology-v2 ledger, claim by claim (AGENTS.md: the Four Claims are
-// never conflated). Source: experiments/v2-emergence/README.md (V2-17).
-export const v2BuildStatus: {
-  stage: string;
-  claim: string;
-  tone: GateState;
-  detail: string;
-}[] = [
-  {
-    stage: "Rules",
-    claim: "Observed",
-    tone: "built",
-    detail:
-      "All 104 Stage-2 runs (13 conditions × 4 seeds × 2 presets, 2,048 ticks on a 320² field) reached their horizon: none extinct, paused, failed or refusing a birth at the ceiling. The largest energy-ledger residual was 7.2 × 10⁻⁹ against a tolerance of 10⁻⁵. The supercolony preset ran with no forces between organisms (INV-08).",
-  },
-  {
-    stage: "Implementation",
-    claim: "Observed",
-    tone: "built",
-    detail:
-      "End-to-end tests run both presets, all 21 features at once (112 inputs, 44 decisions, 48 raw outputs, 34 field planes) and every feature left out in turn, and check reference, CPU and Metal controllers bit for bit, checkpoints, branches and transplants. With every feature off, a v2 run is its v1 model (field-ecology-v1, or field-ecology-v1-contact for the tissue) bit for bit.",
-  },
-  {
-    stage: "Visual",
-    claim: "Observed, not the G5 gate",
-    tone: "partial",
-    detail:
-      "The campaign's report records a visual review of raw and aesthetic renders of both presets on a discovery and a held-out seed. The plan's G5 gate, a human review against the reference screenshots, has not run; it was decided instead by an agent's review of Studio frames on the owner's delegation (README).",
-  },
-  {
-    stage: "Ecological",
-    claim: "Observed, 4 seeds",
-    tone: "built",
-    detail:
-      "Inheritance matters on every seed: without it 36 are alive against the tissue's 15,446, and 317 against the supercolony's 21,308. Each tissue cell has about half as many close neighbours as with v2 off; the supercolony's veins raise alignment by half. Each figure is a mean over 2 discovery and 2 held-out seeds at 2,048 ticks.",
-  },
-  {
-    stage: "Not yet shown",
-    claim: "Open",
-    tone: "open",
-    detail:
-      "Distinct core and sheath cell types (the memory state barely tracks crowding at 2,048 ticks), a gain in population from food sharing or from trails, and the lesion assay on the new tissue. No run of the committed v2 presets past 2,048 ticks has been scored.",
-  },
-];
-
 /** The two v2 presets, side by side (presets/*.toml; `flife validate`; experiments/v2-emergence/README.md). */
 export const v2Bundles = [
   {
@@ -788,30 +743,6 @@ export const v2Residuals = [
   },
 ];
 
-export const claims = [
-  {
-    claim: "Rules",
-    meaning: "The simulation obeys its own rules",
-    evidence:
-      "Invariants INV-01–INV-15 and the energy ledger; the field, ledger and population checks run on every tick before it is published",
-  },
-  {
-    claim: "Implementation",
-    meaning: "The code reproduces those rules",
-    evidence: "Hand-computed fixtures, a separate scalar oracle, and CPU/Metal parity bit for bit",
-  },
-  {
-    claim: "Visual",
-    meaning: "The images have the intended character",
-    evidence: "Human review against the references, raw diagnostic views beside the aesthetic ones (G5)",
-  },
-  {
-    claim: "Ecological",
-    meaning: "Populations show measurable evolutionary phenomena",
-    evidence: "Ablations, seed ensembles and held-out seeds, failed and extinct runs kept (G9)",
-  },
-];
-
 export type GateState = "built" | "partial" | "open";
 
 export const gates: { id: string; name: string; state: GateState; detail: string }[] = [
@@ -849,14 +780,13 @@ export const gates: { id: string; name: string; state: GateState; detail: string
     id: "G5",
     name: "Visual review",
     state: "partial",
-    detail: "Decided on the owner's delegation by Claude's review (2026-11-25) of Studio frames, the small profile and the 262,144-organism confluent world from the whole torus to 32×, against the plan's account of the references: a pass with one limit (density bins do not refine with zoom). The human review against the screenshots that the gate names has not run.",
+    detail: "Passed by Claude's review on the owner's delegation, from the whole torus to 32×, with one limit: density bins do not refine with zoom.",
   },
   {
     id: "G6",
     name: "30 fps with p95 input latency ≤ 100 ms",
     state: "partial",
-    detail:
-      "Small profile verified in a live 2× Retina AppKit window (M5 Ultra): 30.00 fps at 1080p CPU-16 (p95 bound 44.9 ms), 1080p live Metal-8 (p95 bound 42.8 ms, 1.69M GPU evals), and 4K Retina (p95 bound 49.3 ms, 0 B readback). 25k/100k live profiles remain under FL-034.",
+    detail: "The small profile: 30 fps at 1080p and 4K, p95 under 50 ms, on an M5 Ultra. The 25k and 100k profiles are not yet verified.",
   },
   {
     id: "G7",
@@ -994,7 +924,7 @@ export const presets: {
     dt: "1/128",
     kind: "profile",
     chosen: "Reference profile · FL-015",
-    body: "Appendix A at the Reference scale, plus a declared viability tuning. Unfed founders starve and fed lineages breed; the smoke test pins its digest after 1,024 ticks.",
+    body: "Unfed founders starve and fed lineages breed. Its digest is pinned at tick 1,024.",
   },
   {
     file: "interactive-world",
@@ -1018,7 +948,7 @@ export const presets: {
     dt: "1/128",
     kind: "profile",
     chosen: "Desktop profile · FL-034 E2",
-    body: "F16 weights. All 8 of E2's runs settled at 91,664 to 99,361 alive. It runs at about 10 ticks a second on 16 workers of an M5 Ultra, too slow yet to watch at frame rate.",
+    body: "F16 weights; settles at 91,664 to 99,361 alive. About 10 ticks a second on an M5 Ultra.",
   },
   {
     file: "showcase-world",
@@ -1029,7 +959,7 @@ export const presets: {
     torus: 256,
     dt: "1/32",
     kind: "search",
-    chosen: "Outer search · first choice",
+    chosen: "Showcase",
     body: "Membranes, rings and crescents, which inherited chemistry makes without the networks.",
   },
   {
@@ -1041,8 +971,8 @@ export const presets: {
     torus: 256,
     dt: "1/32",
     kind: "search",
-    chosen: "Outer search · stage W",
-    body: "Discrete colonies on a black field, held at a binding ceiling by refuse-excess-births-v1, the plan's declared exhibition policy.",
+    chosen: "Showcase",
+    body: "Discrete colonies on a black field, held at a declared population ceiling.",
   },
   {
     file: "tissue-world",
@@ -1053,8 +983,8 @@ export const presets: {
     torus: 128,
     dt: "1/32",
     kind: "search",
-    chosen: "Outer search · stage W",
-    body: "Lineages paint their surroundings with their own emitted chemistry and merge into a nearly continuous tissue of membranes, voids and mesh walls, 110,000–170,000 strong.",
+    chosen: "Showcase",
+    body: "Lineages paint their surroundings with their own chemistry: membranes, voids and mesh walls, 110,000–170,000 strong.",
   },
   {
     file: "contact-world",
@@ -1065,8 +995,8 @@ export const presets: {
     torus: 128,
     dt: "1/32",
     kind: "search",
-    chosen: "Outer search · stage C",
-    body: "tissue-world with bodies 0.45 units across that push apart and pull alike chemistry together: single-file membranes, rings and foam.",
+    chosen: "Showcase · bodies",
+    body: "tissue-world with bodies that push apart and pull alike chemistry together: membranes, rings and foam.",
   },
   {
     file: "confluent-world",
@@ -1077,8 +1007,8 @@ export const presets: {
     torus: 80,
     dt: "1/32",
     kind: "search",
-    chosen: "Outer search · stage E · the confluent film",
-    body: "contact-world on a field four times finer, fed to its ceiling, with children landing up to 2.5 units away: saturated domains of labyrinth, foam and packed spheres.",
+    chosen: "Showcase · the confluent film",
+    body: "contact-world on a field four times finer, fed to its ceiling: domains of labyrinth, foam and packed spheres.",
   },
   {
     file: "morphogenesis-tissue-v2",
@@ -1090,7 +1020,7 @@ export const presets: {
     dt: "1/32",
     kind: "v2",
     chosen: "V2-17 verified · 52 Stage-2 runs",
-    body: "Bodies that touch, with 14 v2 mechanisms: crowding stops division, polarity orients, inherited tags decide who sticks to whom, kin share food. 108 inputs and 44 outputs per network. Over 4 seeds at tick 2,048 each cell has about half as many close neighbours as with v2 off, and without inheritance 36 are alive against 15,446.",
+    body: "Bodies that touch, 14 mechanisms: crowding stops division, polarity orients, tags decide who sticks, kin share food.",
   },
   {
     file: "supercolony-v2",
@@ -1102,7 +1032,7 @@ export const presets: {
     dt: "1/32",
     kind: "v2",
     chosen: "V2-17 verified · 52 Stage-2 runs",
-    body: "No forces between organisms, 11 v2 mechanisms: blooming oases, bursting emitters, an uneatable trail carrier and veins the field carves for itself, on 34 field planes. Over 4 seeds the veins raise alignment by half, and evolving networks keep 10% more alive than fixed ones on the held-out seeds. It costs 3.1% more per organism-tick than v1.",
+    body: "No forces between organisms, 11 mechanisms: blooming oases, bursting emitters, trails and veins the field carves for itself.",
   },
 ];
 
@@ -1233,4 +1163,4 @@ export const cliSurface = [
 ];
 
 export const inspiration =
-  "The visual and mechanical target comes from screenshots of Fraser Price's Neural-Kimchi-4B and its description. FrankenLife is an original, explicit rule set (FieldEcologyV1 and its modular FieldEcologyV2 extension) built from the described primitives. It is not affiliated with that project and claims no numerical parity with it.";
+  "Inspired by Fraser Price's Neural-Kimchi-4B. FrankenLife is an original rule set, not affiliated with it and claiming no numerical parity.";

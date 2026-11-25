@@ -28,6 +28,7 @@ import { MechanismStory, SharedRules } from "@/components/explain/v2-atlas";
 import { V2Explorer } from "@/components/explain/v2-explorer";
 import { IndependentWeights } from "@/components/explain/weights";
 import { ZoomLadder } from "@/components/explain/zoom-ladder";
+import { FilmFacts } from "@/components/film-facts";
 import { FilmRecords } from "@/components/film-records";
 import { FilmReel } from "@/components/film-reel";
 import { GreenTitle, MicroLabel, Reticle } from "@/components/franken";
@@ -42,11 +43,9 @@ import {
   branchObservation,
   type Chapter,
   chapters,
-  claims,
   cliSurface,
   commands,
   composes,
-  filmChoice,
   gates,
   type GateState,
   heroStats,
@@ -54,13 +53,11 @@ import {
   inheritance,
   inspiration,
   milestones,
-  notThis,
   presets,
   priorWork,
   shortcuts,
   siteConfig,
   stack,
-  v2BuildStatus,
   type Verdict,
   worldModel,
 } from "@/lib/content";
@@ -100,6 +97,18 @@ function index(chapterId: string, sectionId: string): string {
 
 const link = "text-green-300 underline decoration-green-300/30 underline-offset-4 transition-colors hover:decoration-green-300";
 
+/** Run it yourself: the commands shown open; the rest fold away. */
+const FIRST_COMMANDS = 4;
+
+/** The hero's index of what the page shows, each a jump to it. */
+const heroChips = [
+  { label: "One brain per organism", href: "#brains" },
+  { label: "One energy ledger", href: "#world" },
+  { label: "Replay and branch", href: "#replay" },
+  { label: "21 v2 switches", href: "#ch-v2" },
+  { label: "Controls that remove a cause", href: "#controls" },
+];
+
 export default function Home() {
   return (
     <>
@@ -136,20 +145,22 @@ export default function Home() {
                 <GreenTitle lit text="Evolution, [bit for bit]." />
               </h1>
               <p className="lede mt-7 max-w-[36rem]">
-                A real-time artificial-life laboratory. Every organism in these films carries its own heritable neural
-                network; they feed, signal, move, split and die through one shared field of energy and chemistry,
-                and nothing is scripted or trained. A run can be paused, inspected, branched and replayed, and every
-                replay reaches the same world, bit for bit.
+                Every organism here has its own heritable neural network. They feed, move, split and die through one
+                shared field, nothing is scripted or trained, and every replay reaches the same world bit for bit.
               </p>
-              <p className="mt-4 max-w-[36rem] text-[15px] leading-relaxed text-slate-400">
-                <span className="font-semibold text-slate-200">New in version 2:</span> 21 mechanisms, each a switch.
-                With them a tissue stops dividing in a crowd, sorts by kind and feeds its kin, and a supercolony
-                pulses, lays trails and grows veins in the field it shares.{" "}
-                <a className={link} href="#ch-v2">
-                  Step through them
-                </a>
-                .
-              </p>
+              <ul className="mt-6 flex max-w-[36rem] flex-wrap gap-2 font-mono text-[11px] text-slate-300">
+                {heroChips.map((chip) => (
+                  <li key={chip.label}>
+                    <a
+                      href={chip.href}
+                      className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-white/10 bg-black/30 px-3 transition-colors hover:border-green-400/50 hover:text-green-200"
+                    >
+                      <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-green-400" />
+                      {chip.label}
+                    </a>
+                  </li>
+                ))}
+              </ul>
               <div className="mt-9 flex flex-wrap gap-3">
                 <a
                   href="#zoom"
@@ -169,7 +180,7 @@ export default function Home() {
                 <a className={link} href={siteConfig.github}>
                   GitHub
                 </a>
-                . Every figure on this page names where it comes from.
+                .
               </p>
             </div>
           </div>
@@ -212,13 +223,7 @@ export default function Home() {
             layout="wide"
             eyebrow="One organism, one tick"
             title="A life in [nine] steps."
-            kicker={
-              <>
-                Each organism is a small neural network with a body, a metabolism and offspring, living in one shared
-                field of energy and chemistry. Nothing is scripted or trained; the lineages that survive do so under
-                these rules alone.
-              </>
-            }
+            kicker="Sense, decide, feed, move, emit, divide, die: one organism's turn, in the shared field."
           >
             <Reveal>
               <LifeCycle />
@@ -231,13 +236,7 @@ export default function Home() {
             layout="wide"
             eyebrow="A toy world, live"
             title="Run a small world [yourself]."
-            kicker={
-              <>
-                Before the real rules, a toy written for this page: about a thousand organisms, each with its own tiny
-                network, under four of FrankenLife&apos;s rules in miniature. Select one to watch its brain, brush
-                energy into the field, then replay from the seed and land on the same digest.
-              </>
-            }
+            kicker="A toy world in your browser, about a thousand organisms under four of the rules. Select one, brush energy in, replay from the seed."
           >
             <Reveal>
               <Miniature />
@@ -252,7 +251,7 @@ export default function Home() {
             index={index("different", "different")}
             eyebrow="Four shortcuts"
             title="Each one, [forbidden]."
-            kicker="Each of these shortcuts can produce a gorgeous video of nothing evolving. FrankenLife's rules forbid all four, and its tests hold it to them."
+            kicker="Each can make a gorgeous video of nothing evolving. The rules forbid all four; the tests enforce them."
           >
             <Reveal>
               <div className="panel overflow-hidden rounded-[1.75rem]">
@@ -302,60 +301,34 @@ export default function Home() {
               </div>
             </Reveal>
 
+            {/* What the field already has, beside the four things FrankenLife puts together at once. */}
             <Reveal className="mt-5">
               <div className="panel relative rounded-[1.75rem] p-6 sm:p-8">
                 <Reticle inset={9} size={12} />
-                <div className="grid grid-cols-1 gap-9 lg:grid-cols-2">
-                  <div>
-                    <MicroLabel className="text-slate-400">What already exists</MicroLabel>
-                    <ul className="mt-5 space-y-3.5">
-                      {priorWork.map((entry) => (
-                        <li key={entry.name} className="text-sm leading-relaxed text-slate-400">
-                          <span className="font-bold text-slate-200">{entry.name}</span> {entry.shows}.
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                  <div>
-                    <MicroLabel>What FrankenLife composes</MicroLabel>
-                    <ol className="mt-5 space-y-3.5">
-                      {composes.map((entry, at) => (
-                        <li key={entry.title} className="flex gap-3">
-                          <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border border-green-500/30 bg-green-500/10 font-mono text-xs font-bold text-green-300">
-                            {at + 1}
-                          </span>
-                          <span className="text-sm leading-relaxed">
-                            <span className="font-bold text-white">{entry.title}.</span>{" "}
-                            <span className="text-slate-400">{entry.body}</span>
-                          </span>
-                        </li>
-                      ))}
-                    </ol>
-                  </div>
-                </div>
-                <p className="mt-7 border-t border-white/[0.06] pt-5 text-sm leading-relaxed text-slate-400">
-                  <span className="font-bold text-amber-200">Target, not a result:</span> all four at the scale of the
-                  reference screenshots, about 400,000 organisms and four billion independent parameters, where memory
-                  bandwidth rather than arithmetic is the limit.{" "}
-                  <a className={link} href="#scale">
-                    Why that is hard
-                  </a>
-                  .
-                </p>
-              </div>
-            </Reveal>
-
-            <Reveal className="mt-5">
-              <div className="rounded-[1.75rem] border border-dashed border-white/[0.1] p-6 sm:p-7">
-                <MicroLabel className="text-slate-400">What it is not</MicroLabel>
-                <ul className="mt-4 grid grid-cols-1 gap-x-8 gap-y-2.5 text-sm leading-relaxed text-slate-400 sm:grid-cols-2">
-                  {notThis.map((line) => (
-                    <li key={line} className="flex gap-2.5">
-                      <span aria-hidden="true" className="mt-2 h-1 w-1 shrink-0 rounded-full bg-slate-500" />
-                      {line}
+                <MicroLabel>Four things at once</MicroLabel>
+                <ol className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                  {composes.map((entry, at) => (
+                    <li key={entry.title} className="rounded-2xl border border-white/[0.08] bg-black/25 p-4">
+                      <span className="flex h-7 w-7 items-center justify-center rounded-lg border border-green-500/30 bg-green-500/10 font-mono text-xs font-bold text-green-300">
+                        {at + 1}
+                      </span>
+                      <p className="mt-3 text-[15px] leading-snug font-bold text-white">{entry.title}</p>
+                      <p className="mt-1.5 text-[13px] leading-snug text-slate-400">{entry.body}</p>
                     </li>
                   ))}
-                </ul>
+                </ol>
+                <p className="mt-5 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                  <span>Related work:</span>
+                  {priorWork.map((entry) => (
+                    <span
+                      key={entry.name}
+                      title={entry.shows}
+                      className="rounded-full border border-white/10 px-2.5 py-0.5 font-mono text-[11px] text-slate-400"
+                    >
+                      {entry.name}
+                    </span>
+                  ))}
+                </p>
               </div>
             </Reveal>
           </Section>
@@ -366,13 +339,7 @@ export default function Home() {
             layout="wide"
             eyebrow="The model and its controls"
             title="Remove a cause, lose the [structure]."
-            kicker={
-              <>
-                The confluent film&apos;s world, run again twice with one rule changed. Without emission nothing ever
-                leaves an organism, and the tissue becomes a haze; with fresh offspring instead of inherited ones, the
-                world dwindles to scatter. Same preset, seed, founders and food.
-              </>
-            }
+            kicker="Without the networks' emission the tissue becomes a haze; without inheritance the world dwindles to scatter."
           >
             <Reveal>
               <ControlsTrio />
@@ -385,47 +352,13 @@ export default function Home() {
             layout="wide"
             eyebrow="Provenance"
             title="What you are [watching]."
-            kicker={
-              <>
-                <code className="text-green-300">flife render</code> drew each frame from the committed world at its
-                tick. Each world is deterministic: the same commands reach the same digests, listed below, on any
-                machine.
-              </>
-            }
+            kicker="Every frame is flife render's, from the committed world at its tick. The same commands reach the same digests on any machine."
           >
             <Reveal>
-              <FilmRecords />
+              <FilmFacts />
             </Reveal>
             <Reveal className="mt-5">
-              <div className="panel rounded-[1.75rem] p-6 sm:p-8">
-                <MicroLabel>How these worlds were chosen</MicroLabel>
-                <div className="mt-5 grid grid-cols-1 gap-x-10 gap-y-6 text-[14.5px] leading-relaxed text-slate-300 lg:grid-cols-2">
-                  <div className="space-y-3">
-                    <h3 className="text-[17px] font-bold text-white">The confluent world</h3>
-                    {filmChoice.world.map((paragraph) => (
-                      <p key={paragraph.slice(0, 24)}>{paragraph}</p>
-                    ))}
-                  </div>
-                  <div className="space-y-3">
-                    <h3 className="text-[17px] font-bold text-white">The v2 films</h3>
-                    {filmChoice.v2.map((paragraph) => (
-                      <p key={paragraph.slice(0, 24)}>{paragraph}</p>
-                    ))}
-                    <h3 className="pt-3 text-[17px] font-bold text-white">The camera</h3>
-                    <p>{filmChoice.camera}</p>
-                  </div>
-                </div>
-                <p className="mt-6 border-t border-white/[0.06] pt-4 text-[14px] text-slate-400">
-                  <a className={link} href={siteConfig.showcase}>
-                    The confluent world&apos;s search, every sample&apos;s score and the held-out seeds
-                  </a>
-                  ;{" "}
-                  <a className={link} href={siteConfig.websiteFilms}>
-                    every v2 world tried for a film, and why two were kept
-                  </a>
-                  .
-                </p>
-              </div>
+              <FilmRecords />
             </Reveal>
           </Section>
         </ChapterBlock>
@@ -527,14 +460,7 @@ export default function Home() {
             layout="wide"
             eyebrow="field-ecology-v2 · two presets"
             title="Two new [worlds]."
-            kicker={
-              <>
-                Version 2 is one model, <code className="text-green-300">field-ecology-v2</code>, with 21 mechanisms,
-                each switched on or off when a world is founded. Two committed presets combine them: a tissue whose
-                bodies touch, and a supercolony where nothing touches and everything passes through the field. With
-                every switch off, a v2 run is v1 bit for bit.
-              </>
-            }
+            kicker="One model, 21 switches set at founding, two presets: a tissue whose bodies touch, and a supercolony where nothing touches. All off, v2 is v1 bit for bit."
           >
             <BundlePanels />
           </Section>
@@ -545,13 +471,7 @@ export default function Home() {
             layout="wide"
             eyebrow="Bundle A · seven of its own"
             title="How a tissue [forms]."
-            kicker={
-              <>
-                Seven of the tissue&apos;s 14 mechanisms are its own, in six steps: lateral inhibition shares a step
-                with the memory it reads. Each shows its rule, computed here from the preset&apos;s numbers, and what
-                changed when Stage-2 ran the preset without it.
-              </>
-            }
+            kicker="The tissue's seven own mechanisms in six steps, each with its rule on the preset's numbers and what changed without it."
           >
             <Reveal>
               <MechanismStory story="tissue" />
@@ -564,13 +484,7 @@ export default function Home() {
             layout="wide"
             eyebrow="Bundle B · nothing touches"
             title="Held together by the [field]."
-            kicker={
-              <>
-                The supercolony&apos;s organisms are points: none pushes or pulls another, so whatever holds a colony
-                together passes through the field. Four mechanisms are its own; the last two steps are on in both
-                presets and were measured here.
-              </>
-            }
+            kicker="Its organisms are points that never push or pull, so whatever holds a colony together passes through the field."
           >
             <Reveal>
               <MechanismStory story="supercolony" />
@@ -583,13 +497,7 @@ export default function Home() {
             layout="wide"
             eyebrow="Both presets, or neither"
             title="The other [switches]."
-            kicker={
-              <>
-                Four more rules are on in both worlds: what a body costs to keep, what it may spend, and where its
-                deposits land. A twenty-first switch only adds the four views drawn in the steps above, and changes no
-                digest.
-              </>
-            }
+            kicker="On in both worlds: what a body costs to keep, what it may spend, and where its deposits land."
           >
             <Reveal>
               <SharedRules />
@@ -604,25 +512,17 @@ export default function Home() {
             title="Take one [away]."
             kicker={
               <>
-                Each preset ran as committed, beside controls and with each mechanism removed, on two discovery seeds
-                and two held-out seeds the presets were not tuned on: 13 conditions × 4 seeds × 2 presets, 2,048 ticks
-                each.{" "}
+                13 conditions × 4 seeds (2 held out) × 2 presets, 2,048 ticks each.{" "}
                 <a className={link} href={siteConfig.v2Report}>
-                  The full report
-                </a>{" "}
-                keeps every run, including those that went against the hypothesis.
+                  Every run
+                </a>
+                .
               </>
             }
           >
             <Reveal>
               <TakeOneAway />
             </Reveal>
-            <p className="mt-5 text-sm leading-relaxed text-slate-400">
-              Population is one measure; the report scores each condition on a dozen. Some removals leave more
-              organisms alive and less structure: without oases the supercolony grows by half, but its trails fade
-              and its veins stop being bimodal; without the trail carrier it grows by a fifth and lays no trails at
-              all.
-            </p>
           </Section>
 
           <Section
@@ -631,13 +531,7 @@ export default function Home() {
             layout="wide"
             eyebrow="Founding-time switches"
             title="Compose your [own]."
-            kicker={
-              <>
-                Any combination of switches is a world. Pick some to see what they add to each network&apos;s inputs
-                and outputs, and the command that founds the world. Switches enter the configuration hash (INV-14), so
-                a checkpoint always says which rules made it.
-              </>
-            }
+            kicker="Pick switches: see what each adds to every network's inputs and outputs, and the command that founds the world."
           >
             <Reveal>
               <V2Explorer />
@@ -666,7 +560,7 @@ export default function Home() {
             layout="wide"
             eyebrow="Checkpoints · resume · branches"
             title="Rewind and [branch]."
-            kicker="A kept run checkpoints as it goes. Kill it and resume, and it reaches the uninterrupted world. Branch it, and a control reaches the parent's world exactly while an intervention differs only from its brush onwards, so any difference between the two is the brush's doing."
+            kicker="Kill a run and resume it: same world. Branch it: the control matches the parent exactly, so any difference is the intervention's."
           >
             <div className="space-y-5">
               <Reveal>
@@ -682,9 +576,8 @@ export default function Home() {
                     </span>
                   </div>
                   <p className="mt-4 max-w-4xl text-[15px] leading-relaxed text-slate-300">
-                    The reference preset kept for 512 ticks and stepped to {grouped(branchObservation.from)}, then
-                    branched twice from that checkpoint: a control, and a branch with one energy brush (
-                    {branchObservation.brush}). All three resumed to tick {grouped(branchObservation.tick)}:
+                    Branched at tick {grouped(branchObservation.from)}, one branch brushed ({branchObservation.brush}),
+                    all three run to tick {grouped(branchObservation.tick)}:
                   </p>
                   <ul className="mt-5 space-y-2">
                     {branchObservation.digests.map((entry) => (
@@ -713,14 +606,12 @@ export default function Home() {
                       </li>
                     ))}
                   </ul>
-                  <p className="mt-5 text-xs leading-relaxed text-slate-500">
-                    Each line is the run&apos;s <code className="text-slate-400">end</code> record&apos;s SHA-256 world
-                    digest, on an {branchObservation.host}, with a release <code className="text-slate-400">flife</code>{" "}
-                    (SHA-256 {branchObservation.binary}…). The commands are under{" "}
+                  <p className="mt-4 text-xs leading-relaxed text-slate-500">
+                    SHA-256 world digests; {branchObservation.host}, flife {branchObservation.binary}….{" "}
                     <a className={link} href="#try">
-                      Run it yourself
+                      The commands
                     </a>
-                    ; the repository&apos;s own tests make the same comparison on every change.
+                    .
                   </p>
                 </div>
               </Reveal>
@@ -735,11 +626,10 @@ export default function Home() {
             title="What the experiments [found]."
             kicker={
               <>
-                Each hypothesis had its rule written down before the runs, discovery and held-out seeds kept apart, and
-                failed runs kept. One control came out strongly; two hypotheses are not supported, and the rest are
-                stated as narrowly as the data allow.{" "}
+                Rules written before the runs, held-out seeds kept apart, failures kept. One strong result, two
+                unsupported.{" "}
                 <a className={link} href={siteConfig.fl048}>
-                  The full record
+                  The record
                 </a>
                 .
               </>
@@ -820,43 +710,12 @@ export default function Home() {
           </Section>
 
           <Section
-            id="claims"
-            index={index("evidence", "claims")}
-            eyebrow="Four claims"
-            title="Kept [apart]."
-            kicker="A beautiful image establishes only the visual claim. A speed measured on named hardware is a separate kind of result, and evidence for none of the four."
-          >
-            <Reveal>
-              <ol className="panel grid grid-cols-1 overflow-hidden rounded-[1.75rem] sm:grid-cols-2">
-                {claims.map((claim, at) => (
-                  <li
-                    key={claim.claim}
-                    className={cn(
-                      "border-white/[0.06] p-6 sm:p-7",
-                      at > 0 && "border-t",
-                      at === 1 && "sm:border-t-0",
-                      at % 2 === 1 && "sm:border-l",
-                    )}
-                  >
-                    <p className="flex items-baseline gap-3">
-                      <span className="font-mono text-xs text-slate-500 tabular-nums">0{at + 1}</span>
-                      <MicroLabel className="text-[color:var(--chapter)]">{claim.claim}</MicroLabel>
-                    </p>
-                    <h4 className="mt-3 text-lg text-white">{claim.meaning}</h4>
-                    <p className="mt-2 text-sm leading-relaxed text-slate-400">{claim.evidence}</p>
-                  </li>
-                ))}
-              </ol>
-            </Reveal>
-          </Section>
-
-          <Section
             id="scale"
             index={index("evidence", "scale")}
             layout="wide"
             eyebrow="Why the scale is hard"
             title="Four billion [independent] parameters."
-            kicker="No two organisms share weights, so a full sweep cannot reuse them: it streams the whole bank from memory. At the target scale, memory bandwidth runs out before arithmetic does, and a real-time claim needs a measurement with the real weight layout."
+            kicker="No two organisms share weights, so each sweep of the brains streams the whole bank from memory. At 400,000 organisms, bandwidth runs out before arithmetic."
           >
             <Reveal>
               <ScaleCalculator />
@@ -870,10 +729,10 @@ export default function Home() {
             title="Honest [status]."
             kicker={
               <>
-                The foundations are built and tested; the visual, full-scale rate, endurance and export gates are not.
-                The 400,000-organism world at 30 ticks a second is a target, not a result.{" "}
+                Foundations built and tested; full scale, endurance and export not yet. 400,000 organisms at 30 ticks a
+                second is a target.{" "}
                 <a className={link} href={siteConfig.readme}>
-                  The README keeps the full account
+                  The README
                 </a>
                 .
               </>
@@ -922,67 +781,25 @@ export default function Home() {
                 </ol>
               </div>
             </Reveal>
+            {/* Every gate as a tile, coloured by its state: the page's status at a glance. */}
             <Reveal className="mt-5">
-              <ul className="panel ruled overflow-hidden rounded-[1.75rem]">
+              <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                 {gates.map((gate) => {
                   const style = gateStyle[gate.state];
                   return (
-                    <li
-                      key={gate.id}
-                      className="grid grid-cols-[3rem_minmax(0,1fr)] gap-x-4 gap-y-2 p-5 sm:grid-cols-[3rem_minmax(0,1fr)_auto] sm:p-6"
-                    >
-                      <span className="font-mono text-sm font-medium text-[color:var(--chapter)]">{gate.id}</span>
-                      <div className="min-w-0">
-                        <h4 className="text-base text-white">{gate.name}</h4>
-                        <p className="mt-1 text-sm leading-relaxed text-slate-400">{gate.detail}</p>
+                    <li key={gate.id} className={cn("flex flex-col rounded-2xl border p-4", style.className)}>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-mono text-sm font-bold">{gate.id}</span>
+                        <span className="inline-flex items-center gap-1 font-mono text-[9.5px] tracking-[0.1em] uppercase">
+                          <style.Icon className="h-3 w-3" aria-hidden="true" /> {style.label}
+                        </span>
                       </div>
-                      <span
-                        className={cn(
-                          "col-start-2 inline-flex h-fit items-center gap-1.5 justify-self-start rounded-full border px-2.5 py-0.5 font-mono text-[10px] font-medium tracking-[0.1em] whitespace-nowrap uppercase sm:col-start-3",
-                          style.className,
-                        )}
-                      >
-                        <style.Icon className="h-3 w-3" aria-hidden="true" /> {style.label}
-                      </span>
+                      <h4 className="mt-2 text-[15px] leading-snug font-bold text-white">{gate.name}</h4>
+                      <p className="mt-1 text-[12.5px] leading-snug text-slate-400">{gate.detail}</p>
                     </li>
                   );
                 })}
               </ul>
-            </Reveal>
-            <Reveal className="mt-5">
-              <div className="panel rounded-[1.75rem] p-6 sm:p-8">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <MicroLabel>field-ecology-v2 · claim by claim</MicroLabel>
-                  <span className="rounded-full border border-white/15 bg-white/5 px-2.5 py-0.5 font-mono text-[10px] font-medium tracking-[0.1em] text-slate-300 uppercase">
-                    Observed · Four Claims kept apart
-                  </span>
-                </div>
-                <ul className="ruled mt-5">
-                  {v2BuildStatus.map((item) => {
-                    const style = gateStyle[item.tone];
-                    return (
-                      <li
-                        key={item.stage}
-                        className="grid grid-cols-1 gap-x-4 gap-y-2 py-4 first:pt-0 last:pb-0 sm:grid-cols-[11rem_minmax(0,1fr)_auto]"
-                      >
-                        <div>
-                          <p className="text-sm font-bold text-white">{item.stage}</p>
-                          <p className="mt-0.5 font-mono text-[10px] text-slate-500 uppercase">{item.claim}</p>
-                        </div>
-                        <p className="text-sm leading-relaxed text-slate-400">{item.detail}</p>
-                        <span
-                          className={cn(
-                            "inline-flex h-fit items-center gap-1.5 justify-self-start rounded-full border px-2.5 py-0.5 font-mono text-[10px] font-medium tracking-[0.1em] whitespace-nowrap uppercase sm:justify-self-end",
-                            style.className,
-                          )}
-                        >
-                          <style.Icon className="h-3 w-3" aria-hidden="true" /> {style.label}
-                        </span>
-                      </li>
-                    );
-                  })}
-                </ul>
-              </div>
             </Reveal>
           </Section>
         </ChapterBlock>
@@ -995,19 +812,7 @@ export default function Home() {
             layout="wide"
             eyebrow="Presets"
             title="Ten [worlds] to open."
-            kicker={
-              <>
-                Three are the operating profiles, each sized by a declared experiment. Five were chosen by an outer
-                search against image statistics of the reference screenshots and then by eye; the organisms inside them
-                have no aesthetic fitness, and{" "}
-                <a className={link} href={siteConfig.showcase}>
-                  the search states how
-                </a>
-                . Two are the <code className="text-slate-200">field-ecology-v2</code> presets, Bundles A and B, verified in
-                Stage 2&apos;s 104 runs on discovery and held-out seeds; the campaign&apos;s report records what each one
-                trades away.
-              </>
-            }
+            kicker="Three operating profiles, five showcase worlds and the two v2 presets, each a file in presets/."
           >
             <ul className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
               {presets.map((preset, at) => (
@@ -1044,7 +849,7 @@ export default function Home() {
             layout="wide"
             eyebrow="Studio and laboratory"
             title="The Studio and the [command line]."
-            kicker="In the native Studio you can run, pause, step, zoom, select, inspect, brush and record while the session commits every tick. The flife command line does the rest: headless runs, branches, experiments and their analysis."
+            kicker="Run, pause, step, zoom, inspect, brush and record in the Studio; headless runs, branches and experiments on the command line."
           >
             <div className="space-y-5">
               <Reveal>
@@ -1066,16 +871,7 @@ export default function Home() {
                     ))}
                   </dl>
                   <p className="mt-6 text-xs leading-relaxed text-slate-500">
-                    Every command prints versioned NDJSON with stable identifiers and typed errors: a missing
-                    accelerator, an exhausted budget, a schema mismatch, an incompatible checkpoint and a numerical fault
-                    are each their own kind. Founding commands (<code className="text-slate-400">validate</code>,{" "}
-                    <code className="text-slate-400">capabilities --config</code>, <code className="text-slate-400">run</code>,{" "}
-                    <code className="text-slate-400">render CONFIG</code>, <code className="text-slate-400">experiment</code>,{" "}
-                    <code className="text-slate-400">transplant</code>) accept ordered{" "}
-                    <code className="text-slate-400">--disable</code>, <code className="text-slate-400">--enable</code> and{" "}
-                    <code className="text-slate-400">--v1-compat</code> overrides;{" "}
-                    <code className="text-slate-400">resume</code>, <code className="text-slate-400">step</code> and{" "}
-                    <code className="text-slate-400">render --run-dir</code> refuse them (<code className="text-slate-400">INV-14</code>).
+                    Every command prints versioned NDJSON with typed errors.
                   </p>
                 </div>
               </Reveal>
@@ -1112,15 +908,29 @@ export default function Home() {
             index={index("lab", "try")}
             eyebrow="Laboratory mode"
             title="Run it [yourself]."
-            kicker="Every command prints versioned NDJSON. Start with what your machine can run, then the 4,096-organism reference world, then branch it and compare."
+            kicker="What your machine can run, the 4,096-organism reference world, its frames, and the Studio."
           >
             <div className="space-y-3">
-              {commands.map((entry) => (
+              {commands.slice(0, FIRST_COMMANDS).map((entry) => (
                 <Reveal key={entry.command}>
                   <CopyCommand comment={entry.comment} command={entry.command} />
                 </Reveal>
               ))}
             </div>
+            <details className="group mt-3 rounded-2xl border border-white/[0.08] bg-black/20">
+              <summary className="flex min-h-12 cursor-pointer list-none items-center gap-2 px-5 text-sm font-semibold text-slate-300 hover:text-white [&::-webkit-details-marker]:hidden">
+                <Terminal className="h-4 w-4 text-green-400" aria-hidden="true" />
+                {commands.length - FIRST_COMMANDS} more: branches, v2 worlds, 4K films
+                <span aria-hidden="true" className="ml-auto font-mono text-xs text-slate-500 group-open:rotate-45">
+                  +
+                </span>
+              </summary>
+              <div className="space-y-3 px-3 pb-3">
+                {commands.slice(FIRST_COMMANDS).map((entry) => (
+                  <CopyCommand key={entry.command} comment={entry.comment} command={entry.command} />
+                ))}
+              </div>
+            </details>
           </Section>
         </ChapterBlock>
       </main>
@@ -1156,8 +966,7 @@ export default function Home() {
           </div>
           <p className="mt-16 flex flex-wrap items-center gap-x-6 gap-y-2 border-t border-white/[0.06] pt-6 font-mono text-[11px] text-slate-500">
             <span>{siteConfig.name}</span>
-            <span>Every figure on this page names its source</span>
-            <span>Recordings stay out of git; their manifests do not</span>
+            <span>Every figure names its source</span>
           </p>
         </div>
       </footer>

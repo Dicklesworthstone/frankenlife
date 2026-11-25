@@ -11,7 +11,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { filmChoice, filmNotes } from "@/lib/content";
+import { filmFacts, filmNotes } from "@/lib/content";
 import { type FilmManifest, films } from "@/lib/media";
 
 const REPO = join(import.meta.dir, "..", "..");
@@ -69,13 +69,12 @@ describe("film configurations", () => {
     }
   });
 
-  test("the v2 films are the confluent world over the same ticks, drawn the same way, as the selection paragraph says", () => {
+  test("the v2 films are the confluent world over the same ticks, drawn the same way, as the films' tile says", () => {
     const confluent = films.find((film) => film.id === "confluent");
     expect(confluent).toBeDefined();
     if (!confluent) return;
     const { from, to, every, seed, founders, grid, torus } = confluent.world;
-    const span = `${from.tick.toLocaleString("en-US")} to ${to.tick.toLocaleString("en-US")}`;
-    expect(filmChoice.v2.some((paragraph) => paragraph.includes(`the same ticks, ${span}`))).toBe(true);
+    expect(filmFacts.tiles.some((tile) => tile.body.includes("regrow the confluent world from tick 0 with one mechanism on"))).toBe(true);
     for (const film of films.filter((each) => filmNotes[each.id]?.mechanism)) {
       expect([film.world.from.tick, film.world.to.tick, film.world.every]).toEqual([from.tick, to.tick, every]);
       expect([film.world.seed, film.world.founders, film.world.grid, film.world.torus]).toEqual([seed, founders, grid, torus]);
@@ -84,11 +83,11 @@ describe("film configurations", () => {
     }
   });
 
-  test("the v2 films' ceiling, as the selection paragraph names it, holds in every frame", () => {
-    const named = filmChoice.v2.map(namedCeiling).find((value) => value !== undefined);
-    expect(named).toBeDefined();
-    const v2Films = films.filter((film) => filmNotes[film.id]?.mechanism);
-    expect(v2Films.length).toBe(2);
-    for (const film of v2Films) expect(film.world.live.filter((count) => count !== named)).toEqual([]);
+  test("every film holds the ceiling its tile names in every frame", () => {
+    const tile = filmFacts.tiles[0];
+    expect(Number(tile?.value.replaceAll(",", ""))).toBe(filmFacts.ceiling);
+    expect(tile?.label).toBe("alive in every frame");
+    expect(films.filter((film) => filmNotes[film.id]?.mechanism).length).toBe(2);
+    for (const film of films) expect(film.world.live.filter((count) => count !== filmFacts.ceiling)).toEqual([]);
   });
 });

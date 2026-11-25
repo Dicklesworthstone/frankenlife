@@ -3,6 +3,7 @@
 
 import { Terminal } from "lucide-react";
 
+import { CameraTrack } from "@/components/camera-track";
 import { MicroLabel, Reticle } from "@/components/franken";
 import { filmNotes } from "@/lib/content";
 import type { FilmManifest } from "@/lib/media";
@@ -32,8 +33,6 @@ export function FilmProvenance({ film }: { film: FilmManifest }) {
   const seconds = (ticks: number) => (ticks * world.timestep[0]) / world.timestep[1];
   const lowest = Math.min(...world.live);
   const highest = Math.max(...world.live);
-  const segments = video.segments ?? [];
-  const total = segments.length > 1 ? segments.reduce((sum, seg) => sum + seg.bytes, 0) : video.bytes;
   const crfAt = video.encode.indexOf("-crf");
   const crf = crfAt >= 0 ? video.encode[crfAt + 1] : undefined;
   const reproduce = [
@@ -74,10 +73,7 @@ export function FilmProvenance({ film }: { film: FilmManifest }) {
           <dl className="ruled mt-2 text-sm">
             <Row label="Ticks" value={`${grouped(world.from.tick)} → ${grouped(world.to.tick)}, a frame every ${world.every}`} />
             <Row label="Frames" value={`${video.frames} at ${video.fps} fps, ${video.width} × ${video.height}`} />
-            <Row
-              label="Files"
-              value={`${segments.length > 1 ? `${segments.length} segments, ` : ""}${(total / (1024 * 1024)).toFixed(1)} MiB, H.264 CRF ${crf}`}
-            />
+            <Row label="File" value={`one MP4, ${(video.bytes / (1024 * 1024)).toFixed(1)} MiB, H.264 CRF ${crf}`} />
             <Row label="Colour" value={render.meaning.split(":")[0]?.trim() ?? render.mapping} />
             <Row label="Field" value={`${render.field_mapping === "none" ? "not drawn" : render.field_mapping}, ${render.look} look`} />
             <Row label="Camera" value={
@@ -91,6 +87,7 @@ export function FilmProvenance({ film }: { film: FilmManifest }) {
           </dl>
         </div>
       </div>
+      <CameraTrack film={film} />
       <details className="group mt-5 rounded-xl border border-white/[0.06] bg-black/30">
         <summary className="flex min-h-11 cursor-pointer list-none items-center gap-2 px-4 text-sm font-semibold text-slate-300 hover:text-white">
           <Terminal className="h-4 w-4 text-green-400" aria-hidden="true" /> Make it yourself
@@ -106,8 +103,8 @@ export function FilmProvenance({ film }: { film: FilmManifest }) {
         </pre>
         <p className="px-4 pb-4 text-xs leading-relaxed text-slate-400">
           Controllers ran on {render.controllers}; no result depends on the route. The PNG frames are flife&apos;s; the
-          page&apos;s video encodes them with flife&apos;s own BT.709 colour chain, each file named by its SHA-256 (the
-          first: <code className="break-all text-slate-300">{(segments[0] ?? video).sha256}</code>).
+          page&apos;s video encodes them with flife&apos;s own BT.709 colour chain, named by its SHA-256:{" "}
+          <code className="break-all text-slate-300">{video.sha256}</code>.
         </p>
       </details>
     </article>

@@ -99,13 +99,23 @@ export function DemoFrame({
         <BasisBadge basis={basis} />
       </div>
       <div className="mt-6">{children}</div>
-      {source ? (
-        <figcaption className="mt-6 flex gap-3 border-t border-white/[0.06] pt-4 font-mono text-[11px] leading-relaxed [overflow-wrap:anywhere] text-slate-500">
-          <span aria-hidden="true" className="mt-[3px] h-2.5 w-2.5 shrink-0 rounded-full border border-white/20" />
-          <span className="min-w-0">{source}</span>
-        </figcaption>
-      ) : null}
+      {source ? <SourceNote className="mt-5">{source}</SourceNote> : null}
     </figure>
+  );
+}
+
+/** Where a figure's numbers come from, one click away rather than a paragraph under every figure. */
+export function SourceNote({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <figcaption className={cn("border-t border-white/[0.06] pt-2", className)}>
+      <details className="group">
+        <summary className="inline-flex min-h-10 cursor-pointer list-none items-center gap-2 font-mono text-[10px] tracking-[0.16em] text-slate-500 uppercase transition-colors hover:text-slate-300 [&::-webkit-details-marker]:hidden">
+          <span aria-hidden="true" className="h-2.5 w-2.5 rounded-full border border-white/25 group-open:bg-white/25" />
+          Source
+        </summary>
+        <div className="pb-1 font-mono text-[11px] leading-relaxed [overflow-wrap:anywhere] text-slate-500">{children}</div>
+      </details>
+    </figcaption>
   );
 }
 

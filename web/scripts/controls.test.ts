@@ -7,7 +7,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { controls, filmById, mediaFiles } from "../lib/media";
+import { controls, filmById, staticMedia } from "../lib/media";
 
 // The controls are the confluent world's.
 const film = filmById("confluent");
@@ -60,8 +60,8 @@ describe("the controls' manifest", () => {
       } else {
         expect(still.src).toMatch(new RegExp(`^/media/controls-${still.id}-${still.sha256.slice(0, 12)}\\.jpg$`));
       }
-      expect(mediaFiles.some((file) => file.src === still.src && file.sha256 === still.sha256)).toBe(true);
+      expect(staticMedia.some((file) => file.src === still.src && file.sha256 === still.sha256)).toBe(true);
     }
-    expect(new Set(mediaFiles.map((file) => file.src)).size).toBe(mediaFiles.length);
+    expect(new Set(staticMedia.map((file) => file.src)).size).toBe(staticMedia.length);
   });
 });

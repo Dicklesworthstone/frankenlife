@@ -64,7 +64,8 @@ bun test             # worker.ts's byte serving and share-image type, the direct
                      # the controls' manifest against the record, the explainers' arithmetic against the
                      # plan's fixtures, the toy world's determinism
 bun run build        # refuses unless public/media/ holds exactly the manifest's files
-bun run deploy       # build, then `wrangler deploy` (needs `wrangler login`)
+bun run upload-media # put each film's MP4 from media-r2/ into the R2 bucket frankenlife-media
+bun run deploy       # build, upload-media, `wrangler deploy`, then check the live films' bytes (needs `wrangler login`)
 ```
 
 ## The films
@@ -103,16 +104,11 @@ target/release/flife run presets/confluent-world.toml --ticks 2400 --cpu-workers
 bun run media --film confluent --flife ../target/release/flife --run-dir ../RUN --work WORK \
   --ticks 3200 --every 8 --field none --look sphere --color lineage --zooms 1.6,3,2.2,5,2.6 --cpu-workers 24
 
-# Turnkey true 60 fps 4K re-render of confluent-world (`bun run media:4k60` sets --ticks 3200
-# --every 4 -> 801 distinct frames from tick 2,400 to 5,600 = 13.35 s at true 60 fps, matching
-# the 30 fps film's 13.37 s pacing with zero frame duplication, 2160 × 2160, CRF 19,
-# --segments auto, --segment-max-mib 22 so every segment stays <= 25 MiB for Cloudflare Workers,
-# snapped at camera cuts, plus one unconstrained archival 4K60 master outside public/media/;
-# pass --width 3840 --height 2160 to override to 16:9 4K60). The page's films are encoded at
-# CRF 30 (the last --crf given wins): 6 segments each, 102 to 112 MiB, 64 to 70 Mbit/s. At CRF 19
-# the veins film came to 26 segments and 370 MiB, too much to stream:
+# 4K at 60 fps (`bun run media:4k60` sets --ticks 3200 --every 2: 1,601 frames from tick 2,400 to
+# 5,600, 26.7 s, 2160 × 2160, CRF 30, one MP4 per film into media-r2/ for R2; later flags win, so
+# --width 3840 --height 2160 gives 16:9). --master-out adds an archival encode at CRF 16:
 bun run media:4k60 -- --film confluent --flife ../target/release/flife --run-dir ../RUN --work WORK-4K60 \
-  --field none --look sphere --color lineage-energy --crf 30 \
+  --field none --look sphere --color lineage-energy \
   --zooms 1.6,3,2.2,5,2.6 --master-out ../exports/film-4k60-master.mp4 --cpu-workers 24
 
 # The two v2 films: the confluent world as field-ecology-v2 with one mechanism on, at the engine's
@@ -123,13 +119,13 @@ target/release/flife run experiments/website-films/confluent-veins.toml --ticks 
 # Then from web/, the confluent film's recipe. Each was first rendered whole at 1080 and looked at
 # shot by shot; the 4K pass took that pass's preview with --preview-from, which gives the same camera:
 bun run media:4k60 -- --film confluent-veins --flife ../target/release/flife --run-dir ../RUN-VEINS --work WORK-VEINS \
-  --field none --look sphere --color lineage-energy --crf 30 \
+  --field none --look sphere --color lineage-energy \
   --zooms 1.6,3,2.2,5,2.6 --master-out ../exports/confluent-veins-4k60-master.mp4 --cpu-workers 14
 # confluent-polarity: the same, from experiments/website-films/confluent-polarity.toml.
 
 # Widescreen 16:9 4K60 from a fresh field-ecology-v2 preset with V2-16 overlays and founding toggles:
 bun run media:4k60 -- --film colony-wide --flife ../target/release/flife --config ../presets/supercolony-v2.toml --work WORK-V2 \
-  --width 3840 --height 2160 --ticks 3200 --every 4 \
+  --width 3840 --height 2160 \
   --field vascular-conductance --look glow --color lineage \
   --disable oases --master-out ../exports/supercolony-4k60-master.mp4
 ```
@@ -142,22 +138,19 @@ or `--config PATH` (founding a fresh configuration). Founding-only `field-ecolog
 `--v1-compat`, validated against the 21 canonical slugs plus `all-v2`, `bundle-a`, `bundle-b`) are passed in exact CLI
 order with `--config` and refused with `--run-dir` per `INV-14`. Both `--size S` (square) and independent `--width W
 --height H` (e.g. `2160 × 2160` or `3840 × 2160`, even integers for 4:2:0) are supported alongside arbitrary positive
-`--fps` (including `--fps 60`). With `--segments auto` (the default) or `--segments N` (`N >= 2`), any film whose full-CRF
-encode exceeds `--segment-max-mib` (default `22` MiB, strictly below Cloudflare's `25 MiB` static asset limit) is split
-at natural camera shot boundaries into closed-GOP segments (`<id>-seg00-<hash>.mp4`, …) — recursively subdivided if any
-individual shot still exceeds the cap — and played seamlessly through `<Film>`'s dual-`<video>` preloader with a single
-unified scrubber, tick readout, and Cloudflare Worker 206 Range serving. Pass `--segments 1` to force a single bitrate-capped
-web MP4, and `--master-out PATH` (outside `public/media/`) to also encode one unconstrained archival 4K60 MP4 from the
-exact same PNG frames.
+`--fps` (including `--fps 60`). Each film is one MP4, `<id>-<hash>.mp4`, encoded at its CRF alone with a
+keyframe every second so a seek lands quickly, written to `media-r2/` (outside git) and served from R2 by
+`worker.ts`; Cloudflare's 25 MiB limit applies only to static assets, which the films no longer are.
+`--master-out PATH` (outside `public/media/`) also encodes one archival MP4 from the same PNG frames.
 
-`presets/confluent-world.toml` was chosen by outer searches against image statistics of the reference
-screenshots and by eye, under the registered contact model, and `../experiments/showcase/README.md` states
-how (stages C and E). The site says so beside the film.
+`presets/confluent-world.toml` was chosen by outer searches and by eye, under the registered contact model;
+`../experiments/showcase/README.md` states how (stages C and E).
 
 The camera (`--camera auto`, the default) is chosen from the run itself: `scripts/media.ts` first renders the
 same ticks small, as raw dots, and `scripts/director.ts` reads those frames' pixels to find where the organisms
-are changing most, then writes the path that `flife render --camera` follows. The film opens and closes on the
-whole torus and, in between, eases into the most active region of each shot. Each shot spans 51–102 world
+are changing most, then writes the path that `flife render --camera` follows. The film opens on the whole
+torus for 35% of its length, so the world can be seen evolving before the first zoom, and closes on it for
+10%; in between it eases into the most active region of each shot. Each shot spans 51–102 world
 units on any torus of 128 units or more: the zooms are written for a 256-unit torus and scaled to the
 run's, never below 1.25. The rule is stated in
 `director.ts` and recorded in the manifest with every key. The camera is presentation only, and the script
@@ -165,16 +158,15 @@ checks that the preview and the film end on the same world digest. `--camera non
 `--camera fixed --zooms Z` holds the torus centre at zoom Z for the whole film, with no preview.
 `--field energy|composition|component-C|trail-carrier|vascular-conductance|none`, `--look glow|raw|sphere`
 and `--color lineage|lineage-energy|affinity|energy|generation|motion|topology|cell-state|polarity` choose
-how the frames are drawn; `--zooms` lists the shots' zooms on the run's torus instead. The film's shots, at 1.6, 3 and 2.2, show as many
-organisms as the reference screenshots' views at zooms 3–6: a screenshot's zoom over 1.95.
+how the frames are drawn; `--zooms` lists the shots' zooms on the run's torus instead.
 
 The manifest names the commit `--flife` was built from. By default that is HEAD, and `scripts/media.ts`
 refuses a dirty `crates/`, `presets/`, `Cargo.toml` or `Cargo.lock`. A binary built earlier is named with
 `--revision COMMIT`: an ancestor of HEAD whose `presets/` equal the working tree's, since the configurations
 are read from there (`scripts/source-revision.ts`); the working tree's Rust sources may then differ, as
 they are not what runs. It renders into `--work`. Run it again with the same `--work` to re-encode the finished
-frames without rendering them, for example at another `--crf` when the video exceeds Cloudflare's 25 MiB
-limit for a static asset. Each output is copied into `public/media/` under a content-hashed name. The frames
+frames without rendering them, for example at another `--crf`. The poster, card and stills are copied into
+`public/media/` and the video into `media-r2/`, each under a content-hashed name. The frames
 are reproducible, the video's bytes are not: x264 on several threads encodes the same frames differently
 each time, so a re-encode gives the video a new name. The script never deletes anything, so move the
 previous render's files out of `public/media/` before building; `bun run build` names any it finds.
@@ -196,11 +188,12 @@ URL: a platform that cached the old card shows it until its own refresh tool fet
 
 ## Cloudflare
 
-`bun run deploy` uploads `out/` as the Worker's static assets, served at https://frankenlife.org.
-Static assets answer a Range request with the whole file and a 200, and Safari plays no video from such
-a server, so `worker.ts` runs first, and for `/media/*` it streams only the bytes asked for as a 206, sized
-from the manifests, `lib/films/*.json`, `lib/controls.json` and `lib/stills.json` (an asset's response from the binding has
-no Content-Length). The static export
+`bun run deploy` uploads `out/` as the Worker's static assets, served at https://frankenlife.org, and each
+film's MP4 to the R2 bucket `frankenlife-media` (binding `MEDIA`, key `media/<id>-<hash>.mp4`), skipping a
+film the site already serves. `worker.ts` serves `/media/*.mp4` from R2: the whole file, or for a Range
+request only the bytes asked for as a 206 (Safari plays no video without it), sized from the manifests; a
+name R2 does not hold gets the site's 404 page. `bun run upload-media --check` then compares each live
+film's first and last bytes with `media-r2/`, asking again for a minute while the new Worker spreads. The static export
 writes the share images without an extension, so the Worker gives them their type, `image/jpeg`
 (`lib/share.ts`). It also sends www.frankenlife.org to frankenlife.org; every other request goes to the
 static assets unchanged. Both names are custom domains on the Worker

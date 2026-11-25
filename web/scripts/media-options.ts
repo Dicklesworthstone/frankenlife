@@ -9,12 +9,11 @@ import { relative, resolve } from "node:path";
 
 import type { CameraKey } from "./director";
 
-/** Cloudflare Workers serves a static asset of at most 25 MiB. */
+/**
+ * Cloudflare Workers serves a static asset of at most 25 MiB: the posters, cards and stills in public/media/.
+ * The films are not static assets; they are served from R2 (worker.ts), so no film is split or capped to fit.
+ */
 export const ASSET_LIMIT = 25 * 1024 * 1024;
-/** Default target ceiling per Cloudflare-safe segment (22 MiB, leaving 3 MiB safety margin under ASSET_LIMIT). */
-export const DEFAULT_SEGMENT_MAX_MIB = 22;
-/** Hard maximum allowed for `--segment-max-mib` (strictly below Cloudflare's 25 MiB limit). */
-export const MAX_SEGMENT_MAX_MIB = 24.5;
 
 /** Every colour mapping `flife render --color` accepts (ColorMapping::ALL). */
 export const MEDIA_COLORS = [
@@ -101,8 +100,6 @@ export function isValidFieldChoice(value: string): boolean {
   return (MEDIA_FIELDS as readonly string[]).includes(value) || COMPONENT_FIELD.test(value);
 }
 
-export type SegmentMode = "auto" | number;
-
 export type MediaOptions = {
   /** The film's id: its manifest is lib/films/<id>.json and its files are named <id>-…; default `film`. */
   film: string;
@@ -118,8 +115,6 @@ export type MediaOptions = {
   height: number;
   fps: number;
   crf: number;
-  segments: SegmentMode;
-  segmentMaxBytes: number;
   masterOut: string | null;
   masterCrf: number;
   cameraMode: CameraMode;
@@ -147,8 +142,6 @@ const MEDIA_VALUE_FLAGS = new Set([
   "height",
   "fps",
   "crf",
-  "segments",
-  "segment-max-mib",
   "master-out",
   "master-crf",
   "camera",
@@ -259,14 +252,6 @@ export function parseMediaArgs(argv: readonly string[], publicMediaDir?: string)
 
   const fps = parseIntInRange(single.get("fps") ?? "30", "fps", 1);
   const crf = parseIntInRange(single.get("crf") ?? "24", "crf", 0, 51);
-  const segmentsRaw = single.get("segments") ?? "auto";
-  const segments: SegmentMode =
-    segmentsRaw === "auto" ? "auto" : parseIntInRange(segmentsRaw, "segments", 1);
-  const segmentMaxMiB = Number(single.get("segment-max-mib") ?? String(DEFAULT_SEGMENT_MAX_MIB));
-  if (!Number.isFinite(segmentMaxMiB) || segmentMaxMiB <= 0 || segmentMaxMiB > MAX_SEGMENT_MAX_MIB) {
-    throw new Error(`--segment-max-mib must be a number in (0, ${MAX_SEGMENT_MAX_MIB}]`);
-  }
-  const segmentMaxBytes = Math.floor(segmentMaxMiB * 1024 * 1024);
   const masterOut = single.has("master-out") ? resolve(single.get("master-out") as string) : null;
   if (single.has("master-crf") && masterOut === null) {
     throw new Error("--master-crf requires --master-out PATH");
@@ -333,8 +318,6 @@ export function parseMediaArgs(argv: readonly string[], publicMediaDir?: string)
     height,
     fps,
     crf,
-    segments,
-    segmentMaxBytes,
     masterOut,
     masterCrf,
     cameraMode,
@@ -348,25 +331,18 @@ export function parseMediaArgs(argv: readonly string[], publicMediaDir?: string)
   };
 }
 
-/**
- * Compute the ffmpeg maxrate ceiling (kbps) that keeps a film of `frames` at `fps`
- * within `limitBytes` (Cloudflare's 25 MiB static asset limit), with 10% headroom
- * for the MP4 container and VBV overshoot.
- */
-export function cloudflareCeilingKbps(frames: number, fps: number, limitBytes = ASSET_LIMIT): number {
-  if (!Number.isFinite(frames) || frames <= 0) throw new Error("frames must be a positive number");
-  if (!Number.isFinite(fps) || fps <= 0) throw new Error("fps must be a positive number");
-  const seconds = frames / fps;
-  return Math.max(100, Math.floor((0.9 * limitBytes * 8) / seconds / 1000));
-}
-
 const BT709_VF =
   "scale=out_color_matrix=bt709:out_range=tv:out_chroma_loc=left,format=yuv420p," +
   "setparams=range=tv:color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709";
 
-/** ffmpeg arguments for the Cloudflare-hosted web MP4 (capped at <= 25 MiB). */
-export function buildWebEncodeArgs(crf: number, frames: number, fps: number, limitBytes = ASSET_LIMIT): string[] {
-  const ceiling = `${cloudflareCeilingKbps(frames, fps, limitBytes)}k`;
+/**
+ * ffmpeg arguments for a film's one web MP4, served from R2: quality set by the CRF alone, with no
+ * bitrate cap. A keyframe every second (closed GOP, no scene-cut keyframes) keeps a seek anywhere in
+ * the film to at most a second of decoding.
+ */
+export function buildWebEncodeArgs(crf: number, fps: number): string[] {
+  if (!Number.isFinite(fps) || fps <= 0) throw new Error("fps must be a positive number");
+  const gop = String(Math.max(1, Math.round(fps)));
   return [
     "-vf",
     BT709_VF,
@@ -376,10 +352,12 @@ export function buildWebEncodeArgs(crf: number, frames: number, fps: number, lim
     "slow",
     "-crf",
     String(crf),
-    "-maxrate",
-    ceiling,
-    "-bufsize",
-    ceiling,
+    "-g",
+    gop,
+    "-keyint_min",
+    gop,
+    "-sc_threshold",
+    "0",
     "-pix_fmt",
     "yuv420p",
     "-chroma_sample_location",
@@ -408,152 +386,6 @@ export function buildMasterEncodeArgs(masterCrf: number): string[] {
     "-movflags",
     "+faststart",
     "-an",
-  ];
-}
-
-/**
- * ffmpeg arguments for a closed-GOP Cloudflare-safe segment MP4 (e.g. one shot of a 4K60 film).
- * Uses `-g` = 1 s closed GOP for instant clean seeking and zero B-frame bleed across segment
- * boundaries; omits `-maxrate` unless a last-resort fallback cap is supplied.
- */
-export function buildSegmentEncodeArgs(crf: number, fps: number, fallbackMaxrateKbps?: number): string[] {
-  const gop = String(Math.max(1, fps));
-  return [
-    "-vf",
-    BT709_VF,
-    "-c:v",
-    "libx264",
-    "-preset",
-    "slow",
-    "-crf",
-    String(crf),
-    "-g",
-    gop,
-    "-keyint_min",
-    gop,
-    "-sc_threshold",
-    "0",
-    ...(fallbackMaxrateKbps !== undefined
-      ? ["-maxrate", `${fallbackMaxrateKbps}k`, "-bufsize", `${fallbackMaxrateKbps}k`]
-      : []),
-    "-pix_fmt",
-    "yuv420p",
-    "-chroma_sample_location",
-    "left",
-    "-movflags",
-    "+faststart",
-    "-an",
-  ];
-}
-
-/** One contiguous frame slice `[startFrame, startFrame + frames)` of a film. */
-export type SegmentRange = { startFrame: number; frames: number };
-
-/**
- * Map interior camera shot boundaries (`cameraKeys`) onto frame indices in `(0, ticks.length)`.
- * Returns unique sorted frame indices where a camera hold starts or ends (natural cut/inflection
- * points where a segment transition is visually imperceptible).
- */
-export function findCameraCutFrames(ticks: readonly number[], cameraKeys?: readonly CameraKey[] | null): number[] {
-  if (!cameraKeys || cameraKeys.length < 3 || ticks.length < 2) return [];
-  const cuts = new Set<number>();
-  for (let i = 1; i < cameraKeys.length - 1; i += 1) {
-    const prev = cameraKeys[i - 1]!;
-    const curr = cameraKeys[i]!;
-    const next = cameraKeys[i + 1]!;
-    if (prev.zoom === curr.zoom && curr.zoom === next.zoom) continue;
-    // Find the frame whose tick is nearest `curr.tick`.
-    let best = 0;
-    let bestDiff = Number.POSITIVE_INFINITY;
-    for (let f = 0; f < ticks.length; f += 1) {
-      const diff = Math.abs((ticks[f] ?? 0) - curr.tick);
-      if (diff < bestDiff) {
-        bestDiff = diff;
-        best = f;
-      }
-    }
-    if (best > 0 && best < ticks.length) cuts.add(best);
-  }
-  return [...cuts].sort((a, b) => a - b);
-}
-
-/**
- * Partition `totalFrames` into `targetCount` contiguous non-empty segments, snapping each boundary
- * to the nearest camera shot cut within ±35% of the average segment length when available, or
- * splitting evenly when no camera cuts exist.
- */
-export function planSegmentRanges(
-  totalFrames: number,
-  ticks: readonly number[],
-  cameraKeys: readonly CameraKey[] | null | undefined,
-  targetCount: number,
-): SegmentRange[] {
-  if (totalFrames <= 0) throw new Error("totalFrames must be positive");
-  const count = Math.max(1, Math.min(Math.floor(targetCount), totalFrames));
-  if (count === 1) return [{ startFrame: 0, frames: totalFrames }];
-
-  const candidates = findCameraCutFrames(ticks, cameraKeys);
-  const idealStep = totalFrames / count;
-  const snapRadius = idealStep * 0.35;
-  const boundaries: number[] = [0];
-
-  for (let k = 1; k < count; k += 1) {
-    const ideal = Math.round(k * idealStep);
-    const minAllowed = (boundaries[boundaries.length - 1] ?? 0) + 1;
-    const maxAllowed = totalFrames - (count - k);
-    let chosen = Math.min(maxAllowed, Math.max(minAllowed, ideal));
-
-    let bestDist = Number.POSITIVE_INFINITY;
-    for (const candidate of candidates) {
-      if (candidate < minAllowed || candidate > maxAllowed) continue;
-      const dist = Math.abs(candidate - ideal);
-      if (dist <= snapRadius && dist < bestDist) {
-        bestDist = dist;
-        chosen = candidate;
-      }
-    }
-    boundaries.push(chosen);
-  }
-  boundaries.push(totalFrames);
-
-  const ranges: SegmentRange[] = [];
-  for (let i = 0; i < boundaries.length - 1; i += 1) {
-    const startFrame = boundaries[i]!;
-    const endFrame = boundaries[i + 1]!;
-    ranges.push({ startFrame, frames: endFrame - startFrame });
-  }
-  return ranges;
-}
-
-/**
- * Subdivide one oversized segment into two non-empty halves, preferring an interior camera cut
- * inside the middle 50% of the range and falling back to the exact midpoint.
- */
-export function splitSegmentRange(
-  range: SegmentRange,
-  ticks: readonly number[],
-  cameraKeys?: readonly CameraKey[] | null,
-): [SegmentRange, SegmentRange] {
-  if (range.frames < 2) {
-    throw new Error(`cannot subdivide a ${range.frames}-frame segment starting at ${range.startFrame}`);
-  }
-  const mid = range.startFrame + Math.floor(range.frames / 2);
-  const low = range.startFrame + Math.max(1, Math.floor(range.frames * 0.25));
-  const high = range.startFrame + Math.min(range.frames - 1, Math.ceil(range.frames * 0.75));
-  const candidates = findCameraCutFrames(ticks, cameraKeys);
-  let cut = mid;
-  let bestDist = Number.POSITIVE_INFINITY;
-  for (const candidate of candidates) {
-    if (candidate < low || candidate > high) continue;
-    const dist = Math.abs(candidate - mid);
-    if (dist < bestDist) {
-      bestDist = dist;
-      cut = candidate;
-    }
-  }
-  return [
-    { startFrame: range.startFrame, frames: cut - range.startFrame },
-    { startFrame: cut, frames: range.startFrame + range.frames - cut },
   ];
 }
 

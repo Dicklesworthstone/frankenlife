@@ -3,7 +3,7 @@
 //
 //   bun scripts/media.ts [--film ID] --flife PATH (--run-dir DIR | --config PATH) --work DIR
 //     [--ticks 9600] [--every 32] [--size 1080 | --width 3840 --height 2160]
-//     [--fps 30|60] [--crf 24] [--segments auto|N] [--segment-max-mib 22]
+//     [--fps 30|60] [--crf 24]
 //     [--master-out PATH] [--master-crf 16]
 //     [--camera auto|none|fixed]
 //     [--field energy|composition|component-C|trail-carrier|vascular-conductance|none]
@@ -32,19 +32,21 @@
 //
 // - Supports both square 4K (`--size 2160` or `--width 2160 --height 2160`)
 //   and 16:9 4K (`--width 3840 --height 2160`) at `--fps 60` (or any positive
-//   fps). ffmpeg encodes the web MP4 with flife's own BT.709 colour chain
-//   under an automatic bitrate ceiling that keeps the deployed asset within
-//   Cloudflare's 25 MiB limit. Pass `--master-out PATH` (outside
-//   `public/media/`) to also encode an unconstrained high-quality archival
-//   4K60 MP4 from the exact same rendered PNG frames.
+//   fps). ffmpeg encodes the whole film as one web MP4 with flife's own
+//   BT.709 colour chain, its quality set by `--crf` alone: the site serves it
+//   from R2 (worker.ts), which has no per-file limit to fit. Pass
+//   `--master-out PATH` (outside `public/media/`) to also encode an
+//   unconstrained high-quality archival 4K60 MP4 from the same PNG frames.
 //
 // - `--film ID` (default `film`) names the manifest, lib/films/<ID>.json, and
-//   prefixes every file the film publishes (<ID>-seg00-<hash>.mp4,
+//   prefixes every file the film publishes (<ID>-<hash>.mp4,
 //   <ID>-poster-<hash>.jpg, <ID>-social-<hash>.jpg). lib/films/index.ts lists
 //   the films the page shows; add a new id there.
-// - Each web file is named by its SHA-256 and copied into public/media/, which
-//   is outside git like every FrankenLife recording (AGENTS.md); the
-//   committed manifest records each hash and how it was made.
+// - Each web file is named by its SHA-256. The video goes into media-r2/,
+//   for scripts/upload-media.ts to put in R2; the poster and card go into
+//   public/media/, as static assets. Both are outside git like every
+//   FrankenLife recording (AGENTS.md); the committed manifest records each
+//   hash and how it was made.
 // - The manifest names the commit `--flife` was built from: HEAD, whose Rust
 //   sources and presets must then be committed, or `--revision REV`, an
 //   ancestor of HEAD whose presets equal the working tree's
@@ -66,23 +68,14 @@ import {
   direct,
   luminance,
 } from "./director";
-import {
-  ASSET_LIMIT,
-  SOCIAL_CROP_VF,
-  type SegmentRange,
-  buildMasterEncodeArgs,
-  buildSegmentEncodeArgs,
-  buildWebEncodeArgs,
-  cloudflareCeilingKbps,
-  parseMediaArgs,
-  planSegmentRanges,
-  splitSegmentRange,
-} from "./media-options";
+import { ASSET_LIMIT, SOCIAL_CROP_VF, buildMasterEncodeArgs, buildWebEncodeArgs, parseMediaArgs } from "./media-options";
 import { sourceRevision } from "./source-revision";
 
 const WEB = fileURLToPath(new URL("..", import.meta.url));
 const REPO = resolve(WEB, "..");
 const PUBLIC_MEDIA = join(WEB, "public", "media");
+// The films' videos, outside git and outside the static export: scripts/upload-media.ts puts each in R2.
+const FILM_STORE = join(WEB, "media-r2");
 
 function fail(message: string): never {
   console.error(`media: ${message}`);
@@ -107,14 +100,16 @@ function sha256(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-/** Copy `path` into public/media/ as `stem-<hash>.ext`. */
-function publish(path: string, stem: string, extension: string) {
+/** Copy `path` into `dir` as `stem-<hash>.ext`, served at /media/ under that name. */
+function publish(path: string, stem: string, extension: string, dir = PUBLIC_MEDIA) {
   const hash = sha256(path);
   const bytes = readFileSync(path).length;
-  if (bytes > ASSET_LIMIT) fail(`${path} is ${bytes} bytes, above Cloudflare's 25 MiB asset limit`);
+  if (dir === PUBLIC_MEDIA && bytes > ASSET_LIMIT) {
+    fail(`${path} is ${bytes} bytes, above Cloudflare's 25 MiB static asset limit`);
+  }
   const name = `${stem}-${hash.slice(0, 12)}.${extension}`;
-  mkdirSync(PUBLIC_MEDIA, { recursive: true });
-  copyFileSync(path, join(PUBLIC_MEDIA, name));
+  mkdirSync(dir, { recursive: true });
+  copyFileSync(path, join(dir, name));
   return { src: `/media/${name}`, sha256: hash, bytes };
 }
 
@@ -148,8 +143,6 @@ const {
   height,
   fps,
   crf,
-  segments: segmentMode,
-  segmentMaxBytes,
   masterOut,
   masterCrf,
   cameraMode,
@@ -281,11 +274,14 @@ if (existsSync(made)) {
     // same 51–102 world units on any torus of 128 units or more (a 128-unit torus zooms half as far); no zoom
     // goes below 1.25.
     const span = Math.min(...extent) / 256;
+    // The film holds the whole torus for its first 35%, so the world is seen evolving before the camera moves
+    // in (9.3 s of a 1,601-frame film at 60 fps), and for at least its last 10%; each shot eases in over 5%
+    // and holds 16%. A 1,601-frame film fits two shots.
     const directorOptions: DirectorOptions = {
-      opening: Math.round(frameCount * 0.08),
-      transition: Math.round(frameCount * 0.07),
+      opening: Math.round(frameCount * 0.35),
+      transition: Math.round(frameCount * 0.05),
       dwell: Math.round(frameCount * 0.16),
-      closing: Math.round(frameCount * 0.06),
+      closing: Math.round(frameCount * 0.1),
       zooms: zooms ?? [3, 4.5, 2.5, 5, 3.5].map((zoom) => Math.max(1.25, Math.round(zoom * span * 100) / 100)),
     };
     const keys = direct(
@@ -357,168 +353,11 @@ if (provenance.camera && existsSync(previewRecords)) {
 const ticksList = shown.map((record) => record.tick as number);
 const first = join(frames, "frame-000000.png");
 
-type EncodedSegment = {
-  src: string;
-  sha256: string;
-  bytes: number;
-  start_frame: number;
-  frames: number;
-  start_tick: number;
-  end_tick: number;
-};
-
-/**
- * Encode one segment range at full CRF quality (closed GOP, faststart). If the
- * resulting segment still exceeds `segmentMaxBytes` (or 24 MiB), recursively
- * subdivide at an interior camera boundary (or midpoint) so 4K60 never starves
- * bitrate to cram into Cloudflare's 25 MiB per-asset limit.
- */
-const HARD_SEGMENT_LIMIT = Math.min(segmentMaxBytes, 24 * 1024 * 1024);
-const MIN_SUBDIVIDE_FRAMES = Math.max(2, Math.min(fps, 15));
-const segmentWorkDir = join(work, "segments");
-let segmentSeq = 0;
-
-function encodeRangeChecked(
-  range: SegmentRange,
-  outSegments: { path: string; range: SegmentRange; encode: string[] }[],
-): void {
-  mkdirSync(segmentWorkDir, { recursive: true });
-  const tempPath = join(segmentWorkDir, `seg-${String(segmentSeq).padStart(4, "0")}.mp4`);
-  segmentSeq += 1;
-  const segEncode = buildSegmentEncodeArgs(crf, fps);
-  run("ffmpeg", [
-    "-y",
-    "-loglevel",
-    "error",
-    "-framerate",
-    String(fps),
-    "-start_number",
-    String(range.startFrame),
-    "-i",
-    join(frames, "frame-%06d.png"),
-    "-frames:v",
-    String(range.frames),
-    ...segEncode,
-    tempPath,
-  ]);
-  const bytes = readFileSync(tempPath).length;
-  if (bytes <= HARD_SEGMENT_LIMIT) {
-    outSegments.push({ path: tempPath, range, encode: segEncode });
-    return;
-  }
-  if (range.frames >= MIN_SUBDIVIDE_FRAMES * 2) {
-    console.error(
-      `media: segment [${range.startFrame}..${range.startFrame + range.frames}) was ${(bytes / (1024 * 1024)).toFixed(2)} MiB > ${(HARD_SEGMENT_LIMIT / (1024 * 1024)).toFixed(1)} MiB; subdividing`,
-    );
-    const [left, right] = splitSegmentRange(range, ticksList, provenance.camera?.keys);
-    encodeRangeChecked(left, outSegments);
-    encodeRangeChecked(right, outSegments);
-    return;
-  }
-  if (bytes <= ASSET_LIMIT) {
-    outSegments.push({ path: tempPath, range, encode: segEncode });
-    return;
-  }
-  // Last-resort clamp for an extraordinarily dense short segment so ASSET_LIMIT is never violated.
-  const fallbackKbps = cloudflareCeilingKbps(range.frames, fps, ASSET_LIMIT);
-  const clampedEncode = buildSegmentEncodeArgs(crf, fps, fallbackKbps);
-  run("ffmpeg", [
-    "-y",
-    "-loglevel",
-    "error",
-    "-framerate",
-    String(fps),
-    "-start_number",
-    String(range.startFrame),
-    "-i",
-    join(frames, "frame-%06d.png"),
-    "-frames:v",
-    String(range.frames),
-    ...clampedEncode,
-    tempPath,
-  ]);
-  outSegments.push({ path: tempPath, range, encode: clampedEncode });
-}
-
-let encode: string[];
-let primaryVideo: { src: string; sha256: string; bytes: number };
-let publishedSegments: EncodedSegment[] | undefined;
-
-if (segmentMode === 1) {
-  encode = buildWebEncodeArgs(crf, shown.length, fps);
-  const video = join(work, "film.mp4");
-  run("ffmpeg", [
-    "-y",
-    "-loglevel",
-    "error",
-    "-framerate",
-    String(fps),
-    "-i",
-    join(frames, "frame-%06d.png"),
-    ...encode,
-    video,
-  ]);
-  primaryVideo = publish(video, filmId, "mp4");
-} else if (segmentMode === "auto") {
-  // Encode cleanly at CRF without starving bitrate first; if it fits in one Cloudflare-safe file,
-  // keep a single file, otherwise split across natural camera cuts at full quality.
-  const probeEncode = buildSegmentEncodeArgs(crf, fps);
-  const video = join(work, "film.mp4");
-  run("ffmpeg", [
-    "-y",
-    "-loglevel",
-    "error",
-    "-framerate",
-    String(fps),
-    "-i",
-    join(frames, "frame-%06d.png"),
-    ...probeEncode,
-    video,
-  ]);
-  const wholeBytes = readFileSync(video).length;
-  if (wholeBytes <= HARD_SEGMENT_LIMIT) {
-    encode = probeEncode;
-    primaryVideo = publish(video, filmId, "mp4");
-  } else {
-    const targetCount = Math.max(2, Math.ceil(wholeBytes / HARD_SEGMENT_LIMIT));
-    console.error(
-      `media: single CRF ${crf} file is ${(wholeBytes / (1024 * 1024)).toFixed(2)} MiB > ${(HARD_SEGMENT_LIMIT / (1024 * 1024)).toFixed(1)} MiB; splitting into ~${targetCount} Cloudflare-safe segments`,
-    );
-    const planned = planSegmentRanges(shown.length, ticksList, provenance.camera?.keys, targetCount);
-    const encoded: { path: string; range: SegmentRange; encode: string[] }[] = [];
-    for (const range of planned) encodeRangeChecked(range, encoded);
-    encode = encoded[0]?.encode ?? probeEncode;
-    publishedSegments = encoded.map((item, idx) => {
-      const pub = publish(item.path, `${filmId}-seg${String(idx).padStart(2, "0")}`, "mp4");
-      return {
-        ...pub,
-        start_frame: item.range.startFrame,
-        frames: item.range.frames,
-        start_tick: ticksList[item.range.startFrame]!,
-        end_tick: ticksList[item.range.startFrame + item.range.frames - 1]!,
-      };
-    });
-    const head = publishedSegments[0]!;
-    primaryVideo = { src: head.src, sha256: head.sha256, bytes: head.bytes };
-  }
-} else {
-  const planned = planSegmentRanges(shown.length, ticksList, provenance.camera?.keys, segmentMode);
-  const encoded: { path: string; range: SegmentRange; encode: string[] }[] = [];
-  for (const range of planned) encodeRangeChecked(range, encoded);
-  encode = encoded[0]?.encode ?? buildSegmentEncodeArgs(crf, fps);
-  publishedSegments = encoded.map((item, idx) => {
-    const pub = publish(item.path, `${filmId}-seg${String(idx).padStart(2, "0")}`, "mp4");
-    return {
-      ...pub,
-      start_frame: item.range.startFrame,
-      frames: item.range.frames,
-      start_tick: ticksList[item.range.startFrame]!,
-      end_tick: ticksList[item.range.startFrame + item.range.frames - 1]!,
-    };
-  });
-  const head = publishedSegments[0]!;
-  primaryVideo = { src: head.src, sha256: head.sha256, bytes: head.bytes };
-}
+// The whole film as one MP4 at the CRF given, uncapped: R2 serves it whatever its size.
+const encode = buildWebEncodeArgs(crf, fps);
+const encoded = join(work, "film.mp4");
+run("ffmpeg", ["-y", "-loglevel", "error", "-framerate", String(fps), "-i", join(frames, "frame-%06d.png"), ...encode, encoded]);
+const primaryVideo = publish(encoded, filmId, "mp4", FILM_STORE);
 
 let master:
   | { path: string; sha256: string; bytes: number; crf: number; encode: string[] }
@@ -571,7 +410,6 @@ const manifest = {
     fps,
     frames: shown.length,
     encode,
-    ...(publishedSegments && publishedSegments.length > 1 ? { segments: publishedSegments } : {}),
     ...(master ? { master } : {}),
   },
   poster: { ...publish(poster, `${filmId}-poster`, "jpg"), frame: 0 },
@@ -615,11 +453,7 @@ mkdirSync(join(WEB, "lib", "films"), { recursive: true });
 const manifestPath = join(WEB, "lib", "films", `${filmId}.json`);
 writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 console.error(`media: wrote ${manifestPath}; lib/films/index.ts must list "${filmId}" for the page to show it`);
-const totalBytes = publishedSegments
-  ? publishedSegments.reduce((sum, seg) => sum + seg.bytes, 0)
-  : manifest.video.bytes;
 console.error(
-  `media: ${shown.length} frames at ${width}×${height} ${fps} fps${
-    publishedSegments && publishedSegments.length > 1 ? ` in ${publishedSegments.length} segments` : ""
-  }, ticks ${from.tick} to ${String(end.tick)}, video ${totalBytes} bytes`,
+  `media: ${shown.length} frames at ${width}×${height} ${fps} fps, ticks ${from.tick} to ${String(end.tick)}, ` +
+    `video ${manifest.video.bytes} bytes in media-r2/; \`bun run upload-media\` puts it in R2`,
 );

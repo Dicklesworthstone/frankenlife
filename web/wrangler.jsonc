@@ -1,10 +1,10 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   // The static export in `out/` (`bun run build`), served as Workers static
-  // assets at frankenlife.org. worker.ts runs first: it sends www. to the
-  // apex and serves the media's byte ranges (static assets ignore Range
-  // requests, and Safari plays no video without them); everything else goes
-  // straight to the assets.
+  // assets at frankenlife.org, and the films, one MP4 each, in the R2 bucket
+  // frankenlife-media (scripts/upload-media.ts). worker.ts runs first: it
+  // sends www. to the apex and serves the films' byte ranges from R2 (Safari
+  // plays no video without them); everything else goes straight to the assets.
   "name": "frankenlife",
   "main": "worker.ts",
   "compatibility_date": "2026-11-01",
@@ -14,6 +14,7 @@
     { "pattern": "frankenlife.org", "custom_domain": true },
     { "pattern": "www.frankenlife.org", "custom_domain": true }
   ],
+  "r2_buckets": [{ "binding": "MEDIA", "bucket_name": "frankenlife-media" }],
   "assets": {
     "directory": "./out",
     "binding": "ASSETS",

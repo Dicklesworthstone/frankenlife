@@ -37,8 +37,7 @@ export type V2ExplorerFeature = {
  *
  * Verification status reflects the observed branch state (AGENTS.md):
  * - Verified & closed (18/18 V2 beads — all 21 feature slugs + V2-10/V2-17 Stage-2): V2-01..V2-17 + V2-EPIC.
- * - The 104 Stage-2 runs (G9) and their residuals are recorded in `experiments/v2-emergence/README.md`;
- *   the plan's G5 visual gate is not run (README.md).
+ * - The 104 Stage-2 runs (G9) and their residuals are recorded in `experiments/v2-emergence/README.md`.
  */
 export const V2_EXPLORER_FEATURES: readonly V2ExplorerFeature[] = [
   {

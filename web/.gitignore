@@ -7,8 +7,10 @@ next-env.d.ts
 .wrangler/
 
 # Rendered media (`bun run media`). Like every FrankenLife recording it stays out of git (AGENTS.md, plan
-# §18.5); lib/media.json is its committed manifest, with each file's SHA-256 and how it was made.
+# §18.5); lib/films/*.json, lib/controls.json and lib/stills.json are the committed manifests, with each file's
+# SHA-256 and how it was made. The films' videos are in media-r2/, which scripts/upload-media.ts puts in R2.
 /public/media/
+/media-r2/
 # Media a newer film replaced, kept rather than deleted.
 /media-retired/
 

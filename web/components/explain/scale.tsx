@@ -295,12 +295,10 @@ export function ScaleCalculator() {
               </div>
             </div>
             <p className="mt-3 text-xs leading-relaxed text-slate-400">
-              At unit sensing scale each organism of this size pays at least{" "}
-              <span className="font-mono text-slate-200">0.005 + 0.001 + {grouped(parameters)} × 128 × 2·10⁻⁹</span> ={" "}
-              <span className="font-mono text-slate-200">{trim(mandatoryCost(parameters), 4)}</span> energy a simulated
-              second, before moving, emitting or dividing. With perfect uptake the starter&apos;s sources could keep at
-              most about <span className="font-mono text-slate-200">{grouped(Math.floor(ceiling))}</span> alive, so every
-              profile declares its own environment.
+              Each organism this size pays at least{" "}
+              <span className="font-mono text-slate-200">{trim(mandatoryCost(parameters), 4)}</span> energy a second just
+              to exist, so the starter&apos;s sources feed at most{" "}
+              <span className="font-mono text-slate-200">{grouped(Math.floor(ceiling))}</span>.
             </p>
           </div>
         </div>
@@ -311,15 +309,10 @@ export function ScaleCalculator() {
             <BasisBadge basis="record" />
           </div>
           <p className="mt-2 text-sm leading-relaxed text-slate-300">
-            On an Apple M5 Ultra (2026-11-10, with other GPU work on the device), FrankenLife&apos;s resident Metal
-            controller kernel streamed F32 weights at <span className="font-mono text-amber-200">426–748 GB/s</span>{" "}
-            in its fastest rounds, 0.44–0.69 of a plain read of the same bytes, every output identical to the CPU
-            reference. Against a four-billion-parameter F32 bank that is 27–47 full sweeps a second, for the
-            controllers alone; sensing, the field, births and deaths come on top.
-          </p>
-          <p className="mt-2 text-sm leading-relaxed text-slate-400">
-            The scale gate G7 asks for at least 380,000 live organisms averaging 9,000–11,000 parameters, at least 30
-            full-evaluation ticks and 30 frames a second, for ten minutes on a named machine. It has not run.
+            M5 Ultra, Metal: weights streamed at <span className="font-mono text-amber-200">426–748 GB/s</span>, bit for
+            bit the CPU&apos;s. Over four billion F32 parameters that is{" "}
+            <span className="font-mono text-amber-200">27–47</span> sweeps a second, for the brains alone. The G7 scale
+            gate has not run.
           </p>
         </div>
       </div>

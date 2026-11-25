@@ -1,9 +1,11 @@
 // The films' manifests (lib/films/<id>.json, each written by `bun run media`,
 // scripts/media.ts, and listed in lib/films/index.ts) and the stills'
 // (lib/stills.json, written by scripts/stills.ts), all committed. The files
-// they name live in public/media/, outside git, and `bun run build` refuses to
-// build unless each one is there with its manifest's SHA-256
-// (scripts/check-media.ts).
+// they name are outside git. Each film's video is one MP4 in the R2 bucket
+// that worker.ts serves at /media/ (scripts/upload-media.ts puts it there from
+// web/media-r2/). The posters, cards and stills are static assets in
+// public/media/, and `bun run build` refuses to build unless each one is there
+// with its manifest's SHA-256 (scripts/check-media.ts).
 
 import controlsManifest from "./controls.json";
 import { FILM_MANIFESTS } from "./films";
@@ -27,22 +29,11 @@ export type MasterVideo = {
   encode: string[];
 };
 
-/** One <= 25 MiB Cloudflare-safe MP4 segment of a multi-segment film. */
-export type VideoSegment = MediaFile & {
-  /** Zero-based frame index into the full film where this segment starts. */
-  start_frame: number;
-  /** Number of frames encoded in this segment. */
-  frames: number;
-  /** Committed world tick of this segment's first frame. */
-  start_tick: number;
-  /** Committed world tick of this segment's last frame. */
-  end_tick: number;
-};
-
 export type FilmManifest = {
   schema: typeof MEDIA_SCHEMA;
   /** The film's id: lib/films/<id>.json, and the prefix of its files (scripts/media.ts --film). */
   id: string;
+  /** The whole film as one MP4, served from R2 (worker.ts). */
   video: MediaFile & {
     width: number;
     height: number;
@@ -50,12 +41,6 @@ export type FilmManifest = {
     frames: number;
     /** The ffmpeg arguments that encoded it from flife's PNG frames. */
     encode: string[];
-    /**
-     * Optional ordered sequence of <= 25 MiB Cloudflare-safe segments making up
-     * the full film (e.g. high-bitrate 4K60 split cleanly across camera cuts).
-     * Absent or length 1 for single-file films.
-     */
-    segments?: VideoSegment[];
     /** Optional unconstrained archival master (e.g. 4K60) written outside public/media/. */
     master?: MasterVideo;
   };
@@ -186,23 +171,20 @@ export type ControlsManifest = {
 // A JSON import types each array as a list, not a pair; scripts/controls.ts writes the shape above.
 export const controls = controlsManifest as unknown as ControlsManifest;
 
-/** The files one film serves: its video (every segment), poster and social card. */
-export function filmFiles(filmManifest: FilmManifest): MediaFile[] {
-  const videoFiles: MediaFile[] =
-    filmManifest.video.segments && filmManifest.video.segments.length > 0
-      ? [filmManifest.video, ...filmManifest.video.segments]
-      : [filmManifest.video];
-  return [...videoFiles, filmManifest.poster, filmManifest.social];
-}
-
-/** Every file the films and the still sets serve from /media/, deduplicated by path. */
-export function collectMediaFiles(
+/**
+ * Every file the films and the still sets serve as static assets from public/media/ (each film's poster and
+ * social card, and the stills), deduplicated by path. The films' videos are in R2 instead (`filmVideos`).
+ */
+export function collectStaticMedia(
   filmManifests: readonly FilmManifest[],
   stillSets: readonly { stills: readonly MediaFile[] }[],
 ): MediaFile[] {
   return [
     ...new Map(
-      [...filmManifests.flatMap(filmFiles), ...stillSets.flatMap((set) => set.stills)].map((file) => [file.src, file]),
+      [
+        ...filmManifests.flatMap((filmManifest) => [filmManifest.poster, filmManifest.social]),
+        ...stillSets.flatMap((set) => set.stills),
+      ].map((file) => [file.src, file]),
     ).values(),
   ];
 }
@@ -246,5 +228,12 @@ export type StillsManifest = {
 /** The v2 stills (lib/stills.json, written by scripts/stills.ts). */
 export const stills = stillsManifest as unknown as StillsManifest;
 
-/** Every file the site serves from /media/, once each, as the manifests name them. */
-export const mediaFiles: MediaFile[] = collectMediaFiles(films, [controls, stills]);
+/** Every static file the site serves from /media/ (public/media/), once each, as the manifests name them. */
+export const staticMedia: MediaFile[] = collectStaticMedia(films, [controls, stills]);
+
+/** Each film's one video, served from R2 at its `src` (worker.ts). */
+export const filmVideos: MediaFile[] = films.map((filmManifest) => ({
+  src: filmManifest.video.src,
+  sha256: filmManifest.video.sha256,
+  bytes: filmManifest.video.bytes,
+}));

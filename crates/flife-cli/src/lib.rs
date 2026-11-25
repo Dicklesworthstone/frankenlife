@@ -115,14 +115,15 @@ pub use discovery::{
 pub use experiment::{
     ABLATIONS, Ablation, Condition, EXPERIMENT_CATALOG_FILE, EXPERIMENT_SCHEMA, Experiment,
     ExperimentOptions, ExperimentRecord, LastRecord, MANIFEST_SCHEMA, MEASURES, Measure, Measures,
-    REPORT_FILE, REPORT_SCHEMA, Report, RunResult, Spec, experiment,
+    REPORT_FILE, REPORT_SCHEMA, Report, RunResult, Spec, V2Measures, experiment,
 };
 pub use features::{FEATURES_SCHEMA, FeatureInfo, FeatureListing, list_features};
 pub use flife_backend_metal::{BackendBudget, ControllerChoice};
 pub use flife_manim::{ColorMapping, FieldComponent, FieldMapping, Look, Particles, Style};
 pub use inspect::{
-    INSPECT_SCHEMA, InspectOptions, Inspected, InspectedCheckpoint, InspectedExtent,
-    InspectedField, InspectedLayer, InspectedOrganism, InspectedWeights, Inspection, inspect,
+    INSPECT_SCHEMA, InspectOptions, Inspected, InspectedCheckpoint, InspectedDiagnostics,
+    InspectedExtent, InspectedField, InspectedLayer, InspectedOrganism, InspectedWeights,
+    Inspection, inspect,
 };
 pub use memory::{MemoryAdmission, RESERVE_BYTES};
 pub use metrics::{Declaration, METRICS_SCHEMA, Metrics, Tracked, Tracker};

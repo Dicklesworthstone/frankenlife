@@ -12,9 +12,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use flife_cli::{InspectOptions, Inspection, MotorAgencyDiagnostics, v2_diagnostics};
-use flife_core::ValidatedConfig;
+use flife_cli::{
+    ControllerChoice, Experiment, ExperimentOptions, InspectOptions, Inspection, MEASURES,
+    MotorAgencyDiagnostics, Spec, V2Diagnostics, V2Measures, analyze, experiment, v2_diagnostics,
+};
+use flife_core::{CoreError, V2Feature, ValidatedConfig};
 use flife_engine::{OrganismSnapshot, Stepped, World};
+use serde_json::Value;
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
 
@@ -334,4 +338,409 @@ profile = "minimal"
         v2_diagnostics::motor_agency_of_world(&world_v1).expect("v1 motor"),
         MotorAgencyDiagnostics::unavailable(live_v1)
     );
+}
+
+#[test]
+fn flife_inspect_diagnostics_cli_and_library_match_live_world_including_dedt() {
+    let tail = r#"
+[contact]
+diameter = 0.5
+stiffness = 0.75
+adhesion = 0.35
+adhesion_range = 1.5
+
+[v2]
+profile = "minimal"
+
+[v2.motor]
+enabled = true
+"#;
+    let toml_text = ecology_toml("field-ecology-v2", tail);
+    let ticks = 12_u64;
+    let world = step_world(&toml_text, ticks);
+    let expected = v2_diagnostics::of_world(&world).expect("live world diagnostics");
+    assert!(expected.geometry.is_some());
+    assert!(expected.motor_agency.corr_me_dedt.is_some());
+
+    let dir = scratch("inspect_cli_diagnostics");
+    let cfg_path = dir.join("config.toml");
+    let run_dir = dir.join("run");
+    fs::write(&cfg_path, &toml_text).expect("writes config");
+    let run_out = Command::new(env!("CARGO_BIN_EXE_flife"))
+        .args([
+            "run",
+            cfg_path.to_str().expect("UTF-8"),
+            "--ticks",
+            "12",
+            "--every",
+            "0",
+            "--controllers",
+            "cpu",
+            "--run-dir",
+            run_dir.to_str().expect("UTF-8"),
+            "--checkpoint-every",
+            "12",
+            "--checkpoint-durability",
+            "process-crash",
+        ])
+        .output()
+        .expect("flife run executes");
+    assert_eq!(
+        run_out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+
+    // Without --diagnostics: no diagnostics record emitted.
+    let plain_out = Command::new(env!("CARGO_BIN_EXE_flife"))
+        .args(["inspect", run_dir.to_str().expect("UTF-8")])
+        .output()
+        .expect("flife inspect executes");
+    assert_eq!(plain_out.status.code(), Some(0));
+    let plain_records: Vec<Value> = String::from_utf8(plain_out.stdout)
+        .expect("UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSON"))
+        .collect();
+    assert!(
+        plain_records.iter().all(|r| r["record"] != "diagnostics"),
+        "plain inspect must not emit diagnostics"
+    );
+
+    // With --diagnostics: library and CLI both match live world bit-for-bit,
+    // including real `corr_me_dedt` from checkpoint-restored `energy_change_rate`.
+    let inspected_lib = flife_cli::inspect(
+        &run_dir,
+        InspectOptions {
+            diagnostics: true,
+            ..InspectOptions::default()
+        },
+    )
+    .expect("inspect with diagnostics");
+    let lib_diag = inspected_lib
+        .diagnostics
+        .expect("diagnostics present")
+        .diagnostics;
+    assert_eq!(lib_diag, expected);
+
+    let diag_out = Command::new(env!("CARGO_BIN_EXE_flife"))
+        .args(["inspect", run_dir.to_str().expect("UTF-8"), "--diagnostics"])
+        .output()
+        .expect("flife inspect --diagnostics executes");
+    assert_eq!(
+        diag_out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&diag_out.stderr)
+    );
+    let diag_records: Vec<Value> = String::from_utf8(diag_out.stdout)
+        .expect("UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSON"))
+        .collect();
+    let diag_line = diag_records.last().expect("last record is diagnostics");
+    assert_eq!(diag_line["record"], "diagnostics");
+    let parsed: V2Diagnostics = serde_json::from_value(serde_json::json!({
+        "geometry": diag_line["geometry"],
+        "motor_agency": diag_line["motor_agency"],
+    }))
+    .expect("deserializes V2Diagnostics");
+    assert_eq!(parsed, expected);
+
+    // Explicit --diameter override changes geometry diameter cleanly.
+    let expected_override =
+        v2_diagnostics::geometry_of_world_with_diameter(&world, 1.25).expect("override");
+    let override_out = Command::new(env!("CARGO_BIN_EXE_flife"))
+        .args([
+            "inspect",
+            run_dir.to_str().expect("UTF-8"),
+            "--diagnostics",
+            "--diameter",
+            "1.25",
+        ])
+        .output()
+        .expect("flife inspect --diagnostics --diameter executes");
+    assert_eq!(override_out.status.code(), Some(0));
+    let override_records: Vec<Value> = String::from_utf8(override_out.stdout)
+        .expect("UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSON"))
+        .collect();
+    let override_diag = override_records.last().expect("diagnostics record");
+    let override_parsed: V2Diagnostics = serde_json::from_value(serde_json::json!({
+        "geometry": override_diag["geometry"],
+        "motor_agency": override_diag["motor_agency"],
+    }))
+    .expect("deserializes override V2Diagnostics");
+    assert_eq!(override_parsed.geometry, Some(expected_override));
+    assert_eq!(override_parsed.motor_agency, expected.motor_agency);
+
+    // Library refuses dangling diameter without diagnostics and non-positive diameter.
+    assert!(matches!(
+        flife_cli::inspect(
+            &run_dir,
+            InspectOptions {
+                diagnostics: false,
+                diameter: Some(0.5),
+                ..InspectOptions::default()
+            }
+        ),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    assert!(matches!(
+        flife_cli::inspect(
+            &run_dir,
+            InspectOptions {
+                diagnostics: true,
+                diameter: Some(0.0),
+                ..InspectOptions::default()
+            }
+        ),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+}
+
+#[test]
+fn v2_experiment_and_analyze_support_per_condition_toggles_and_v2_measures() {
+    let tail = r#"
+[contact]
+diameter = 0.5
+stiffness = 0.75
+adhesion = 0.35
+adhesion_range = 1.5
+
+[v2]
+profile = "minimal"
+
+[v2.motor]
+enabled = true
+
+[v2.polarity]
+enabled = true
+"#;
+    let base_toml = ecology_toml("field-ecology-v2", tail);
+    let make_spec = |name: &str, discovery: &str, held_out: &str, no_pcp_disable: &str| -> Spec {
+        let text = format!(
+            r#"
+schema = "frankenlife.experiment.v1"
+name = "{name}"
+hypothesis = "Per-condition V2 toggles and end-state V2Measures flow through experiment and analyze."
+base = "base.toml"
+ticks = 12
+metrics_every = 12
+control = "control"
+selection = "All conditions run on discovery and held-out seeds."
+
+[seeds]
+discovery = {discovery}
+held_out = {held_out}
+
+[[conditions]]
+name = "control"
+
+[[conditions]]
+name = "no-pcp"
+disable = [{no_pcp_disable}]
+
+[[conditions]]
+name = "v1-baseline"
+v1_compat = true
+
+[[conditions]]
+name = "chemistry-only"
+ablation = "chemistry-only"
+"#
+        );
+        toml::from_str(&text).expect("valid spec TOML")
+    };
+
+    let exp_a = Experiment::new(
+        make_spec("v2-a", "[1, 2]", "[11]", "\"pcp-polarity\""),
+        &base_toml,
+    )
+    .expect("exp_a resolves");
+    // Per-condition feature toggles resolve directly on each condition's ValidatedConfig.
+    let cfg_control = exp_a.configuration(0, 1).expect("control cfg");
+    let cfg_no_pcp = exp_a.configuration(1, 1).expect("no-pcp cfg");
+    let cfg_v1 = exp_a.configuration(2, 1).expect("v1-baseline cfg");
+    assert!(cfg_control.is_v2_feature_enabled(V2Feature::PcpPolarity));
+    assert!(cfg_control.is_v2_feature_enabled(V2Feature::So2Motor));
+    assert!(!cfg_no_pcp.is_v2_feature_enabled(V2Feature::PcpPolarity));
+    assert!(cfg_no_pcp.is_v2_feature_enabled(V2Feature::So2Motor));
+    assert!(!cfg_v1.is_v2_feature_enabled(V2Feature::PcpPolarity));
+    assert!(!cfg_v1.is_v2_feature_enabled(V2Feature::So2Motor));
+
+    // Selection rules accept V2 measures.
+    let select_spec_text = r#"
+schema = "frankenlife.experiment.v1"
+name = "v2-select"
+hypothesis = "Select on mean_abs_psi6."
+base = "base.toml"
+ticks = 12
+control = "control"
+selection = "Pick max mean_abs_psi6 on discovery."
+
+[seeds]
+discovery = [1]
+
+[select]
+measure = "mean_abs_psi6"
+rule = "max"
+
+[[conditions]]
+name = "control"
+
+[[conditions]]
+name = "no-pcp"
+disable = ["pcp-polarity"]
+"#;
+    assert!(
+        Experiment::new(toml::from_str(select_spec_text).expect("parse"), &base_toml).is_ok(),
+        "[select] must accept V2Measures"
+    );
+
+    // Invalid per-condition toggles are refused upfront before any run starts:
+    // unknown feature slug, and V2 toggles on a field-ecology-v1 base.
+    assert!(
+        Experiment::new(
+            make_spec("bad-slug", "[1]", "[]", "\"not-a-real-feature\""),
+            &base_toml
+        )
+        .is_err()
+    );
+    let v1_base = ecology_toml("field-ecology-v1", "");
+    assert!(
+        Experiment::new(
+            make_spec("bad-v1", "[1]", "[]", "\"pcp-polarity\""),
+            &v1_base
+        )
+        .is_err()
+    );
+
+    // Run two disjoint-seed V2 experiments and pool them with `flife analyze`.
+    let dir_a = scratch("v2_exp_a");
+    let report_a = experiment(
+        &exp_a,
+        &dir_a,
+        ExperimentOptions {
+            cpu_workers: None,
+            controllers: ControllerChoice::Cpu,
+        },
+        |_| {},
+    )
+    .expect("exp_a runs");
+    assert_eq!(report_a.measures.len(), MEASURES.len());
+    assert_eq!(MEASURES.len(), 33);
+
+    // Verify cataloged V2Measures on control seed 1 match live `v2_diagnostics::of_world` bit-for-bit.
+    let mut direct = flife_cli::found(&cfg_control).expect("direct world");
+    for _ in 0..12 {
+        match direct.step().expect("step") {
+            Stepped::Published(_) => {}
+            Stepped::Paused(shortfall) => panic!("paused: {shortfall:?}"),
+        }
+    }
+    let expected_v2 = V2Measures::of_world(&direct)
+        .expect("v2 measures")
+        .expect("v2 active");
+    let control_seed_1 = report_a
+        .runs
+        .iter()
+        .find(|r| r.condition == "control" && r.seed == 1)
+        .expect("control seed 1");
+    assert_eq!(
+        control_seed_1.result.measures.expect("measures").v2,
+        Some(expected_v2)
+    );
+    assert!(expected_v2.median_d1_over_d.is_some());
+    assert!(expected_v2.mean_abs_psi6.is_some());
+    assert!(expected_v2.corr_me_dedt.is_some());
+    assert!(expected_v2.corr_me_energy.is_some());
+
+    // `chemistry-only` zeroes motor variance -> corr_me_dedt / corr_me_energy are undefined
+    // and listed in `undefined_seeds` rather than treated as 0.
+    let chem_comp = report_a
+        .comparisons
+        .iter()
+        .find(|c| c.condition == "chemistry-only" && c.split == "discovery")
+        .expect("chemistry-only discovery comparison");
+    assert_eq!(chem_comp.effects["corr_me_dedt"].n, 0);
+    assert_eq!(chem_comp.effects["corr_me_dedt"].undefined_seeds, [1, 2]);
+    assert_eq!(chem_comp.effects["mean_abs_psi6"].n, 2);
+
+    // `no-pcp` keeps both contact geometry and so2-motor active -> all 9 V2 measures paired.
+    let no_pcp_comp = report_a
+        .comparisons
+        .iter()
+        .find(|c| c.condition == "no-pcp" && c.split == "discovery")
+        .expect("no-pcp discovery comparison");
+    for name in [
+        "median_d1_over_d",
+        "mean_overlaps_within_1d",
+        "chain_fraction_z1_z2",
+        "mean_abs_psi6",
+        "global_abs_mean_psi6",
+        "mean_me",
+        "std_me",
+        "corr_me_dedt",
+        "corr_me_energy",
+    ] {
+        assert_eq!(no_pcp_comp.effects[name].n, 2, "measure {name}");
+    }
+
+    // Second disjoint experiment pools cleanly through `analyze`.
+    let exp_b = Experiment::new(
+        make_spec("v2-b", "[3, 4]", "[12]", "\"pcp-polarity\""),
+        &base_toml,
+    )
+    .expect("exp_b resolves");
+    let dir_b = scratch("v2_exp_b");
+    experiment(
+        &exp_b,
+        &dir_b,
+        ExperimentOptions {
+            cpu_workers: None,
+            controllers: ControllerChoice::Cpu,
+        },
+        |_| {},
+    )
+    .expect("exp_b runs");
+    let pooled =
+        analyze(&[dir_a.as_path(), dir_b.as_path()]).expect("analyze pools V2 experiments");
+    assert_eq!(pooled.measures.len(), MEASURES.len());
+    let pooled_no_pcp = pooled
+        .comparisons
+        .iter()
+        .find(|c| c.condition == "no-pcp" && c.split == "discovery")
+        .expect("pooled no-pcp discovery");
+    assert_eq!(pooled_no_pcp.effects["mean_abs_psi6"].n, 4);
+    assert_eq!(pooled_no_pcp.effects["corr_me_dedt"].n, 4);
+
+    // `analyze` refuses pooling when a condition of the same name has different feature toggles.
+    let exp_mismatch = Experiment::new(
+        make_spec(
+            "v2-mismatch",
+            "[5]",
+            "[]",
+            "\"pcp-polarity\", \"so2-motor\"",
+        ),
+        &base_toml,
+    )
+    .expect("mismatch resolves");
+    let dir_m = scratch("v2_exp_mismatch");
+    experiment(
+        &exp_mismatch,
+        &dir_m,
+        ExperimentOptions {
+            cpu_workers: None,
+            controllers: ControllerChoice::Cpu,
+        },
+        |_| {},
+    )
+    .expect("mismatch runs");
+    assert!(matches!(
+        analyze(&[dir_a.as_path(), dir_m.as_path()]),
+        Err(CoreError::StateConflict { .. })
+    ));
 }

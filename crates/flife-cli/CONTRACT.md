@@ -193,10 +193,10 @@ texel scratch) into `MemoryAdmission::render` before creating a run directory or
     by default.
   - In the library: `transplant(package, &host, dir, &TransplantOptions { at, name, durability })` returns the
     `Record::Transplant`.
-- `flife inspect DIR --at T --field --weights ID…` (plan §14.6; FL-048's raw state; FL-021's on-demand weight
-  dump, §14.2). `DIR` is a run directory no process holds; `--at` the committed tick of one of its checkpoints, the
-  newest that restores by default; `--weights` (repeatable) names organisms whose whole controller to print. In the
-  library: `inspect(dir, InspectOptions { at, field, weights })` returns an `Inspection`.
+- `flife inspect DIR --at T --field --weights ID… --diagnostics [--diameter D]` (plan §14.6; FL-048's raw state; FL-021's on-demand weight
+  dump, §14.2; `V2-10` / `V2-17` diagnostics). `DIR` is a run directory no process holds; `--at` the committed tick of one of its checkpoints, the
+  newest that restores by default; `--weights` (repeatable) names organisms whose whole controller to print; `--diagnostics` computes read-only periodic tissue geometry (using `[contact] diameter`, or `--diameter D` when supplied) and `so2-motor` neural-agency correlations directly from the restored committed world (including persisted `energy_change_rate`). In the
+  library: `inspect(dir, InspectOptions { at, field, weights, diagnostics, diameter })` returns an `Inspection`.
 - `flife capabilities --config C --ticks N --cpu-workers W` (plan §14.6, §20.5), every flag optional. C is a
   configuration to run instead of the compiled-in reference preset; N (at least 1) the ticks each route runs,
   `PROBE_TICKS` = 8 by default; W the world's workers, the configuration's by default. In the library:
@@ -378,17 +378,23 @@ texel scratch) into `MemoryAdmission::render` before creating a run directory or
     condition and split (reached, extinct, capacity-paused, failed, error), every comparison with the control, and
     every cataloged run with its result.
   - A result is `reached`, `capacity-paused`, `failed` or `error` (refused before or broken during the run, with
-    its `CoreError` kind), the committed tick and digest, whether it is extinct, and its measures. FL-048 extends
-    them to 24 (`MEASURES`), each with its basis (§15.2), which the report lists (`measures`):
+    its `CoreError` kind), the committed tick and digest, whether it is extinct, and its measures. `MEASURES`
+    compares 33 measures (24 baseline FL-048 measures plus 9 `V2-10` / `V2-17` end-state measures), each with its
+    basis (§15.2), which the report lists (`measures`):
     - complete over the run (the tally): peak and least live, births, deaths, emitter-ticks, emission paid,
       topology changes, mutated parameters;
-    - complete at the end (the survey and the last metrics record's complete figures): survived, final live,
-      deepest generation, lineages and distinct genomes alive, live topologies, lineage entropy, the dominant
-      lineage's share, mean generation;
+    - complete at the end (the survey, the last metrics record's complete figures, and `V2Measures` from the committed
+      world): survived, final live, deepest generation, lineages and distinct genomes alive, live topologies, lineage
+      entropy, the dominant lineage's share, mean generation; plus periodic tissue geometry (`median_d1_over_d`,
+      `mean_overlaps_within_1d`, `chain_fraction_z1_z2`, `mean_abs_psi6`, `global_abs_mean_psi6`, undefined without
+      `[contact]` or when extinct) and `so2-motor` agency (`mean_me`, `std_me`, `corr_me_dedt`, `corr_me_energy`,
+      undefined when disabled, unevaluated or zero-variance);
     - sampled from the render epoch at the last metrics record: occupied fraction, Morisita's index and Moran's I
       of the organisms over 16 × 16 bins, the field's Gini and Moran's I, mean speed and moving fraction.
     The last-record measures (`LastRecord`) need `metrics_every` > 0 and a metrics record at the run's last tick;
-    otherwise they are undefined.
+    otherwise they are undefined. Conditions in a `field-ecology-v2*` specification may also declare per-condition
+    feature toggles (`v1_compat`, `disable`, `enable`, applied in that order via `ValidatedConfig::from_toml_with_overrides`),
+    recorded in the canonical design and verified identically by `flife analyze`.
   - A comparison, per split and condition: the paired seeds (both runs reached their tick), the unpaired ones, and
     per measure n, both means, the mean difference, seeds higher, lower and equal, the differences in seed order,
     and the exact two-sided sign-flip p-value over all 2^n sign assignments (up to `EXACT_TEST_MAX_SEEDS` = 20).

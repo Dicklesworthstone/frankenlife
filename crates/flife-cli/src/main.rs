@@ -1446,4 +1446,39 @@ mod tests {
             Err(flife_core::CoreError::InvalidConfig(_))
         ));
     }
+
+    #[test]
+    fn inspect_cli_parses_diagnostics_and_requires_diagnostics_for_diameter() {
+        let mut command = Cli::command();
+        let inspect = command
+            .find_subcommand_mut("inspect")
+            .expect("inspect subcommand exists");
+        let help = inspect.render_long_help().to_string();
+        assert!(help.contains("--diagnostics"), "{help}");
+        assert!(help.contains("--diameter"), "{help}");
+
+        assert!(
+            Cli::command()
+                .try_get_matches_from(["flife", "inspect", "run_dir", "--diagnostics"])
+                .is_ok()
+        );
+        assert!(
+            Cli::command()
+                .try_get_matches_from([
+                    "flife",
+                    "inspect",
+                    "run_dir",
+                    "--diagnostics",
+                    "--diameter",
+                    "0.5",
+                ])
+                .is_ok()
+        );
+        assert!(
+            Cli::command()
+                .try_get_matches_from(["flife", "inspect", "run_dir", "--diameter", "0.5"])
+                .is_err(),
+            "--diameter without --diagnostics must be rejected by CLI"
+        );
+    }
 }

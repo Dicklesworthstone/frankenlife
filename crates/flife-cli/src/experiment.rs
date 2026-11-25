@@ -752,18 +752,16 @@ impl Experiment {
         let seed = i64::try_from(seed)
             .map_err(|_| spec_error("seeds", format!("{seed} is not a TOML integer")))?;
         table.insert("seed".to_owned(), toml::Value::Integer(seed));
-        if condition.has_feature_overrides() {
-            let text = toml::to_string(&table)
-                .map_err(|error| spec_error("toml", error.to_string().trim().to_owned()))?;
-            let overrides = condition.feature_overrides();
-            return ValidatedConfig::from_toml_with_overrides(&text, &overrides);
-        }
-        let config: RunConfig =
+        let mut config: RunConfig =
             toml::Value::Table(table)
                 .try_into()
                 .map_err(|error: toml::de::Error| {
                     spec_error("toml", error.to_string().trim().to_owned())
                 })?;
+        if condition.has_feature_overrides() {
+            let overrides = condition.feature_overrides();
+            flife_core::apply_feature_overrides(&mut config, &overrides)?;
+        }
         flife_core::validate(config)
     }
 
@@ -1120,7 +1118,9 @@ pub const MEASURES: [Measure; 33] = [
     sample("moving_fraction", |m| {
         m.last.and_then(|l| l.moving_fraction)
     }),
-    end("median_d1_over_d", |m| m.v2.and_then(|v| v.median_d1_over_d)),
+    end("median_d1_over_d", |m| {
+        m.v2.and_then(|v| v.median_d1_over_d)
+    }),
     end("mean_overlaps_within_1d", |m| {
         m.v2.and_then(|v| v.mean_overlaps_within_1d)
     }),

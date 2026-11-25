@@ -108,8 +108,8 @@ export function ControlsTrio() {
       basis="render"
       source={
         <>
-          Each still is <code>{controls.render.command}</code> on the film&apos;s preset ({controls.preset}) with only its{" "}
-          <code>{controls.change}</code> changed, coloured as the film is ({controls.render.mapping}, {controls.render.look}{" "}
+          Each still is <code>{controls.render.command}</code> on the confluent film&apos;s preset ({controls.preset}) with only its{" "}
+          <code>{controls.change}</code> changed, coloured as the confluent film is ({controls.render.mapping}, {controls.render.look}{" "}
           look). At tick {grouped(controls.tick)} each world&apos;s
           SHA-256 digest equals the one the record names for its trial (
           {stills.map((still) => still.record.trial).join(", ")} in {controls.record.json}), and the first is the film&apos;s
@@ -171,7 +171,7 @@ export function ControlsTrio() {
       <ol
         ref={scroller}
         onScroll={onScroll}
-        aria-label="The film's world and its two controls at the same tick"
+        aria-label="The confluent world and its two controls at the same tick"
         // slop-ok(S12-three-cards): the film's world and its two plan §5.4 controls, compared side by side.
         className="-mx-5 mt-5 flex snap-x snap-mandatory gap-4 overflow-x-auto px-5 pb-2 [scrollbar-width:none] sm:-mx-7 sm:px-7 lg:mx-0 lg:grid lg:grid-cols-3 lg:gap-5 lg:overflow-visible lg:px-0 lg:pb-0 [&::-webkit-scrollbar]:hidden"
       >
@@ -271,7 +271,7 @@ export function ControlsTrio() {
             itself.{" "}
             {full ? (
               <>
-                From {grouped(film.world.founders)} founders the film&apos;s world reaches its ceiling of{" "}
+                From {grouped(film.world.founders)} founders the confluent world reaches its ceiling of{" "}
                 {grouped(controls.ceiling)}; without inheritance,{" "}
                 {grouped(stills.find((still) => still.id === "fresh-offspring")?.live ?? 0)} are alive at the same tick.{" "}
               </>

@@ -227,6 +227,12 @@ frames.
 Both films are on the site beside the confluent film. The record panel names
 each film's configuration. The Version 2 chapter's presets each point to the
 film of one of their mechanisms: polarity is in the tissue preset, veins in
-the supercolony. The films stay visual choices on one seed, and the site says
-so. What each mechanism does, measured, is in the Stage-2 campaign
+the supercolony. The films run each mechanism at the engine's defaults, not at
+the presets' settings, and the site says so. Polarity's
+`initial_polarity_strength_max` is 0.3 in the film and 0.88 in
+`morphogenesis-tissue-v2.toml`. The veins' `flux_half_saturation` is 0.1 in
+the film and 0.25 in `supercolony-v2.toml`, and its `maximum_diffusion` is
+0.298717 (ten times this world's diffusion) against 0.3. Every other value
+of the two tables is the same. The films stay visual choices on one seed, and
+the site says so. What each mechanism does, measured, is in the Stage-2 campaign
 (`experiments/v2-emergence/README.md`).

@@ -109,8 +109,8 @@ bun run media --film confluent --flife ../target/release/flife --run-dir ../RUN 
 # --segments auto, --segment-max-mib 22 so every segment stays <= 25 MiB for Cloudflare Workers,
 # snapped at camera cuts, plus one unconstrained archival 4K60 master outside public/media/;
 # pass --width 3840 --height 2160 to override to 16:9 4K60). The page's films are encoded at
-# CRF 30 (the last --crf given wins): 6 segments, about 110 MiB and 70 Mbit/s, where CRF 19
-# makes 26 segments and 370 MiB, too much to stream:
+# CRF 30 (the last --crf given wins): 6 segments each, 102 to 112 MiB, 64 to 70 Mbit/s. At CRF 19
+# the veins film came to 26 segments and 370 MiB, too much to stream:
 bun run media:4k60 -- --film confluent --flife ../target/release/flife --run-dir ../RUN --work WORK-4K60 \
   --field none --look sphere --color lineage-energy --crf 30 \
   --zooms 1.6,3,2.2,5,2.6 --master-out ../exports/film-4k60-master.mp4 --cpu-workers 24

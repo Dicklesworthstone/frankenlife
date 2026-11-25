@@ -106,6 +106,10 @@ describe("arithmetic the same in every engine", () => {
   });
 });
 
+// Each of these steps a world thousands of times: a few seconds on an idle machine, but past bun's
+// default 5 s when other builds share it (5.2 to 8.4 s seen). A timeout there is load, not a wrong ledger.
+const SLOW = 60_000;
+
 describe("the ledger", () => {
   for (const [name, mode] of [
     ["own", OWN],
@@ -126,7 +130,7 @@ describe("the ledger", () => {
         for (let c = 0; c < world.field.length; c++) expect(world.field[c] ?? 0).toBeGreaterThanOrEqual(0);
         for (let i = 0; i < world.count; i++) expect(world.energy[i] ?? 0).toBeGreaterThanOrEqual(0);
       }
-    });
+    }, SLOW);
   }
 
   test("a long run stays exact and alive", () => {
@@ -134,7 +138,7 @@ describe("the ledger", () => {
     for (let t = 0; t < 12000; t++) world.step();
     expect(world.ledger().residual).toBe(0);
     expect(world.count).toBeGreaterThan(200);
-  });
+  }, SLOW);
 });
 
 describe("determinism", () => {

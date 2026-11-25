@@ -34,7 +34,7 @@ export const siteConfig = {
 export const filmChoice = {
   world: [
     "The confluent film's world runs field-ecology-v1-contact, a registered variant of the baseline model with one added rule: every organism is a body, here 0.25 world units across, and after each tick overlapping bodies push apart while bodies within 1.5 diameters pull together by the square of how alike their inherited chemistry is. The rule moves organisms, never energy. It was added because the organisms in the reference screenshots look like packed spheres, which points cannot. Measured, the bodies stack two or three deep instead of packing, because the pull, summed over every neighbour, outweighs the push.",
-    "Its numbers were chosen by searches outside the simulation, in several stages, against 14 statistics of the reference screenshots that inspired the project. The last stage kept the rules and set the scale. The field is four times finer than in the stage before, so a field cell holds about 2.6 organisms rather than about ten, nearer the references' one. Food is plentiful, so the population sits at its ceiling of 262,144, as the references' counters show theirs do at a million. Children land up to 2.5 world units from their parent, so colonies fill the 80-unit torus instead of leaving most of it black. It scores 0.74 on the statistics' scale, against 1.93 for the same rules at the coarser scale and 1.03 for the same ecology without bodies, scored the same way; the nearest any world of the last stage came was 0.73. Every trial was scored coloured by chemical affinity; this world was chosen by eye, coloured by lineage. The film colours each organism by its lineage and lights it by its own energy: black with none, white with nearly twice what it needs to divide, so pale patches are well fed and dark ones starving. Coloured that way, the scored frame comes to 0.72, against 0.90 coloured by lineage alone. The film shows the chosen world itself, from the tick where it was scored.",
+    "Its numbers were chosen by searches outside the simulation, in several stages, against 14 statistics of the reference screenshots that inspired the project. The last stage kept the rules and set the scale. The field is four times finer than in the stage before, so a field cell holds about 2.6 organisms rather than about ten, nearer the references' one. Food is plentiful, so the population sits at its ceiling of 262,144, as the references' counters show theirs do at a million. Children land up to 2.5 world units from their parent, so colonies fill the 80-unit torus instead of leaving most of it black. It scores 0.74 on the statistics' scale, against 1.93 for the same rules at the coarser scale and 1.03 for the same ecology without bodies, scored the same way; the nearest any world of the last stage came was 0.73. Every trial was scored coloured by chemical affinity; this world was chosen by eye, coloured by lineage. The film colours each organism by its lineage and lights it by its own energy: black with none, white with nearly twice what it needs to divide, so pale patches are well fed and dark ones starving. Coloured that way, the scored frame comes to 0.72, against 0.90 coloured by lineage alone. The confluent film shows the chosen world itself, from the tick where it was scored.",
     "Nothing the search measured feeds back into a run. The organisms have no aesthetic fitness: they feed, emit, split and die by energy alone. The seed is the Desktop preset's 42, not a pick. On three seeds the search never saw, the world scores 0.81 to 1.57, against 1.92 to 2.68 for the coarser world on the same seeds.",
     "Emission, chosen by the neural networks, makes the structure, and contact shapes it at the scale of bodies. Organisms return about half of what they eat to the field, in a chemical composition their networks choose and kin choose alike, so each lineage paints its surroundings with its own chemistry. Adhesion then sorts lineages by that chemistry, as real tissues sort by adhesion, into domains of labyrinths, foam and packed spheres. With every controller's decisions zeroed, nothing is emitted and the bodies settle into a uniform mottled haze, with no domains, labyrinths or foam. With every newborn's genome drawn fresh instead of inherited, the population falls from its ceiling to about 1,200.",
   ],
@@ -45,7 +45,7 @@ export const filmChoice = {
     "Like the confluent film's, both worlds sit at their population ceiling of 262,144 in every frame, where births are refused: a capacity limit, not an ecological result. The films show how one mechanism changes the look of one world; what each mechanism does, measured, is the Stage-2 campaign's, in the Version 2 chapter.",
   ],
   camera:
-    "Where the camera looks comes from the run; only each shot's zoom is given by hand. The same ticks are first rendered small, each shot then eases into the region where the organisms changed most during it, and the film opens and closes on the whole torus. The camera changes no result: the preview and the film end on the same digest.",
+    "Where the camera looks comes from the run; only each shot's zoom is given by hand, the same in all three films. The same ticks are first rendered small, each shot then eases into the region where the organisms changed most during it, and each film opens and closes on the whole torus. The camera changes no result: each film ends on its preview's digest.",
 };
 
 /**
@@ -690,8 +690,9 @@ export const v2Bundles = [
       { label: "Energy passed to kin", value: "79,910", note: "units per run, in every window" },
     ],
     // One of this preset's mechanisms, switched on alone in the confluent world (filmNotes, filmChoice.v2).
+    // The film's is at the engine's defaults; this preset starts bodies more strongly polarised (0.88, not 0.3).
     film: "confluent-polarity",
-    filmLine: "This preset's polarity, switched on alone in the confluent world, is one of the films at the top of the page.",
+    filmLine: "One of the films at the top of the page switches on polarity, one of this preset's mechanisms, alone in the confluent world, at the engine's default settings rather than this preset's.",
   },
   {
     id: "supercolony",
@@ -706,8 +707,9 @@ export const v2Bundles = [
       { label: "Alignment from veins", value: "+50%", note: "0.378 against 0.252 without; 4/4" },
       { label: "Alive from bursts", value: "+58%", note: "against no relay; 4/4" },
     ],
+    // The film's veins are at the engine's defaults; this preset saturates the flux later (0.25, not 0.1).
     film: "confluent-veins",
-    filmLine: "This preset's veins, switched on alone in the confluent world, are one of the films at the top of the page.",
+    filmLine: "One of the films at the top of the page switches on veins, one of this preset's mechanisms, alone in the confluent world, at the engine's default settings rather than this preset's.",
   },
 ] as const;
 
@@ -1075,7 +1077,7 @@ export const presets: {
     torus: 80,
     dt: "1/32",
     kind: "search",
-    chosen: "Outer search · stage E · the film",
+    chosen: "Outer search · stage E · the confluent film",
     body: "contact-world on a field four times finer, fed to its ceiling, with children landing up to 2.5 units away: saturated domains of labyrinth, foam and packed spheres.",
   },
   {

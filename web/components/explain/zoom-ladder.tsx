@@ -108,7 +108,7 @@ const STOPS: Stop[] = [
     title: `[${grouped(LIVE_POSTER)}] organisms, one world.`,
     body: (
       <>
-        The film&apos;s first frame: the whole {TORUS} × {TORUS}-unit torus at tick {grouped(POSTER.tick)}, after{" "}
+        The confluent film&apos;s first frame: the whole {TORUS} × {TORUS}-unit torus at tick {grouped(POSTER.tick)}, after{" "}
         {fmt(seconds(POSTER.tick), 0)} simulated seconds of evolution. Every speck is one organism, with a body, a
         metabolism and its own neural network. <code className="text-lime-200">flife render</code> drew it from the
         committed world.
@@ -128,7 +128,7 @@ const STOPS: Stop[] = [
     title: "Lineages become [tissue].",
     body: (
       <>
-        A {fmt(CARD_VIEW)} × {fmt(CARD_VIEW)}-unit patch of the film&apos;s closest shot, at the same place on the
+        A {fmt(CARD_VIEW)} × {fmt(CARD_VIEW)}-unit patch of the confluent film&apos;s closest shot, at the same place on the
         torus {grouped(CARD.tick - POSTER.tick)} ticks ({fmt(seconds(CARD.tick - POSTER.tick), 0)} simulated seconds)
         later. Each founder&apos;s lineage wears one of {LINEAGE.length} colours, lighter where an organism holds more energy. The labyrinths,
         rims and foam come from what the networks choose to emit: in the record&apos;s control without emission, this
@@ -781,7 +781,7 @@ export function ZoomLadder({ index }: { index?: string }) {
                 <GreenTitle text="From the world to [one brain]." />
               </h3>
               <p className="max-w-md text-[15px] leading-relaxed text-slate-400">
-                Five steps from the film&apos;s whole world to the {grouped(PARAMETERS)} numbers inside one of its
+                Five steps from the confluent film&apos;s whole world to the {grouped(PARAMETERS)} numbers inside one of its
                 organisms.{" "}
                 <span className="text-slate-300">
                   {scrolly

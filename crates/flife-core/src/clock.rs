@@ -71,10 +71,16 @@ impl TimeStep {
     /// is then correctly rounded. For a power-of-two denominator, such as
     /// the reference 1/128, the result is exact whenever the product is
     /// below 2^53.
+    #[inline]
     #[must_use]
     pub fn seconds(self, span: TickSpan) -> f64 {
-        let scaled = u128::from(span.get()) * u128::from(self.numerator);
-        scaled as f64 / f64::from(self.denominator)
+        let num = u64::from(self.numerator);
+        let scaled = if let Some(product) = span.get().checked_mul(num) {
+            product as f64
+        } else {
+            (u128::from(span.get()) * u128::from(num)) as f64
+        };
+        scaled / f64::from(self.denominator)
     }
 
     /// Ticks in exactly `seconds`, which must be a whole number of ticks
@@ -244,6 +250,7 @@ impl TickSpan {
 ///
 /// # Errors
 /// [`CoreError::Overflow`] when `birth` is after `now`.
+#[inline]
 pub fn age_seconds(birth: Tick, now: Tick, step: TimeStep) -> Result<f64, CoreError> {
     Ok(step.seconds(now.since(birth)?))
 }

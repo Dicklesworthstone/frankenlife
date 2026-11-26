@@ -1338,6 +1338,14 @@ impl Population {
         self.occupants.get(slot).copied().flatten()
     }
 
+    /// Direct O(1) committed energy read at a physical `slot` (0.8 MB flat
+    /// column at 100k organisms, avoiding touching `Working` in Phase-6
+    /// spatial chemistry pre-pass).
+    #[inline]
+    pub(crate) fn energy_at_slot(&self, slot: usize) -> Option<f64> {
+        self.energies.get(slot).copied()
+    }
+
     /// Direct O(1) genome and arena-slot read at a validated physical `slot`.
     #[inline]
     pub(crate) fn genome_and_arena_at_slot(

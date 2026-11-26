@@ -1848,22 +1848,66 @@ struct Run<'a> {
 /// in [`reduce_run`]. Flushing 32 cells per plane avoids 32-way L1D
 /// cache-set thrashing on power-of-two grids (e.g. 512² where planes are
 /// 1 MiB apart) while writing bit-identical F32 values.
-const REDUCE_BATCH: usize = 32;
+const REDUCE_BATCH: usize = 64;
 
-/// Flush `count` buffered cell updates into `moments`, one plane at a time.
+/// Flush `count` pre-scaled cell updates into `moments`, one plane at a time.
+/// Rebinding `plane` once per channel lets LLVM hoist its pointer and length
+/// out of the inner cell loop; the 4-cell fast path proves strict ascending
+/// distinctness and in-bounds indices in one branch so NEON pairs F64 adds
+/// while preserving exact `-0.0` semantics (`added != 0.0`).
 #[inline]
 fn flush_moment_batch_const<const M: usize>(
     moments: &mut [&mut [f32]],
     count: usize,
     cell_at: &[usize; REDUCE_BATCH],
-    factors: &[f64; REDUCE_BATCH],
     accum: &[[f64; M]; REDUCE_BATCH],
 ) {
-    for (channel, plane) in moments.iter_mut().take(M).enumerate() {
-        for b in 0..count {
-            let added = accum[b][channel] * factors[b];
-            if added != 0.0 {
-                let slot = &mut plane[cell_at[b]];
+    let quads = count / 4;
+    let tail_start = quads * 4;
+    for (channel, plane_slot) in moments.iter_mut().take(M).enumerate() {
+        let plane: &mut [f32] = plane_slot;
+        let plane_len = plane.len();
+        for q in 0..quads {
+            let b = q * 4;
+            let i0 = cell_at[b];
+            let i1 = cell_at[b + 1];
+            let i2 = cell_at[b + 2];
+            let i3 = cell_at[b + 3];
+            let a0 = accum[b][channel];
+            let a1 = accum[b + 1][channel];
+            let a2 = accum[b + 2][channel];
+            let a3 = accum[b + 3][channel];
+            if (i0 < i1)
+                & (i1 < i2)
+                & (i2 < i3)
+                & (i3 < plane_len)
+                & (a0 != 0.0)
+                & (a1 != 0.0)
+                & (a2 != 0.0)
+                & (a3 != 0.0)
+            {
+                let v01 = [f64::from(plane[i0]) + a0, f64::from(plane[i1]) + a1];
+                let v23 = [f64::from(plane[i2]) + a2, f64::from(plane[i3]) + a3];
+                plane[i0] = v01[0] as f32;
+                plane[i1] = v01[1] as f32;
+                plane[i2] = v23[0] as f32;
+                plane[i3] = v23[1] as f32;
+            } else {
+                for k in 0..4 {
+                    let added = accum[b + k][channel];
+                    if added != 0.0
+                        && let Some(slot) = plane.get_mut(cell_at[b + k])
+                    {
+                        *slot = (f64::from(*slot) + added) as f32;
+                    }
+                }
+            }
+        }
+        for b in tail_start..count {
+            let added = accum[b][channel];
+            if added != 0.0
+                && let Some(slot) = plane.get_mut(cell_at[b])
+            {
                 *slot = (f64::from(*slot) + added) as f32;
             }
         }
@@ -1885,7 +1929,6 @@ fn reduce_run_const<const M: usize>(
     let mut occupied = 0_usize;
     let mut batch_len = 0_usize;
     let mut cell_at = [0_usize; REDUCE_BATCH];
-    let mut factors = [0.0_f64; REDUCE_BATCH];
     let mut accum = [[0.0_f64; M]; REDUCE_BATCH];
     let cell_base = run.cell_base;
     let energy_len = run.energy.len();
@@ -1966,23 +2009,19 @@ fn reduce_run_const<const M: usize>(
         occupied += 1;
 
         if factor != 0.0 {
+            for slot in moment.iter_mut() {
+                *slot *= factor;
+            }
             cell_at[batch_len] = at;
-            factors[batch_len] = factor;
             batch_len += 1;
             if batch_len == REDUCE_BATCH {
-                flush_moment_batch_const::<M>(
-                    &mut run.moments[..M],
-                    batch_len,
-                    &cell_at,
-                    &factors,
-                    &accum,
-                );
+                flush_moment_batch_const::<M>(&mut run.moments[..M], batch_len, &cell_at, &accum);
                 batch_len = 0;
             }
         }
     }
     if batch_len > 0 {
-        flush_moment_batch_const::<M>(&mut run.moments[..M], batch_len, &cell_at, &factors, &accum);
+        flush_moment_batch_const::<M>(&mut run.moments[..M], batch_len, &cell_at, &accum);
     }
     occupied
 }
@@ -2009,7 +2048,6 @@ fn reduce_run(
             let mut occupied = 0_usize;
             let mut batch_len = 0_usize;
             let mut cell_at = [0_usize; REDUCE_BATCH];
-            let mut factors = [0.0_f64; REDUCE_BATCH];
             let mut accum = [[0.0_f64; CHANNELS]; REDUCE_BATCH];
             let cell_base = run.cell_base;
 
@@ -2064,8 +2102,10 @@ fn reduce_run(
                 occupied += 1;
 
                 if factor != 0.0 {
+                    for slot in moment.iter_mut().take(moment_count) {
+                        *slot *= factor;
+                    }
                     cell_at[batch_len] = at;
-                    factors[batch_len] = factor;
                     accum[batch_len] = moment;
                     batch_len += 1;
                     if batch_len == REDUCE_BATCH {
@@ -2073,7 +2113,6 @@ fn reduce_run(
                             &mut run.moments[..moment_count],
                             batch_len,
                             &cell_at,
-                            &factors,
                             &accum,
                         );
                         batch_len = 0;
@@ -2085,7 +2124,6 @@ fn reduce_run(
                     &mut run.moments[..moment_count],
                     batch_len,
                     &cell_at,
-                    &factors,
                     &accum,
                 );
             }

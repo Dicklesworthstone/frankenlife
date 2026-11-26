@@ -569,6 +569,7 @@ impl Bins {
 
     /// Bucket `bucket`'s positions in [`Bins::order`]; empty for an empty
     /// or out-of-range bucket.
+    #[inline]
     #[must_use]
     pub fn range(&self, bucket: usize) -> Range<usize> {
         match (
@@ -583,6 +584,7 @@ impl Bins {
     }
 
     /// Bucket `bucket`'s item indices, in the order they were given.
+    #[inline]
     #[must_use]
     pub fn bucket(&self, bucket: usize) -> &[u32] {
         self.order.get(self.range(bucket)).unwrap_or(&[])

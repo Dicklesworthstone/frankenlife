@@ -53,8 +53,8 @@ use flife_genome::{BirthAttempt, Mutator, ParameterValues, Prepared, TopologyId}
 use flife_neural::{DenseTopology, WeightDtype, Weights};
 
 use super::{
-    DecisionLane, ModelVariant, PACKETS_PER_ORGANISM, Rules, SettleReport, SettleTileBuf, Settled,
-    Stages, Working, compositions_into, fit, in_runs_mut, parameter_count, settle_all,
+    Decision, DecisionLane, ModelVariant, PACKETS_PER_ORGANISM, Rules, SettleReport, SettleTileBuf,
+    Settled, Stages, Working, compositions_into, fit, in_runs_mut, parameter_count, settle_all,
     settle_stages,
 };
 use crate::chemistry::{UptakeSettlement, effective_affinity};
@@ -169,6 +169,7 @@ pub(super) fn settle_with(
     spatial: super::SpatialSettle<'_>,
     from: Tick,
     watched: Option<OrganismId>,
+    decisions: &[Decision],
     working: &mut [Working],
     lanes: &mut [DecisionLane],
     settle_tiles: &mut Vec<SettleTileBuf>,
@@ -198,6 +199,7 @@ pub(super) fn settle_with(
             (by_demand, granted),
             from,
             watched,
+            decisions,
             working,
             lanes,
             work,
@@ -224,7 +226,7 @@ pub(super) fn settle_with(
         rules,
         population,
         (by_demand, granted, cell_compositions, packet_compositions),
-        working,
+        working.len(),
         lanes.len(),
         spatial_rows,
         row_to_spatial,
@@ -238,6 +240,7 @@ pub(super) fn settle_with(
         (row_to_spatial, spatial_uptake.as_slice()),
         from,
         watched,
+        decisions,
         working,
         lanes,
         settle_tiles,
@@ -263,6 +266,7 @@ fn settle_on(
     grants: (&Bins, &[GrantPacket]),
     from: Tick,
     watched: Option<OrganismId>,
+    decisions: &[Decision],
     working: &mut [Working],
     lanes: &mut [DecisionLane],
     work: &mut SettleWork,
@@ -329,7 +333,8 @@ fn settle_on(
                 granted: packet.granted,
             });
         }
-        let post_phase4_h0 = organism.held.recurrent_state_array()[0];
+        let decision = organism.decision(decisions);
+        let post_phase4_h0 = decision.held.recurrent_state_array()[0];
         let affinity = effective_affinity(
             traits,
             post_phase4_h0,
@@ -346,19 +351,19 @@ fn settle_on(
         motion.push(MotionOrganism {
             remaining: 0.0,
             exhausted: false,
-            evaluated: organism.evaluated,
+            evaluated: decision.evaluated,
             parameters: parameter_count(&rules.catalog, genome)?,
             sensing_scale: traits.sensing_scale(),
             absorbed: 0.0,
             velocity: organism.velocity,
             position: organism.position,
             response: *traits.motion_response(),
-            gradients: organism.gradients,
+            gradients: decision.gradients,
         });
         if needs_motion_v2 {
             motion_extras.push(MotionV2Extras {
                 basal_multiplier: organism.basal_multiplier,
-                motor: organism
+                motor: decision
                     .actions
                     .motor
                     .map_or_else(MotorSteeringInputs::default, MotorSteeringInputs::from),
@@ -397,15 +402,21 @@ fn settle_on(
             emitters.push(usize::MAX);
         } else {
             emitters.push(emission.len());
+            let decision = organism.decision(decisions);
             let (deposit_position, effective_emission) = if emission_v2_active {
-                let ctx =
-                    rules.emission_context(organism, outcome.position, outcome.velocity, from)?;
+                let ctx = rules.emission_context(
+                    organism,
+                    decision,
+                    outcome.position,
+                    outcome.velocity,
+                    from,
+                )?;
                 let plan = rules.v2.emission().plan_with_recovery_alpha(
                     &rules.grid,
                     rules.step,
                     outcome.remaining,
                     false,
-                    organism.actions.emission.as_ref(),
+                    decision.actions.emission.as_ref(),
                     &ctx,
                     rules.v2.emission_recovery_alpha(),
                 )?;
@@ -416,7 +427,7 @@ fn settle_on(
             } else {
                 (
                     outcome.position,
-                    organism.actions.emission.map(EmissionAction::from),
+                    decision.actions.emission.map(EmissionAction::from),
                 )
             };
             emission.push(EmissionOrganism {
@@ -447,6 +458,7 @@ fn settle_on(
     for (organism, &at) in working.iter().zip(emitters.iter()) {
         match emission_out.get(at) {
             Some(outcome) if !outcome.exhausted => {
+                let decision = organism.decision(decisions);
                 proposers.push(proposal.len());
                 proposal.push(ProposalOrganism {
                     entity: organism.committed.id.get(),
@@ -454,8 +466,8 @@ fn settle_on(
                     cooldown_deadline: organism.cooldown_deadline.get(),
                     remaining: outcome.remaining,
                     exhausted: false,
-                    attempt_probability: rules.effective_attempt_probability(organism)?,
-                    child_fraction: organism.actions.child_fraction,
+                    attempt_probability: rules.effective_attempt_probability(organism, decision)?,
+                    child_fraction: decision.actions.child_fraction,
                 });
             }
             _ => proposers.push(usize::MAX),
@@ -520,7 +532,9 @@ fn settle_on(
                             detail: format!("{} has no genome", organism.committed.id),
                         })?
                         .traits();
+                    let decision = organism.decision(decisions);
                     let mut stages = Device {
+                        decision,
                         chemistry: chemistry_out.get(index).ok_or_else(missing)?,
                         motion: motion_out.get(index).ok_or_else(missing)?,
                         emission: emitters.get(index).and_then(|&at| emission_out.get(at)),
@@ -531,6 +545,7 @@ fn settle_on(
                     *slot = settle_stages(
                         rules,
                         organism,
+                        decision,
                         traits,
                         &mut stages,
                         from,
@@ -621,6 +636,7 @@ fn same(a: f64, b: f64) -> bool {
 /// the backend's amounts, and the backend's payments and balances must be
 /// the host's, bit for bit.
 struct Device<'a> {
+    decision: &'a Decision,
     chemistry: &'a ChemistryOutcome,
     motion: &'a MotionOutcome,
     /// `None` for an organism the backend found dead before emission.
@@ -860,13 +876,13 @@ impl Stages for Device<'_> {
             next_readiness,
             next_cooldown_deadline,
         ) = if rules.v2.emission().any_enabled() {
-            let ctx = rules.emission_context(organism, position, velocity, from)?;
+            let ctx = rules.emission_context(organism, self.decision, position, velocity, from)?;
             let plan = rules.v2.emission().plan_with_recovery_alpha(
                 &rules.grid,
                 rules.step,
                 available,
                 budget.is_exhausted(),
-                organism.actions.emission.as_ref(),
+                self.decision.actions.emission.as_ref(),
                 &ctx,
                 rules.v2.emission_recovery_alpha(),
             )?;
@@ -880,7 +896,7 @@ impl Stages for Device<'_> {
         } else {
             (
                 position,
-                organism.actions.emission,
+                self.decision.actions.emission,
                 0.0,
                 organism.secretory_readiness,
                 organism.emission_cooldown_deadline,
@@ -1010,7 +1026,7 @@ impl Stages for Device<'_> {
                 Err(unexpected())
             };
         }
-        check_probability(rules.effective_attempt_probability(organism)?)?;
+        check_probability(rules.effective_attempt_probability(organism, self.decision)?)?;
         match outcome {
             ProposalOutcome::NoAttempt => Ok(ReproductionProposal::NoAttempt),
             ProposalOutcome::Exhausted | ProposalOutcome::CoolingDown => Err(unexpected()),
@@ -1018,7 +1034,7 @@ impl Stages for Device<'_> {
                 let proposal = rules.reproduction.attempted(
                     parent,
                     tick,
-                    organism.actions.child_fraction,
+                    self.decision.actions.child_fraction,
                     budget,
                 )?;
                 if agrees(&proposal, attempted) {

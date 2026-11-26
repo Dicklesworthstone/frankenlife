@@ -699,11 +699,12 @@ impl Rules {
     pub(super) fn effective_attempt_probability(
         &self,
         organism: &Working,
+        decision: &Decision,
     ) -> Result<f64, CoreError> {
         match self.v2.crowding() {
-            None => Ok(organism.actions.attempt_probability),
+            None => Ok(decision.actions.attempt_probability),
             Some(crowding) => hippo_attempt_probability(
-                organism.actions.attempt_rate,
+                decision.actions.attempt_rate,
                 self.step,
                 organism.local_crowding,
                 crowding.arrest_threshold,
@@ -716,11 +717,12 @@ impl Rules {
     pub(super) fn emission_context(
         &self,
         organism: &Working,
+        decision: &Decision,
         position: [f64; 2],
         velocity: [f64; 2],
         from: Tick,
     ) -> Result<EmissionContext, CoreError> {
-        let outputs = organism
+        let outputs = decision
             .held
             .outputs()
             .ok_or_else(|| CoreError::StateConflict {
@@ -765,7 +767,7 @@ impl Rules {
         Ok(EmissionContext {
             position,
             velocity,
-            energy_gradient: organism.gradients[0],
+            energy_gradient: decision.gradients[0],
             polarity: self.v2.polarity().map(|_| organism.committed.polarity),
             raw_spend_logit,
             raw_pump_logit,
@@ -1324,16 +1326,19 @@ struct Watch {
 const MINIMUM_ROWS_PER_LANE: usize = 128;
 
 /// One organism's state during a candidate tick.
+///
+/// Read-only Phase-3/4 outputs (`held`, `evaluated`, `actions`, `gradients` —
+/// ~1.2 KiB per organism) stay in `Scratch::decisions[decision_index]` instead
+/// of being copied into `Working`, shrinking `Working` by ~2.7× and eliminating
+/// random 1.2 KiB gathers from `decisions` during `GatherTile`.
 #[derive(Debug, Clone, Copy)]
 struct Working {
     /// Its committed row at tick `n`.
     committed: Organism,
     budget: EnergyBudget,
     vitality: Vitality,
-    held: HeldOutput,
-    evaluated: bool,
-    actions: DecodedActions,
-    gradients: [[f64; 2]; RESPONSE_TERMS],
+    /// Index into `Scratch::decisions` for this organism's read-only `Decision`.
+    decision_index: u32,
     /// `V2-03` basal maintenance multiplier (`1.0` when `senescence` is off).
     basal_multiplier: f64,
     /// `V2-07` post-Phase-1 local crowding count `N_loc` (`0` when off).
@@ -1352,6 +1357,14 @@ struct Working {
     /// `clear_tiny`, handed to `Recycling` without `Flow::TinyReservoir`.
     lysed_residual: f64,
     intent: Option<BirthIntent>,
+}
+
+impl Working {
+    /// This organism's read-only Phase-3/4 [`Decision`].
+    #[inline]
+    fn decision<'a>(&self, decisions: &'a [Decision]) -> &'a Decision {
+        &decisions[self.decision_index as usize]
+    }
 }
 
 /// A committed world and the operators that advance it.
@@ -3144,7 +3157,7 @@ impl World {
         // observation and its due or forced evaluation, in identity order.
         let view = pyramid.build_on(observed, field_work.workers())?;
         let (sampled, sensor_failure) = sample_with(population, rows, &view, observed, sensors);
-        decide_with(
+        let evaluated = decide_with(
             rules,
             population,
             &view,
@@ -3185,7 +3198,11 @@ impl World {
                 detail: format!("{} decisions for {} organisms", decisions.len(), rows.len()),
             });
         }
-        let mut evaluated = 0_usize;
+        if u32::try_from(decisions.len()).is_err() {
+            return Err(CoreError::Overflow {
+                quantity: "decision indices",
+            });
+        }
         let spatial_decisions = !row_to_spatial.is_empty();
         if spatial_decisions && row_to_spatial.len() != rows.len() {
             return Err(CoreError::StateConflict {
@@ -3197,15 +3214,13 @@ impl World {
                 ),
             });
         }
+        let decision_count = decisions.len();
         if rows.len() >= 512 && lanes.len() > 1 {
             let placeholder = Working {
                 committed: rows[0],
                 budget: EnergyBudget::new(0.0)?,
                 vitality: Vitality::new(),
-                held: rows[0].held,
-                evaluated: false,
-                actions: DecodedActions::default(),
-                gradients: [[0.0; 2]; RESPONSE_TERMS],
+                decision_index: 0,
                 basal_multiplier: 1.0,
                 local_crowding: 0,
                 position: [0.0, 0.0],
@@ -3226,14 +3241,11 @@ impl World {
                 .min(rows.len().div_ceil(512))
                 .max(1);
             let tile_len = rows.len().div_ceil(tile_count);
-            let all_decisions: &[Decision] = decisions.as_slice();
             struct GatherTile<'a> {
                 start: usize,
                 rows: &'a [Organism],
-                decisions: &'a [Decision],
                 spatial_map: &'a [u32],
                 out: &'a mut [Working],
-                evaluated: usize,
             }
             let mut tiles: Vec<GatherTile<'_>> = rows
                 .chunks(tile_len)
@@ -3245,18 +3257,12 @@ impl World {
                     GatherTile {
                         start,
                         rows: row_c,
-                        decisions: if spatial_decisions {
-                            all_decisions
-                        } else {
-                            &all_decisions[start..end]
-                        },
                         spatial_map: if spatial_decisions {
                             &row_to_spatial[start..end]
                         } else {
                             &[]
                         },
                         out: out_c,
-                        evaluated: 0,
                     }
                 })
                 .collect();
@@ -3265,18 +3271,29 @@ impl World {
                 "gather decisions",
                 &mut tiles,
                 |_, tile| {
-                    let mut local_eval = 0_usize;
                     let mapped = !tile.spatial_map.is_empty();
                     for (i, (&organism, slot)) in
                         tile.rows.iter().zip(tile.out.iter_mut()).enumerate()
                     {
                         let dec_idx = if mapped {
-                            tile.spatial_map[i] as usize
+                            tile.spatial_map[i]
                         } else {
-                            i
+                            #[expect(
+                                clippy::cast_possible_truncation,
+                                reason = "decisions.len() <= u32::MAX checked above"
+                            )]
+                            {
+                                (tile.start + i) as u32
+                            }
                         };
-                        let decision = &tile.decisions[dec_idx];
-                        local_eval += usize::from(decision.evaluated);
+                        if (dec_idx as usize) >= decision_count {
+                            return Err(CoreError::StateConflict {
+                                operation: "gather decisions",
+                                detail: format!(
+                                    "decision index {dec_idx} out of bounds for {decision_count}"
+                                ),
+                            });
+                        }
                         let basal_multiplier =
                             rules
                                 .v2
@@ -3287,10 +3304,7 @@ impl World {
                             committed: organism,
                             budget: EnergyBudget::new(organism.energy)?,
                             vitality: Vitality::new(),
-                            held: decision.held,
-                            evaluated: decision.evaluated,
-                            actions: decision.actions,
-                            gradients: decision.gradients,
+                            decision_index: dec_idx,
                             basal_multiplier,
                             local_crowding,
                             position: organism.position,
@@ -3304,23 +3318,31 @@ impl World {
                             intent: None,
                         };
                     }
-                    tile.evaluated = local_eval;
                     Ok(())
                 },
             )?;
-            for tile in &tiles {
-                evaluated += tile.evaluated;
-            }
         } else {
             working.clear();
             for (row_index, &organism) in rows.iter().enumerate() {
                 let dec_idx = if spatial_decisions {
-                    row_to_spatial[row_index] as usize
+                    row_to_spatial[row_index]
                 } else {
-                    row_index
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "decisions.len() <= u32::MAX checked above"
+                    )]
+                    {
+                        row_index as u32
+                    }
                 };
-                let decision = &decisions[dec_idx];
-                evaluated += usize::from(decision.evaluated);
+                if (dec_idx as usize) >= decision_count {
+                    return Err(CoreError::StateConflict {
+                        operation: "gather decisions",
+                        detail: format!(
+                            "decision index {dec_idx} out of bounds for {decision_count}"
+                        ),
+                    });
+                }
                 let basal_multiplier =
                     rules
                         .v2
@@ -3330,10 +3352,7 @@ impl World {
                     committed: organism,
                     budget: EnergyBudget::new(organism.energy)?,
                     vitality: Vitality::new(),
-                    held: decision.held,
-                    evaluated: decision.evaluated,
-                    actions: decision.actions,
-                    gradients: decision.gradients,
+                    decision_index: dec_idx,
                     basal_multiplier,
                     local_crowding,
                     position: organism.position,
@@ -3401,6 +3420,7 @@ impl World {
             },
             from,
             watch.organism,
+            decisions,
             working,
             lanes,
             settle_tiles,
@@ -3741,7 +3761,15 @@ impl World {
         // The contact models displace every survivor from the settled
         // positions, before any moves (crate::contact).
         let contacted = if let Some(bodies) = &rules.contact {
-            contact_displacements(rules, bodies, population, working, contact, lanes.len())?;
+            contact_displacements(
+                rules,
+                bodies,
+                population,
+                decisions,
+                working,
+                contact,
+                lanes.len(),
+            )?;
             if rules.v2.trophallaxis().is_some()
                 && contact.trophallaxis_summary.total_out_quanta > 0
             {
@@ -3926,7 +3954,7 @@ impl World {
                                 velocity,
                                 energy,
                                 energy_change_rate: (energy - organism.committed.energy) / seconds,
-                                held: organism.held,
+                                held: organism.decision(decisions).held,
                                 cooldown_deadline: organism.cooldown_deadline,
                                 secretory_readiness: organism.secretory_readiness,
                                 emission_cooldown_deadline: organism.emission_cooldown_deadline,
@@ -3971,7 +3999,7 @@ impl World {
                         detail: format!("{} has no genome", organism.committed.id),
                     }
                 })?;
-                let recurrent_h0 = organism.held.recurrent_state_array()[0];
+                let recurrent_h0 = organism.decision(decisions).held.recurrent_state_array()[0];
                 let (death, corpse_dir) = if organism.lysed_residual > 0.0 {
                     let death = Death::lysed(
                         &organism.committed,
@@ -4077,7 +4105,7 @@ impl World {
                             velocity,
                             energy,
                             energy_change_rate: (energy - organism.committed.energy) / seconds,
-                            held: organism.held,
+                            held: organism.decision(decisions).held,
                             cooldown_deadline: organism.cooldown_deadline,
                             secretory_readiness: organism.secretory_readiness,
                             emission_cooldown_deadline: organism.emission_cooldown_deadline,
@@ -4094,7 +4122,8 @@ impl World {
                                     detail: format!("{} has no genome", organism.committed.id),
                                 }
                             })?;
-                        let recurrent_h0 = organism.held.recurrent_state_array()[0];
+                        let recurrent_h0 =
+                            organism.decision(decisions).held.recurrent_state_array()[0];
                         let (death, corpse_dir) = if organism.lysed_residual > 0.0 {
                             let death = Death::lysed(
                                 &organism.committed,
@@ -6403,7 +6432,7 @@ fn spatial_chemistry_prepass(
     rules: &Rules,
     population: &Population,
     grants: (&Bins, &[GrantPacket], &[[f64; CHANNELS]], &[u32]),
-    working: &[Working],
+    count: usize,
     workers: usize,
     spatial_rows: &[u32],
     row_to_spatial: &[u32],
@@ -6413,12 +6442,12 @@ fn spatial_chemistry_prepass(
     spatial_uptake.clear();
     let ordered_slots = population.ordered_slots();
     if workers <= 1
-        || working.is_empty()
-        || row_to_spatial.len() != working.len()
-        || spatial_rows.len() != working.len()
-        || spatial_tile_offsets[SPATIAL_TILES] != working.len()
-        || ordered_slots.len() != working.len()
-        || spatial_uptake.capacity() < working.len()
+        || count == 0
+        || row_to_spatial.len() != count
+        || spatial_rows.len() != count
+        || spatial_tile_offsets[SPATIAL_TILES] != count
+        || ordered_slots.len() != count
+        || spatial_uptake.capacity() < count
         || rules.v2.affinity_rotation_enabled()
         || rules.limits.affinity_norm() > rules.chemistry.affinity_norm_limit()
         || !rules.exchange.is_grid_cic()
@@ -6439,11 +6468,10 @@ fn spatial_chemistry_prepass(
         },
         zero_budget,
     );
-    set_len_reuse(spatial_uptake, working.len(), placeholder);
+    set_len_reuse(spatial_uptake, count, placeholder);
 
     let (by_demand, granted, compositions, packet_compositions) = grants;
-    let max_sub_tile = working
-        .len()
+    let max_sub_tile = count
         .div_ceil(workers.saturating_mul(4))
         .max(MINIMUM_ROWS_PER_LANE);
     struct ChemTile<'a> {
@@ -6455,13 +6483,13 @@ fn spatial_chemistry_prepass(
     for t in 0..SPATIAL_TILES {
         let base = spatial_tile_offsets[t];
         let end = spatial_tile_offsets[t + 1];
-        let count = end.saturating_sub(base);
-        if count == 0 {
+        let tile_count = end.saturating_sub(base);
+        if tile_count == 0 {
             continue;
         }
         let mut off = 0_usize;
-        while off < count {
-            let sub_len = (count - off).min(max_sub_tile);
+        while off < tile_count {
+            let sub_len = (tile_count - off).min(max_sub_tile);
             let (out_head, out_tail) = rem_out.split_at_mut(sub_len);
             rem_out = out_tail;
             tiles.push(ChemTile {
@@ -6479,18 +6507,23 @@ fn spatial_chemistry_prepass(
             let mut stack_packets = [(0.0_f64, 0_u32); PACKETS_PER_ORGANISM];
             for (&row_u32, out_slot) in tile.row_indices.iter().zip(tile.out.iter_mut()) {
                 let row_idx = row_u32 as usize;
-                let organism = &working[row_idx];
                 let phys_slot = ordered_slots[row_idx] as usize;
-                if population.id_at_slot(phys_slot) != Some(organism.committed.id) {
+                let Some(energy) = population.energy_at_slot(phys_slot) else {
+                    return Err(CoreError::StateConflict {
+                        operation: "spatial chemistry prepass",
+                        detail: format!("slot {phys_slot} missing energy"),
+                    });
+                };
+                if population.id_at_slot(phys_slot).is_none() {
                     return Err(CoreError::StateConflict {
                         operation: "read genome",
-                        detail: format!("{} slot mismatch", organism.committed.id),
+                        detail: format!("slot {phys_slot} vacant"),
                     });
                 }
                 let (genome, _) = population.genome_and_arena_at_slot(phys_slot);
                 let genome = genome.ok_or_else(|| CoreError::StateConflict {
                     operation: "read genome",
-                    detail: format!("{} has no genome", organism.committed.id),
+                    detail: format!("slot {phys_slot} has no genome"),
                 })?;
                 let bucket = by_demand.bucket(row_idx);
                 if bucket.len() > PACKETS_PER_ORGANISM {
@@ -6509,7 +6542,7 @@ fn spatial_chemistry_prepass(
                         n += 1;
                     }
                 }
-                let mut budget = organism.budget;
+                let mut budget = EnergyBudget::new(energy)?;
                 let settlement = rules.chemistry.settle_indexed_slice(
                     genome.traits().affinity(),
                     &stack_packets[..n],
@@ -6545,6 +6578,7 @@ fn settle_all(
     spatial_precomputed: (&[u32], &[(UptakeSettlement, EnergyBudget)]),
     from: Tick,
     watched: Option<OrganismId>,
+    decisions: &[Decision],
     working: &mut [Working],
     lanes: &mut [DecisionLane],
     settle_tiles: &mut Vec<SettleTileBuf>,
@@ -6659,9 +6693,11 @@ fn settle_all(
                             operation: "read genome",
                             detail: format!("{} has no genome", organism.committed.id),
                         })?;
+                    let decision = organism.decision(decisions);
                     let traits = genome.traits();
                     let mut stages = Reference {
                         traits,
+                        decision,
                         parameters: parameter_count(&rules.catalog, genome)?,
                         packets: packet_slice,
                         compositions,
@@ -6672,6 +6708,7 @@ fn settle_all(
                     settle_stages(
                         rules,
                         organism,
+                        decision,
                         traits,
                         &mut stages,
                         from,
@@ -6744,9 +6781,11 @@ fn settle_all(
                     operation: "read genome",
                     detail: format!("{} has no genome", organism.committed.id),
                 })?;
+            let decision = organism.decision(decisions);
             let traits = genome.traits();
             let mut stages = Reference {
                 traits,
+                decision,
                 parameters: parameter_count(&rules.catalog, genome)?,
                 packets: packet_slice,
                 compositions,
@@ -6756,6 +6795,7 @@ fn settle_all(
             settle_stages(
                 rules,
                 organism,
+                decision,
                 traits,
                 &mut stages,
                 from,
@@ -6847,9 +6887,12 @@ fn compositions_into(
             let mut cells = [0_usize; COMP_BATCH];
             let mut energies = [0.0_f64; COMP_BATCH];
             let mut slots = [0_usize; COMP_BATCH];
+            let mut raw = [0.0_f32; COMP_BATCH];
+            let mut quotients = [0.0_f64; COMP_BATCH];
             let mut i = 0_usize;
             let n = occ_chunk.len();
             while i < n {
+                let batch_start = i;
                 let mut count = 0_usize;
                 while i < n && count < COMP_BATCH {
                     let cell = occ_chunk[i] as usize;
@@ -6893,14 +6936,52 @@ fn compositions_into(
                     i += 1;
                 }
                 if count > 0 {
+                    let contiguous = i - batch_start == count;
                     for (channel, plane) in all_data[total_cells..]
                         .chunks_exact(total_cells)
                         .enumerate()
                         .take(active_channels)
                     {
-                        for b in 0..count {
-                            comp_chunk[slots[b]][channel] =
-                                f64::from(plane[cells[b]]) / energies[b];
+                        // Separate power-of-two gather (`raw`) from division
+                        // (`quotients`) so LLVM emits bounds-check-free NEON
+                        // `fdiv.2d` across the full batch.
+                        let plane_len = plane.len();
+                        if plane_len.is_power_of_two() {
+                            let mask = plane_len - 1;
+                            for (dst, &cell) in raw[..count].iter_mut().zip(&cells[..count]) {
+                                *dst = plane[cell & mask];
+                            }
+                        } else {
+                            for (dst, &cell) in raw[..count].iter_mut().zip(&cells[..count]) {
+                                *dst = plane[cell];
+                            }
+                        }
+                        if count == COMP_BATCH {
+                            for ((dst, &m), &energy) in
+                                quotients.iter_mut().zip(&raw).zip(&energies)
+                            {
+                                *dst = f64::from(m) / energy;
+                            }
+                        } else {
+                            for ((dst, &m), &energy) in quotients[..count]
+                                .iter_mut()
+                                .zip(&raw[..count])
+                                .zip(&energies[..count])
+                            {
+                                *dst = f64::from(m) / energy;
+                            }
+                        }
+                        if contiguous {
+                            for (comp, &q) in comp_chunk[batch_start..batch_start + count]
+                                .iter_mut()
+                                .zip(&quotients[..count])
+                            {
+                                comp[channel] = q;
+                            }
+                        } else {
+                            for (&slot, &q) in slots[..count].iter().zip(&quotients[..count]) {
+                                comp_chunk[slot][channel] = q;
+                            }
                         }
                     }
                 }
@@ -7012,11 +7093,11 @@ fn decide_all(
     ticks: [Tick; 2],
     decisions: &mut Vec<Decision>,
     lanes: &mut [DecisionLane],
-) -> Result<(), CoreError> {
+) -> Result<usize, CoreError> {
     let dual_carrier = rules.v2.dual_carrier().is_some();
     if rows.is_empty() {
         decisions.clear();
-        return Ok(());
+        return Ok(0);
     }
     reserve_for(
         decisions,
@@ -7036,20 +7117,33 @@ fn decide_all(
             .max(worker_budget.min(max_tiles))
     };
     let tile_len = rows.len().div_ceil(tile_count);
-    let mut tiles: Vec<(usize, &[Organism], &mut [Decision])> = rows
+    struct DecideTile<'a> {
+        start: usize,
+        run: &'a [Organism],
+        dec_out: &'a mut [Decision],
+        evaluated: usize,
+    }
+    let mut tiles: Vec<DecideTile<'_>> = rows
         .chunks(tile_len)
         .zip(decisions.chunks_mut(tile_len))
         .enumerate()
-        .map(|(idx, (run, dec_out))| (idx * tile_len, run, dec_out))
+        .map(|(idx, (run, dec_out))| DecideTile {
+            start: idx * tile_len,
+            run,
+            dec_out,
+            evaluated: 0,
+        })
         .collect();
     flife_core::pool::try_parallel_tasks_with_lanes(
         worker_budget,
         "decide",
         lanes,
         &mut tiles,
-        |_, (start, run, dec_out), lane| {
-            let start = *start;
-            let run = *run;
+        |_, tile, lane| {
+            let start = tile.start;
+            let run = tile.run;
+            let dec_out = &mut *tile.dec_out;
+            let mut local_eval = 0_usize;
             let DecisionLane { controller, .. } = lane;
             let mut live = run.first().map(|first| population.ascending_from(first.id));
             if dual_carrier {
@@ -7077,7 +7171,9 @@ fn decide_all(
                             ticks,
                             controller,
                         )?;
+                        local_eval += usize::from(slot.evaluated);
                     }
+                    tile.evaluated = local_eval;
                     return Ok(());
                 }
                 let mut queries = [SensorQuery {
@@ -7111,7 +7207,7 @@ fn decide_all(
                         let Some(genome) = batch_genomes[i] else {
                             return Ok(());
                         };
-                        dec_chunk[i] = decide_from_dual_raw(
+                        let dec = decide_from_dual_raw(
                             rules,
                             genome,
                             &chunk[i],
@@ -7120,9 +7216,12 @@ fn decide_all(
                             ticks,
                             controller,
                         )?;
+                        local_eval += usize::from(dec.evaluated);
+                        dec_chunk[i] = dec;
                         Ok(())
                     })?;
                 }
+                tile.evaluated = local_eval;
                 return Ok(());
             }
             if let Some(Sampled::Single(samples)) = sampled {
@@ -7147,7 +7246,9 @@ fn decide_all(
                         ticks,
                         controller,
                     )?;
+                    local_eval += usize::from(slot.evaluated);
                 }
+                tile.evaluated = local_eval;
                 return Ok(());
             }
             let mut queries = [SensorQuery {
@@ -7181,7 +7282,7 @@ fn decide_all(
                     let Some(genome) = batch_genomes[i] else {
                         return Ok(());
                     };
-                    dec_chunk[i] = decide_from_raw(
+                    let dec = decide_from_raw(
                         rules,
                         genome,
                         &chunk[i],
@@ -7190,12 +7291,16 @@ fn decide_all(
                         ticks,
                         controller,
                     )?;
+                    local_eval += usize::from(dec.evaluated);
+                    dec_chunk[i] = dec;
                     Ok(())
                 })?;
             }
+            tile.evaluated = local_eval;
             Ok(())
         },
-    )
+    )?;
+    Ok(tiles.iter().map(|t| t.evaluated).sum())
 }
 
 /// How the batched path ended.
@@ -7244,7 +7349,7 @@ fn decide_with(
     spatial_tile_offsets: &mut [usize; SPATIAL_TILES + 1],
     lanes: &mut [DecisionLane],
     controllers: &mut Controllers,
-) -> Result<(), CoreError> {
+) -> Result<usize, CoreError> {
     let Controllers {
         backend,
         report,
@@ -7315,7 +7420,9 @@ fn decide_with(
             report.deferred = report.deferred.saturating_add(deferred);
             report.device_nanoseconds =
                 report.device_nanoseconds.saturating_add(device_nanoseconds);
-            Ok(())
+            usize::try_from(batched.saturating_add(deferred)).map_err(|_| CoreError::Overflow {
+                quantity: "evaluated organisms",
+            })
         }
         Ok(Batched::Device(error)) => {
             report.failure = Some(error.to_string());
@@ -9390,6 +9497,7 @@ trait Stages {
 /// packet pairs referencing the deduplicated per-cell `compositions` table.
 struct Reference<'a> {
     traits: &'a Traits,
+    decision: &'a Decision,
     parameters: u32,
     packets: &'a [(f64, u32)],
     compositions: &'a [[f64; CHANNELS]],
@@ -9401,14 +9509,14 @@ impl Stages for Reference<'_> {
     fn uptake(
         &mut self,
         rules: &Rules,
-        organism: &Working,
+        _organism: &Working,
         budget: &mut EnergyBudget,
     ) -> Result<UptakeSettlement, CoreError> {
         if let Some((settlement, next_budget)) = self.precomputed_uptake {
             *budget = next_budget;
             return Ok(settlement);
         }
-        let h0 = organism.held.recurrent_state_array()[0];
+        let h0 = self.decision.held.recurrent_state_array()[0];
         if (!rules.v2.affinity_rotation_enabled() || h0 == 0.0)
             && rules.limits.affinity_norm() <= rules.chemistry.affinity_norm_limit()
         {
@@ -9447,7 +9555,7 @@ impl Stages for Reference<'_> {
                 rules.step,
                 self.traits.sensing_scale(),
                 self.parameters,
-                organism.evaluated,
+                self.decision.evaluated,
                 organism.basal_multiplier,
             )?
             .settle(budget)
@@ -9467,11 +9575,11 @@ impl Stages for Reference<'_> {
         } else {
             MotionResponse::new(*self.traits.motion_response(), &rules.motion)?
         };
-        let acceleration = match (rules.v2.motor(), organism.actions.motor) {
+        let acceleration = match (rules.v2.motor(), self.decision.actions.motor) {
             (Some(constants), Some(motor)) => rules.motion.acceleration_v2(
                 ratio,
                 &response,
-                &organism.gradients,
+                &self.decision.gradients,
                 organism.velocity,
                 budget.remaining(),
                 &constants,
@@ -9479,7 +9587,7 @@ impl Stages for Reference<'_> {
             )?,
             _ => rules
                 .motion
-                .acceleration(ratio, &response, &organism.gradients)?,
+                .acceleration(ratio, &response, &self.decision.gradients)?,
         };
         let proposed = rules.motion.propose(organism.velocity, acceleration)?;
         rules.motion.settle(proposed, budget)
@@ -9518,7 +9626,7 @@ impl Stages for Reference<'_> {
                     rules.exchange,
                     organism.committed.id,
                     position,
-                    organism.actions.emission.as_ref(),
+                    self.decision.actions.emission.as_ref(),
                     0.0,
                     trail_share,
                     budget,
@@ -9533,7 +9641,7 @@ impl Stages for Reference<'_> {
                     organism.emission_cooldown_deadline,
                 ));
             }
-            let ctx = rules.emission_context(organism, position, velocity, from)?;
+            let ctx = rules.emission_context(organism, self.decision, position, velocity, from)?;
             let (settlement, plan) = rules.emission.emit_v2_dual_reusing_footprint(
                 &rules.grid,
                 rules.exchange,
@@ -9541,7 +9649,7 @@ impl Stages for Reference<'_> {
                 rules.v2.emission(),
                 recovery_alpha,
                 organism.committed.id,
-                organism.actions.emission.as_ref(),
+                self.decision.actions.emission.as_ref(),
                 &ctx,
                 trail_share,
                 budget,
@@ -9558,7 +9666,7 @@ impl Stages for Reference<'_> {
                 rules.exchange,
                 organism.committed.id,
                 position,
-                organism.actions.emission.as_ref(),
+                self.decision.actions.emission.as_ref(),
                 0.0,
                 budget,
                 emissions,
@@ -9571,7 +9679,7 @@ impl Stages for Reference<'_> {
                 organism.emission_cooldown_deadline,
             ));
         }
-        let ctx = rules.emission_context(organism, position, velocity, from)?;
+        let ctx = rules.emission_context(organism, self.decision, position, velocity, from)?;
         let (settlement, plan) = rules.emission.emit_v2_reusing_footprint(
             &rules.grid,
             rules.exchange,
@@ -9579,7 +9687,7 @@ impl Stages for Reference<'_> {
             rules.v2.emission(),
             recovery_alpha,
             organism.committed.id,
-            organism.actions.emission.as_ref(),
+            self.decision.actions.emission.as_ref(),
             &ctx,
             budget,
             emissions,
@@ -9597,13 +9705,13 @@ impl Stages for Reference<'_> {
         tick: Tick,
         budget: &EnergyBudget,
     ) -> Result<ReproductionProposal, CoreError> {
-        let attempt_probability = rules.effective_attempt_probability(organism)?;
+        let attempt_probability = rules.effective_attempt_probability(organism, self.decision)?;
         rules.reproduction.propose_with_probability(
             &rules.rng,
             parent,
             tick,
             attempt_probability,
-            organism.actions.child_fraction,
+            self.decision.actions.child_fraction,
             budget,
         )
     }
@@ -9655,17 +9763,17 @@ fn inhibited(velocity: [f64; 2], push: [f64; 2], share: f64) -> [f64; 2] {
     }
 }
 
-/// Combined EMT adhesion multiplier for `organism` (`V2-08` `2 σ(o_adh)`
+/// Combined EMT adhesion multiplier for `decision` (`V2-08` `2 σ(o_adh)`
 /// composed multiplicatively with `V2-12` post-Phase-4
 /// `m(h_1) = clamp(1 + h_1, 0, 1)`).
-fn effective_emt_factor(rules: &Rules, organism: &Working) -> f64 {
+fn effective_emt_factor(rules: &Rules, decision: &Decision) -> f64 {
     let base = if rules.v2.emt_gate() {
-        2.0 * organism.actions.emt_gate.unwrap_or(0.5)
+        2.0 * decision.actions.emt_gate.unwrap_or(0.5)
     } else {
         1.0
     };
     if rules.v2.emt_h1_adhesion_enabled() {
-        let h1 = organism.held.recurrent_state_array()[1];
+        let h1 = decision.held.recurrent_state_array()[1];
         base * (1.0 + f64::from(h1)).clamp(0.0, 1.0)
     } else {
         base
@@ -9725,6 +9833,7 @@ fn contact_displacements(
     rules: &Rules,
     bodies: &ContactRules,
     population: &Population,
+    decisions: &[Decision],
     working: &[Working],
     work: &mut ContactWork,
     workers: usize,
@@ -9801,14 +9910,16 @@ fn contact_displacements(
                     .push(traits.and_then(Traits::polarity_strength).unwrap_or(0.0));
                 work.wedge_curvatures
                     .push(traits.and_then(Traits::wedge_curvature).unwrap_or(0.0));
-                work.energy_gradients.push(organism.gradients[0]);
+                work.energy_gradients
+                    .push(organism.decision(decisions).gradients[0]);
             }
             if needs_emt_factors {
-                work.emt_factors.push(effective_emt_factor(rules, organism));
+                work.emt_factors
+                    .push(effective_emt_factor(rules, organism.decision(decisions)));
             }
             if notch_delta {
                 work.cell_states_h0
-                    .push(organism.held.recurrent_state_array()[0]);
+                    .push(organism.decision(decisions).held.recurrent_state_array()[0]);
             }
             if cadherin {
                 let cad = genome
@@ -9908,13 +10019,13 @@ fn contact_displacements(
                     out.pol[i] = organism.committed.polarity;
                     out.pol_s[i] = traits.and_then(Traits::polarity_strength).unwrap_or(0.0);
                     out.wedge[i] = traits.and_then(Traits::wedge_curvature).unwrap_or(0.0);
-                    out.grad[i] = organism.gradients[0];
+                    out.grad[i] = organism.decision(decisions).gradients[0];
                 }
                 if needs_emt_factors {
-                    out.emt[i] = effective_emt_factor(rules, organism);
+                    out.emt[i] = effective_emt_factor(rules, organism.decision(decisions));
                 }
                 if notch_delta {
-                    out.h0[i] = organism.held.recurrent_state_array()[0];
+                    out.h0[i] = organism.decision(decisions).held.recurrent_state_array()[0];
                 }
                 if cadherin {
                     let cad = genome
@@ -10057,6 +10168,7 @@ fn contact_displacements(
 fn settle_stages(
     rules: &Rules,
     organism: &Working,
+    decision: &Decision,
     traits: &Traits,
     stages: &mut impl Stages,
     from: Tick,
@@ -10077,7 +10189,7 @@ fn settle_stages(
         let candidate = (waste_rule.byproduct_recycle_fraction * unconverted).min(unconverted);
         let retained_uptake = uptake.absorbed - candidate;
         if candidate > 0.0 && retained_uptake >= uptake.gain {
-            let recurrent_h0 = organism.held.recurrent_state_array()[0];
+            let recurrent_h0 = decision.held.recurrent_state_array()[0];
             let a_eff = effective_affinity(
                 traits,
                 recurrent_h0,
@@ -10204,7 +10316,7 @@ fn settle_stages(
     }
     if let ReproductionProposal::Intent(mut intent) = proposal {
         if let Some(diff) = rules.v2.differentiation() {
-            let parent_state = organism.held.recurrent_state_array();
+            let parent_state = decision.held.recurrent_state_array();
             intent.newborn_state = Reproduction::inherit_epigenetic_state(
                 &rules.rng,
                 intent.parent,
@@ -10230,7 +10342,7 @@ fn settle_stages(
         if local_radius.is_some() || lateral_diameter.is_some() {
             let (lambda_epi, lateral_offset) = if let Some(diameter) = lateral_diameter {
                 let alpha_pol = traits.polarity_strength().unwrap_or(0.0);
-                let emt_eff = effective_emt_factor(rules, organism);
+                let emt_eff = effective_emt_factor(rules, decision);
                 let lambda = (alpha_pol * emt_eff.min(1.0)).clamp(0.0, 1.0);
                 if lambda > 0.0 {
                     let offset = Reproduction::lateral_mitosis_offset(
@@ -10254,8 +10366,8 @@ fn settle_stages(
                     intent.parent,
                     intent.tick,
                     local_radius,
-                    organism.actions.budding,
-                    organism.gradients[0],
+                    decision.actions.budding,
+                    decision.gradients[0],
                     settled.velocity,
                     lambda_epi,
                     lateral_offset,

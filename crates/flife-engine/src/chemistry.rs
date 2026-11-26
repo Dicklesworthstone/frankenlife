@@ -88,6 +88,42 @@ fn err_invalid_efficiency(efficiency: f64) -> CoreError {
     }
 }
 
+/// Four-packet exact channel-order (`0..32`) dot products `a · c_k` for
+/// `k ∈ 0..4`. Chunking by 4 channels lets LLVM's SLP vectorizer emit pure
+/// 2-wide NEON `fmul.2d` + `fadd.2d` across packets `(c0, c1)` and `(c2, c3)`
+/// with zero scalar lane-extraction chains while preserving exact left-to-right
+/// IEEE-754 summation per packet.
+#[inline(always)]
+fn dot4_channels(
+    aff: &[f64; CHANNELS],
+    c0: &[f64; CHANNELS],
+    c1: &[f64; CHANNELS],
+    c2: &[f64; CHANNELS],
+    c3: &[f64; CHANNELS],
+) -> [f64; 4] {
+    let mut d = [0.0_f64; 4];
+    for ((((&a, &x), &y), &z), &w) in aff
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(c0.as_chunks::<4>().0)
+        .zip(c1.as_chunks::<4>().0)
+        .zip(c2.as_chunks::<4>().0)
+        .zip(c3.as_chunks::<4>().0)
+    {
+        for k in 0..4 {
+            let ak = a[k];
+            d = [
+                d[0] + ak * x[k],
+                d[1] + ak * y[k],
+                d[2] + ak * z[k],
+                d[3] + ak * w[k],
+            ];
+        }
+    }
+    d
+}
+
 /// The chemistry family this module implements.
 pub const BOUNDED_AFFINITY_V1: &str = "bounded-affinity-v1";
 
@@ -255,19 +291,13 @@ impl Chemistry {
         let mut efficiencies = [(0.0, 0.0); 4];
         let mut scored = Vec::new();
         let list: &mut [(f64, f64)] = if packets.len() == 4 {
-            let (mut d0, mut d1, mut d2, mut d3) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
-            let aff = &affinity.0;
-            let c0 = &packets[0].composition;
-            let c1 = &packets[1].composition;
-            let c2 = &packets[2].composition;
-            let c3 = &packets[3].composition;
-            for ch in 0..CHANNELS {
-                let a = aff[ch];
-                d0 += a * c0[ch];
-                d1 += a * c1[ch];
-                d2 += a * c2[ch];
-                d3 += a * c3[ch];
-            }
+            let [d0, d1, d2, d3] = dot4_channels(
+                &affinity.0,
+                &packets[0].composition,
+                &packets[1].composition,
+                &packets[2].composition,
+                &packets[3].composition,
+            );
             let args = [
                 self.gain * d0 - self.threshold,
                 self.gain * d1 - self.threshold,
@@ -311,7 +341,7 @@ impl Chemistry {
             }
             &mut scored
         };
-        settle_efficiencies(self.toxicity_sensitivity, list, budget)
+        settle_efficiencies_trusted(self.toxicity_sensitivity, list, budget)
     }
 
     /// Zero-copy counterpart to [`Chemistry::settle`] where each packet holds
@@ -357,16 +387,10 @@ impl Chemistry {
                 compositions.get(packets[3].1 as usize),
             ) {
             // Fused 4-packet channel-order dot product + 4-lane SIMD `tanh_4`:
-            // reads `aff` once and computes bit-identical IEEE-754 sums
-            // and `tanh` evaluations as four sequential `efficiency` calls.
-            let (mut d0, mut d1, mut d2, mut d3) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
-            for ch in 0..CHANNELS {
-                let a = aff[ch];
-                d0 += a * c0[ch];
-                d1 += a * c1[ch];
-                d2 += a * c2[ch];
-                d3 += a * c3[ch];
-            }
+            // reads `aff` once and pairs `(d0, d1)` / `(d2, d3)` via 2-wide
+            // NEON `fmul.2d` + `fadd.2d` so each packet sums strictly in
+            // channel order `0..32` (bit-identical to four sequential calls).
+            let [d0, d1, d2, d3] = dot4_channels(aff, c0, c1, c2, c3);
             let args = [
                 self.gain * d0 - self.threshold,
                 self.gain * d1 - self.threshold,
@@ -410,7 +434,7 @@ impl Chemistry {
             }
             &mut scored
         };
-        settle_efficiencies(self.toxicity_sensitivity, list, budget)
+        settle_efficiencies_trusted(self.toxicity_sensitivity, list, budget)
     }
 }
 
@@ -569,6 +593,15 @@ pub fn settle_efficiencies(
     if !toxicity_sensitivity.is_finite() || toxicity_sensitivity <= 0.0 {
         return Err(err_invalid_kappa(toxicity_sensitivity));
     }
+    settle_efficiencies_trusted(toxicity_sensitivity, packets, budget)
+}
+
+#[inline]
+fn settle_efficiencies_trusted(
+    toxicity_sensitivity: f64,
+    packets: &[(f64, f64)],
+    budget: &mut EnergyBudget,
+) -> Result<UptakeSettlement, CoreError> {
     let (mut absorbed, mut gain, mut harm) = (
         CompensatedSum::ZERO,
         CompensatedSum::ZERO,

@@ -1139,8 +1139,6 @@ impl PyramidView<'_> {
             // validated index `< cells0`).
             if !need_fallback && n_l0 > 0 {
                 let cells0 = meta0.cells;
-                let pow2_l0 = cells0.is_power_of_two();
-                let mask0 = cells0.saturating_sub(1);
                 let ordered = if n_l0 > SUB_BATCH {
                     sort_by_tile(
                         &l0_idx[..n_l0],
@@ -1157,21 +1155,64 @@ impl PyramidView<'_> {
                     for (dst, &qi) in sub_lo[..n].iter_mut().zip(sub) {
                         *dst = prepared[qi as usize].lo;
                     }
-                    let mut finite_acc = 0.0_f64;
+                    let mut finite_acc = [0.0_f64; 4];
                     if unit_l0 {
                         for plane in 0..P {
                             let plane_slice = &field_data[plane * cells0..(plane + 1) * cells0];
-                            if pow2_l0 && plane_slice.len() > mask0 {
-                                for (p, slot) in sub_lo[..n].iter().zip(&mut samples[..n]) {
+                            let plane_len = plane_slice.len();
+                            if plane_len.is_power_of_two() {
+                                let mask = plane_len - 1;
+                                let (p_quads, p_rem) = sub_lo[..n].as_chunks::<4>();
+                                let (s_quads, s_rem) = samples[..n].as_chunks_mut::<4>();
+                                for ([p0, p1, p2, p3], [s0, s1, s2, s3]) in
+                                    p_quads.iter().zip(s_quads.iter_mut())
+                                {
+                                    let (v, dx, dy) = bilinear_raw_4(
+                                        [
+                                            f64::from(plane_slice[(p0.i00 as usize) & mask]),
+                                            f64::from(plane_slice[(p1.i00 as usize) & mask]),
+                                            f64::from(plane_slice[(p2.i00 as usize) & mask]),
+                                            f64::from(plane_slice[(p3.i00 as usize) & mask]),
+                                        ],
+                                        [
+                                            f64::from(plane_slice[(p0.i10 as usize) & mask]),
+                                            f64::from(plane_slice[(p1.i10 as usize) & mask]),
+                                            f64::from(plane_slice[(p2.i10 as usize) & mask]),
+                                            f64::from(plane_slice[(p3.i10 as usize) & mask]),
+                                        ],
+                                        [
+                                            f64::from(plane_slice[(p0.i01 as usize) & mask]),
+                                            f64::from(plane_slice[(p1.i01 as usize) & mask]),
+                                            f64::from(plane_slice[(p2.i01 as usize) & mask]),
+                                            f64::from(plane_slice[(p3.i01 as usize) & mask]),
+                                        ],
+                                        [
+                                            f64::from(plane_slice[(p0.i11 as usize) & mask]),
+                                            f64::from(plane_slice[(p1.i11 as usize) & mask]),
+                                            f64::from(plane_slice[(p2.i11 as usize) & mask]),
+                                            f64::from(plane_slice[(p3.i11 as usize) & mask]),
+                                        ],
+                                        [p0.fx, p1.fx, p2.fx, p3.fx],
+                                        [p0.fy, p1.fy, p2.fy, p3.fy],
+                                    );
+                                    for k in 0..4 {
+                                        finite_acc[k] += (v[k] + dx[k]) + dy[k];
+                                    }
+                                    s0.write_plane(plane, v[0], dx[0], dy[0]);
+                                    s1.write_plane(plane, v[1], dx[1], dy[1]);
+                                    s2.write_plane(plane, v[2], dx[2], dy[2]);
+                                    s3.write_plane(plane, v[3], dx[3], dy[3]);
+                                }
+                                for (p, slot) in p_rem.iter().zip(s_rem.iter_mut()) {
                                     let (value, dx, dy) = bilinear_raw(
-                                        f64::from(plane_slice[(p.i00 as usize) & mask0]),
-                                        f64::from(plane_slice[(p.i10 as usize) & mask0]),
-                                        f64::from(plane_slice[(p.i01 as usize) & mask0]),
-                                        f64::from(plane_slice[(p.i11 as usize) & mask0]),
+                                        f64::from(plane_slice[(p.i00 as usize) & mask]),
+                                        f64::from(plane_slice[(p.i10 as usize) & mask]),
+                                        f64::from(plane_slice[(p.i01 as usize) & mask]),
+                                        f64::from(plane_slice[(p.i11 as usize) & mask]),
                                         p.fx,
                                         p.fy,
                                     );
-                                    finite_acc += (value + dx) + dy;
+                                    finite_acc[0] += (value + dx) + dy;
                                     slot.write_plane(plane, value, dx, dy);
                                 }
                             } else {
@@ -1184,7 +1225,7 @@ impl PyramidView<'_> {
                                         p.fx,
                                         p.fy,
                                     );
-                                    finite_acc += (value + dx) + dy;
+                                    finite_acc[0] += (value + dx) + dy;
                                     slot.write_plane(plane, value, dx, dy);
                                 }
                             }
@@ -1194,19 +1235,74 @@ impl PyramidView<'_> {
                     {
                         for plane in 0..P {
                             let plane_slice = &field_data[plane * cells0..(plane + 1) * cells0];
-                            if pow2_l0 && plane_slice.len() > mask0 {
-                                for (p, slot) in sub_lo[..n].iter().zip(&mut samples[..n]) {
+                            let plane_len = plane_slice.len();
+                            if plane_len.is_power_of_two() {
+                                let mask = plane_len - 1;
+                                let (p_quads, p_rem) = sub_lo[..n].as_chunks::<4>();
+                                let (s_quads, s_rem) = samples[..n].as_chunks_mut::<4>();
+                                for ([p0, p1, p2, p3], [s0, s1, s2, s3]) in
+                                    p_quads.iter().zip(s_quads.iter_mut())
+                                {
+                                    let (v, dx_num, dy_num) = bilinear_raw_4(
+                                        [
+                                            f64::from(plane_slice[(p0.i00 as usize) & mask]) * ra,
+                                            f64::from(plane_slice[(p1.i00 as usize) & mask]) * ra,
+                                            f64::from(plane_slice[(p2.i00 as usize) & mask]) * ra,
+                                            f64::from(plane_slice[(p3.i00 as usize) & mask]) * ra,
+                                        ],
+                                        [
+                                            f64::from(plane_slice[(p0.i10 as usize) & mask]) * ra,
+                                            f64::from(plane_slice[(p1.i10 as usize) & mask]) * ra,
+                                            f64::from(plane_slice[(p2.i10 as usize) & mask]) * ra,
+                                            f64::from(plane_slice[(p3.i10 as usize) & mask]) * ra,
+                                        ],
+                                        [
+                                            f64::from(plane_slice[(p0.i01 as usize) & mask]) * ra,
+                                            f64::from(plane_slice[(p1.i01 as usize) & mask]) * ra,
+                                            f64::from(plane_slice[(p2.i01 as usize) & mask]) * ra,
+                                            f64::from(plane_slice[(p3.i01 as usize) & mask]) * ra,
+                                        ],
+                                        [
+                                            f64::from(plane_slice[(p0.i11 as usize) & mask]) * ra,
+                                            f64::from(plane_slice[(p1.i11 as usize) & mask]) * ra,
+                                            f64::from(plane_slice[(p2.i11 as usize) & mask]) * ra,
+                                            f64::from(plane_slice[(p3.i11 as usize) & mask]) * ra,
+                                        ],
+                                        [p0.fx, p1.fx, p2.fx, p3.fx],
+                                        [p0.fy, p1.fy, p2.fy, p3.fy],
+                                    );
+                                    let dx = [
+                                        dx_num[0] * rx,
+                                        dx_num[1] * rx,
+                                        dx_num[2] * rx,
+                                        dx_num[3] * rx,
+                                    ];
+                                    let dy = [
+                                        dy_num[0] * ry,
+                                        dy_num[1] * ry,
+                                        dy_num[2] * ry,
+                                        dy_num[3] * ry,
+                                    ];
+                                    for k in 0..4 {
+                                        finite_acc[k] += (v[k] + dx[k]) + dy[k];
+                                    }
+                                    s0.write_plane(plane, v[0], dx[0], dy[0]);
+                                    s1.write_plane(plane, v[1], dx[1], dy[1]);
+                                    s2.write_plane(plane, v[2], dx[2], dy[2]);
+                                    s3.write_plane(plane, v[3], dx[3], dy[3]);
+                                }
+                                for (p, slot) in p_rem.iter().zip(s_rem.iter_mut()) {
                                     let (value, dx_num, dy_num) = bilinear_raw(
-                                        f64::from(plane_slice[(p.i00 as usize) & mask0]) * ra,
-                                        f64::from(plane_slice[(p.i10 as usize) & mask0]) * ra,
-                                        f64::from(plane_slice[(p.i01 as usize) & mask0]) * ra,
-                                        f64::from(plane_slice[(p.i11 as usize) & mask0]) * ra,
+                                        f64::from(plane_slice[(p.i00 as usize) & mask]) * ra,
+                                        f64::from(plane_slice[(p.i10 as usize) & mask]) * ra,
+                                        f64::from(plane_slice[(p.i01 as usize) & mask]) * ra,
+                                        f64::from(plane_slice[(p.i11 as usize) & mask]) * ra,
                                         p.fx,
                                         p.fy,
                                     );
                                     let dx = dx_num * rx;
                                     let dy = dy_num * ry;
-                                    finite_acc += (value + dx) + dy;
+                                    finite_acc[0] += (value + dx) + dy;
                                     slot.write_plane(plane, value, dx, dy);
                                 }
                             } else {
@@ -1221,7 +1317,7 @@ impl PyramidView<'_> {
                                     );
                                     let dx = dx_num * rx;
                                     let dy = dy_num * ry;
-                                    finite_acc += (value + dx) + dy;
+                                    finite_acc[0] += (value + dx) + dy;
                                     slot.write_plane(plane, value, dx, dy);
                                 }
                             }
@@ -1242,12 +1338,16 @@ impl PyramidView<'_> {
                                 );
                                 let dx = dx_num / sx;
                                 let dy = dy_num / sy;
-                                finite_acc += (value + dx) + dy;
+                                finite_acc[0] += (value + dx) + dy;
                                 slot.write_plane(plane, value, dx, dy);
                             }
                         }
                     }
-                    if !finite_acc.is_finite() {
+                    if !(finite_acc[0].is_finite()
+                        && finite_acc[1].is_finite()
+                        && finite_acc[2].is_finite()
+                        && finite_acc[3].is_finite())
+                    {
                         need_fallback = true;
                         break;
                     }
@@ -1297,28 +1397,110 @@ impl PyramidView<'_> {
                             t: pq.t,
                         };
                     }
-                    let mut finite_acc = 0.0_f64;
+                    let mut finite_acc = [0.0_f64; 4];
                     if unit_l0 && let (Some(rx1), Some(ry1)) = (meta1.inv_sx, meta1.inv_sy) {
                         for plane in 0..P {
                             let p0 = &field_data[plane * cells0..(plane + 1) * cells0];
                             let p1 = &coarse1[plane * cells1..(plane + 1) * cells1];
-                            if pow2_both && p0.len() > mask0 && p1.len() > mask1 {
-                                for (pb, slot) in sub_blend[..n].iter().zip(&mut samples[..n]) {
+                            let len0 = p0.len();
+                            let len1 = p1.len();
+                            if len0.is_power_of_two() && len1.is_power_of_two() {
+                                let m0 = len0 - 1;
+                                let m1 = len1 - 1;
+                                let (b_quads, b_rem) = sub_blend[..n].as_chunks::<4>();
+                                let (s_quads, s_rem) = samples[..n].as_chunks_mut::<4>();
+                                for ([pb0, pb1, pb2, pb3], [s0, s1, s2, s3]) in
+                                    b_quads.iter().zip(s_quads.iter_mut())
+                                {
+                                    let (lv, ldx, ldy) = bilinear_raw_4(
+                                        [
+                                            f64::from(p0[(pb0.lo.i00 as usize) & m0]),
+                                            f64::from(p0[(pb1.lo.i00 as usize) & m0]),
+                                            f64::from(p0[(pb2.lo.i00 as usize) & m0]),
+                                            f64::from(p0[(pb3.lo.i00 as usize) & m0]),
+                                        ],
+                                        [
+                                            f64::from(p0[(pb0.lo.i10 as usize) & m0]),
+                                            f64::from(p0[(pb1.lo.i10 as usize) & m0]),
+                                            f64::from(p0[(pb2.lo.i10 as usize) & m0]),
+                                            f64::from(p0[(pb3.lo.i10 as usize) & m0]),
+                                        ],
+                                        [
+                                            f64::from(p0[(pb0.lo.i01 as usize) & m0]),
+                                            f64::from(p0[(pb1.lo.i01 as usize) & m0]),
+                                            f64::from(p0[(pb2.lo.i01 as usize) & m0]),
+                                            f64::from(p0[(pb3.lo.i01 as usize) & m0]),
+                                        ],
+                                        [
+                                            f64::from(p0[(pb0.lo.i11 as usize) & m0]),
+                                            f64::from(p0[(pb1.lo.i11 as usize) & m0]),
+                                            f64::from(p0[(pb2.lo.i11 as usize) & m0]),
+                                            f64::from(p0[(pb3.lo.i11 as usize) & m0]),
+                                        ],
+                                        [pb0.lo.fx, pb1.lo.fx, pb2.lo.fx, pb3.lo.fx],
+                                        [pb0.lo.fy, pb1.lo.fy, pb2.lo.fy, pb3.lo.fy],
+                                    );
+                                    let (hv, hdx_num, hdy_num) = bilinear_raw_4(
+                                        [
+                                            p1[(pb0.hi.i00 as usize) & m1],
+                                            p1[(pb1.hi.i00 as usize) & m1],
+                                            p1[(pb2.hi.i00 as usize) & m1],
+                                            p1[(pb3.hi.i00 as usize) & m1],
+                                        ],
+                                        [
+                                            p1[(pb0.hi.i10 as usize) & m1],
+                                            p1[(pb1.hi.i10 as usize) & m1],
+                                            p1[(pb2.hi.i10 as usize) & m1],
+                                            p1[(pb3.hi.i10 as usize) & m1],
+                                        ],
+                                        [
+                                            p1[(pb0.hi.i01 as usize) & m1],
+                                            p1[(pb1.hi.i01 as usize) & m1],
+                                            p1[(pb2.hi.i01 as usize) & m1],
+                                            p1[(pb3.hi.i01 as usize) & m1],
+                                        ],
+                                        [
+                                            p1[(pb0.hi.i11 as usize) & m1],
+                                            p1[(pb1.hi.i11 as usize) & m1],
+                                            p1[(pb2.hi.i11 as usize) & m1],
+                                            p1[(pb3.hi.i11 as usize) & m1],
+                                        ],
+                                        [pb0.hi.fx, pb1.hi.fx, pb2.hi.fx, pb3.hi.fx],
+                                        [pb0.hi.fy, pb1.hi.fy, pb2.hi.fy, pb3.hi.fy],
+                                    );
+                                    let t = [pb0.t, pb1.t, pb2.t, pb3.t];
+                                    let mut v = [0.0_f64; 4];
+                                    let mut dx = [0.0_f64; 4];
+                                    let mut dy = [0.0_f64; 4];
+                                    for k in 0..4 {
+                                        let hdx = hdx_num[k] * rx1;
+                                        let hdy = hdy_num[k] * ry1;
+                                        v[k] = lv[k] + t[k] * (hv[k] - lv[k]);
+                                        dx[k] = ldx[k] + t[k] * (hdx - ldx[k]);
+                                        dy[k] = ldy[k] + t[k] * (hdy - ldy[k]);
+                                        finite_acc[k] += (v[k] + dx[k]) + dy[k];
+                                    }
+                                    s0.write_plane(plane, v[0], dx[0], dy[0]);
+                                    s1.write_plane(plane, v[1], dx[1], dy[1]);
+                                    s2.write_plane(plane, v[2], dx[2], dy[2]);
+                                    s3.write_plane(plane, v[3], dx[3], dy[3]);
+                                }
+                                for (pb, slot) in b_rem.iter().zip(s_rem.iter_mut()) {
                                     let lo = &pb.lo;
                                     let hi = &pb.hi;
                                     let (lv, ldx, ldy) = bilinear_raw(
-                                        f64::from(p0[(lo.i00 as usize) & mask0]),
-                                        f64::from(p0[(lo.i10 as usize) & mask0]),
-                                        f64::from(p0[(lo.i01 as usize) & mask0]),
-                                        f64::from(p0[(lo.i11 as usize) & mask0]),
+                                        f64::from(p0[(lo.i00 as usize) & m0]),
+                                        f64::from(p0[(lo.i10 as usize) & m0]),
+                                        f64::from(p0[(lo.i01 as usize) & m0]),
+                                        f64::from(p0[(lo.i11 as usize) & m0]),
                                         lo.fx,
                                         lo.fy,
                                     );
                                     let (hv, hdx_num, hdy_num) = bilinear_raw(
-                                        p1[(hi.i00 as usize) & mask1],
-                                        p1[(hi.i10 as usize) & mask1],
-                                        p1[(hi.i01 as usize) & mask1],
-                                        p1[(hi.i11 as usize) & mask1],
+                                        p1[(hi.i00 as usize) & m1],
+                                        p1[(hi.i10 as usize) & m1],
+                                        p1[(hi.i01 as usize) & m1],
+                                        p1[(hi.i11 as usize) & m1],
                                         hi.fx,
                                         hi.fy,
                                     );
@@ -1328,7 +1510,7 @@ impl PyramidView<'_> {
                                     let v = lv + t * (hv - lv);
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
-                                    finite_acc += (v + dx) + dy;
+                                    finite_acc[0] += (v + dx) + dy;
                                     slot.write_plane(plane, v, dx, dy);
                                 }
                             } else {
@@ -1357,7 +1539,7 @@ impl PyramidView<'_> {
                                     let v = lv + t * (hv - lv);
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
-                                    finite_acc += (v + dx) + dy;
+                                    finite_acc[0] += (v + dx) + dy;
                                     slot.write_plane(plane, v, dx, dy);
                                 }
                             }
@@ -1400,7 +1582,7 @@ impl PyramidView<'_> {
                                     let v = lv + t * (hv - lv);
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
-                                    finite_acc += (v + dx) + dy;
+                                    finite_acc[0] += (v + dx) + dy;
                                     slot.write_plane(plane, v, dx, dy);
                                 }
                             } else {
@@ -1431,7 +1613,7 @@ impl PyramidView<'_> {
                                     let v = lv + t * (hv - lv);
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
-                                    finite_acc += (v + dx) + dy;
+                                    finite_acc[0] += (v + dx) + dy;
                                     slot.write_plane(plane, v, dx, dy);
                                 }
                             }
@@ -1469,12 +1651,16 @@ impl PyramidView<'_> {
                                 let v = lv + t * (hv - lv);
                                 let dx = ldx + t * (hdx - ldx);
                                 let dy = ldy + t * (hdy - ldy);
-                                finite_acc += (v + dx) + dy;
+                                finite_acc[0] += (v + dx) + dy;
                                 slot.write_plane(plane, v, dx, dy);
                             }
                         }
                     }
-                    if !finite_acc.is_finite() {
+                    if !(finite_acc[0].is_finite()
+                        && finite_acc[1].is_finite()
+                        && finite_acc[2].is_finite()
+                        && finite_acc[3].is_finite())
+                    {
                         need_fallback = true;
                         break;
                     }
@@ -1894,6 +2080,35 @@ fn bilinear_raw(v00: f64, v10: f64, v01: f64, v11: f64, fx: f64, fy: f64) -> (f6
     let value = lower + fy * (upper - lower);
     let dx_num = across_lower + fy * (across_upper - across_lower);
     let dy_num = up_left + fx * (up_right - up_left);
+    (value, dx_num, dy_num)
+}
+
+/// Four-lane lockstep [`bilinear_raw`] with identical IEEE-754 operations and
+/// parenthesization per lane so LLVM's SLP vectorizer emits 2-wide NEON FP64
+/// (`fsub.2d` / `fmul.2d` / `fadd.2d`) without FMA contraction or drift.
+#[inline(always)]
+fn bilinear_raw_4(
+    v00: [f64; 4],
+    v10: [f64; 4],
+    v01: [f64; 4],
+    v11: [f64; 4],
+    fx: [f64; 4],
+    fy: [f64; 4],
+) -> ([f64; 4], [f64; 4], [f64; 4]) {
+    let mut value = [0.0_f64; 4];
+    let mut dx_num = [0.0_f64; 4];
+    let mut dy_num = [0.0_f64; 4];
+    for k in 0..4 {
+        let across_lower = v10[k] - v00[k];
+        let across_upper = v11[k] - v01[k];
+        let up_left = v01[k] - v00[k];
+        let up_right = v11[k] - v10[k];
+        let lower = v00[k] + fx[k] * across_lower;
+        let upper = v01[k] + fx[k] * across_upper;
+        value[k] = lower + fy[k] * (upper - lower);
+        dx_num[k] = across_lower + fy[k] * (across_upper - across_lower);
+        dy_num[k] = up_left + fx[k] * (up_right - up_left);
+    }
     (value, dx_num, dy_num)
 }
 

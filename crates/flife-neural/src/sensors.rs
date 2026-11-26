@@ -602,15 +602,11 @@ pub fn observe_for_controller_f32_into(
     let (observed, own) = out_inputs_f32.split_at_mut(3 * PLANES);
     let (value_slots, derivative_slots) = observed.split_at_mut(PLANES);
     let (x_slots, y_slots) = derivative_slots.split_at_mut(PLANES);
-    let (energy_norm, age_norm, val_finite_acc) =
+    let (energy_norm, age_norm, val_finite_ok) =
         normalize_single_to_f32(raw, intrinsic, scales, value_slots, out_gradients)?;
     let (vx, vy, de) =
         saturate_single_gradients_f32_into(out_gradients, intrinsic, scales, x_slots, y_slots)?;
-    let mut finite_acc = val_finite_acc + (energy_norm + age_norm);
-    for &[gx, gy] in out_gradients.iter() {
-        finite_acc += gx + gy;
-    }
-    if !finite_acc.is_finite() {
+    if !(val_finite_ok && (energy_norm + age_norm).is_finite()) {
         check_finite_single_from_raw_slow(
             raw,
             intrinsic,
@@ -622,6 +618,85 @@ pub fn observe_for_controller_f32_into(
     }
     own.copy_from_slice(&[energy_norm as f32, age_norm as f32, vx, vy, de]);
     Ok(())
+}
+
+#[inline]
+fn normalize_single_to_f32(
+    raw: &RawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    value_slots: &mut [f32],
+    out_gradients: &mut [[f64; 2]; PLANES],
+) -> Result<(f64, f64, bool), CoreError> {
+    let [density, ref moments @ ..] = raw.values;
+    let [density_x, ref moments_x @ ..] = raw.dx;
+    let [density_y, ref moments_y @ ..] = raw.dy;
+    let (shifted, regularized, energy_denom, age_denom) =
+        validate_single_denoms(density, intrinsic, scales)?;
+    let slope = scales.energy_density / (shifted * shifted);
+    let q0 = density / shifted;
+    let gx0 = slope * density_x;
+    let gy0 = slope * density_y;
+    if let Some(slot) = value_slots.first_mut() {
+        *slot = q0 as f32;
+    }
+    out_gradients[0] = [gx0, gy0];
+    let mut val_acc = [q0 + (gx0 + gy0), 0.0, 0.0, 0.0];
+    for (((vc, gc), (mc, mxc)), myc) in value_slots[1..]
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(out_gradients[1..].as_chunks_mut::<4>().0.iter_mut())
+        .zip(
+            moments
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(moments_x.as_chunks::<4>().0),
+        )
+        .zip(moments_y.as_chunks::<4>().0)
+    {
+        let z = [
+            mc[0] / regularized,
+            mc[1] / regularized,
+            mc[2] / regularized,
+            mc[3] / regularized,
+        ];
+        let gx = [
+            (mxc[0] - z[0] * density_x) / regularized,
+            (mxc[1] - z[1] * density_x) / regularized,
+            (mxc[2] - z[2] * density_x) / regularized,
+            (mxc[3] - z[3] * density_x) / regularized,
+        ];
+        let gy = [
+            (myc[0] - z[0] * density_y) / regularized,
+            (myc[1] - z[1] * density_y) / regularized,
+            (myc[2] - z[2] * density_y) / regularized,
+            (myc[3] - z[3] * density_y) / regularized,
+        ];
+        val_acc = [
+            val_acc[0] + z[0],
+            val_acc[1] + z[1],
+            val_acc[2] + z[2],
+            val_acc[3] + z[3],
+        ];
+        *vc = [z[0] as f32, z[1] as f32, z[2] as f32, z[3] as f32];
+        *gc = [
+            [gx[0], gy[0]],
+            [gx[1], gy[1]],
+            [gx[2], gy[2]],
+            [gx[3], gy[3]],
+        ];
+    }
+    let val_finite_ok = val_acc[0].is_finite()
+        & val_acc[1].is_finite()
+        & val_acc[2].is_finite()
+        & val_acc[3].is_finite();
+    Ok((
+        intrinsic.energy / energy_denom,
+        intrinsic.age_seconds / age_denom,
+        val_finite_ok,
+    ))
 }
 
 /// Encode `raw` and `intrinsic` directly into a controller's F32 input buffer
@@ -798,47 +873,6 @@ fn validate_single_denoms(
 }
 
 #[inline]
-fn normalize_single_to_f32(
-    raw: &RawSample,
-    intrinsic: &Intrinsic,
-    scales: &SensorScales,
-    value_slots: &mut [f32],
-    out_gradients: &mut [[f64; 2]; PLANES],
-) -> Result<(f64, f64, f64), CoreError> {
-    let [density, ref moments @ ..] = raw.values;
-    let [density_x, ref moments_x @ ..] = raw.dx;
-    let [density_y, ref moments_y @ ..] = raw.dy;
-    let (shifted, regularized, energy_denom, age_denom) =
-        validate_single_denoms(density, intrinsic, scales)?;
-    let slope = scales.energy_density / (shifted * shifted);
-    let q0 = density / shifted;
-    let mut val_acc = q0;
-    if let Some(slot) = value_slots.first_mut() {
-        *slot = q0 as f32;
-    }
-    out_gradients[0] = [slope * density_x, slope * density_y];
-    for ((slot, gradient), ((&moment, &moment_x), &moment_y)) in value_slots
-        .iter_mut()
-        .skip(1)
-        .zip(out_gradients.iter_mut().skip(1))
-        .zip(moments.iter().zip(moments_x).zip(moments_y))
-    {
-        let z = moment / regularized;
-        val_acc += z;
-        *slot = z as f32;
-        *gradient = [
-            (moment_x - z * density_x) / regularized,
-            (moment_y - z * density_y) / regularized,
-        ];
-    }
-    Ok((
-        intrinsic.energy / energy_denom,
-        intrinsic.age_seconds / age_denom,
-        val_acc,
-    ))
-}
-
-#[inline]
 fn normalize_single_gradients_into(
     raw: &RawSample,
     intrinsic: &Intrinsic,
@@ -921,9 +955,18 @@ fn saturate_single_gradients_f32_into(
     y_f32: &mut [f32],
 ) -> Result<(f32, f32, f32), CoreError> {
     let l = scales.gradient_length;
+    let unit_l = l == 1.0;
     let [ex, ey, vx, vy] = saturate_4([
-        l * gradients[0][0],
-        l * gradients[0][1],
+        if unit_l {
+            gradients[0][0]
+        } else {
+            l * gradients[0][0]
+        },
+        if unit_l {
+            gradients[0][1]
+        } else {
+            l * gradients[0][1]
+        },
         intrinsic.velocity[0] / scales.velocity,
         intrinsic.velocity[1] / scales.velocity,
     ])?;
@@ -932,27 +975,48 @@ fn saturate_single_gradients_f32_into(
     {
         *x0 = ex;
         *y0 = ey;
-        for ((x_chunk, y_chunk), grad_chunk) in x_rest
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(y_rest.as_chunks_mut::<4>().0.iter_mut())
-            .zip(gradients[1..].as_chunks::<4>().0)
-        {
-            let tx = saturate_4([
-                l * grad_chunk[0][0],
-                l * grad_chunk[1][0],
-                l * grad_chunk[2][0],
-                l * grad_chunk[3][0],
-            ])?;
-            let ty = saturate_4([
-                l * grad_chunk[0][1],
-                l * grad_chunk[1][1],
-                l * grad_chunk[2][1],
-                l * grad_chunk[3][1],
-            ])?;
-            *x_chunk = tx;
-            *y_chunk = ty;
+        if unit_l {
+            for ((x_chunk, y_chunk), grad_chunk) in x_rest
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(y_rest.as_chunks_mut::<4>().0.iter_mut())
+                .zip(gradients[1..].as_chunks::<4>().0)
+            {
+                *x_chunk = saturate_4([
+                    grad_chunk[0][0],
+                    grad_chunk[1][0],
+                    grad_chunk[2][0],
+                    grad_chunk[3][0],
+                ])?;
+                *y_chunk = saturate_4([
+                    grad_chunk[0][1],
+                    grad_chunk[1][1],
+                    grad_chunk[2][1],
+                    grad_chunk[3][1],
+                ])?;
+            }
+        } else {
+            for ((x_chunk, y_chunk), grad_chunk) in x_rest
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(y_rest.as_chunks_mut::<4>().0.iter_mut())
+                .zip(gradients[1..].as_chunks::<4>().0)
+            {
+                *x_chunk = saturate_4([
+                    l * grad_chunk[0][0],
+                    l * grad_chunk[1][0],
+                    l * grad_chunk[2][0],
+                    l * grad_chunk[3][0],
+                ])?;
+                *y_chunk = saturate_4([
+                    l * grad_chunk[0][1],
+                    l * grad_chunk[1][1],
+                    l * grad_chunk[2][1],
+                    l * grad_chunk[3][1],
+                ])?;
+            }
         }
     }
     let de_arg = intrinsic.energy_change_per_second / scales.energy_change_per_second;
@@ -1608,9 +1672,18 @@ fn saturate_dual_gradients_f32_into(
     y_f32: &mut [f32],
 ) -> Result<(f32, f32, f32, f32, f32), CoreError> {
     let l = scales.gradient_length;
+    let unit_l = l == 1.0;
     let [ex, ey, vx, vy] = saturate_4([
-        l * gradients[0][0],
-        l * gradients[0][1],
+        if unit_l {
+            gradients[0][0]
+        } else {
+            l * gradients[0][0]
+        },
+        if unit_l {
+            gradients[0][1]
+        } else {
+            l * gradients[0][1]
+        },
         intrinsic.velocity[0] / scales.velocity,
         intrinsic.velocity[1] / scales.velocity,
     ])?;
@@ -1619,27 +1692,48 @@ fn saturate_dual_gradients_f32_into(
     {
         *x0 = ex;
         *y0 = ey;
-        for ((x_chunk, y_chunk), grad_chunk) in x_rest
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(y_rest.as_chunks_mut::<4>().0.iter_mut())
-            .zip(gradients[1..].as_chunks::<4>().0)
-        {
-            let tx = saturate_4([
-                l * grad_chunk[0][0],
-                l * grad_chunk[1][0],
-                l * grad_chunk[2][0],
-                l * grad_chunk[3][0],
-            ])?;
-            let ty = saturate_4([
-                l * grad_chunk[0][1],
-                l * grad_chunk[1][1],
-                l * grad_chunk[2][1],
-                l * grad_chunk[3][1],
-            ])?;
-            *x_chunk = tx;
-            *y_chunk = ty;
+        if unit_l {
+            for ((x_chunk, y_chunk), grad_chunk) in x_rest
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(y_rest.as_chunks_mut::<4>().0.iter_mut())
+                .zip(gradients[1..].as_chunks::<4>().0)
+            {
+                *x_chunk = saturate_4([
+                    grad_chunk[0][0],
+                    grad_chunk[1][0],
+                    grad_chunk[2][0],
+                    grad_chunk[3][0],
+                ])?;
+                *y_chunk = saturate_4([
+                    grad_chunk[0][1],
+                    grad_chunk[1][1],
+                    grad_chunk[2][1],
+                    grad_chunk[3][1],
+                ])?;
+            }
+        } else {
+            for ((x_chunk, y_chunk), grad_chunk) in x_rest
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(y_rest.as_chunks_mut::<4>().0.iter_mut())
+                .zip(gradients[1..].as_chunks::<4>().0)
+            {
+                *x_chunk = saturate_4([
+                    l * grad_chunk[0][0],
+                    l * grad_chunk[1][0],
+                    l * grad_chunk[2][0],
+                    l * grad_chunk[3][0],
+                ])?;
+                *y_chunk = saturate_4([
+                    l * grad_chunk[0][1],
+                    l * grad_chunk[1][1],
+                    l * grad_chunk[2][1],
+                    l * grad_chunk[3][1],
+                ])?;
+            }
         }
     }
     let [de, t1x, t1y, _] = saturate_4([

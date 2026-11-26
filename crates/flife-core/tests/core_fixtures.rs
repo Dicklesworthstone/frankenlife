@@ -1347,3 +1347,40 @@ fn v2_rejects_empty_override_tokens_and_tiny_oasis_sigma_min() {
     disabled_oasis.v2 = Some(v2_off);
     assert!(validate(disabled_oasis).is_ok());
 }
+
+#[test]
+fn timestep_seconds_u64_fast_path_matches_u128_oracle_bit_for_bit() {
+    let steps = [
+        TimeStep::new(1, 128).unwrap(),
+        TimeStep::new(3, 100).unwrap(),
+        TimeStep::new(u32::MAX, 7).unwrap(),
+        TimeStep::new(1_000_000_007, 1_000_000_009).unwrap(),
+    ];
+    let spans = [
+        0_u64,
+        1,
+        160,
+        (1_u64 << 53) - 1,
+        1_u64 << 53,
+        (1_u64 << 53) + 1,
+        u64::MAX / u64::from(u32::MAX),
+        (u64::MAX / u64::from(u32::MAX)) + 1,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    for step in steps {
+        for raw in spans {
+            let span = TickSpan::new(raw);
+            let got = step.seconds(span);
+            let want = (u128::from(raw) * u128::from(step.numerator())) as f64
+                / f64::from(step.denominator());
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "step={}/{}, span={raw}",
+                step.numerator(),
+                step.denominator()
+            );
+        }
+    }
+}

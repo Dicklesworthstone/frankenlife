@@ -14,10 +14,10 @@ import {
 import { BasisBadge, DemoFrame, fixed } from "@/components/explain/demo";
 import { siteConfig } from "@/lib/content";
 import { type ControlStill, controls, filmById } from "@/lib/media";
+import { TONE } from "@/lib/palette";
 
 // The controls are the confluent world's, drawn as the confluent film is.
 const film = filmById("confluent");
-import { TONE } from "@/lib/palette";
 import { cn, grouped } from "@/lib/utils";
 
 /**
@@ -281,6 +281,15 @@ function Panel({
   const tone = removed ? TONE.wrong : TONE.rule;
   const headingId = `control-${still.id}`;
 
+  // The loupe draws the still as a CSS background, which `loading="lazy"` does not hold back: open from the start,
+  // it fetched all three stills with the page, one of them the film's 3 MB poster, wherever the reader was. So it
+  // waits for the still's own lazy load, then reuses that file.
+  const image = useRef<HTMLImageElement>(null);
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    if (image.current?.complete && image.current.naturalWidth > 0) setLoaded(true);
+  }, []);
+
   const at = (event: ReactPointerEvent<HTMLDivElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
     return { x: clamp((event.clientX - rect.left) / rect.width), y: clamp((event.clientY - rect.top) / rect.height) };
@@ -352,6 +361,7 @@ function Panel({
           style={{ borderColor: `${tone}40` }}
         >
           <img
+            ref={image}
             src={still.src}
             alt={`${still.label}, drawn by flife at tick ${grouped(still.tick)}: ${still.record.by_eye}.`}
             width={still.width}
@@ -359,6 +369,7 @@ function Panel({
             loading="lazy"
             decoding="async"
             draggable={false}
+            onLoad={() => setLoaded(true)}
             className="pointer-events-none h-full w-full"
           />
           {/* Shade under the label so it reads over any tissue. */}
@@ -376,7 +387,7 @@ function Panel({
           <span className="pointer-events-none absolute bottom-3 left-3 rounded-lg border border-white/10 bg-black/60 px-2 py-1 font-mono text-[11px] text-slate-200 tabular-nums backdrop-blur-sm">
             {grouped(still.live)} {still.live === 1 ? "body" : "bodies"}
           </span>
-          {spot ? <Loupe src={still.src} spot={spot} zoom={zoom} tone={tone} /> : null}
+          {spot && loaded ? <Loupe src={still.src} spot={spot} zoom={zoom} tone={tone} /> : null}
         </div>
 
         <div className="mt-4 flex flex-1 flex-col">

@@ -90,7 +90,30 @@
     "src": "/media/confluent-poster-22ee4c761576.jpg",
     "sha256": "22ee4c761576f91ee81465ced1cc068f3c24e7282c11357b03a3b029a9c955dc",
     "bytes": 3260590,
-    "frame": 0
+    "frame": 0,
+    "small": {
+      "src": "/media/confluent-poster-small-9eacf73cc2d8.avif",
+      "sha256": "9eacf73cc2d882a3d1ee778464164f07a796869d0af2f094c0c088ed11d703d9",
+      "bytes": 252603,
+      "width": 1080,
+      "height": 1080,
+      "encode": [
+        "-vf",
+        "scale=w=1080:h=1080:flags=lanczos:in_range=full:out_range=full,format=yuv420p",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "libsvtav1",
+        "-preset",
+        "4",
+        "-crf",
+        "42",
+        "-colorspace",
+        "bt470bg",
+        "-color_range",
+        "pc"
+      ]
+    }
   },
   "social": {
     "src": "/media/confluent-social-05f61667c12a.jpg",

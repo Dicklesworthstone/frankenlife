@@ -800,6 +800,8 @@ export function ZoomLadder({ index }: { index?: string }) {
                   alt={`The confluent film's first frame: the whole torus at tick ${grouped(POSTER.tick)}, ${grouped(LIVE_POSTER)} organisms coloured by founder lineage.`}
                   width={film.video.width}
                   height={film.video.height}
+                  // Lazy: a phone's hero shows the small poster, so this 3 MB JPEG is no longer already loaded.
+                  loading="lazy"
                   decoding="async"
                   draggable={false}
                   className="absolute top-0 left-0 w-full max-w-none origin-top-left will-change-transform"

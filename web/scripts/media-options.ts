@@ -410,6 +410,36 @@ export function buildMasterEncodeArgs(masterCrf: number): string[] {
   ];
 }
 
+/** The phone poster's AV1 CRF: 253 KB for the confluent film's 1080² poster, against its 3.26 MB JPEG at 2160². */
+export const SMALL_POSTER_CRF = 42;
+
+/**
+ * ffmpeg arguments that make a film's phone poster from its poster JPEG (`ffmpeg -i poster.jpg ARGS out.avif`):
+ * scaled to the phone encode's size and written as a one-frame AVIF. The JPEG's samples keep their own colour,
+ * BT.601 at full range, and are tagged so: drawn by Chrome, that is closer to the JPEG (mean error 3.1, 2.3 and
+ * 3.8 levels in R, G and B, near-lossless) than tagging them BT.709 (4.6, 2.1, 5.4) or a 4:2:0 JPEG (4.4, 2.8,
+ * 5.6). At this CRF the error is 8.3, 5.7 and 9.7 levels, a little smoothing of single bodies the film soon
+ * replaces.
+ */
+export function buildSmallPosterArgs(size: readonly [number, number]): string[] {
+  return [
+    "-vf",
+    `scale=w=${size[0]}:h=${size[1]}:flags=lanczos:in_range=full:out_range=full,format=yuv420p`,
+    "-frames:v",
+    "1",
+    "-c:v",
+    "libsvtav1",
+    "-preset",
+    "4",
+    "-crf",
+    String(SMALL_POSTER_CRF),
+    "-colorspace",
+    "bt470bg",
+    "-color_range",
+    "pc",
+  ];
+}
+
 /**
  * ffmpeg crop filter for the 1200 × 630 social card: fills 1200 × 630 from any aspect ratio
  * (1:1 1080/2160, 16:9 3840×2160, or wider) before taking the centred crop.

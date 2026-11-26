@@ -339,10 +339,25 @@ export function Film({
         className={cn("@container relative w-full overflow-hidden bg-black lg:rounded-[2rem]", isSquare && "aspect-square")}
         style={isSquare ? undefined : { aspectRatio: `${video.width} / ${video.height}` }}
       >
+        {/* The poster, under the film until its first frame paints over it. A phone takes the 1080² AVIF, as it takes
+            the small encode; anything else (or a browser without AVIF) takes the 2160² JPEG. A picture, because a
+            video's poster attribute names one file for every screen: a phone on a slow network fetched the 3 MB JPEG
+            for more than 16 s, and its largest paint waited 10 s for the film's own first frame. */}
+        <picture>
+          {poster.small ? <source media={PHONE} type="image/avif" srcSet={poster.small.src} /> : null}
+          {/* eslint-disable-next-line @next/next/no-img-element -- a static export; the manifest names the file */}
+          <img
+            src={poster.src}
+            alt=""
+            width={video.width}
+            height={video.height}
+            fetchPriority="high"
+            className={cn("absolute inset-0 h-full w-full object-cover", feather && "specimen-feather")}
+          />
+        </picture>
         <video
           ref={videoRef}
-          className={cn("h-full w-full object-cover", feather && "specimen-feather")}
-          poster={poster.src}
+          className={cn("relative h-full w-full object-cover", feather && "specimen-feather")}
           width={video.width}
           height={video.height}
           muted

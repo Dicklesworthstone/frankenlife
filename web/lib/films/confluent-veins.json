@@ -90,7 +90,30 @@
     "src": "/media/confluent-veins-poster-caebe7e521c3.jpg",
     "sha256": "caebe7e521c3dde4c544749d94895d5b741df42a5734266ae67e145452177bc0",
     "bytes": 3097534,
-    "frame": 0
+    "frame": 0,
+    "small": {
+      "src": "/media/confluent-veins-poster-small-402734d79bfd.avif",
+      "sha256": "402734d79bfd06ba45e3ebeba8546a8b2f479a8636d6d4230070627f4f72b87d",
+      "bytes": 243383,
+      "width": 1080,
+      "height": 1080,
+      "encode": [
+        "-vf",
+        "scale=w=1080:h=1080:flags=lanczos:in_range=full:out_range=full,format=yuv420p",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "libsvtav1",
+        "-preset",
+        "4",
+        "-crf",
+        "42",
+        "-colorspace",
+        "bt470bg",
+        "-color_range",
+        "pc"
+      ]
+    }
   },
   "social": {
     "src": "/media/confluent-veins-social-44774b4db99a.jpg",

@@ -36,6 +36,13 @@ export type SmallVideo = MediaFile & {
   encode: string[];
 };
 
+export type SmallPoster = MediaFile & {
+  width: number;
+  height: number;
+  /** The ffmpeg arguments that made it from the poster JPEG (scripts/media-options.ts, buildSmallPosterArgs). */
+  encode: string[];
+};
+
 export type FilmManifest = {
   schema: typeof MEDIA_SCHEMA;
   /** The film's id: lib/films/<id>.json, and the prefix of its files (scripts/media.ts --film). */
@@ -57,7 +64,15 @@ export type FilmManifest = {
      */
     small?: SmallVideo;
   };
-  poster: MediaFile & { frame: number };
+  poster: MediaFile & {
+    frame: number;
+    /**
+     * The poster at the phone encode's size, as an AVIF (scripts/media.ts, with `--small`): what a narrow screen
+     * shows until the film's first frame (components/film.tsx, PHONE). The 2160² JPEG is about 3 MB, which a
+     * phone on a slow network took past 16 s to fetch, after the video's own first frame.
+     */
+    small?: SmallPoster;
+  };
   /** The social card: a 1200 × 630 crop of film frame `frame` (scripts/media.ts). */
   social: MediaFile & { width: number; height: number; frame: number };
   world: {
@@ -185,8 +200,9 @@ export type ControlsManifest = {
 export const controls = controlsManifest as unknown as ControlsManifest;
 
 /**
- * Every file the films and the still sets serve as static assets from public/media/ (each film's poster and
- * social card, and the stills), deduplicated by path. The films' videos are in R2 instead (`filmVideos`).
+ * Every file the films and the still sets serve as static assets from public/media/ (each film's poster, its
+ * phone poster if it has one, and its social card, and the stills), deduplicated by path. The films' videos are
+ * in R2 instead (`filmVideos`).
  */
 export function collectStaticMedia(
   filmManifests: readonly FilmManifest[],
@@ -195,7 +211,11 @@ export function collectStaticMedia(
   return [
     ...new Map(
       [
-        ...filmManifests.flatMap((filmManifest) => [filmManifest.poster, filmManifest.social]),
+        ...filmManifests.flatMap((filmManifest) => [
+          filmManifest.poster,
+          ...(filmManifest.poster.small ? [filmManifest.poster.small] : []),
+          filmManifest.social,
+        ]),
         ...stillSets.flatMap((set) => set.stills),
       ].map((file) => [file.src, file]),
     ).values(),

@@ -90,7 +90,30 @@
     "src": "/media/confluent-polarity-poster-9fdaaeff0824.jpg",
     "sha256": "9fdaaeff08243486ae3e844ee84d739cf6b98db241d530e38c2787c138247b67",
     "bytes": 3169513,
-    "frame": 0
+    "frame": 0,
+    "small": {
+      "src": "/media/confluent-polarity-poster-small-f9dde4fe4ed7.avif",
+      "sha256": "f9dde4fe4ed7a425a9db15663aa99dd2d15e1fca6e7910586aba6d1cf025ee26",
+      "bytes": 242134,
+      "width": 1080,
+      "height": 1080,
+      "encode": [
+        "-vf",
+        "scale=w=1080:h=1080:flags=lanczos:in_range=full:out_range=full,format=yuv420p",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "libsvtav1",
+        "-preset",
+        "4",
+        "-crf",
+        "42",
+        "-colorspace",
+        "bt470bg",
+        "-color_range",
+        "pc"
+      ]
+    }
   },
   "social": {
     "src": "/media/confluent-polarity-social-a18e5fab45a1.jpg",

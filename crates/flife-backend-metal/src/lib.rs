@@ -110,6 +110,127 @@ const fn forward_threads(widest_hidden: usize) -> usize {
     }
 }
 
+/// Pack a binary16 genome into `out` (`u32` pairs, even element low) matching
+/// `controller_forward_half`'s coalesced AoSoA layout: any layer whose
+/// slot-relative offset and `fan_in` are both multiples of 4 is stored as
+/// `[q][out][4]` (2 `u32` words per `(q, out)`), followed by `biases`; all
+/// other layers stay row-major. Exact element count `values.len()`, zero extra
+/// slot padding beyond F16's 4-element alignment, preserving every bit and
+/// exact ascending MAC order `0..fan_in`.
+fn pack_f16_for_metal(
+    topology: &DenseTopology,
+    values: &[flife_core::binary16::F16],
+    out: &mut Vec<u32>,
+) -> Result<(), CoreError> {
+    out.clear();
+    let word_count = values.len().div_ceil(2);
+    if out.capacity() < word_count {
+        reserve(out, word_count, "metal binary16 words")?;
+    }
+    let mut pending_lo: Option<u16> = None;
+    let push_slice =
+        |slice: &[flife_core::binary16::F16], pending: &mut Option<u16>, dst: &mut Vec<u32>| {
+            let mut iter = slice.iter();
+            if let Some(lo) = pending.take() {
+                if let Some(&hi) = iter.next() {
+                    dst.push(u32::from(lo) | (u32::from(hi.to_bits()) << 16));
+                } else {
+                    *pending = Some(lo);
+                    return;
+                }
+            }
+            let rem = iter.as_slice();
+            let (pairs, tail) = rem.as_chunks::<2>();
+            dst.extend(
+                pairs.iter().map(|[low, high]| {
+                    u32::from(low.to_bits()) | (u32::from(high.to_bits()) << 16)
+                }),
+            );
+            if let Some(&last) = tail.first() {
+                *pending = Some(last.to_bits());
+            }
+        };
+
+    let mut layer_offset = 0_usize;
+    for layer in topology.layers() {
+        let fan_in = layer.inputs;
+        let fan_out = layer.outputs;
+        let weight_count =
+            fan_in
+                .checked_mul(fan_out)
+                .ok_or_else(|| CoreError::LayoutMismatch {
+                    buffer: "metal binary16 weights",
+                    detail: format!("weight count overflow for {fan_in}x{fan_out}"),
+                })?;
+        let weights_end =
+            layer
+                .weights
+                .checked_add(weight_count)
+                .ok_or_else(|| CoreError::LayoutMismatch {
+                    buffer: "metal binary16 weights",
+                    detail: "weight range overflow".to_string(),
+                })?;
+        let biases_end =
+            layer
+                .biases
+                .checked_add(fan_out)
+                .ok_or_else(|| CoreError::LayoutMismatch {
+                    buffer: "metal binary16 biases",
+                    detail: "bias range overflow".to_string(),
+                })?;
+        let weights =
+            values
+                .get(layer.weights..weights_end)
+                .ok_or_else(|| CoreError::LayoutMismatch {
+                    buffer: "metal binary16 weights",
+                    detail: format!(
+                        "weight slice {}..{} out of bounds for {} values",
+                        layer.weights,
+                        weights_end,
+                        values.len()
+                    ),
+                })?;
+        let biases =
+            values
+                .get(layer.biases..biases_end)
+                .ok_or_else(|| CoreError::LayoutMismatch {
+                    buffer: "metal binary16 biases",
+                    detail: format!(
+                        "bias slice {}..{} out of bounds for {} values",
+                        layer.biases,
+                        biases_end,
+                        values.len()
+                    ),
+                })?;
+        if ((layer_offset | fan_in) & 3) == 0 && pending_lo.is_none() {
+            let quads = fan_in >> 2;
+            let (weight_quads, tail) = weights.as_chunks::<4>();
+            if !tail.is_empty() || weight_quads.len() != fan_out * quads {
+                return Err(CoreError::LayoutMismatch {
+                    buffer: "metal binary16 weights",
+                    detail: "AoSoA quad count mismatch".to_string(),
+                });
+            }
+            for q in 0..quads {
+                if let Some(shifted) = weight_quads.get(q..) {
+                    for w in shifted.iter().step_by(quads) {
+                        out.push(u32::from(w[0].to_bits()) | (u32::from(w[1].to_bits()) << 16));
+                        out.push(u32::from(w[2].to_bits()) | (u32::from(w[3].to_bits()) << 16));
+                    }
+                }
+            }
+        } else {
+            push_slice(weights, &mut pending_lo, out);
+        }
+        push_slice(biases, &mut pending_lo, out);
+        layer_offset += weight_count + fan_out;
+    }
+    if let Some(lo) = pending_lo {
+        out.push(u32::from(lo));
+    }
+    Ok(())
+}
+
 /// The jobs words per organism: its row, parameter offset, hidden-layer
 /// count and two hidden widths.
 const JOB_WORDS: usize = 5;
@@ -1455,9 +1576,6 @@ impl MetalBackend {
                 .map(|words| [words[2], words[3], words[4]]);
             let widest_hidden =
                 topology.hidden_widths().iter().copied().max().unwrap_or(0) as usize;
-            // Trap A defense-in-depth: `fitting_for_dtype` pads F16 slot stride
-            // to a multiple of 4 elements, guaranteeing zero F16 alignment
-            // deferrals even for odd-parameter topologies.
             DeviceBucket {
                 topology: topology.clone(),
                 dtype,
@@ -1964,22 +2082,9 @@ impl MetalBackend {
                     }
                     // Two binary16 values a word, the even one low; F16 slot
                     // stride is a multiple of 4 elements, so `offset` is always
-                    // even (and 4-aligned). An odd `values.len()` writes its
-                    // trailing element into the low 16 bits of the last word
-                    // with zero high-half padding inside this slot's stride.
+                    // 8-byte aligned for coalesced AoSoA `half4` loads.
                     (Some(ShardWriteLease::F16(lease)), Weights::F16(values)) => {
-                        packed.clear();
-                        let word_count = values.len().div_ceil(2);
-                        if packed.capacity() < word_count {
-                            reserve(packed, word_count, "metal binary16 words")?;
-                        }
-                        let (pairs, remainder) = values.as_chunks::<2>();
-                        packed.extend(pairs.iter().map(|[low, high]| {
-                            u32::from(low.to_bits()) | (u32::from(high.to_bits()) << 16)
-                        }));
-                        if let Some(&last) = remainder.first() {
-                            packed.push(u32::from(last.to_bits()));
-                        }
+                        pack_f16_for_metal(controller.topology(), values, packed)?;
                         lease.write(offset / 2, packed)?;
                     }
                     _ => {
@@ -2453,18 +2558,11 @@ impl MetalBackend {
                         lease.write(offset, values)?;
                     }
                     (Some(ShardWriteLease::F16(lease)), Weights::F16(values)) => {
-                        self.packed_f16.clear();
-                        let word_count = values.len().div_ceil(2);
-                        if self.packed_f16.capacity() < word_count {
-                            reserve(&mut self.packed_f16, word_count, "metal binary16 words")?;
-                        }
-                        let (pairs, remainder) = values.as_chunks::<2>();
-                        self.packed_f16.extend(pairs.iter().map(|[low, high]| {
-                            u32::from(low.to_bits()) | (u32::from(high.to_bits()) << 16)
-                        }));
-                        if let Some(&last) = remainder.first() {
-                            self.packed_f16.push(u32::from(last.to_bits()));
-                        }
+                        pack_f16_for_metal(
+                            job.controller().topology(),
+                            values,
+                            &mut self.packed_f16,
+                        )?;
                         lease.write(offset / 2, &self.packed_f16)?;
                     }
                     _ => return Ok(None),

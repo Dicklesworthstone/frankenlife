@@ -382,9 +382,13 @@ static void forward_pass_f32(
 // Binary16 forward pass (compact F16, FL-030): every parameter is widened
 // exactly to F32 and accumulated in the reference order. Layer inputs are
 // checked once against HALF_TINY_INPUT_BITS (2^-78), eliminating per-product
-// subnormal checks from the inner loop, with 128-bit uint4 loads on 8-aligned
-// rows, 2x unrolled half4 loads on 4-aligned even-quad rows, vectorized uint4
-// min_z tracking off the FP chain, and register-accumulated local_fault.
+// subnormal checks from the inner loop. Layers with `((offset | fan_in) & 3) == 0`
+// use coalesced AoSoA `[q][o][4]` packing (`weights4[q * fan_out + o]`)
+// so all 32 SIMD lanes issue 256-byte contiguous coalesced `half4` bursts in
+// exact ascending input order `0..fan_in` (0-ULP bit-identical, 2x unrolled,
+// zero extra slot padding beyond F16's 4-element alignment); other layers use
+// row-major scalar loads, with vectorized uint4 min_z tracking off the FP
+// chain and register-accumulated local_fault.
 static void forward_pass_half(
     device const half *params,
     device const float *inputs,
@@ -447,48 +451,22 @@ static void forward_pass_half(
         threadgroup const float *source = reinterpret_cast<threadgroup const float *>(source4);
         device const half *weights = params + offset;
         device const half *biases = weights + fan_in * fan_out;
-        bool aligned8 = ((offset | fan_in) & 7u) == 0u;
         bool aligned4 = ((offset | fan_in) & 3u) == 0u;
         uint quads = fan_in >> 2;
-        uint octets = fan_in >> 3;
+        device const half4 *weights4 = aligned4
+            ? reinterpret_cast<device const half4 *>(weights)
+            : nullptr;
         for (uint o = lane; o < fan_out; o += lanes) {
             device const half *row = weights + o * fan_in;
             float z = float(biases[o]);
             uint min_z = 0xFFFFFFFFu;
-            if (aligned8) {
-                device const uint4 *row8 = reinterpret_cast<device const uint4 *>(row);
-                uint4 min_z4_a = uint4(0xFFFFFFFFu);
-                uint4 min_z4_b = uint4(0xFFFFFFFFu);
-                for (uint oct = 0u; oct < octets; ++oct) {
-                    uint4 raw = row8[oct];
-                    float4 w0 = float4(as_type<half4>(raw.xy));
-                    float4 w1 = float4(as_type<half4>(raw.zw));
-                    float4 x0 = source4[oct * 2u];
-                    float4 x1 = source4[oct * 2u + 1u];
-                    float4 p0 = w0 * x0;
-                    float4 p1 = w1 * x1;
-                    float z0 = z;
-                    float z1 = z0 + p0.x;
-                    float z2 = z1 + p0.y;
-                    float z3 = z2 + p0.z;
-                    float z4 = z3 + p0.w;
-                    float z5 = z4 + p1.x;
-                    float z6 = z5 + p1.y;
-                    float z7 = z6 + p1.z;
-                    z = z7 + p1.w;
-                    min_z4_a = min(min_z4_a, (as_type<uint4>(float4(z0, z1, z2, z3)) & 0x7FFFFFFFu) - 1u);
-                    min_z4_b = min(min_z4_b, (as_type<uint4>(float4(z4, z5, z6, z7)) & 0x7FFFFFFFu) - 1u);
-                }
-                uint4 min_z4 = min(min_z4_a, min_z4_b);
-                min_z = min(min(min_z4.x, min_z4.y), min(min_z4.z, min_z4.w));
-            } else if (aligned4) {
-                device const half4 *row4 = reinterpret_cast<device const half4 *>(row);
+            if (aligned4) {
                 uint4 min_z4_a = uint4(0xFFFFFFFFu);
                 uint4 min_z4_b = uint4(0xFFFFFFFFu);
                 uint q = 0u;
                 for (; q + 1u < quads; q += 2u) {
-                    float4 w0 = float4(row4[q]);
-                    float4 w1 = float4(row4[q + 1u]);
+                    float4 w0 = float4(weights4[q * fan_out + o]);
+                    float4 w1 = float4(weights4[(q + 1u) * fan_out + o]);
                     float4 x0 = source4[q];
                     float4 x1 = source4[q + 1u];
                     float4 p0 = w0 * x0;
@@ -506,7 +484,7 @@ static void forward_pass_half(
                     min_z4_b = min(min_z4_b, (as_type<uint4>(float4(z4, z5, z6, z7)) & 0x7FFFFFFFu) - 1u);
                 }
                 if (q < quads) {
-                    float4 w = float4(row4[q]);
+                    float4 w = float4(weights4[q * fan_out + o]);
                     float4 x = source4[q];
                     float4 p = w * x;
                     float z0 = z;

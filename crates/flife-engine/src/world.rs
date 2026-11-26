@@ -3890,12 +3890,93 @@ impl World {
                         });
                     }
                 }
+                let inv_seconds = {
+                    let bits = seconds.to_bits();
+                    let sign = bits >> 63;
+                    let exp = (bits >> 52) & 0x7FF;
+                    let frac = bits & 0x000F_FFFF_FFFF_FFFF;
+                    if sign == 0 && frac == 0 && (1..=2045).contains(&exp) {
+                        Some(1.0 / seconds)
+                    } else {
+                        None
+                    }
+                };
+                let plain_v1_survivors = trophallaxis_deltas.is_empty()
+                    && contacted.is_none()
+                    && next_velocities.is_empty()
+                    && pressed.is_empty()
+                    && next_polarities.is_empty()
+                    && next_neighbor_h0.is_empty();
                 flife_core::pool::try_parallel_tasks(
                     lanes.len(),
                     "phase 8 build survivors",
                     &mut build_tiles,
                     |_, tile| {
-                        let mut dst = 0_usize;
+                        let mut out_iter = tile.out.iter_mut().zip(tile.energies.iter_mut());
+                        if plain_v1_survivors {
+                            if let Some(inv_dt) = inv_seconds {
+                                for organism in tile.chunk {
+                                    if !organism.vitality.is_alive() {
+                                        continue;
+                                    }
+                                    if let Some((out, out_energy)) = out_iter.next() {
+                                        let energy = organism.budget.remaining();
+                                        let committed = &organism.committed;
+                                        out.id = committed.id;
+                                        out.genome = committed.genome;
+                                        out.parent = committed.parent;
+                                        out.lineage = committed.lineage;
+                                        out.generation = committed.generation;
+                                        out.birth_tick = committed.birth_tick;
+                                        out.position = organism.position;
+                                        out.velocity = organism.velocity;
+                                        out.energy = energy;
+                                        out.energy_change_rate =
+                                            (energy - committed.energy) * inv_dt;
+                                        out.held = organism.decision(decisions).held;
+                                        out.phase = committed.phase;
+                                        out.cooldown_deadline = organism.cooldown_deadline;
+                                        out.secretory_readiness = organism.secretory_readiness;
+                                        out.emission_cooldown_deadline =
+                                            organism.emission_cooldown_deadline;
+                                        out.polarity = committed.polarity;
+                                        out.last_neighbor_h0 = 0.0;
+                                        *out_energy = energy;
+                                    }
+                                }
+                            } else {
+                                for organism in tile.chunk {
+                                    if !organism.vitality.is_alive() {
+                                        continue;
+                                    }
+                                    if let Some((out, out_energy)) = out_iter.next() {
+                                        let energy = organism.budget.remaining();
+                                        let committed = &organism.committed;
+                                        out.id = committed.id;
+                                        out.genome = committed.genome;
+                                        out.parent = committed.parent;
+                                        out.lineage = committed.lineage;
+                                        out.generation = committed.generation;
+                                        out.birth_tick = committed.birth_tick;
+                                        out.position = organism.position;
+                                        out.velocity = organism.velocity;
+                                        out.energy = energy;
+                                        out.energy_change_rate =
+                                            (energy - committed.energy) / seconds;
+                                        out.held = organism.decision(decisions).held;
+                                        out.phase = committed.phase;
+                                        out.cooldown_deadline = organism.cooldown_deadline;
+                                        out.secretory_readiness = organism.secretory_readiness;
+                                        out.emission_cooldown_deadline =
+                                            organism.emission_cooldown_deadline;
+                                        out.polarity = committed.polarity;
+                                        out.last_neighbor_h0 = 0.0;
+                                        *out_energy = energy;
+                                    }
+                                }
+                            }
+                            return Ok(());
+                        }
                         for (offset, organism) in tile.chunk.iter().enumerate() {
                             if !organism.vitality.is_alive() {
                                 continue;
@@ -3949,21 +4030,31 @@ impl World {
                                 .unwrap_or(organism.committed.polarity);
                             let last_neighbor_h0 =
                                 next_neighbor_h0.get(index).copied().unwrap_or(0.0);
-                            tile.out[dst] = Organism {
-                                position,
-                                velocity,
-                                energy,
-                                energy_change_rate: (energy - organism.committed.energy) / seconds,
-                                held: organism.decision(decisions).held,
-                                cooldown_deadline: organism.cooldown_deadline,
-                                secretory_readiness: organism.secretory_readiness,
-                                emission_cooldown_deadline: organism.emission_cooldown_deadline,
-                                polarity,
-                                last_neighbor_h0,
-                                ..organism.committed
-                            };
-                            tile.energies[dst] = energy;
-                            dst += 1;
+                            if let Some((out, out_energy)) = out_iter.next() {
+                                let committed = &organism.committed;
+                                out.id = committed.id;
+                                out.genome = committed.genome;
+                                out.parent = committed.parent;
+                                out.lineage = committed.lineage;
+                                out.generation = committed.generation;
+                                out.birth_tick = committed.birth_tick;
+                                out.position = position;
+                                out.velocity = velocity;
+                                out.energy = energy;
+                                out.energy_change_rate = match inv_seconds {
+                                    Some(inv_dt) => (energy - committed.energy) * inv_dt,
+                                    None => (energy - committed.energy) / seconds,
+                                };
+                                out.held = organism.decision(decisions).held;
+                                out.phase = committed.phase;
+                                out.cooldown_deadline = organism.cooldown_deadline;
+                                out.secretory_readiness = organism.secretory_readiness;
+                                out.emission_cooldown_deadline =
+                                    organism.emission_cooldown_deadline;
+                                out.polarity = polarity;
+                                out.last_neighbor_h0 = last_neighbor_h0;
+                                *out_energy = energy;
+                            }
                         }
                         Ok(())
                     },

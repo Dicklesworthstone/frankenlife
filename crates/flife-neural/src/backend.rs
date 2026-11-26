@@ -204,6 +204,14 @@ pub trait ControllerBackend: Debug + Send {
         false
     }
 
+    /// Whether this backend executes off-CPU (such as on a Metal GPU) so the
+    /// engine may overlap [`Self::evaluate_flat_f32`] with independent CPU
+    /// phases inside the world's single worker budget. CPU-backed evaluators
+    /// return `false` so they do not compete for the same CPU workers.
+    fn prefers_cpu_overlap(&self) -> bool {
+        false
+    }
+
     /// Evaluate `jobs` from a contiguous row-major F32 input buffer
     /// (`inputs_f32.len() == jobs.len() * input_width`) with per-job finiteness
     /// flags (`inputs_finite.len() == jobs.len()`), writing contiguous row-major

@@ -3428,6 +3428,10 @@ impl ControllerBackend for MetalBackend {
         true
     }
 
+    fn prefers_cpu_overlap(&self) -> bool {
+        true
+    }
+
     fn evaluate_flat_f32(
         &mut self,
         jobs: &[FlatControllerJob<'_>],

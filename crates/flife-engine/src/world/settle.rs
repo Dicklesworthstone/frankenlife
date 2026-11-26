@@ -167,6 +167,7 @@ pub(super) fn settle_with(
     grants: (&Bins, &[GrantPacket], &Bins),
     compositions: (&mut Vec<[f64; CHANNELS]>, &mut Vec<u32>),
     spatial: super::SpatialSettle<'_>,
+    precomputed_fused_chem: bool,
     from: Tick,
     watched: Option<OrganismId>,
     decisions: &[Decision],
@@ -183,7 +184,6 @@ pub(super) fn settle_with(
         tile_offsets: spatial_tile_offsets,
         uptake: spatial_uptake,
     } = spatial;
-    spatial_uptake.clear();
     let Settle {
         backend,
         report,
@@ -191,6 +191,7 @@ pub(super) fn settle_with(
     } = settle;
     let mut failure = None;
     if let Some(device) = backend.as_deref_mut() {
+        spatial_uptake.clear();
         match settle_on(
             device,
             rules,
@@ -214,19 +215,27 @@ pub(super) fn settle_with(
             }
         }
     }
-    let fused = super::spatial_chemistry_prepass_fused(
-        rules,
-        population,
-        observed,
-        (by_demand, granted, grants_bins),
-        working.len(),
-        lanes.len(),
-        spatial_rows,
-        row_to_spatial,
-        spatial_tile_offsets,
-        (cell_compositions, packet_compositions),
-        spatial_uptake,
-    );
+    let fused = if precomputed_fused_chem
+        && spatial_uptake.len() == working.len()
+        && !row_to_spatial.is_empty()
+    {
+        true
+    } else {
+        spatial_uptake.clear();
+        super::spatial_chemistry_prepass_fused(
+            rules,
+            population,
+            observed,
+            (by_demand, granted, grants_bins),
+            working.len(),
+            lanes.len(),
+            spatial_rows,
+            row_to_spatial,
+            spatial_tile_offsets,
+            (cell_compositions, packet_compositions),
+            spatial_uptake,
+        )
+    };
     if !fused {
         compositions_into(
             observed,

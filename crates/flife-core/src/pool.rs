@@ -40,6 +40,11 @@ thread_local! {
     /// Set on the calling thread while inside an active [`scope_workers`]
     /// parallel fanout, preventing nested fanout from the caller side too.
     static IN_SCOPE_DISPATCH: Cell<bool> = const { Cell::new(false) };
+    /// Non-zero on the calling thread while inside [`overlap_off_cpu`]: names
+    /// the outer pool's worker budget so inner parallel phases reuse that
+    /// exact pool (with at most `workers - 1` active threads) instead of
+    /// allocating a second pool.
+    static OVERLAP_POOL_WORKERS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[inline]
@@ -65,6 +70,27 @@ impl Drop for DispatchGuard {
     #[inline]
     fn drop(&mut self) {
         IN_SCOPE_DISPATCH.set(self.prev);
+    }
+}
+
+/// RAII guard recording the outer pool size during [`overlap_off_cpu`] and
+/// restoring the previous value on normal exit or panic unwind.
+struct OverlapGuard {
+    prev: usize,
+}
+
+impl OverlapGuard {
+    #[inline]
+    fn enter(workers: usize) -> Self {
+        let prev = OVERLAP_POOL_WORKERS.replace(workers);
+        Self { prev }
+    }
+}
+
+impl Drop for OverlapGuard {
+    #[inline]
+    fn drop(&mut self) {
+        OVERLAP_POOL_WORKERS.set(self.prev);
     }
 }
 
@@ -171,6 +197,64 @@ where
     F: FnOnce(&WorkerScope<'scope, '_>) -> Result<R, CoreError>,
 {
     scope_workers(workers, operation, body)?
+}
+
+/// Overlap one blocking off-CPU operation (such as a Metal GPU submission and
+/// wait) with independent CPU work inside the single `workers` budget.
+///
+/// When `workers >= 2` and not already inside a pool dispatch, spawns
+/// `off_cpu` onto one background thread of the cached `workers` pool while
+/// `on_cpu` runs on the calling thread with an inner worker budget of
+/// `workers - 1` (reusing the same `workers` pool for its `workers - 2`
+/// remaining background threads, so total OS threads never exceed `workers`
+/// and no second pool is created). When `workers <= 1` or nested, runs
+/// `off_cpu` then `on_cpu(1)` sequentially inline.
+///
+/// # Errors
+/// [`CoreError::StateConflict`] if pool creation fails or either closure
+/// panics.
+pub fn overlap_off_cpu<A, B, RA, RB>(
+    workers: usize,
+    operation: &'static str,
+    off_cpu: A,
+    on_cpu: B,
+) -> Result<(RA, RB), CoreError>
+where
+    A: FnOnce() -> RA + Send,
+    B: FnOnce(usize) -> RB,
+    RA: Send,
+{
+    if workers <= 1 || in_worker_dispatch() || OVERLAP_POOL_WORKERS.get() != 0 {
+        return catch_unwind(AssertUnwindSafe(|| {
+            let a = off_cpu();
+            let b = on_cpu(1);
+            (a, b)
+        }))
+        .map_err(|_| worker_panicked(operation));
+    }
+    let Some(pool) = pool_for(workers, operation)? else {
+        return catch_unwind(AssertUnwindSafe(|| {
+            let a = off_cpu();
+            let b = on_cpu(1);
+            (a, b)
+        }))
+        .map_err(|_| worker_panicked(operation));
+    };
+    let cpu_workers = workers - 1;
+    let mut off_result: Option<RA> = None;
+    let on_result = catch_unwind(AssertUnwindSafe(|| {
+        let slot = &mut off_result;
+        pool.in_place_scope(|scope| {
+            scope.spawn(move |_| {
+                *slot = Some(off_cpu());
+            });
+            let _guard = OverlapGuard::enter(workers);
+            on_cpu(cpu_workers)
+        })
+    }))
+    .map_err(|_| worker_panicked(operation))?;
+    let off_value = off_result.ok_or_else(|| worker_panicked(operation))?;
+    Ok((off_value, on_result))
 }
 
 /// Apply `f(index, item)` across every element of `items`, running item `0` on
@@ -595,7 +679,13 @@ fn pool_for(workers: usize, operation: &'static str) -> Result<Option<PoolRef>, 
     if workers <= 1 || in_worker_dispatch() {
         return Ok(None);
     }
-    if let Some(slot) = FAST_POOLS.get(workers - 2) {
+    let overlap_outer = OVERLAP_POOL_WORKERS.get();
+    let pool_workers = if overlap_outer >= 2 {
+        overlap_outer
+    } else {
+        workers
+    };
+    if let Some(slot) = FAST_POOLS.get(pool_workers - 2) {
         if let Some(pool) = slot.get() {
             return Ok(Some(PoolRef::Static(pool)));
         }
@@ -603,7 +693,7 @@ fn pool_for(workers: usize, operation: &'static str) -> Result<Option<PoolRef>, 
         if let Some(pool) = slot.get() {
             return Ok(Some(PoolRef::Static(pool)));
         }
-        let built = build_pool(workers, operation)?;
+        let built = build_pool(pool_workers, operation)?;
         let _ = slot.set(built);
         let pool = slot.get().ok_or_else(|| CoreError::StateConflict {
             operation,
@@ -614,11 +704,11 @@ fn pool_for(workers: usize, operation: &'static str) -> Result<Option<PoolRef>, 
 
     let map = OVERFLOW_POOLS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut pools = lock_or_recover(map);
-    if let Some(existing) = pools.get(&workers) {
+    if let Some(existing) = pools.get(&pool_workers) {
         return Ok(Some(PoolRef::Owned(Arc::clone(existing))));
     }
-    let built = build_pool(workers, operation)?;
-    pools.insert(workers, Arc::clone(&built));
+    let built = build_pool(pool_workers, operation)?;
+    pools.insert(pool_workers, Arc::clone(&built));
     Ok(Some(PoolRef::Owned(built)))
 }
 
@@ -936,5 +1026,100 @@ mod tests {
             err.to_string().contains("boom at 9"),
             "expected deterministic lowest-index error, got: {err}"
         );
+    }
+
+    #[test]
+    fn overlap_off_cpu_runs_concurrently_within_single_worker_budget_and_handles_panics() {
+        // Dedicated worker count (7) so parallel tests do not share a barrier pool.
+        let workers = 7_usize;
+        let caller = thread::current().id();
+        let sync = Barrier::new(2);
+        let sync_ref = &sync;
+
+        let ((off_tid, off_name), (inner_workers_seen, cpu_tids)) = overlap_off_cpu(
+            workers,
+            "overlap test",
+            || {
+                sync_ref.wait();
+                (
+                    thread::current().id(),
+                    thread::current().name().map(str::to_owned),
+                )
+            },
+            |cpu_w| {
+                sync_ref.wait();
+                let mut slots: Vec<(thread::ThreadId, Option<String>)> =
+                    vec![(caller, None); cpu_w * 4];
+                parallel_tasks(cpu_w, "inner overlap tasks", &mut slots, |_, slot| {
+                    *slot = (
+                        thread::current().id(),
+                        thread::current().name().map(str::to_owned),
+                    );
+                })
+                .expect("inner parallel_tasks succeeds inside overlap_off_cpu");
+                (cpu_w, slots)
+            },
+        )
+        .expect("overlap_off_cpu succeeds");
+
+        assert_eq!(inner_workers_seen, workers - 1);
+        assert_ne!(off_tid, caller, "off_cpu runs on a background pool thread");
+        let off_name = off_name.expect("named off_cpu pool thread");
+        assert!(
+            off_name.starts_with("flife-w7-"),
+            "off_cpu must run on flife-w7-*, got `{off_name}`"
+        );
+        let mut all_tids = HashSet::new();
+        all_tids.insert(off_tid);
+        for (tid, name) in cpu_tids {
+            all_tids.insert(tid);
+            if tid != caller {
+                let name = name.expect("named inner worker");
+                assert!(
+                    name.starts_with("flife-w7-"),
+                    "inner tasks must reuse flife-w7-*, never build flife-w6-*, got `{name}`"
+                );
+            }
+        }
+        assert!(
+            all_tids.len() <= workers,
+            "distinct OS threads {} exceeded budget {workers}",
+            all_tids.len()
+        );
+
+        // workers = 1 runs sequentially inline; workers = 2 overlaps 1 background + caller serial.
+        let (a1, b1) = overlap_off_cpu(1, "overlap w1", || 11_u32, |w| (w, 22_u32))
+            .expect("workers=1 succeeds");
+        assert_eq!((a1, b1), (11, (1, 22)));
+        let b2 = Barrier::new(2);
+        let b2_ref = &b2;
+        let (a2, c2) = overlap_off_cpu(
+            2,
+            "overlap w2",
+            || {
+                b2_ref.wait();
+                thread::current().id()
+            },
+            |w| {
+                b2_ref.wait();
+                (w, thread::current().id())
+            },
+        )
+        .expect("workers=2 succeeds");
+        assert_ne!(a2, caller);
+        assert_eq!(c2, (1, caller));
+
+        // Panic in off_cpu or on_cpu returns StateConflict and restores TLS cleanly.
+        assert!(matches!(
+            overlap_off_cpu(workers, "panic off", || -> () { panic!("off boom") }, |_| 1),
+            Err(CoreError::StateConflict { .. })
+        ));
+        assert!(matches!(
+            overlap_off_cpu(workers, "panic on", || 1, |_| -> () { panic!("on boom") }),
+            Err(CoreError::StateConflict { .. })
+        ));
+        let (ok_a, ok_b) =
+            overlap_off_cpu(workers, "after panic", || 7, |w| w).expect("pool healthy after panic");
+        assert_eq!((ok_a, ok_b), (7, workers - 1));
     }
 }

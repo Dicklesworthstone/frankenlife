@@ -337,3 +337,137 @@ fn flat_f32_batched_world_matches_reference_bit_for_bit_and_never_grows() {
         assert_eq!(batched.allocated().scratch, before.scratch);
     }
 }
+
+#[derive(Debug, Default)]
+struct OverlappedFlatReferenceBatch {
+    inner: FlatReferenceBatch,
+    fail_on_call: Option<u64>,
+    calls: u64,
+}
+
+impl ControllerBackend for OverlappedFlatReferenceBatch {
+    fn describe(&self) -> String {
+        "overlapped flat f32 reference batch (test)".to_owned()
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.inner.resident_bytes()
+    }
+
+    fn forget(&mut self) {}
+
+    fn supports_flat_f32(&self) -> bool {
+        true
+    }
+
+    fn prefers_cpu_overlap(&self) -> bool {
+        true
+    }
+
+    fn evaluate(
+        &mut self,
+        jobs: &[ControllerJob<'_>],
+        outputs: &mut Vec<Option<RawOutputs>>,
+    ) -> Result<(), CoreError> {
+        self.inner.evaluate(jobs, outputs)
+    }
+
+    fn evaluate_flat_f32(
+        &mut self,
+        jobs: &[FlatControllerJob<'_>],
+        input_width: usize,
+        inputs_f32: &[f32],
+        inputs_finite: &[u8],
+        outputs: &mut FlatOutputs,
+    ) -> Result<(), CoreError> {
+        self.calls += 1;
+        if self.fail_on_call == Some(self.calls) {
+            outputs.clear();
+            return Err(CoreError::StateConflict {
+                operation: "overlapped test backend",
+                detail: "injected mid-run overlap failure".to_owned(),
+            });
+        }
+        self.inner
+            .evaluate_flat_f32(jobs, input_width, inputs_f32, inputs_finite, outputs)
+    }
+}
+
+#[test]
+fn overlapped_flat_f32_backend_matches_reference_and_recovers_on_failure() {
+    // 1. Non-spatial world (512 founders) on 2 and 4 workers, plus mid-run failure recovery.
+    let small = config();
+    for (workers, fail_on) in [(2_usize, None), (4_usize, None), (4_usize, Some(5_u64))] {
+        let w = NonZeroUsize::new(workers).expect("nonzero");
+        let mut reference = found(&small);
+        let mut overlapped = found(&small);
+        reference.set_cpu_workers(w).expect("workers");
+        overlapped.set_cpu_workers(w).expect("workers");
+        overlapped.set_controller_backend(Some(Box::new(OverlappedFlatReferenceBatch {
+            inner: FlatReferenceBatch {
+                defer_every: 7,
+                ..FlatReferenceBatch::default()
+            },
+            fail_on_call: fail_on,
+            calls: 0,
+        })));
+        let installed = overlapped.allocated();
+        let (difference, _, _) = race(&mut reference, &mut overlapped, 24);
+        assert_eq!(
+            difference, None,
+            "small world workers={workers} fail_on={fail_on:?} diverged"
+        );
+        assert_eq!(
+            overlapped.allocated().scratch,
+            installed.scratch,
+            "small world workers={workers} fail_on={fail_on:?}: scratch grew"
+        );
+        if fail_on.is_some() {
+            assert_eq!(overlapped.controller_report().reference_ticks, 1);
+            assert!(
+                overlapped
+                    .controller_report()
+                    .failure
+                    .as_deref()
+                    .is_some_and(|s| s.contains("injected mid-run overlap failure"))
+            );
+        } else {
+            assert_eq!(overlapped.controller_report().failure, None);
+            assert_eq!(overlapped.controller_report().reference_ticks, 0);
+        }
+    }
+
+    // 2. Spatial-tiled world (2,048 founders >= SPATIAL_PASS1_MIN_ROWS on 128x128)
+    // exercises BOTH overlapped Phase 5 uptake AND overlapped Phase 6 fused spatial
+    // chemistry prepass, plus fallback recovery on mid-run controller failure.
+    let spatial_toml = PRESET
+        .replace("initial_count = 4096", "initial_count = 2048")
+        .replace("maximum_count = 16384", "maximum_count = 4096");
+    let spatial_cfg = ValidatedConfig::from_toml(&spatial_toml).expect("spatial config validates");
+    for fail_on in [None, Some(3_u64)] {
+        let w = NonZeroUsize::new(4).expect("nonzero");
+        let mut reference = found(&spatial_cfg);
+        let mut overlapped = found(&spatial_cfg);
+        reference.set_cpu_workers(w).expect("workers");
+        overlapped.set_cpu_workers(w).expect("workers");
+        overlapped.set_controller_backend(Some(Box::new(OverlappedFlatReferenceBatch {
+            inner: FlatReferenceBatch {
+                defer_every: 11,
+                ..FlatReferenceBatch::default()
+            },
+            fail_on_call: fail_on,
+            calls: 0,
+        })));
+        let installed = overlapped.allocated();
+        let (difference, _, _) = race(&mut reference, &mut overlapped, 10);
+        assert_eq!(
+            difference, None,
+            "spatial world fail_on={fail_on:?} diverged"
+        );
+        assert_eq!(
+            overlapped.allocated().scratch,
+            installed.scratch,
+            "spatial world fail_on={fail_on:?}: scratch grew"
+        );
+    }
+}

@@ -3191,8 +3191,26 @@ impl World {
 
         // Phases 3 and 4: the pyramid, then every remaining organism's
         // observation and its due or forced evaluation, in identity order.
+        // When an off-CPU controller backend (e.g. Metal GPU) runs on >= 2
+        // workers and Phase 5 stays on CPU, overlap Phase 5 uptake (+ Phase 6
+        // fused spatial chemistry prepass when Phase 6 stays on CPU) behind
+        // the GPU controller dispatch inside the single worker budget.
         let view = pyramid.build_on(observed, field_work.workers())?;
         let (sampled, sensor_failure) = sample_with(population, rows, &view, observed, sensors);
+        let mut overlap = (uptake_state.backend.is_none() && lanes.len() >= 2).then(|| {
+            OverlapPhase56 {
+                observed,
+                demands,
+                grants,
+                by_demand,
+                compositions,
+                packet_compositions,
+                spatial_uptake,
+                run_fused_chem: settle_state.backend.is_none(),
+                uptake_result: None,
+                fused_chem_done: false,
+            }
+        });
         let evaluated = decide_with(
             rules,
             population,
@@ -3207,7 +3225,15 @@ impl World {
             spatial_tile_offsets,
             lanes,
             controllers,
+            overlap.as_mut(),
         )?;
+        let (precomputed_uptake, precomputed_fused_chem) = match overlap {
+            Some(ov) => (
+                ov.uptake_result,
+                ov.fused_chem_done && !row_to_spatial.is_empty(),
+            ),
+            None => (None, false),
+        };
         let (sensed, sensed_state, sensed_trail, sensed_crowding, sensed_notch_delta) =
             match watch.organism {
                 Some(id) => watched(
@@ -3403,22 +3429,30 @@ impl World {
         }
 
         // Phase 5: requests from the observation field, resolved per cell,
-        // on the uptake backend if the world has one.
-        let uptake = uptake_with(
-            rules,
-            working,
-            observed,
-            demands,
-            grants,
-            uptake_state,
-            lanes,
-        )?;
-        // The packets are in (cell, identity) order, so grouping them by
-        // demand keeps each organism's in cell order.
+        // on the uptake backend if the world has one (or already completed
+        // during the off-CPU controller overlap window).
+        let uptake = match precomputed_uptake {
+            Some(result) => result?,
+            None => {
+                let summary = uptake_with(
+                    rules,
+                    rows,
+                    observed,
+                    demands,
+                    grants,
+                    uptake_state,
+                    lanes,
+                )?;
+                // The packets are in (cell, identity) order, so grouping them by
+                // demand keeps each organism's in cell order.
+                let granted = grants.packets();
+                by_demand.group_on(demands.len(), granted.len(), lanes.len(), |at| {
+                    granted.get(at).map_or(usize::MAX, |packet| packet.demand)
+                })?;
+                summary
+            }
+        };
         let granted = grants.packets();
-        by_demand.group_on(demands.len(), granted.len(), lanes.len(), |at| {
-            granted.get(at).map_or(usize::MAX, |packet| packet.demand)
-        })?;
 
         // Room for the watched organism's transactions, so that publishing
         // them never allocates.
@@ -3452,6 +3486,7 @@ impl World {
                 tile_offsets: spatial_tile_offsets,
                 uptake: spatial_uptake,
             },
+            precomputed_fused_chem,
             from,
             watch.organism,
             decisions,
@@ -5657,7 +5692,7 @@ fn sample_dual_on(
 /// computed on the lanes ([`demands_on_lanes`]).
 fn uptake_with(
     rules: &Rules,
-    working: &[Working],
+    rows: &[Organism],
     field: &FieldState,
     demands: &mut Vec<Demand>,
     grants: &mut Grants,
@@ -5669,11 +5704,7 @@ fn uptake_with(
         capacity_per_second: rules.uptake_capacity,
         half_saturation_density: rules.half_saturation,
     };
-    let requesters = || {
-        working
-            .iter()
-            .map(|organism| (organism.committed.id, organism.position))
-    };
+    let requesters = || rows.iter().map(|organism| (organism.id, organism.position));
     let Uptake {
         backend,
         report,
@@ -5698,7 +5729,7 @@ fn uptake_with(
             }
             Err(error) => {
                 report.reference_ticks = report.reference_ticks.saturating_add(1);
-                demands_on_lanes(field, &rule, rules.exchange, working, demands, lanes)?;
+                demands_on_lanes(field, &rule, rules.exchange, rows, demands, lanes, lanes.len())?;
                 let summary = resolve_uptake_with_on_workers(
                     field,
                     rules.exchange,
@@ -5712,37 +5743,39 @@ fn uptake_with(
             }
         }
     }
-    demands_on_lanes(field, &rule, rules.exchange, working, demands, lanes)?;
+    demands_on_lanes(field, &rule, rules.exchange, rows, demands, lanes, lanes.len())?;
     resolve_uptake_with_on_workers(field, rules.exchange, demands, grants, lanes.len())
 }
 
-/// Phase 5's demands on the reference, on the lanes: `demands` gets each
-/// working organism's identity and position in identity order, then each
-/// lane computes a contiguous identity-ordered run of them ([`in_runs_mut`])
-/// with [`demand_with_scratch`]. A demand reads only the observed field, so
-/// the demands are the same at any lane count, and the error returned is the
-/// first in identity order, as one thread would report it.
+/// Phase 5's demands on the reference, on up to `workers` lanes: `demands`
+/// gets each committed organism's identity and position in identity order,
+/// then each lane computes a contiguous identity-ordered run of them with
+/// [`demand_with_scratch`]. A demand reads only the observed field and
+/// committed positions, so the demands are identical at any lane count and
+/// independent of Phase 4 decisions, and the error returned is the first in
+/// identity order.
 fn demands_on_lanes(
     field: &FieldState,
     rule: &RequestRule,
     exchange: ExchangeKernel,
-    working: &[Working],
+    rows: &[Organism],
     demands: &mut Vec<Demand>,
     lanes: &mut [DecisionLane],
+    workers: usize,
 ) -> Result<(), CoreError> {
     demands.clear();
-    if working.is_empty() {
+    if rows.is_empty() {
         return Ok(());
     }
-    reserve_for(demands, working.len(), "organism demands")?;
+    reserve_for(demands, rows.len(), "organism demands")?;
     let placeholder = Demand {
-        organism: working[0].committed.id,
-        position: working[0].position,
+        organism: rows[0].id,
+        position: rows[0].position,
         amount: 0.0,
     };
-    set_len_reuse(demands, working.len(), placeholder);
-    let worker_budget = lanes.len().max(1);
-    let max_tiles = working.len().div_ceil(MINIMUM_ROWS_PER_LANE).max(1);
+    set_len_reuse(demands, rows.len(), placeholder);
+    let worker_budget = workers.min(lanes.len()).max(1);
+    let max_tiles = rows.len().div_ceil(MINIMUM_ROWS_PER_LANE).max(1);
     let tile_count = if worker_budget <= 1 || max_tiles <= 1 {
         1
     } else {
@@ -5752,8 +5785,8 @@ fn demands_on_lanes(
             .min(max_tiles)
             .max(worker_budget.min(max_tiles))
     };
-    let tile_len = working.len().div_ceil(tile_count);
-    let mut tiles: Vec<(&[Working], &mut [Demand])> = working
+    let tile_len = rows.len().div_ceil(tile_count);
+    let mut tiles: Vec<(&[Organism], &mut [Demand])> = rows
         .chunks(tile_len)
         .zip(demands.chunks_mut(tile_len))
         .collect();
@@ -5762,13 +5795,13 @@ fn demands_on_lanes(
         "uptake demands",
         lanes,
         &mut tiles,
-        |_, (work_chunk, dem_chunk), lane| {
-            for (organism, slot) in work_chunk.iter().zip(dem_chunk.iter_mut()) {
+        |_, (row_chunk, dem_chunk), lane| {
+            for (organism, slot) in row_chunk.iter().zip(dem_chunk.iter_mut()) {
                 *slot = demand_with_scratch(
                     field,
                     rule,
                     exchange,
-                    organism.committed.id,
+                    organism.id,
                     organism.position,
                     &mut lane.exchange,
                 )?;
@@ -5776,6 +5809,85 @@ fn demands_on_lanes(
             Ok(())
         },
     )
+}
+
+/// CPU Phase 5 (uptake + demand grouping) and optional Phase 6 fused spatial
+/// chemistry prepass state that can overlap behind an off-CPU controller
+/// backend (e.g. Metal GPU) because neither depends on Phase 4 decisions.
+struct OverlapPhase56<'a> {
+    observed: &'a FieldState,
+    demands: &'a mut Vec<Demand>,
+    grants: &'a mut Grants,
+    by_demand: &'a mut Bins,
+    compositions: &'a mut Vec<[f64; CHANNELS]>,
+    packet_compositions: &'a mut Vec<u32>,
+    spatial_uptake: &'a mut Vec<(UptakeSettlement, EnergyBudget)>,
+    run_fused_chem: bool,
+    uptake_result: Option<Result<UptakeSummary, CoreError>>,
+    fused_chem_done: bool,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "runs Phase 5 uptake and optional Phase 6 fused chemistry prepass on CPU while off-CPU controllers execute"
+)]
+fn run_overlapped_phase56(
+    rules: &Rules,
+    population: &Population,
+    rows: &[Organism],
+    spatial_rows: &[u32],
+    row_to_spatial: &[u32],
+    spatial_tile_offsets: &[usize; SPATIAL_TILES + 1],
+    lanes: &mut [DecisionLane],
+    cpu_workers: usize,
+    ov: &mut OverlapPhase56<'_>,
+) {
+    let rule = RequestRule {
+        step: rules.step,
+        capacity_per_second: rules.uptake_capacity,
+        half_saturation_density: rules.half_saturation,
+    };
+    let uptake_res = demands_on_lanes(
+        ov.observed,
+        &rule,
+        rules.exchange,
+        rows,
+        ov.demands,
+        lanes,
+        cpu_workers,
+    )
+    .and_then(|()| {
+        let summary = resolve_uptake_with_on_workers(
+            ov.observed,
+            rules.exchange,
+            ov.demands,
+            ov.grants,
+            cpu_workers,
+        )?;
+        let granted = ov.grants.packets();
+        ov.by_demand
+            .group_on(ov.demands.len(), granted.len(), cpu_workers, |at| {
+                granted.get(at).map_or(usize::MAX, |packet| packet.demand)
+            })?;
+        Ok(summary)
+    });
+    let uptake_ok = uptake_res.is_ok();
+    ov.uptake_result = Some(uptake_res);
+    if uptake_ok && ov.run_fused_chem && !row_to_spatial.is_empty() {
+        ov.fused_chem_done = spatial_chemistry_prepass_fused(
+            rules,
+            population,
+            ov.observed,
+            (ov.by_demand, ov.grants.packets(), ov.grants.bins()),
+            rows.len(),
+            cpu_workers,
+            spatial_rows,
+            row_to_spatial,
+            spatial_tile_offsets,
+            (ov.compositions, ov.packet_compositions),
+            ov.spatial_uptake,
+        );
+    }
 }
 
 /// The watched organism's observation in the step from `from` to `to`,
@@ -8042,6 +8154,7 @@ fn decide_with(
     spatial_tile_offsets: &mut [usize; SPATIAL_TILES + 1],
     lanes: &mut [DecisionLane],
     controllers: &mut Controllers,
+    overlap: Option<&mut OverlapPhase56<'_>>,
 ) -> Result<usize, CoreError> {
     let Controllers {
         backend,
@@ -8084,6 +8197,7 @@ fn decide_with(
             flat_inputs_f32,
             flat_inputs_finite,
             flat_outputs,
+            overlap,
         )
     } else {
         row_to_spatial.clear();
@@ -8856,6 +8970,7 @@ fn decide_batched_flat_f32(
     flat_inputs_f32: &mut Vec<f32>,
     flat_inputs_finite: &mut Vec<u8>,
     flat_outputs: &mut FlatOutputs,
+    overlap: Option<&mut OverlapPhase56<'_>>,
 ) -> Result<Batched, CoreError> {
     row_to_spatial.clear();
     *spatial_tile_offsets = [0; SPATIAL_TILES + 1];
@@ -9131,13 +9246,50 @@ fn decide_batched_flat_f32(
             if flat_jobs.is_empty() {
                 flat_outputs.clear();
             } else {
-                if let Err(error) = device.evaluate_flat_f32(
-                    &flat_jobs,
-                    input_width,
-                    flat_inputs_f32,
-                    flat_inputs_finite,
-                    flat_outputs,
-                ) {
+                let eval_result = if device.prefers_cpu_overlap()
+                    && worker_budget >= 2
+                    && let Some(ov) = overlap
+                {
+                    let flat_jobs_ref: &[FlatControllerJob<'_>] = &flat_jobs;
+                    let flat_in_f32_ref: &[f32] = flat_inputs_f32;
+                    let flat_in_fin_ref: &[u8] = flat_inputs_finite;
+                    let (eval_res, ()) = flife_core::pool::overlap_off_cpu(
+                        worker_budget,
+                        "overlap controllers and phase 5-6",
+                        || {
+                            device.evaluate_flat_f32(
+                                flat_jobs_ref,
+                                input_width,
+                                flat_in_f32_ref,
+                                flat_in_fin_ref,
+                                flat_outputs,
+                            )
+                        },
+                        |cpu_workers| {
+                            run_overlapped_phase56(
+                                rules,
+                                population,
+                                rows,
+                                spatial_rows,
+                                row_to_spatial,
+                                spatial_tile_offsets,
+                                lanes,
+                                cpu_workers,
+                                ov,
+                            );
+                        },
+                    )?;
+                    eval_res
+                } else {
+                    device.evaluate_flat_f32(
+                        &flat_jobs,
+                        input_width,
+                        flat_inputs_f32,
+                        flat_inputs_finite,
+                        flat_outputs,
+                    )
+                };
+                if let Err(error) = eval_result {
                     flat_outputs.clear();
                     return Ok(Batched::Device(error));
                 }
@@ -9380,13 +9532,50 @@ fn decide_batched_flat_f32(
     if flat_jobs.is_empty() {
         flat_outputs.clear();
     } else {
-        if let Err(error) = device.evaluate_flat_f32(
-            &flat_jobs,
-            input_width,
-            flat_inputs_f32,
-            flat_inputs_finite,
-            flat_outputs,
-        ) {
+        let eval_result = if device.prefers_cpu_overlap()
+            && worker_budget >= 2
+            && let Some(ov) = overlap
+        {
+            let flat_jobs_ref: &[FlatControllerJob<'_>] = &flat_jobs;
+            let flat_in_f32_ref: &[f32] = flat_inputs_f32;
+            let flat_in_fin_ref: &[u8] = flat_inputs_finite;
+            let (eval_res, ()) = flife_core::pool::overlap_off_cpu(
+                worker_budget,
+                "overlap controllers and phase 5",
+                || {
+                    device.evaluate_flat_f32(
+                        flat_jobs_ref,
+                        input_width,
+                        flat_in_f32_ref,
+                        flat_in_fin_ref,
+                        flat_outputs,
+                    )
+                },
+                |cpu_workers| {
+                    run_overlapped_phase56(
+                        rules,
+                        population,
+                        rows,
+                        spatial_rows,
+                        row_to_spatial,
+                        spatial_tile_offsets,
+                        lanes,
+                        cpu_workers,
+                        ov,
+                    );
+                },
+            )?;
+            eval_res
+        } else {
+            device.evaluate_flat_f32(
+                &flat_jobs,
+                input_width,
+                flat_inputs_f32,
+                flat_inputs_finite,
+                flat_outputs,
+            )
+        };
+        if let Err(error) = eval_result {
             flat_outputs.clear();
             return Ok(Batched::Device(error));
         }

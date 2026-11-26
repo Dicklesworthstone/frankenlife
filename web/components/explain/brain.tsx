@@ -1,5 +1,6 @@
 "use client";
 
+import { Pause, Play } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -175,7 +176,9 @@ export function BrainAnatomy() {
   const figure = useRef<HTMLDivElement>(null);
   const inView = useInView(figure);
   const reduced = useReducedMotion();
-  const flowing = inView && !reduced;
+  // The flow never ends on its own, so a reader can stop it (WCAG 2.2.2), as reduced motion does.
+  const [stopped, setStopped] = useState(false);
+  const flowing = inView && !reduced && !stopped;
 
   const topology = CATALOG[topologyIndex] ?? CATALOG[DEFAULT_TOPOLOGY]!;
   const layers = widths(topology);
@@ -293,16 +296,29 @@ export function BrainAnatomy() {
       <div ref={figure} className="space-y-5">
         <div className="flex flex-wrap items-center gap-3">
           <span className="text-xs text-slate-400">Hidden layers</span>
-          <Segmented
-            label="The catalog network to draw"
-            options={CATALOG.map((member, index) => ({
-              value: String(index),
-              label: member.hidden.join("·"),
-              tone: index === DEFAULT_TOPOLOGY ? ("rule" as const) : ("neutral" as const),
-            }))}
-            value={String(topologyIndex)}
-            onChange={(value) => setTopologyIndex(Number(value))}
-          />
+          {/* On a phone the choice wraps under its label, and the stop button keeps the label's line. */}
+          <div className="max-sm:order-last">
+            <Segmented
+              label="The catalog network to draw"
+              options={CATALOG.map((member, index) => ({
+                value: String(index),
+                label: member.hidden.join("·"),
+                tone: index === DEFAULT_TOPOLOGY ? ("rule" as const) : ("neutral" as const),
+              }))}
+              value={String(topologyIndex)}
+              onChange={(value) => setTopologyIndex(Number(value))}
+            />
+          </div>
+          <button
+            type="button"
+            onClick={() => setStopped((on) => !on)}
+            disabled={reduced}
+            aria-pressed={reduced ? undefined : stopped}
+            aria-label="Stop the connections flowing"
+            className="ml-auto flex h-8 w-8 items-center justify-center rounded-lg border border-white/15 text-slate-300 transition hover:border-green-400/50 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none disabled:opacity-40"
+          >
+            {stopped || reduced ? <Play className="h-3.5 w-3.5" aria-hidden="true" /> : <Pause className="h-3.5 w-3.5" aria-hidden="true" />}
+          </button>
         </div>
 
         <div ref={box} className="relative mx-auto w-full max-w-[52rem]">

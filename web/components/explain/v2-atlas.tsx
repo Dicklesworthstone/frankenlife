@@ -96,10 +96,10 @@ function Frame({ title, children, xLabel, yLabel, xTicks, yTicks, s }: {
             {tick.label}
           </text>
         ))}
-        <text x={PAD.left + IW} y={FH - 1} textAnchor="end" fill="#64748b">
+        <text x={PAD.left + IW} y={FH - 1} textAnchor="end" fill={TONE.muted}>
           {xLabel}
         </text>
-        <text x={PAD.left - 4} y={8} fill="#64748b">
+        <text x={PAD.left - 4} y={8} fill={TONE.muted}>
           {yLabel}
         </text>
       </g>
@@ -220,7 +220,7 @@ function SurplusChart() {
         protected
       </text>
       {/* Left of and above its own line, past the protected band: at the top right, both lines ran through it. */}
-      <text x={s.x(1.2)} y={s.y(1.36)} fontSize="7" fill="#64748b" textAnchor="end" fontFamily="var(--font-mono, ui-monospace)">
+      <text x={s.x(1.2)} y={s.y(1.36)} fontSize="7" fill={TONE.muted} textAnchor="end" fontFamily="var(--font-mono, ui-monospace)">
         without the floor
       </text>
     </Frame>
@@ -415,7 +415,7 @@ function TurnChart() {
           </text>
           {/* Up and to the left of its tip: on the right, the circle ran through it, and a_eff (always on the
               right: the turn is ±90° at most) would meet it at 90°. */}
-          <text x={ja.x - 4} y={ja.y - 4} fill="#64748b" textAnchor="end">
+          <text x={ja.x - 4} y={ja.y - 4} fill={TONE.muted} textAnchor="end">
             Ja
           </text>
           <text x={eff.x + (Math.cos(angle) >= 0 ? 4 : -4)} y={eff.y - 4} fill="#ddd6fe" textAnchor={Math.cos(angle) >= 0 ? "start" : "end"}>
@@ -445,7 +445,11 @@ function TurnChart() {
 function DepositChart({ slug }: { slug: AtlasEntry["slug"] }) {
   const id = useId().replace(/[^a-zA-Z0-9_-]/g, "");
   const c = { x: 112, y: 64 };
+  // The other mechanisms' arrows fade to 0.28, which marks this one; their words only to 0.7, which keeps them
+  // readable (at 0.28 they were 1.8:1 on the panel, under WCAG AA's 4.5:1; at 0.7 the faintest, rose, is 4.8:1 even
+  // on the lightest panel).
   const lit = (on: boolean) => (on ? 1 : 0.28);
+  const said = (on: boolean) => (on ? 1 : 0.7);
   const isLysis = slug === "lysis-recycling";
   const isWaste = slug === "symplectic-waste";
   const isWake = slug === "wake-offset";
@@ -461,28 +465,22 @@ function DepositChart({ slug }: { slug: AtlasEntry["slug"] }) {
         <text x={c.x + 56} y={c.y + 3} fill="#94a3b8">
           a (diet)
         </text>
-        <g opacity={lit(isLysis)}>
-          <line x1={c.x} y1={c.y} x2={c.x - 52} y2={c.y} stroke={TONE.wrong} strokeWidth="1.8" markerEnd={`url(#${id}-arrow)`} />
-          <text x={c.x - 56} y={c.y + 3} fill="#fda4af" textAnchor="end">
-            corpse −a
-          </text>
-        </g>
-        <g opacity={lit(isWaste)}>
-          <line x1={c.x} y1={c.y} x2={c.x} y2={c.y - 46} stroke={TONE.rule} strokeWidth="1.8" markerEnd={`url(#${id}-arrow)`} />
-          <text x={c.x + 4} y={c.y - 44} fill="#86efac">
-            waste Ja ⟂ a
-          </text>
-        </g>
-        <g opacity={lit(isWake)}>
-          <line x1={c.x + 8} y1={c.y + 34} x2={c.x + 46} y2={c.y + 34} stroke="#e2e8f0" strokeWidth="1.2" markerEnd={`url(#${id}-arrow)`} />
-          <text x={c.x + 50} y={c.y + 37} fill="#e2e8f0">
-            moving
-          </text>
-          <circle cx={c.x - 6} cy={c.y + 34} r="3" fill={TONE.chemistry} />
-          <text x={c.x - 12} y={c.y + 37} fill={TONE.chemistry} textAnchor="end">
-            deposit δ behind
-          </text>
-        </g>
+        <line x1={c.x} y1={c.y} x2={c.x - 52} y2={c.y} stroke={TONE.wrong} strokeWidth="1.8" markerEnd={`url(#${id}-arrow)`} opacity={lit(isLysis)} />
+        <text x={c.x - 56} y={c.y + 3} fill="#fda4af" textAnchor="end" opacity={said(isLysis)}>
+          corpse −a
+        </text>
+        <line x1={c.x} y1={c.y} x2={c.x} y2={c.y - 46} stroke={TONE.rule} strokeWidth="1.8" markerEnd={`url(#${id}-arrow)`} opacity={lit(isWaste)} />
+        <text x={c.x + 4} y={c.y - 44} fill="#86efac" opacity={said(isWaste)}>
+          waste Ja ⟂ a
+        </text>
+        <line x1={c.x + 8} y1={c.y + 34} x2={c.x + 46} y2={c.y + 34} stroke="#e2e8f0" strokeWidth="1.2" markerEnd={`url(#${id}-arrow)`} opacity={lit(isWake)} />
+        <text x={c.x + 50} y={c.y + 37} fill="#e2e8f0" opacity={said(isWake)}>
+          moving
+        </text>
+        <circle cx={c.x - 6} cy={c.y + 34} r="3" fill={TONE.chemistry} opacity={lit(isWake)} />
+        <text x={c.x - 12} y={c.y + 37} fill={TONE.chemistry} textAnchor="end" opacity={said(isWake)}>
+          deposit δ behind
+        </text>
       </g>
       <circle cx={c.x} cy={c.y} r="7" fill="#2EC4B6" stroke="#020a02" strokeWidth="1.5" />
     </svg>

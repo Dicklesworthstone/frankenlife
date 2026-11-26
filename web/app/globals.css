@@ -7,8 +7,10 @@
   --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
   --font-mono: var(--font-jetbrains), ui-monospace, monospace;
   /* The muted tone of notes and captions. Tailwind's slate-500 (#64748b) is 4.2:1 on the ink, under
-     WCAG AA for small text; this one is 5.2:1 and still a clear step below slate-400 (7.7:1). */
-  --color-slate-500: #74839a;
+     WCAG AA for small text. #74839a was 5.2:1 on the ink but 4.1 to 4.4:1 on the lighter panels (measured
+     from pixels, 2026-11-25); this one is 6.0:1 on the ink, at least 4.5:1 on every panel, and still a step
+     below slate-400 (7.8:1). SVG text takes the same colour as TONE.muted (lib/palette.ts). */
+  --color-slate-500: #7f8ea5;
 }
 
 /* The system, in roles (the FrankenSuite lab, derived for FrankenLife):

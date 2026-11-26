@@ -16,6 +16,7 @@ import {
 } from "@/components/explain/brain-math";
 import { DemoFrame, Segmented } from "@/components/explain/demo";
 import { useFigureWidth, useInView, useReducedMotion } from "@/lib/hooks";
+import { TONE } from "@/lib/palette";
 import { cn, grouped } from "@/lib/utils";
 
 /**
@@ -442,7 +443,7 @@ export function BrainAnatomy() {
                 {hiddenLabel(index, column.width)}
               </text>
             ))}
-            <text x={output.x} y={VIEW_H - 2} textAnchor="middle" fontSize={footnote} fill="#64748b">
+            <text x={output.x} y={VIEW_H - 2} textAnchor="middle" fontSize={footnote} fill={TONE.muted}>
               linear · σ once, in decoding
             </text>
           </svg>

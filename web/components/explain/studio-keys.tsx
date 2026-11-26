@@ -5,6 +5,7 @@ import { useState } from "react";
 
 import { DemoFrame } from "@/components/explain/demo";
 import { GESTURES, GROUPS, KEYS, type KeyGroup, ROWS } from "@/components/explain/studio-keymap";
+import { TONE } from "@/lib/palette";
 import { cn } from "@/lib/utils";
 
 const COLOR = Object.fromEntries(GROUPS.map((group) => [group.id, group.color])) as Record<KeyGroup, string>;
@@ -56,7 +57,9 @@ export function StudioKeys() {
                   }
                   const color = COLOR[live.group];
                   const on = selected === cap.label;
-                  const dimmed = focusGroup !== null && focusGroup !== live.group;
+                  // A key outside the chosen group loses its colour, not its legibility: its label stays 6:1
+                  // (opacity alone could not keep magenta or coral at WCAG AA's 4.5:1 and still read as dimmed).
+                  const dimmed = !on && focusGroup !== null && focusGroup !== live.group;
                   return (
                     <div key={`${rowIndex}-${capIndex}`} style={style} className="p-[2px]">
                       <button
@@ -69,14 +72,17 @@ export function StudioKeys() {
                         className={cn(
                           "flex h-8 w-full items-center justify-center rounded-md border font-mono text-[10px] font-bold transition sm:h-10 sm:text-xs",
                           "focus-visible:ring-2 focus-visible:ring-white/80 focus-visible:outline-none",
-                          dimmed ? "opacity-25" : "opacity-100",
                         )}
-                        style={{
-                          color: on ? "#020a02" : color,
-                          background: on ? color : `${color}1f`,
-                          borderColor: `${color}${on ? "" : "66"}`,
-                          boxShadow: on ? `0 0 18px -2px ${color}` : undefined,
-                        }}
+                        style={
+                          dimmed
+                            ? { color: TONE.muted, background: "transparent", borderColor: "rgba(255,255,255,0.1)" }
+                            : {
+                                color: on ? "#020a02" : color,
+                                background: on ? color : `${color}1f`,
+                                borderColor: `${color}${on ? "" : "66"}`,
+                                boxShadow: on ? `0 0 18px -2px ${color}` : undefined,
+                              }
+                        }
                       >
                         {cap.label}
                       </button>

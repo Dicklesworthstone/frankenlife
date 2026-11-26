@@ -28,4 +28,6 @@ export const TONE = {
   chemistry: "#67e8f9",
   dissipated: "#94a3b8",
   ink: "#020a02",
+  /** The muted tone for SVG labels: app/globals.css's --color-slate-500, which meets WCAG AA on every panel. */
+  muted: "#7f8ea5",
 } as const;

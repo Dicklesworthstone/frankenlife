@@ -582,11 +582,11 @@ export function SignalsFigure({ a, b, cell, food }: { a: Packet; b: Packet; cell
         aria-label={`Packet A: energy ${fixed(a.e)}, moment ${fixed(ma)}. Packet B: energy ${fixed(b.e)}, moment ${fixed(mb)}. The cell: energy ${fixed(cell.e)}, moment ${fixed(norm(cell.m))}. If the signals were the food, ${fixed(food)}.`}
       >
         {disk(a, at(62), "Packet A")}
-        <text x={at(124)} y={y + 7} fontSize={22} textAnchor="middle" fill="#64748b">
+        <text x={at(124)} y={y + 7} fontSize={22} textAnchor="middle" fill={TONE.muted}>
           +
         </text>
         {disk(b, at(188), "Packet B")}
-        <text x={at(256)} y={y + 7} fontSize={22} textAnchor="middle" fill="#64748b">
+        <text x={at(256)} y={y + 7} fontSize={22} textAnchor="middle" fill={TONE.muted}>
           =
         </text>
         {disk(cell, at(368), "The cell")}
@@ -733,7 +733,7 @@ export function ToxicityFigure({ energy, ruleAfter, wrongAfter }: { energy: numb
           negative energy: impossible
         </text>
         <line x1={zero} y1={20} x2={zero} y2={102} stroke="#64748b" />
-        <text x={zero} y={118} fontSize={11} textAnchor="middle" fill="#64748b" className="mono">
+        <text x={zero} y={118} fontSize={11} textAnchor="middle" fill={TONE.muted} className="mono">
           0
         </text>
         <text x={before} y={16} fontSize={11} textAnchor={before > right - 30 ? "end" : "middle"} fill={TONE.energy}>
@@ -825,10 +825,10 @@ export function MixturePanel() {
           <rect x={X(-1)} y={20} width={X(1) - X(-1)} height={Y(0) - 20} fill={TONE.rule} fillOpacity={0.04} />
           <rect x={X(-1)} y={Y(0)} width={X(1) - X(-1)} height={210 - Y(0)} fill={TONE.wrong} fillOpacity={0.06} />
           <line x1={X(-1)} y1={Y(0)} x2={X(1)} y2={Y(0)} stroke="#64748b" />
-          <text x={X(-1) - 6} y={Y(0) + 4} fontSize={11} textAnchor="end" fill="#64748b" className="mono">
+          <text x={X(-1) - 6} y={Y(0) + 4} fontSize={11} textAnchor="end" fill={TONE.muted} className="mono">
             0
           </text>
-          <text x={X(-1) - 6} y={Y(0.8) + 4} fontSize={11} textAnchor="end" fill="#64748b" className="mono">
+          <text x={X(-1) - 6} y={Y(0.8) + 4} fontSize={11} textAnchor="end" fill={TONE.muted} className="mono">
             0.8
           </text>
           <text x={X(1) - 6} y={Y(0) - 8} fontSize={11} textAnchor="end" fill={TONE.rule}>
@@ -852,7 +852,7 @@ export function MixturePanel() {
               {tick === -1 ? "−1 against" : tick === 1 ? "along +1" : X(0) - X(-1) >= 100 ? "0 neutral" : "0"}
             </text>
           ))}
-          <text x={X(0)} y={246} fontSize={11} textAnchor="middle" fill="#64748b">
+          <text x={X(0)} y={246} fontSize={11} textAnchor="middle" fill={TONE.muted}>
             {width < 480 ? "a·z: chemistry along the affinity" : "a·z: the packet\u2019s chemistry along the organism\u2019s affinity"}
           </text>
           {/* The chord: the per-packet result is twice its midpoint. */}
@@ -951,7 +951,7 @@ export function LogitPanel() {
           {[0, 0.5, 1].map((v) => (
             <g key={v}>
               <line x1={X(-10)} y1={Y(v)} x2={X(10)} y2={Y(v)} stroke="#334155" strokeDasharray={v === 0.5 ? "3 3" : undefined} />
-              <text x={X(-10) - 6} y={Y(v) + 4} fontSize={11} textAnchor="end" fill="#64748b" className="mono">
+              <text x={X(-10) - 6} y={Y(v) + 4} fontSize={11} textAnchor="end" fill={TONE.muted} className="mono">
                 {v}
               </text>
             </g>
@@ -966,7 +966,7 @@ export function LogitPanel() {
               {tick}
             </text>
           ))}
-          <text x={X(0)} y={232} fontSize={11} textAnchor="middle" fill="#64748b">
+          <text x={X(0)} y={232} fontSize={11} textAnchor="middle" fill={TONE.muted}>
             the output layer&apos;s logit
           </text>
         </svg>
@@ -1157,7 +1157,7 @@ export function WrapFigure({
       <text x={cx} y={cy + 12} fontSize={11} textAnchor="middle" fill="#94a3b8">
         {safe ? "interpolate" : "rule snaps · wrong goes back"}
       </text>
-      <text x={150} y={284} fontSize={10} textAnchor="middle" fill="#64748b">
+      <text x={150} y={284} fontSize={10} textAnchor="middle" fill={TONE.muted}>
         ○ {FROM} before · ● {fixed(to)} after
       </text>
     </svg>

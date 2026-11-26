@@ -257,7 +257,7 @@ export function V2Explorer() {
                             </span>
                             <code className="block font-mono text-[10.5px] text-slate-500">{feature.slug}</code>
                             {!feature.abiNote.startsWith("none") ? (
-                              <span className={cn("mt-0.5 block font-mono text-[10px] leading-tight", active ? "text-cyan-200" : "text-slate-600")}>
+                              <span className={cn("mt-0.5 block font-mono text-[10px] leading-tight", active ? "text-cyan-200" : "text-slate-500")}>
                                 {feature.abiNote}
                               </span>
                             ) : null}

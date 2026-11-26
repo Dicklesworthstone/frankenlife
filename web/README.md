@@ -113,7 +113,9 @@ mobile throttling the JPEG took more than 16 s on a phone, and the page's larges
 video. A picture under the video chooses the poster, since a video's own poster attribute names one file for
 every screen, and the video waits for it (`preload="none"` until then): streaming at once, it slowed the
 poster by about 1.3 s. Nothing below the hero loads with the page: an image that is also a CSS background
-(the controls' loupe) waits for its lazy `<img>`.
+(the controls' loupe) waits for its lazy `<img>`. Measured on frankenlife.org on 2026-11-26, cold, three runs
+each: the largest paint (the poster) now comes at 3.8 s on a 390 px phone under that throttling (10.1 s
+before), and at 1.5–1.8 s on a 1,440 px desktop over 10 Mbps with 40 ms round trips (3.0–3.1 s before).
 
 Three v2 films of denser worlds (`presets/morphogenesis-tissue-v2-dense.toml`,
 `presets/supercolony-v2-dense.toml`, rendered 2026-11-24) were taken down the same day: in motion they

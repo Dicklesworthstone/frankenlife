@@ -38,7 +38,9 @@
 //   also encodes the same frames scaled to that height for phones
 //   (<ID>-small-<hash>.mp4), at `--small-crf` (default `--crf`), and the poster
 //   at that size as an AVIF (<ID>-poster-small-<hash>.avif, under a twelfth of
-//   the 2160² JPEG's bytes), which a phone shows until the film starts. `media:4k60`
+//   the 2160² JPEG's bytes), which a phone shows until the film starts; every
+//   film's poster is an AVIF at its own size too (<ID>-poster-<hash>.avif, a
+//   fifth of the JPEG's bytes), for every other screen. `media:4k60`
 //   passes 1080 at CRF 26: at 1080 a 4K film's CRF 30 smears single bodies
 //   that the 4K encode, scaled to 1080, keeps; 26 matches it, at about 56% of
 //   its bytes, and at H.264 level 4.2, which phones decode, where 2160² at
@@ -82,7 +84,7 @@ import {
   ASSET_LIMIT,
   SOCIAL_CROP_VF,
   buildMasterEncodeArgs,
-  buildSmallPosterArgs,
+  buildPosterAvifArgs,
   buildWebEncodeArgs,
   parseMediaArgs,
 } from "./media-options";
@@ -412,15 +414,19 @@ if (masterOut !== null) {
 
 const poster = join(work, "poster.jpg");
 run("ffmpeg", ["-y", "-loglevel", "error", "-i", first, "-q:v", "3", poster]);
-// With a phone encode, a phone poster of its size: what a narrow screen shows until the film starts.
-let smallPoster: { src: string; sha256: string; bytes: number; width: number; height: number; encode: string[] } | undefined;
-if (small !== null) {
-  const posterEncode = buildSmallPosterArgs(small);
-  const smallPosterFile = join(work, "poster-small.avif");
-  run("ffmpeg", ["-y", "-loglevel", "error", "-i", poster, ...posterEncode, smallPosterFile]);
-  smallPoster = { ...publish(smallPosterFile, `${filmId}-poster-small`, "avif"), width: small[0], height: small[1], encode: posterEncode };
-  console.error(`media: phone poster ${small[0]}×${small[1]}, ${smallPoster.bytes} bytes`);
-}
+// The poster as an AVIF, at the film's size and, with a phone encode, at its size too: what a page shows until the
+// film starts (the JPEG stays, for a browser without AVIF and for what magnifies it).
+type PosterAvif = { src: string; sha256: string; bytes: number; width: number; height: number; encode: string[] };
+const posterAvif = (size: readonly [number, number], stem: string): PosterAvif => {
+  const posterEncode = buildPosterAvifArgs(size);
+  const file = join(work, `${stem}.avif`);
+  run("ffmpeg", ["-y", "-loglevel", "error", "-i", poster, ...posterEncode, file]);
+  const published = { ...publish(file, `${filmId}-${stem}`, "avif"), width: size[0], height: size[1], encode: posterEncode };
+  console.error(`media: ${stem} AVIF ${size[0]}×${size[1]}, ${published.bytes} bytes`);
+  return published;
+};
+const fullPoster = posterAvif([width, height], "poster");
+const smallPoster = small !== null ? posterAvif(small, "poster-small") : undefined;
 const card = provenance.camera ? cardFrame(provenance.camera.keys, ticksList) : 0;
 const cardSource = join(frames, `frame-${String(card).padStart(6, "0")}.png`);
 if (!existsSync(cardSource)) fail(`the social card's frame ${cardSource} is missing`);
@@ -446,7 +452,7 @@ const manifest = {
     ...(master ? { master } : {}),
     ...(smallVideo ? { small: smallVideo } : {}),
   },
-  poster: { ...publish(poster, `${filmId}-poster`, "jpg"), frame: 0, ...(smallPoster ? { small: smallPoster } : {}) },
+  poster: { ...publish(poster, `${filmId}-poster`, "jpg"), frame: 0, avif: fullPoster, ...(smallPoster ? { small: smallPoster } : {}) },
   social: { ...publish(social, `${filmId}-social`, "jpg"), width: 1200, height: 630, frame: card },
   world: {
     preset,

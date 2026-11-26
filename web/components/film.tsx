@@ -375,11 +375,12 @@ export function Film({
         style={isSquare ? undefined : { aspectRatio: `${video.width} / ${video.height}` }}
       >
         {/* The poster, under the film until its first frame paints over it. A phone takes the 1080² AVIF, as it takes
-            the small encode; anything else (or a browser without AVIF) takes the 2160² JPEG. A picture, because a
-            video's poster attribute names one file for every screen: a phone on a slow network fetched the 3 MB JPEG
-            for more than 16 s, and its largest paint waited 10 s for the film's own first frame. */}
+            the small encode; any other screen the film-size AVIF; a browser without AVIF the 2160² JPEG (3 MB). A
+            picture, because a video's poster attribute names one file for every screen: a phone on a slow network
+            fetched the JPEG for more than 16 s, and its largest paint waited 10 s for the film's own first frame. */}
         <picture>
           {poster.small ? <source media={PHONE} type="image/avif" srcSet={poster.small.src} /> : null}
+          {poster.avif ? <source type="image/avif" srcSet={poster.avif.src} /> : null}
           {/* eslint-disable-next-line @next/next/no-img-element -- a static export; the manifest names the file */}
           <img
             ref={posterRef}

@@ -91,6 +91,29 @@
     "sha256": "22ee4c761576f91ee81465ced1cc068f3c24e7282c11357b03a3b029a9c955dc",
     "bytes": 3260590,
     "frame": 0,
+    "avif": {
+      "src": "/media/confluent-poster-5745df4c4ea8.avif",
+      "sha256": "5745df4c4ea84dc1c93516ec057b4ac565aa26751db57cfbcdb26718fa42af5a",
+      "bytes": 668434,
+      "width": 2160,
+      "height": 2160,
+      "encode": [
+        "-vf",
+        "scale=w=2160:h=2160:flags=lanczos:in_range=full:out_range=full,format=yuv420p",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "libsvtav1",
+        "-preset",
+        "4",
+        "-crf",
+        "42",
+        "-colorspace",
+        "bt470bg",
+        "-color_range",
+        "pc"
+      ]
+    },
     "small": {
       "src": "/media/confluent-poster-small-9eacf73cc2d8.avif",
       "sha256": "9eacf73cc2d882a3d1ee778464164f07a796869d0af2f094c0c088ed11d703d9",

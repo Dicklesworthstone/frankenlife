@@ -105,13 +105,15 @@ and the same world with one v2 mechanism on, `confluent-veins` (vascular-field) 
 list its manifest in `lib/films/index.ts` and move the files of any film it replaces from `public/media` to
 `media-retired/`.
 
-A phone plays each film's 1080² encode and shows, until its first frame, the poster as a 1080² AVIF
-(`poster.small`, about 250 KB, against the 2160² JPEG's 3 MB; `buildSmallPosterArgs` in
-`scripts/media-options.ts`, which `--small` runs). Under Lighthouse's mobile throttling the JPEG took
-more than 16 s, and the page's largest paint waited 10 s for the video. A picture under the video chooses
-between the two posters, since a video's own poster attribute names one file for every screen. Nothing
-below the hero loads with the page: an image that is also a CSS background (the controls' loupe) waits for
-its lazy `<img>`.
+Until a film's first frame, the page shows its poster as an AVIF: 1080² on a phone, which plays the 1080²
+encode (`poster.small`, about 250 KB), and the film's own size elsewhere (`poster.avif`, about 650 KB),
+against the 2160² JPEG's 3 MB, which stays for a browser without AVIF and for the figures that zoom into it
+(`buildPosterAvifArgs` in `scripts/media-options.ts`, which `scripts/media.ts` runs). Under Lighthouse's
+mobile throttling the JPEG took more than 16 s on a phone, and the page's largest paint waited 10 s for the
+video. A picture under the video chooses the poster, since a video's own poster attribute names one file for
+every screen, and the video waits for it (`preload="none"` until then): streaming at once, it slowed the
+poster by about 1.3 s. Nothing below the hero loads with the page: an image that is also a CSS background
+(the controls' loupe) waits for its lazy `<img>`.
 
 Three v2 films of denser worlds (`presets/morphogenesis-tissue-v2-dense.toml`,
 `presets/supercolony-v2-dense.toml`, rendered 2026-11-24) were taken down the same day: in motion they

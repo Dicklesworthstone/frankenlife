@@ -9,11 +9,11 @@ import { type ControlsManifest, type FilmManifest, collectStaticMedia, videosOf 
 import {
   ASSET_LIMIT,
   MEDIA_COLORS,
+  POSTER_AVIF_CRF,
   SOCIAL_CROP_VF,
   V2_FEATURE_SLUGS,
-  SMALL_POSTER_CRF,
   buildMasterEncodeArgs,
-  buildSmallPosterArgs,
+  buildPosterAvifArgs,
   buildWebEncodeArgs,
   isInsideDirectory,
   isValidFieldChoice,
@@ -288,8 +288,8 @@ describe("one film, one file, served from R2", () => {
     expect(phone.filter((_, at) => at !== vf)).toEqual(film.filter((_, at) => at !== vf));
   });
 
-  test("the phone poster is one AV1 frame at the phone's size, keeping the JPEG's own colour", () => {
-    const args = buildSmallPosterArgs([1080, 1080]);
+  test("a poster AVIF is one AV1 frame at the size asked, keeping the JPEG's own colour", () => {
+    const args = buildPosterAvifArgs([1080, 1080]);
     const value = (flag: string) => args[args.indexOf(flag) + 1];
     // Scaled without converting range or matrix: the JPEG's full-range BT.601 samples, tagged as such.
     expect(value("-vf")).toBe("scale=w=1080:h=1080:flags=lanczos:in_range=full:out_range=full,format=yuv420p");
@@ -297,8 +297,12 @@ describe("one film, one file, served from R2", () => {
     expect(value("-color_range")).toBe("pc");
     expect(value("-frames:v")).toBe("1");
     expect(value("-c:v")).toBe("libsvtav1");
-    expect(value("-crf")).toBe(String(SMALL_POSTER_CRF));
-    expect(buildSmallPosterArgs([1080, 608])[1]).toContain("scale=w=1080:h=608:");
+    expect(value("-crf")).toBe(String(POSTER_AVIF_CRF));
+    // The film's size and the phone's differ only in the scale.
+    const full = buildPosterAvifArgs([2160, 2160]);
+    expect(full[1]).toContain("scale=w=2160:h=2160:");
+    expect(full.slice(2)).toEqual(args.slice(2));
+    expect(buildPosterAvifArgs([1080, 608])[1]).toContain("scale=w=1080:h=608:");
   });
 
   test("refuses the retired segment flags", () => {
@@ -457,18 +461,27 @@ describe("one film, one file, served from R2", () => {
       rmSync(join(store, phone.src.replace("/media/", "")));
       expect(verifyFilmVideos([withPhone], store).some((e) => e.includes("is missing"))).toBe(true);
 
-      // A phone poster (poster.small) is one of its film's static files: a stray until its manifest names it, served
-      // between the poster and the card, and caught when its bytes are not the manifest's.
+      // The poster AVIFs (poster.avif, poster.small) are their film's static files: strays until its manifest names
+      // them, served between the poster and the card, and caught when their bytes are not the manifest's.
+      const tissueAvif = writeAsset("tissue-poster-666666666666.avif", "tissue-poster-avif");
       const tissueSmall = writeAsset("tissue-poster-small-777777777777.avif", "tissue-poster-small");
-      const smallPoster = { ...tissueSmall, width: 1080, height: 1080, encode: buildSmallPosterArgs([1080, 1080]) };
-      expect(
-        verifyMediaDirectory([filmManifest, second], [controls4k], temp).some((e) => e.includes("tissue-poster-small-777777777777.avif")),
-      ).toBe(true);
-      const withSmall: FilmManifest = { ...second, poster: { ...second.poster, small: smallPoster } };
+      const fullPoster = { ...tissueAvif, width: 2160, height: 2160, encode: buildPosterAvifArgs([2160, 2160]) };
+      const smallPoster = { ...tissueSmall, width: 1080, height: 1080, encode: buildPosterAvifArgs([1080, 1080]) };
+      const strays = verifyMediaDirectory([filmManifest, second], [controls4k], temp);
+      expect(strays.some((e) => e.includes("tissue-poster-666666666666.avif"))).toBe(true);
+      expect(strays.some((e) => e.includes("tissue-poster-small-777777777777.avif"))).toBe(true);
+      const withSmall: FilmManifest = { ...second, poster: { ...second.poster, avif: fullPoster, small: smallPoster } };
       expect(verifyMediaDirectory([filmManifest, withSmall], [controls4k], temp)).toEqual([]);
-      expect(collectStaticMedia([withSmall], []).map((f) => f.src)).toEqual([tissuePoster.src, tissueSmall.src, tissueSocial.src]);
-      const otherSmall: FilmManifest = { ...second, poster: { ...second.poster, small: { ...smallPoster, bytes: smallPoster.bytes + 1 } } };
-      expect(verifyMediaDirectory([filmManifest, otherSmall], [controls4k], temp)).not.toEqual([]);
+      expect(collectStaticMedia([withSmall], []).map((f) => f.src)).toEqual([
+        tissuePoster.src,
+        tissueAvif.src,
+        tissueSmall.src,
+        tissueSocial.src,
+      ]);
+      const otherSmall: FilmManifest = { ...withSmall, poster: { ...withSmall.poster, small: { ...smallPoster, bytes: smallPoster.bytes + 1 } } };
+      const wrong = verifyMediaDirectory([filmManifest, otherSmall], [controls4k], temp);
+      expect(wrong.length).toBe(1);
+      expect(wrong[0]).toContain("tissue-poster-small-777777777777.avif");
 
       // Defect 3: unlisted stray file in public/media/ caught.
       writeFileSync(join(mediaDir, "stray-old.mp4"), "junk");

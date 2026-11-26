@@ -36,10 +36,10 @@ export type SmallVideo = MediaFile & {
   encode: string[];
 };
 
-export type SmallPoster = MediaFile & {
+export type PosterAvif = MediaFile & {
   width: number;
   height: number;
-  /** The ffmpeg arguments that made it from the poster JPEG (scripts/media-options.ts, buildSmallPosterArgs). */
+  /** The ffmpeg arguments that made it from the poster JPEG (scripts/media-options.ts, buildPosterAvifArgs). */
   encode: string[];
 };
 
@@ -67,11 +67,17 @@ export type FilmManifest = {
   poster: MediaFile & {
     frame: number;
     /**
-     * The poster at the phone encode's size, as an AVIF (scripts/media.ts, with `--small`): what a narrow screen
-     * shows until the film's first frame (components/film.tsx, PHONE). The 2160² JPEG is about 3 MB, which a
-     * phone on a slow network took past 16 s to fetch, after the video's own first frame.
+     * The poster as an AVIF at the film's size, about a fifth of the JPEG's bytes (scripts/media.ts): what a page
+     * shows until the film's first frame (components/film.tsx). The JPEG stays, for a browser without AVIF and for
+     * the figures that magnify it.
      */
-    small?: SmallPoster;
+    avif?: PosterAvif;
+    /**
+     * The poster at the phone encode's size, as an AVIF (scripts/media.ts, with `--small`): what a narrow screen
+     * shows instead (PHONE). The 2160² JPEG is about 3 MB, which a phone on a slow network took past 16 s to
+     * fetch, after the video's own first frame.
+     */
+    small?: PosterAvif;
   };
   /** The social card: a 1200 × 630 crop of film frame `frame` (scripts/media.ts). */
   social: MediaFile & { width: number; height: number; frame: number };
@@ -201,8 +207,8 @@ export const controls = controlsManifest as unknown as ControlsManifest;
 
 /**
  * Every file the films and the still sets serve as static assets from public/media/ (each film's poster, its
- * phone poster if it has one, and its social card, and the stills), deduplicated by path. The films' videos are
- * in R2 instead (`filmVideos`).
+ * poster AVIFs, and its social card, and the stills), deduplicated by path. The films' videos are in R2 instead
+ * (`filmVideos`).
  */
 export function collectStaticMedia(
   filmManifests: readonly FilmManifest[],
@@ -213,6 +219,7 @@ export function collectStaticMedia(
       [
         ...filmManifests.flatMap((filmManifest) => [
           filmManifest.poster,
+          ...(filmManifest.poster.avif ? [filmManifest.poster.avif] : []),
           ...(filmManifest.poster.small ? [filmManifest.poster.small] : []),
           filmManifest.social,
         ]),

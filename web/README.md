@@ -44,7 +44,11 @@ or is cut off at 390, 768 or 1,440 px, so a label wraps rather than truncating w
 heading's long word may break; at 320 px only the life cycle's "Sense" and "Divide" reach past the ring's
 drawing, by 5 and 7 px. Anything that moves by itself for more than five seconds has a control that
 stops it (the films, the life cycle, the brain's flowing connections), and stands still under reduced
-motion.
+motion. Whatever pointing shows, the keyboard reaches too (the weight grid steps by arrow keys), and
+nothing is said only in a hover title. The focus ring is one unlayered rule in `app/globals.css`, so no
+utility removes it (forced colours keep outlines and drop box-shadow rings); a control that fills an
+overflow-hidden frame takes `focus-inset`, which draws it inside. Tabbing through every stop at 390 and
+1,440 px (239 and 265) and shooting each focused and unfocused, every one changes visibly.
 
 ## The explainers
 

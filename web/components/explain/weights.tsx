@@ -296,6 +296,7 @@ export function IndependentWeights() {
           role="group"
           tabIndex={0}
           onKeyDown={onKeyDown}
+          onBlur={() => setHovered(null)}
           aria-label={`${
             mode === "shared"
               ? "48 organisms in eight lineage colours, every one drawn with the same weight matrix."

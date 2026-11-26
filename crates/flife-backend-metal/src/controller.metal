@@ -77,33 +77,37 @@ static inline ff ff_mul(ff a, ff b) {
     return quick_two_sum(p.hi, p.lo);
 }
 
-static inline ff ff_div(ff a, ff b) {
-    float q1 = a.hi / b.hi;
-    ff r = ff_add(a, ff_neg(ff_mul(b, ff_make(q1, 0.0f))));
-    float q2 = r.hi / b.hi;
-    r = ff_add(r, ff_neg(ff_mul(b, ff_make(q2, 0.0f))));
-    float q3 = r.hi / b.hi;
-    return ff_add(quick_two_sum(q1, q2), ff_make(q3, 0.0f));
+static inline ff ff_add_f32(ff a, float b) {
+    ff s = two_sum(a.hi, b);
+    return quick_two_sum(s.hi, s.lo + a.lo);
 }
 
-// tanh x = x P(x^2) for |x| < 1/2: P's Taylor coefficients, (hi, lo).
-constant float2 TANH_SERIES[16] = {
-    {as_type<float>(0x3F800000u), as_type<float>(0x00000000u)},
-    {as_type<float>(0xBEAAAAABu), as_type<float>(0x322AAAABu)},
-    {as_type<float>(0x3E088889u), as_type<float>(0xB1EEEEEFu)},
-    {as_type<float>(0xBD5D0DD1u), as_type<float>(0x300BC8BDu)},
-    {as_type<float>(0x3CB327A4u), as_type<float>(0x3002C110u)},
-    {as_type<float>(0xBC11371Bu), as_type<float>(0x2FA193DCu)},
-    {as_type<float>(0x3B6B69E8u), as_type<float>(0x2EE157DEu)},
-    {as_type<float>(0xBABED1B2u), as_type<float>(0xADA56EBCu)},
-    {as_type<float>(0x3A1AAC12u), as_type<float>(0x2D803674u)},
-    {as_type<float>(0xB97ABEBCu), as_type<float>(0x2CCB2E9Au)},
-    {as_type<float>(0x38CB3F0Cu), as_type<float>(0x2C2FCAFBu)},
-    {as_type<float>(0xB824BEC7u), as_type<float>(0xABEA2526u)},
-    {as_type<float>(0x37858997u), as_type<float>(0xAB4659FBu)},
-    {as_type<float>(0xB6D87B97u), as_type<float>(0x2A411DB1u)},
-    {as_type<float>(0x362F796Du), as_type<float>(0x290E9CB7u)},
-    {as_type<float>(0xB58E3BF0u), as_type<float>(0x28D47C7Eu)},
+static inline ff ff_mul_f32(ff a, float b) {
+    ff p = two_prod(a.hi, b);
+    return quick_two_sum(p.hi, fma(a.lo, b, p.lo));
+}
+
+static inline ff ff_div2(ff a, ff b) {
+    float q1 = a.hi / b.hi;
+    ff r = ff_add(a, ff_neg(ff_mul_f32(b, q1)));
+    float q2 = r.hi / b.hi;
+    return quick_two_sum(q1, q2);
+}
+
+// Minimax [7/8] rational approximant tanh(a) ≈ a * P(a^2) / Q(a^2) on
+// [0, 2.25] (p0 = q0 = 1, max relative error ~1.64e-13, >22x below
+// GUARD = 2^-38), replacing both the 15-term Taylor series and the [0.5, 2.25]
+// exp branch with a single branchless path for typical hidden pre-activations.
+constant float2 TANH_RAT78_P[3] = {
+    {as_type<float>(0x3E082820u), as_type<float>(0x319E91A0u)},
+    {as_type<float>(0x3B5D2557u), as_type<float>(0xAEDA9135u)},
+    {as_type<float>(0x378EE65Du), as_type<float>(0x2AEBDD9Eu)},
+};
+constant float2 TANH_RAT78_Q[4] = {
+    {as_type<float>(0x3EEEBEBBu), as_type<float>(0xB1B6CA20u)},
+    {as_type<float>(0x3CD0AEF6u), as_type<float>(0xB049C80Du)},
+    {as_type<float>(0x399F18B9u), as_type<float>(0x2CAB41CFu)},
+    {as_type<float>(0x34F6C9E0u), as_type<float>(0x2866F77Cu)},
 };
 
 // e^(-r) = sum (-1)^n r^n / n!, n = 0..13, for |r| <= ln2/2, (hi, lo).
@@ -132,36 +136,43 @@ constant float LN2_3 = as_type<float>(0x29779ABDu);
 constant float INV_LN2 = as_type<float>(0x3FB8AA3Bu);
 
 constant uint FAST_IDENTITY_BELOW = 0x39000000u;  // 2^-13
-constant uint FAST_SERIES_BELOW = 0x3F000000u;    // 1/2
+constant uint FAST_RAT78_MAX = 0x40100000u;       // 2.25
 constant uint SATURATES_AT = 0x41A00000u;         // 20
 constant float GUARD = as_type<float>(0x2C800000u);  // 2^-38
 
-// tanh a for 2^-13 <= a < 1/2.
-static ff tanh_series(float a) {
+// tanh a for 2^-13 <= a <= 2.25 via minimax [7/8] rational in float-float.
+static ff tanh_rat78(float a) {
     ff s = two_prod(a, a);
-    ff acc = ff_make(TANH_SERIES[15].x, TANH_SERIES[15].y);
-    for (int n = 14; n >= 0; --n) {
-        acc = ff_add(ff_mul(acc, s), ff_make(TANH_SERIES[n].x, TANH_SERIES[n].y));
-    }
-    return ff_mul(acc, ff_make(a, 0.0f));
+    ff p = ff_add(ff_mul(ff_make(TANH_RAT78_P[2].x, TANH_RAT78_P[2].y), s),
+                  ff_make(TANH_RAT78_P[1].x, TANH_RAT78_P[1].y));
+    p = ff_add(ff_mul(p, s), ff_make(TANH_RAT78_P[0].x, TANH_RAT78_P[0].y));
+    p = ff_add_f32(ff_mul(p, s), 1.0f);
+
+    ff q = ff_add(ff_mul(ff_make(TANH_RAT78_Q[3].x, TANH_RAT78_Q[3].y), s),
+                  ff_make(TANH_RAT78_Q[2].x, TANH_RAT78_Q[2].y));
+    q = ff_add(ff_mul(q, s), ff_make(TANH_RAT78_Q[1].x, TANH_RAT78_Q[1].y));
+    q = ff_add(ff_mul(q, s), ff_make(TANH_RAT78_Q[0].x, TANH_RAT78_Q[0].y));
+    q = ff_add_f32(ff_mul(q, s), 1.0f);
+
+    return ff_div2(ff_mul_f32(p, a), q);
 }
 
-// tanh a = 1 - 2e/(1 + e), e = e^(-2a), for 1/2 <= a < 20.
+// tanh a = 1 - 2e/(1 + e), e = e^(-2a), for 2.25 < a < 20.
 static ff tanh_exp(float a) {
     float t = a + a;
     float k = rint(t * INV_LN2);
     // t - k L1 is exact (Sterbenz); then the rest of k ln 2 in float-float.
     ff r = ff_make(t - k * LN2_1, 0.0f);
     r = ff_add(r, ff_neg(two_prod(k, LN2_2)));
-    r = ff_add(r, ff_make(-(k * LN2_3), 0.0f));
+    r = ff_add_f32(r, -(k * LN2_3));
     ff acc = ff_make(EXP_SERIES[13].x, EXP_SERIES[13].y);
     for (int n = 12; n >= 0; --n) {
         acc = ff_add(ff_mul(acc, r), ff_make(EXP_SERIES[n].x, EXP_SERIES[n].y));
     }
     int shift = -int(k);
     ff e = ff_make(ldexp(acc.hi, shift), ldexp(acc.lo, shift));
-    ff fraction = ff_div(ff_make(e.hi + e.hi, e.lo + e.lo), ff_add(ff_make(1.0f, 0.0f), e));
-    return ff_add(ff_make(1.0f, 0.0f), ff_neg(fraction));
+    ff fraction = ff_div2(ff_make(e.hi + e.hi, e.lo + e.lo), ff_add_f32(e, 1.0f));
+    return ff_add_f32(ff_neg(fraction), 1.0f);
 }
 
 // The F32 that every value within GUARD |v| of the positive normal v
@@ -190,8 +201,8 @@ static float activation(float z, thread uint &fallbacks) {
         // tanh a = a (1 - a^2/3 + ...), and a^2/3 < 2^-27 rounds away.
         value = a;
         settled = true;
-    } else if (magnitude < FAST_SERIES_BELOW) {
-        settled = settle(tanh_series(a), value);
+    } else if (magnitude <= FAST_RAT78_MAX) {
+        settled = settle(tanh_rat78(a), value);
     } else {
         settled = settle(tanh_exp(a), value);
     }

@@ -218,14 +218,13 @@ pub(super) fn settle_with(
         rules,
         population,
         observed,
-        (by_demand, granted),
+        (by_demand, granted, grants_bins),
         working.len(),
         lanes.len(),
         spatial_rows,
         row_to_spatial,
         spatial_tile_offsets,
-        cell_compositions,
-        packet_compositions,
+        (cell_compositions, packet_compositions),
         spatial_uptake,
     );
     if !fused {

@@ -1,5 +1,6 @@
-# supercolony-v2-abundant: the world of the website's supercolony and veins
-# films.
+# supercolony-v2-abundant: the world of the website's first supercolony and
+# veins films (commit ca706d2, 2026-11-24). They came down the same day, and
+# the site no longer shows this world (experiments/website-films/README.md).
 #
 # presets/supercolony-v2.toml with only its food changed: each of its 16
 # oases has power 16,000 where the preset's have 3,200, five times as much

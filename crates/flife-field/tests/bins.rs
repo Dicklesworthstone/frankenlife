@@ -1678,3 +1678,158 @@ fn apply_grants_parallel_band_groups_match_serial_bit_for_bit() {
         "failed apply_grants_on must not mutate field"
     );
 }
+
+#[test]
+fn reduce_run_single_and_multi_packet_matches_across_carriers_and_sequence_modes() {
+    use flife_field::CarrierLayout;
+
+    // Exercise `reduce_run_const_inner::<M, HAS_SEQ>` across:
+    // - M = 32 (single-carrier), M = 24 (Carrier 0), M = 8 (Carrier 1)
+    // - HAS_SEQ = false (strictly ascending organism IDs) and HAS_SEQ = true (scrambled IDs)
+    // - Single-packet cells with factor > 0.0 AND factor == 0.0 (tiny deposit underflow onto high F32 energy)
+    // - Multi-packet cells with mixed/opposite directions (including > REDUCE_BATCH occupied cells)
+    let g = grid(32, 32);
+    let limits = BufferLimits::host();
+
+    // Build a deterministic set of deposits with:
+    //  - 40 well-separated single-packet cells (exceeding REDUCE_BATCH=32),
+    //  - 10 tiny single-packet deposits onto high-energy cells where `round_down_f32(e + tiny) == e` -> factor == 0.0,
+    //  - 20 overlapping deposits hitting shared hotspot cells (multi-packet path).
+    let mut next = lcg(0x0D1E_5A77);
+    let mut records: Vec<(OrganismId, [f64; 2], f64, [f64; CHANNELS])> = Vec::new();
+    let mut next_id = 1_u64;
+
+    // Single-packet normal deposits on scattered integer cell centers (grid-cic lands on 4 cells each;
+    // spacing by 3 ensures single-packet cells dominate).
+    for row in (1..30).step_by(3) {
+        for col in (1..30).step_by(3) {
+            let mut dir = [0.0_f64; CHANNELS];
+            for (ch, slot) in dir.iter_mut().enumerate() {
+                *slot = if (ch + row + col) % 2 == 0 {
+                    0.125
+                } else {
+                    -0.125
+                };
+            }
+            let amount = if (row + col) % 5 == 0 {
+                // Tiny amount onto large cell energy -> received == 0.0 -> factor == 0.0!
+                1.0e-12
+            } else {
+                0.05 + 0.25 * next()
+            };
+            records.push((
+                OrganismId::new(next_id),
+                [col as f64 + 0.25, row as f64 + 0.25],
+                amount,
+                dir,
+            ));
+            next_id += 1;
+        }
+    }
+    // Overlapping multi-packet hotspot deposits (including exact cancellation on one pair).
+    for k in 0..24 {
+        let mut dir = [0.0_f64; CHANNELS];
+        let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+        for (ch, slot) in dir.iter_mut().enumerate() {
+            *slot = sign * (0.1 + 0.01 * ((ch + k) % 7) as f64) * 0.1;
+        }
+        records.push((
+            OrganismId::new(next_id),
+            [4.5 + (k % 3) as f64 * 0.2, 4.5 + ((k / 3) % 3) as f64 * 0.2],
+            0.08 + 0.02 * (k as f64),
+            dir,
+        ));
+        next_id += 1;
+    }
+
+    let scrambled_order = shuffled(records.len(), 0x5EED_C0DE);
+
+    // Build dual-carrier and single-carrier base fields with high energy on tiny-deposit cells.
+    let mut base_single = field(g, 0x1111);
+    for e in base_single.energy_mut().iter_mut() {
+        *e += 1024.0;
+    }
+    let mut base_dual = FieldState::zeroed_with_planes(g, 34, &limits).expect("dual field");
+    for (idx, e) in base_dual
+        .plane_mut(CarrierLayout::CARRIER_0.energy_plane)
+        .expect("c0 e")
+        .iter_mut()
+        .enumerate()
+    {
+        *e = 1024.0 + (idx % 17) as f32 * 0.25;
+    }
+    for (idx, e) in base_dual
+        .plane_mut(CarrierLayout::CARRIER_1.energy_plane)
+        .expect("c1 e")
+        .iter_mut()
+        .enumerate()
+    {
+        *e = 1024.0 + (idx % 13) as f32 * 0.25;
+    }
+
+    let cases: [(&str, &FieldState, CarrierLayout); 3] = [
+        ("single_M32", &base_single, base_single.carrier0()),
+        ("dual_M24", &base_dual, CarrierLayout::CARRIER_0),
+        ("dual_M8", &base_dual, CarrierLayout::CARRIER_1),
+    ];
+
+    for (label, base, carrier) in cases {
+        // Ascending ID submission (HAS_SEQ = false), workers = 1 reference
+        let mut dep_asc_1 = Deposits::with_capacity(&g, records.len() as u64, &limits).expect("cap");
+        for &(org, pos, amount, dir) in &records {
+            dep_asc_1
+                .push(&g, org, pos, amount, amount, &dir)
+                .expect("push asc");
+        }
+        let mut field_asc_1 = base.clone();
+        let sum_asc_1 = apply_deposits_to_carrier_on(&mut field_asc_1, &mut dep_asc_1, carrier, 1)
+            .expect("apply asc w1");
+
+        // Ascending ID submission (HAS_SEQ = false), workers = 4
+        let mut dep_asc_4 = Deposits::with_capacity(&g, records.len() as u64, &limits).expect("cap");
+        for &(org, pos, amount, dir) in &records {
+            dep_asc_4
+                .push(&g, org, pos, amount, amount, &dir)
+                .expect("push asc 4");
+        }
+        let mut field_asc_4 = base.clone();
+        let sum_asc_4 = apply_deposits_to_carrier_on(&mut field_asc_4, &mut dep_asc_4, carrier, 4)
+            .expect("apply asc w4");
+        assert_eq!(
+            summary_bits(&sum_asc_4),
+            summary_bits(&sum_asc_1),
+            "{label}: w4 asc summary mismatch"
+        );
+        assert_eq!(
+            planes(&field_asc_4),
+            planes(&field_asc_1),
+            "{label}: w4 asc field mismatch"
+        );
+
+        // Scrambled ID submission (HAS_SEQ = true), workers = 1 and 4 must match bit-for-bit!
+        for workers in [1_usize, 4] {
+            let mut dep_seq =
+                Deposits::with_capacity(&g, records.len() as u64, &limits).expect("cap");
+            for &idx in &scrambled_order {
+                let (org, pos, amount, dir) = records[idx];
+                dep_seq
+                    .push(&g, org, pos, amount, amount, &dir)
+                    .expect("push seq");
+            }
+            let mut field_seq = base.clone();
+            let sum_seq =
+                apply_deposits_to_carrier_on(&mut field_seq, &mut dep_seq, carrier, workers)
+                    .expect("apply seq");
+            assert_eq!(
+                summary_bits(&sum_seq),
+                summary_bits(&sum_asc_1),
+                "{label} (HAS_SEQ=true, w={workers}): summary mismatch"
+            );
+            assert_eq!(
+                planes(&field_seq),
+                planes(&field_asc_1),
+                "{label} (HAS_SEQ=true, w={workers}): field mismatch"
+            );
+        }
+    }
+}

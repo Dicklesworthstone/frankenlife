@@ -1848,13 +1848,13 @@ struct Run<'a> {
 /// in [`reduce_run`]. Flushing 32 cells per plane avoids 32-way L1D
 /// cache-set thrashing on power-of-two grids (e.g. 512² where planes are
 /// 1 MiB apart) while writing bit-identical F32 values.
-const REDUCE_BATCH: usize = 64;
+const REDUCE_BATCH: usize = 32;
 
 /// Flush `count` pre-scaled cell updates into `moments`, one plane at a time.
 /// Classifies contiguous 4-cell quads once before the plane loop so dense
 /// runs emit contiguous 16-byte NEON `ldr q` / `fcvtl` / `fadd.2d` / `fcvtn`
 /// / `str q` updates while preserving exact `-0.0` semantics (`added != 0.0`).
-#[inline]
+#[inline(never)]
 fn flush_moment_batch_const<const M: usize>(
     moments: &mut [&mut [f32]],
     count: usize,
@@ -1936,22 +1936,27 @@ fn flush_moment_batch_const<const M: usize>(
 
 /// Fixed-channel specialization of [`reduce_run`] iterating only occupied cells
 /// with compile-time channel count `M` (`32` single-carrier, `24` Carrier 0,
-/// `8` Carrier 1) so LLVM auto-vectorizes the inner moment accumulation loop
-/// cleanly while preserving exact IEEE-754 order.
-fn reduce_run_const<const M: usize>(
+/// `8` Carrier 1) and compile-time `HAS_SEQ` specialization (hoisting the
+/// identity-sequence branch out of the per-cell loop) so LLVM auto-vectorizes
+/// the inner moment accumulation loop cleanly while preserving exact IEEE-754
+/// order (`(amount * component) * factor`).
+#[inline(never)]
+fn reduce_run_const_inner<const M: usize, const HAS_SEQ: bool>(
     run: &mut Run<'_>,
     offsets: &[u32],
     order: &[u32],
-    sequence: Option<&[u32]>,
+    sequence: &[u32],
     packets: &[Packet],
     directions: &[[f64; CHANNELS]],
 ) -> usize {
+    debug_assert!(M <= CHANNELS);
     let mut occupied = 0_usize;
     let mut batch_len = 0_usize;
     let mut cell_at = [0_usize; REDUCE_BATCH];
     let mut accum = [[0.0_f64; M]; REDUCE_BATCH];
     let cell_base = run.cell_base;
     let energy_len = run.energy.len();
+    let mut received_iter = run.received.iter_mut();
 
     for &cell_u32 in run.occupied_cells {
         let cell = cell_u32 as usize;
@@ -1959,64 +1964,78 @@ fn reduce_run_const<const M: usize>(
         if at >= energy_len {
             continue;
         }
-        let first = offsets[cell] as usize;
-        let end = offsets[cell + 1] as usize;
+        let Some(&[first_u, end_u]) = offsets
+            .get(cell..cell + 2)
+            .and_then(|pair| pair.first_chunk::<2>())
+        else {
+            continue;
+        };
+        let first = first_u as usize;
+        let end = end_u as usize;
         if first >= end {
             continue;
         }
         let slice = &order[first..end];
         let before = run.energy[at];
-        // Accumulate directly into `accum[batch_len]` to avoid copying 256 B
-        // per cell before batch flush; fast-path single-packet cells (skipping
-        // `moment.fill(0.0)` and `add_down(0.0, amount)`).
-        let moment = &mut accum[batch_len];
-        let total = if slice.len() == 1 {
-            let pkt_idx = match sequence {
-                None => slice[0] as usize,
-                Some(seq_slice) => seq_slice[slice[0] as usize] as usize,
-            };
+
+        if slice.len() == 1 {
+            // Fast path for single-packet cells: compute `after`, `received`,
+            // and `factor` before touching `accum[batch_len]`, then fuse
+            // `(amount * component) * factor` in registers in one pass
+            // (preserving exact IEEE-754 order and skipping the 32-ch loop
+            // entirely when `factor == 0.0`).
+            let ord = slice[0] as usize;
+            let pkt_idx = if HAS_SEQ { sequence[ord] as usize } else { ord };
             let packet = &packets[pkt_idx];
-            if let Some(dir) = directions[packet.entry].first_chunk::<M>() {
-                let amount = packet.amount;
-                for (slot, &component) in moment.iter_mut().zip(dir) {
-                    *slot = amount * component;
-                }
+            let total = packet.amount;
+            let after = round_down_f32(add_down(f64::from(before), total));
+            let received = f64::from(after) - f64::from(before);
+            let factor = if total > 0.0 && total.is_finite() {
+                received / total
             } else {
-                moment.fill(0.0);
+                0.0
+            };
+            run.energy[at] = after;
+            if let Some(rec_slot) = received_iter.next() {
+                *rec_slot = received;
             }
-            packet.amount
-        } else {
-            let mut total = 0.0_f64;
-            moment.fill(0.0);
-            match sequence {
-                None => {
-                    for &ord in slice {
-                        let packet = &packets[ord as usize];
-                        total = add_down(total, packet.amount);
-                        if let Some(dir) = directions[packet.entry].first_chunk::<M>() {
-                            let amount = packet.amount;
-                            for (slot, &component) in moment.iter_mut().zip(dir) {
-                                *slot += amount * component;
-                            }
-                        }
-                    }
+            occupied += 1;
+
+            if factor != 0.0 {
+                let moment = &mut accum[batch_len];
+                let dir = &directions[packet.entry][..M];
+                for (slot, &component) in moment.iter_mut().zip(dir) {
+                    *slot = (total * component) * factor;
                 }
-                Some(sequence) => {
-                    for &ord in slice {
-                        let seq = sequence[ord as usize];
-                        let packet = &packets[seq as usize];
-                        total = add_down(total, packet.amount);
-                        if let Some(dir) = directions[packet.entry].first_chunk::<M>() {
-                            let amount = packet.amount;
-                            for (slot, &component) in moment.iter_mut().zip(dir) {
-                                *slot += amount * component;
-                            }
-                        }
-                    }
+                cell_at[batch_len] = at;
+                batch_len += 1;
+                if batch_len == REDUCE_BATCH {
+                    flush_moment_batch_const::<M>(
+                        &mut run.moments[..M],
+                        batch_len,
+                        &cell_at,
+                        &accum,
+                    );
+                    batch_len = 0;
                 }
             }
-            total
-        };
+            continue;
+        }
+
+        let moment = &mut accum[batch_len];
+        let mut total = 0.0_f64;
+        moment.fill(0.0);
+        for &ord_u in slice {
+            let ord = ord_u as usize;
+            let pkt_idx = if HAS_SEQ { sequence[ord] as usize } else { ord };
+            let packet = &packets[pkt_idx];
+            let amount = packet.amount;
+            total = add_down(total, amount);
+            let dir = &directions[packet.entry][..M];
+            for (slot, &component) in moment.iter_mut().zip(dir) {
+                *slot += amount * component;
+            }
+        }
         let after = round_down_f32(add_down(f64::from(before), total));
         let received = f64::from(after) - f64::from(before);
         let factor = if total > 0.0 && total.is_finite() {
@@ -2025,7 +2044,9 @@ fn reduce_run_const<const M: usize>(
             0.0
         };
         run.energy[at] = after;
-        run.received[occupied] = received;
+        if let Some(rec_slot) = received_iter.next() {
+            *rec_slot = received;
+        }
         occupied += 1;
 
         if factor != 0.0 {
@@ -2044,6 +2065,24 @@ fn reduce_run_const<const M: usize>(
         flush_moment_batch_const::<M>(&mut run.moments[..M], batch_len, &cell_at, &accum);
     }
     occupied
+}
+
+/// Fixed-channel specialization of [`reduce_run`] dispatching once on
+/// `sequence.is_some()` outside the occupied-cell loop.
+fn reduce_run_const<const M: usize>(
+    run: &mut Run<'_>,
+    offsets: &[u32],
+    order: &[u32],
+    sequence: Option<&[u32]>,
+    packets: &[Packet],
+    directions: &[[f64; CHANNELS]],
+) -> usize {
+    match sequence {
+        None => reduce_run_const_inner::<M, false>(run, offsets, order, &[], packets, directions),
+        Some(seq) => {
+            reduce_run_const_inner::<M, true>(run, offsets, order, seq, packets, directions)
+        }
+    }
 }
 
 /// Reduce and write `run`'s occupied cells in cell order, each as

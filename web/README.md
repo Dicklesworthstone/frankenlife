@@ -116,9 +116,10 @@ poster by about 1.3 s. Nothing below the hero loads with the page (checked at 39
 1,920 px). `loading="lazy"` was not enough for that: Chrome fetches a lazy image well before it is on screen,
 and on desktops the zoom ladder's 3 MB JPEG and its 444 KB card came with the page, so the ladder shows the
 hero's AVIF until it is on screen and loads them then. An image that is also a CSS background (the controls'
-loupe) waits for its lazy `<img>`. Measured on frankenlife.org on 2026-11-26, cold, three runs
+loupe) waits for its lazy `<img>`. Measured on frankenlife.org on 2026-11-26, cold, three or four runs
 each: the largest paint (the poster) now comes at 3.8 s on a 390 px phone under that throttling (10.1 s
-before), and at 1.5–1.8 s on a 1,440 px desktop over 10 Mbps with 40 ms round trips (3.0–3.1 s before).
+before), and at 1.1–1.2 s on a 1,024 or 1,440 px desktop over 10 Mbps with 40 ms round trips (3.0–3.1 s
+at 1,440 before; 1.5–1.8 s with the AVIF poster while the ladder's JPEG still came with the page).
 
 Three v2 films of denser worlds (`presets/morphogenesis-tissue-v2-dense.toml`,
 `presets/supercolony-v2-dense.toml`, rendered 2026-11-24) were taken down the same day: in motion they

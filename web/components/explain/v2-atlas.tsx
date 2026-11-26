@@ -46,6 +46,9 @@ const FH = 144;
 const PAD = { left: 26, right: 8, top: 20, bottom: 22 };
 const IW = W - PAD.left - PAD.right;
 const IH = FH - PAD.top - PAD.bottom;
+/** A dark outline under a label, so a line that crosses it breaks around the letters (fixture-panels.tsx draws
+ *  its 11-unit labels with a 4-unit one; these are 7 to 8 units). */
+const HALO = { stroke: TONE.ink, strokeWidth: 3, strokeLinejoin: "round", paintOrder: "stroke" } as const;
 
 type Scale = { x: (value: number) => number; y: (value: number) => number };
 
@@ -120,7 +123,7 @@ function Dot({ x, y, s, colour = TONE.rule, label, anchor = "start", below = fal
     <g>
       <circle cx={s.x(x)} cy={s.y(y)} r="2.4" fill={colour} />
       {label ? (
-        <text x={s.x(x) + dx} y={s.y(y) + (below ? 10 : -4)} fontSize="7.5" fill="#e2e8f0" textAnchor={anchor} fontFamily="var(--font-mono, ui-monospace)">
+        <text x={s.x(x) + dx} y={s.y(y) + (below ? 10 : -4)} fontSize="7.5" fill="#e2e8f0" textAnchor={anchor} fontFamily="var(--font-mono, ui-monospace)" {...HALO}>
           {label}
         </text>
       ) : null}
@@ -168,7 +171,8 @@ function OasesChart() {
       {shown.map((j, at) => (
         <path key={j} d={line(sample(0, 24, 120, (t) => oasisPowerShare(t, j)), s)} stroke={colours[at]} strokeWidth="1.6" fill="none" />
       ))}
-      <text x={s.x(23.5)} y={s.y(1) - 3} fontSize="7" fill="#e2e8f0" textAnchor="end" fontFamily="var(--font-mono, ui-monospace)">
+      {/* Some source crosses the mean every few seconds, so no stretch of it is free for the label: a halo instead. */}
+      <text x={s.x(23.5)} y={s.y(1) - 3} fontSize="7" fill="#e2e8f0" textAnchor="end" fontFamily="var(--font-mono, ui-monospace)" {...HALO}>
         mean of all {OASES.sources}
       </text>
     </Frame>
@@ -337,7 +341,8 @@ function KinChart() {
       <rect x={s.x(0)} y={PAD.top} width={s.x(0.5) - s.x(0)} height={IH} fill="#64748b" opacity="0.08" />
       <path d={line(sample(0.5, 1, 60, (c) => kinWeight(c)), s)} stroke={TONE.energy} strokeWidth="1.8" fill="none" />
       <path d={line([[0, 0], [0.5, 0]], s)} stroke={TONE.energy} strokeWidth="1.8" fill="none" />
-      <Dot x={0.5} y={kinWeight(0.5)} s={s} colour={TONE.energy} label="0.06" />
+      {/* Left of the point, over the flat part: on the right the rising curve ran through it. */}
+      <Dot x={0.5} y={kinWeight(0.5)} s={s} colour={TONE.energy} label="0.06" anchor="end" />
       <text x={s.x(0.03)} y={s.y(0.9)} fontSize="7" fill="#94a3b8" fontFamily="var(--font-mono, ui-monospace)">
         not kin
       </text>
@@ -374,7 +379,8 @@ function GateChart() {
       yTicks={[0, 0.5, 1].map((at) => ({ at, label: String(at) }))}
     >
       <path d={line(sample(-4, 8, 120, (z) => epigeneticGate(z)), s)} stroke="#C8B6FF" strokeWidth="1.8" fill="none" />
-      <Dot x={0} y={epigeneticGate(0)} s={s} colour="#C8B6FF" label="0.076 at rest" />
+      {/* Left of the point, over the flat part: on the right the rising curve ran through it. */}
+      <Dot x={0} y={epigeneticGate(0)} s={s} colour="#C8B6FF" label="0.076 at rest" anchor="end" />
     </Frame>
   );
 }
@@ -384,7 +390,8 @@ function TurnChart() {
   const [h0, setH0] = useState(0.5);
   const id = useId().replace(/[^a-zA-Z0-9_-]/g, "");
   const angle = affinityTurn(h0);
-  const c = { x: 120, y: 64 };
+  // Left of the middle: "a, inherited diet" (about 82 units) ends inside the 240 then; centred, 12 were cut off.
+  const c = { x: 100, y: 64 };
   const r = 46;
   const tip = (theta: number, scale = 1) => ({ x: c.x + Math.cos(theta) * r * scale, y: c.y - Math.sin(theta) * r * scale });
   const a = tip(0);
@@ -406,7 +413,9 @@ function TurnChart() {
           <text x={a.x + 4} y={a.y + 3} fill="#94a3b8">
             a, inherited diet
           </text>
-          <text x={ja.x + 4} y={ja.y + 2} fill="#64748b">
+          {/* Up and to the left of its tip: on the right, the circle ran through it, and a_eff (always on the
+              right: the turn is ±90° at most) would meet it at 90°. */}
+          <text x={ja.x - 4} y={ja.y - 4} fill="#64748b" textAnchor="end">
             Ja
           </text>
           <text x={eff.x + (Math.cos(angle) >= 0 ? 4 : -4)} y={eff.y - 4} fill="#ddd6fe" textAnchor={Math.cos(angle) >= 0 ? "start" : "end"}>

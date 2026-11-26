@@ -611,7 +611,8 @@ export function ZoomLadder({ index }: { index?: string }) {
         : `tick ${grouped(CARD.tick)} · frame ${film.social.frame}`,
     );
     text(zoomRef.current, `×${fmt(TORUS / view.span, TORUS / view.span < 10 ? 1 : 0)}`);
-    text(spanRef.current, `${fmt(view.span, view.span < 10 ? 1 : 0)} × ${fmt(view.span, view.span < 10 ? 1 : 0)} units`);
+    // No-break spaces hold "80 × 80" together; "units" may wrap under it if a reader widens letter spacing.
+    text(spanRef.current, `${fmt(view.span, view.span < 10 ? 1 : 0)} × ${fmt(view.span, view.span < 10 ? 1 : 0)} units`);
     text(
       countRef.current,
       view.span >= TORUS - 1e-6 ? `${grouped(live)} alive` : `≈ ${grouped(roughly(inView(live, view.span)))} in view`,
@@ -878,8 +879,8 @@ export function ZoomLadder({ index }: { index?: string }) {
                     <span ref={zoomRef} className="block text-base font-bold text-white sm:text-lg">
                       ×1
                     </span>
-                    <span ref={spanRef} className="block whitespace-nowrap text-slate-300">
-                      {TORUS} × {TORUS} units
+                    <span ref={spanRef} className="block text-slate-300">
+                      {`${TORUS} × ${TORUS} units`}
                     </span>
                   </div>
                 </div>
@@ -940,14 +941,15 @@ export function ZoomLadder({ index }: { index?: string }) {
                           onClick={() => goTo(index)}
                           aria-current={index === stop ? "step" : undefined}
                           className={cn(
-                            "flex h-11 w-full flex-col items-center justify-center rounded-lg text-[10px] font-bold tracking-wide transition-[background-color,color] focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none sm:text-[11px]",
+                            "flex min-h-11 w-full flex-col items-center justify-center rounded-lg text-[10px] font-bold tracking-wide transition-[background-color,color] focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none sm:text-[11px]",
                             index === stop ? "bg-white/[0.07] text-white" : "text-slate-400 hover:text-green-300",
                           )}
                         >
                           <span className={cn("font-mono", index === stop ? "text-green-300" : "text-slate-500")}>
                             {String(index + 1).padStart(2, "0")}
                           </span>
-                          <span className="max-w-full truncate">{entry.rail}</span>
+                          {/* Breaks inside the word rather than hiding letters, if a reader widens letter spacing. */}
+                          <span className="max-w-full [overflow-wrap:anywhere]">{entry.rail}</span>
                         </button>
                       </li>
                     ))}

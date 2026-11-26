@@ -76,6 +76,15 @@ h5 {
   line-height: 1.2;
 }
 
+/* A heading's long word breaks rather than spills when a reader widens letter spacing (WCAG 1.4.12: at 0.12em
+   the display sizes' words outgrow their columns; "Evolution," ran over the hero film at 1,440 px). At the
+   page's own spacing every word fits, so this changes nothing. */
+h1,
+h2,
+h3 {
+  overflow-wrap: break-word;
+}
+
 .display-1 {
   font-size: clamp(3.1rem, 7.2vw, 7.4rem);
   line-height: 0.94;

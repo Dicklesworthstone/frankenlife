@@ -443,7 +443,10 @@ export function BrainAnatomy() {
                 {hiddenLabel(index, column.width)}
               </text>
             ))}
-            <text x={output.x} y={VIEW_H - 2} textAnchor="middle" fontSize={footnote} fill={TONE.muted}>
+            {/* Under the output column: its end where the centred line's would be (the line measures 12.4 font
+                sizes wide), never past the drawing's edge, so wider letter spacing (WCAG 1.4.12) grows it leftwards
+                instead of out of the drawing. */}
+            <text x={Math.min(viewW - 2, output.x + 6.2 * footnote)} y={VIEW_H - 2} textAnchor="end" fontSize={footnote} fill={TONE.muted}>
               linear · σ once, in decoding
             </text>
           </svg>

@@ -216,7 +216,8 @@ function SurplusChart() {
       {/* The floorless line stops at the top of the plot (1.6), not at E = 2 above the frame. */}
       <path d={line(sample(0, 1.6, 64, (e) => e), s)} stroke="#64748b" strokeDasharray="3 3" strokeWidth="1" fill="none" />
       <path d={line(sample(0, 2, 80, (e) => emissionSurplus(e)), s)} stroke={TONE.rule} strokeWidth="1.8" fill="none" />
-      <text x={s.x(0.04)} y={s.y(1.42)} fontSize="7" fill="#fda4af" fontFamily="var(--font-mono, ui-monospace)">
+      {/* A line below "without the floor": level with it, wider letter spacing (WCAG 1.4.12) ran the two together. */}
+      <text x={s.x(0.04)} y={s.y(1.2)} fontSize="7" fill="#fda4af" fontFamily="var(--font-mono, ui-monospace)">
         protected
       </text>
       {/* Left of and above its own line, past the protected band: at the top right, both lines ran through it. */}

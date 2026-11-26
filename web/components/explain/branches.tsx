@@ -215,9 +215,10 @@ export function BranchDiagram() {
           <div className="grid grid-cols-[5.75rem_minmax(0,1fr)] items-center gap-x-3 gap-y-2 sm:grid-cols-[8.5rem_minmax(0,1fr)]">
             {LANES.map((lane) => (
               <div key={lane.id} className="contents">
+                {/* The names wrap, not truncate: wider letter spacing (WCAG 1.4.12) cut "Killed, resumed" short. */}
                 <div className="min-w-0">
-                  <p className="truncate text-xs font-bold text-slate-200">{lane.name}</p>
-                  <p className="hidden truncate text-[10px] text-slate-500 sm:block">{lane.note}</p>
+                  <p className="text-xs leading-tight font-bold text-slate-200">{lane.name}</p>
+                  <p className="hidden text-[10px] leading-tight text-slate-500 sm:block">{lane.note}</p>
                 </div>
                 <div className="relative h-9 cursor-crosshair" onClick={pick} aria-hidden="true">
                   <span className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-white/[0.06]" />

@@ -72,7 +72,8 @@ export function BundlePanels() {
                   {bundle.measured.map((stat) => (
                     <div key={stat.label} className="min-w-0">
                       <dt className="text-[11px] leading-tight text-slate-500">{stat.label}</dt>
-                      <dd className="mt-1 text-2xl font-extrabold tracking-tight text-white tabular-nums">{stat.value}</dd>
+                      {/* At 320 px with wider letter spacing (WCAG 1.4.12) "15,446" outgrew its third: it wraps. */}
+                      <dd className="mt-1 text-2xl font-extrabold tracking-tight text-white tabular-nums [overflow-wrap:anywhere]">{stat.value}</dd>
                       <dd className="mt-0.5 text-[11px] leading-snug text-slate-500">{stat.note}</dd>
                     </div>
                   ))}

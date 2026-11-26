@@ -39,6 +39,10 @@ from pixels (axe leaves text over gradients and other text undecided), every lin
 and 1,440 px in 81 states, apart from disabled controls and the keyboard picture's dead keys. Every
 control is at least 24 px square on a phone (WCAG 2.5.8; axe ships the rule off, so run it by name):
 below 640 px the Studio's keyboard splits in two halves, which is what keeps its keys wide enough.
+With WCAG 1.4.12's text spacing forced on (letters 0.12em, words 0.16em, lines 1.5), no text overlaps
+or is cut off at 390, 768 or 1,440 px, so a label wraps rather than truncating with an ellipsis, and a
+heading's long word may break; at 320 px only the life cycle's "Sense" and "Divide" reach past the ring's
+drawing, by 5 and 7 px.
 
 ## The explainers
 

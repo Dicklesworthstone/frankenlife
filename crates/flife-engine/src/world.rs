@@ -6699,12 +6699,93 @@ fn fit_settle_tiles(
     Ok(())
 }
 
+/// Write four contiguous moment planes (`ch..ch+4`) for a contiguous cell run
+/// into `comps_out`, processing four cells per iteration so LLVM emits 16-byte
+/// NEON `ldr q` loads, `fcvtl`/`fdiv.2d`, in-register 4×4 transpose, and
+/// 32-byte contiguous `stp q, q` stores (`0`-ULP bit-exact `f64::from(m) / e`).
+#[inline]
+fn write_four_planes_contig(
+    ch: usize,
+    s0: &[f32],
+    s1: &[f32],
+    s2: &[f32],
+    s3: &[f32],
+    energies: &[f64],
+    dst: &mut [[f64; CHANNELS]],
+) {
+    let (s0_q, s0_r) = s0.as_chunks::<4>();
+    let (s1_q, s1_r) = s1.as_chunks::<4>();
+    let (s2_q, s2_r) = s2.as_chunks::<4>();
+    let (s3_q, s3_r) = s3.as_chunks::<4>();
+    let (e_q, e_r) = energies.as_chunks::<4>();
+    let (d_q, d_r) = dst.as_chunks_mut::<4>();
+    for (((((m0, m1), m2), m3), ek), dk) in s0_q
+        .iter()
+        .zip(s1_q)
+        .zip(s2_q)
+        .zip(s3_q)
+        .zip(e_q)
+        .zip(d_q)
+    {
+        let q0 = [
+            f64::from(m0[0]) / ek[0],
+            f64::from(m0[1]) / ek[1],
+            f64::from(m0[2]) / ek[2],
+            f64::from(m0[3]) / ek[3],
+        ];
+        let q1 = [
+            f64::from(m1[0]) / ek[0],
+            f64::from(m1[1]) / ek[1],
+            f64::from(m1[2]) / ek[2],
+            f64::from(m1[3]) / ek[3],
+        ];
+        let q2 = [
+            f64::from(m2[0]) / ek[0],
+            f64::from(m2[1]) / ek[1],
+            f64::from(m2[2]) / ek[2],
+            f64::from(m2[3]) / ek[3],
+        ];
+        let q3 = [
+            f64::from(m3[0]) / ek[0],
+            f64::from(m3[1]) / ek[1],
+            f64::from(m3[2]) / ek[2],
+            f64::from(m3[3]) / ek[3],
+        ];
+        for k in 0..4 {
+            let out = &mut dk[k][ch..ch + 4];
+            out[0] = q0[k];
+            out[1] = q1[k];
+            out[2] = q2[k];
+            out[3] = q3[k];
+        }
+    }
+    for (((((&m0, &m1), &m2), &m3), &e), out_cell) in s0_r
+        .iter()
+        .zip(s1_r)
+        .zip(s2_r)
+        .zip(s3_r)
+        .zip(e_r)
+        .zip(d_r)
+    {
+        let out = &mut out_cell[ch..ch + 4];
+        out[0] = f64::from(m0) / e;
+        out[1] = f64::from(m1) / e;
+        out[2] = f64::from(m2) / e;
+        out[3] = f64::from(m3) / e;
+    }
+}
+
 /// Compute normalized chemical compositions `m / e` for `new_cells` directly
-/// into a worker lane's L2-resident `comps_out` slice, reading each active
-/// moment plane sequentially in batches of 32 cells with bounds-check-free
-/// NEON `fdiv.2d`. Marked `#[inline(never)]` so [`spatial_chemistry_prepass_fused`]'s
-/// inner tile closure stays compact enough for LLVM to inline
-/// [`Chemistry::settle_indexed_slice`].
+/// into a worker lane's L2-resident `comps_out` slice, reading four moment
+/// planes per pass (matching Apple Silicon 8-way L1D associativity without
+/// set-conflict thrashing while cutting `comps_out` store traffic 4×) and
+/// breaking batches at row jumps so dense halo rows run through
+/// [`write_four_planes_contig`]. Marked `#[inline(never)]` so
+/// [`spatial_chemistry_prepass_fused`]'s inner tile closure stays compact.
+#[expect(
+    clippy::too_many_lines,
+    reason = "4-plane contiguous and sparse batched composition kernels"
+)]
 #[inline(never)]
 fn compute_tile_compositions(
     observed: &FieldState,
@@ -6720,6 +6801,7 @@ fn compute_tile_compositions(
     let active_channels = observed.carrier0_moments_count();
     if !total_cells.is_power_of_two()
         || active_channels > CHANNELS
+        || planes < 1 + active_channels
         || all_data.len() != planes.saturating_mul(total_cells)
         || comps_out.len() < new_cells.len()
     {
@@ -6732,15 +6814,27 @@ fn compute_tile_compositions(
     let mut cells = [0_usize; COMP_BATCH];
     let mut energies = [0.0_f64; COMP_BATCH];
     let mut slots = [0_usize; COMP_BATCH];
-    let mut raw = [0.0_f32; COMP_BATCH];
-    let mut quotients = [0.0_f64; COMP_BATCH];
     let n = new_cells.len();
+    let quad_channels = (active_channels / 4) * 4;
     let mut i = 0_usize;
     while i < n {
         let batch_start = i;
         let mut batch_count = 0_usize;
+        let mut cells_contig = true;
         while i < n && batch_count < COMP_BATCH {
             let cell = new_cells[i] as usize;
+            if batch_count > 0 && cells_contig {
+                let prev = cells[batch_count - 1];
+                if cell != prev.wrapping_add(1) {
+                    // Flush a contiguous run on a row jump or once >= 4 cells
+                    // are queued so dense halo rows stay on the contiguous
+                    // NEON path while sparse halos still pack full batches.
+                    if batch_count >= 4 || cell.wrapping_sub(prev) >= 32 {
+                        break;
+                    }
+                    cells_contig = false;
+                }
+            }
             let e = f64::from(energy_plane[cell & e_mask]);
             if e > 0.0 {
                 cells[batch_count] = cell;
@@ -6755,63 +6849,88 @@ fn compute_tile_compositions(
             }
             i += 1;
         }
-        if batch_count > 0 {
-            let contiguous = i - batch_start == batch_count;
-            for (channel, plane) in all_data[total_cells..]
-                .chunks_exact(total_cells)
-                .enumerate()
-                .take(active_channels)
-            {
-                let ch = channel & (CHANNELS - 1);
-                let plane_len = plane.len();
-                if batch_count == COMP_BATCH {
-                    if plane_len.is_power_of_two() {
-                        let mask = plane_len - 1;
-                        for (dst, &cell) in raw.iter_mut().zip(&cells) {
-                            *dst = plane[cell & mask];
-                        }
-                    } else {
-                        for (dst, &cell) in raw.iter_mut().zip(&cells) {
-                            *dst = plane[cell];
-                        }
-                    }
-                    for ((dst, &m), &energy) in quotients.iter_mut().zip(&raw).zip(&energies) {
-                        *dst = f64::from(m) / energy;
-                    }
-                } else {
-                    if plane_len.is_power_of_two() {
-                        let mask = plane_len - 1;
-                        for (dst, &cell) in raw[..batch_count].iter_mut().zip(&cells[..batch_count])
-                        {
-                            *dst = plane[cell & mask];
-                        }
-                    } else {
-                        for (dst, &cell) in raw[..batch_count].iter_mut().zip(&cells[..batch_count])
-                        {
-                            *dst = plane[cell];
-                        }
-                    }
-                    for ((dst, &m), &energy) in quotients[..batch_count]
-                        .iter_mut()
-                        .zip(&raw[..batch_count])
-                        .zip(&energies[..batch_count])
-                    {
-                        *dst = f64::from(m) / energy;
-                    }
+        if batch_count == 0 {
+            continue;
+        }
+        let slots_contig = i - batch_start == batch_count;
+        let c0 = cells[0];
+        let contig_in_bounds =
+            cells_contig && c0.checked_add(batch_count).is_some_and(|end| end <= total_cells);
+        let mut ch = 0_usize;
+        while ch < quad_channels {
+            let base = (ch + 1) * total_cells;
+            let p0 = &all_data[base..base + total_cells];
+            let p1 = &all_data[base + total_cells..base + 2 * total_cells];
+            let p2 = &all_data[base + 2 * total_cells..base + 3 * total_cells];
+            let p3 = &all_data[base + 3 * total_cells..base + 4 * total_cells];
+            if slots_contig && contig_in_bounds {
+                write_four_planes_contig(
+                    ch,
+                    &p0[c0..c0 + batch_count],
+                    &p1[c0..c0 + batch_count],
+                    &p2[c0..c0 + batch_count],
+                    &p3[c0..c0 + batch_count],
+                    &energies[..batch_count],
+                    &mut comps_out[batch_start..batch_start + batch_count],
+                );
+            } else if slots_contig {
+                for ((out_cell, &cell), &e) in comps_out[batch_start..batch_start + batch_count]
+                    .iter_mut()
+                    .zip(&cells[..batch_count])
+                    .zip(&energies[..batch_count])
+                {
+                    let c = cell & e_mask;
+                    let out = &mut out_cell[ch..ch + 4];
+                    out[0] = f64::from(p0[c]) / e;
+                    out[1] = f64::from(p1[c]) / e;
+                    out[2] = f64::from(p2[c]) / e;
+                    out[3] = f64::from(p3[c]) / e;
                 }
-                if contiguous {
-                    for (comp, &q) in comps_out[batch_start..batch_start + batch_count]
-                        .iter_mut()
-                        .zip(&quotients[..batch_count])
-                    {
-                        comp[ch] = q;
-                    }
-                } else {
-                    for (&slot, &q) in slots[..batch_count].iter().zip(&quotients[..batch_count]) {
-                        comps_out[slot][ch] = q;
-                    }
+            } else {
+                for ((&slot, &cell), &e) in slots[..batch_count]
+                    .iter()
+                    .zip(&cells[..batch_count])
+                    .zip(&energies[..batch_count])
+                {
+                    let c = cell & e_mask;
+                    let out = &mut comps_out[slot][ch..ch + 4];
+                    out[0] = f64::from(p0[c]) / e;
+                    out[1] = f64::from(p1[c]) / e;
+                    out[2] = f64::from(p2[c]) / e;
+                    out[3] = f64::from(p3[c]) / e;
                 }
             }
+            ch += 4;
+        }
+        while ch < active_channels {
+            let base = (ch + 1) * total_cells;
+            let plane = &all_data[base..base + total_cells];
+            if slots_contig && contig_in_bounds {
+                for ((out_cell, &m), &e) in comps_out[batch_start..batch_start + batch_count]
+                    .iter_mut()
+                    .zip(&plane[c0..c0 + batch_count])
+                    .zip(&energies[..batch_count])
+                {
+                    out_cell[ch] = f64::from(m) / e;
+                }
+            } else if slots_contig {
+                for ((out_cell, &cell), &e) in comps_out[batch_start..batch_start + batch_count]
+                    .iter_mut()
+                    .zip(&cells[..batch_count])
+                    .zip(&energies[..batch_count])
+                {
+                    out_cell[ch] = f64::from(plane[cell & e_mask]) / e;
+                }
+            } else {
+                for ((&slot, &cell), &e) in slots[..batch_count]
+                    .iter()
+                    .zip(&cells[..batch_count])
+                    .zip(&energies[..batch_count])
+                {
+                    comps_out[slot][ch] = f64::from(plane[cell & e_mask]) / e;
+                }
+            }
+            ch += 1;
         }
     }
     Ok(())
@@ -7088,32 +7207,42 @@ fn spatial_chemistry_prepass_fused(
             // `dot4_channels_pair` saturates all 4 FP add pipelines.
             let comps_ready = &lane.comps[..tile_distinct];
             let halo_map = &lane.halo_to_local[..halo_cells];
+            #[derive(Clone, Copy)]
+            struct HaloGeom {
+                total_cells: usize,
+                x_mask: usize,
+                y_mask: usize,
+                x_shift: u32,
+                x0: usize,
+                y0: usize,
+                halo_w: usize,
+                halo_h: usize,
+                tile_distinct: usize,
+            }
             struct LoadedOrg<'a> {
                 aff: &'a [f64; CHANNELS],
                 budget: EnergyBudget,
                 pkts: [(f64, u32); PACKETS_PER_ORGANISM],
                 n: usize,
             }
-            let load_org = |row_u32: u32| -> Result<LoadedOrg<'_>, CoreError> {
+            #[inline(always)]
+            fn load_org<'a>(
+                row_u32: u32,
+                ordered_slots: &[u32],
+                population: &'a Population,
+                by_demand: &Bins,
+                granted: &[GrantPacket],
+                halo_map: &[u32],
+                geom: HaloGeom,
+            ) -> Result<LoadedOrg<'a>, CoreError> {
                 let row_idx = row_u32 as usize;
                 let phys_slot = ordered_slots[row_idx] as usize;
-                let Some(energy) = population.energy_at_slot(phys_slot) else {
+                let Some((energy, genome)) = population.chemistry_slot_read(phys_slot) else {
                     return Err(CoreError::StateConflict {
                         operation: "fused spatial chemistry prepass",
-                        detail: format!("slot {phys_slot} missing energy"),
+                        detail: format!("slot {phys_slot} missing occupied state"),
                     });
                 };
-                if population.id_at_slot(phys_slot).is_none() {
-                    return Err(CoreError::StateConflict {
-                        operation: "read genome",
-                        detail: format!("slot {phys_slot} vacant"),
-                    });
-                }
-                let (genome, _) = population.genome_and_arena_at_slot(phys_slot);
-                let genome = genome.ok_or_else(|| CoreError::StateConflict {
-                    operation: "read genome",
-                    detail: format!("slot {phys_slot} has no genome"),
-                })?;
                 let bucket = by_demand.bucket(row_idx);
                 if bucket.len() > PACKETS_PER_ORGANISM {
                     return Err(CoreError::StateConflict {
@@ -7132,22 +7261,22 @@ fn spatial_chemistry_prepass_fused(
                                 detail: format!("missing grant packet {at}"),
                             })?;
                     let cell = packet.cell;
-                    if cell >= total_cells {
+                    if cell >= geom.total_cells {
                         return Err(CoreError::LayoutMismatch {
                             buffer: "field",
                             detail: format!("cell {cell} is not in this field"),
                         });
                     }
-                    let dx = (cell & x_mask).wrapping_sub(x0) & x_mask;
-                    let dy = (cell >> x_shift).wrapping_sub(y0) & y_mask;
-                    if dx >= halo_w || dy >= halo_h {
+                    let dx = (cell & geom.x_mask).wrapping_sub(geom.x0) & geom.x_mask;
+                    let dy = (cell >> geom.x_shift).wrapping_sub(geom.y0) & geom.y_mask;
+                    if dx >= geom.halo_w || dy >= geom.halo_h {
                         return Err(CoreError::StateConflict {
                             operation: "fused spatial chemistry prepass",
                             detail: "grant cell fell outside spatial tile halo".to_owned(),
                         });
                     }
-                    let local_idx = halo_map[dy * halo_w + dx];
-                    if (local_idx as usize) >= tile_distinct {
+                    let local_idx = halo_map[dy * geom.halo_w + dx];
+                    if (local_idx as usize) >= geom.tile_distinct {
                         return Err(CoreError::StateConflict {
                             operation: "fused spatial chemistry prepass",
                             detail: "grant cell missing from halo composition map".to_owned(),
@@ -7163,13 +7292,40 @@ fn spatial_chemistry_prepass_fused(
                     pkts,
                     n,
                 })
+            }
+            let geom = HaloGeom {
+                total_cells,
+                x_mask,
+                y_mask,
+                x_shift,
+                x0,
+                y0,
+                halo_w,
+                halo_h,
+                tile_distinct,
             };
 
             let (row_pairs, row_rem) = tile.row_indices.as_chunks::<2>();
             let (out_pairs, out_rem) = tile.out.as_chunks_mut::<2>();
             for (&[row_a, row_b], [out_a, out_b]) in row_pairs.iter().zip(out_pairs.iter_mut()) {
-                let mut a = load_org(row_a)?;
-                let mut b = load_org(row_b)?;
+                let mut a = load_org(
+                    row_a,
+                    ordered_slots,
+                    population,
+                    by_demand,
+                    granted,
+                    halo_map,
+                    geom,
+                )?;
+                let mut b = load_org(
+                    row_b,
+                    ordered_slots,
+                    population,
+                    by_demand,
+                    granted,
+                    halo_map,
+                    geom,
+                )?;
                 if a.n == PACKETS_PER_ORGANISM && b.n == PACKETS_PER_ORGANISM {
                     let (sa, sb) = rules.chemistry.settle_indexed_pair_4(
                         a.aff,
@@ -7200,7 +7356,15 @@ fn spatial_chemistry_prepass_fused(
                 }
             }
             for (&row_u32, out_slot) in row_rem.iter().zip(out_rem.iter_mut()) {
-                let mut org = load_org(row_u32)?;
+                let mut org = load_org(
+                    row_u32,
+                    ordered_slots,
+                    population,
+                    by_demand,
+                    granted,
+                    halo_map,
+                    geom,
+                )?;
                 let settlement = rules.chemistry.settle_indexed_slice(
                     org.aff,
                     &org.pkts[..org.n],
@@ -11286,4 +11450,104 @@ fn settle_stages(
         settled.intent = Some(intent);
     }
     Ok(settled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_tile_compositions;
+    use flife_field::state::CHANNELS;
+    use flife_field::{BufferLimits, FieldGrid, FieldState};
+
+    #[test]
+    fn compute_tile_compositions_matches_scalar_across_contig_row_jumps_sparse_and_zero_energy() {
+        let grid = FieldGrid::new(64, 64, 64.0, 64.0).expect("grid");
+        let limits = BufferLimits::host();
+
+        // Test single-carrier (32 active channels) and dual-carrier (24 active channels).
+        for &(planes, expected_active) in &[(33_u32, 32_usize), (34_u32, 24_usize)] {
+            let mut field = FieldState::zeroed_with_planes(grid, planes, &limits).expect("field");
+            let total_cells = field.energy().len();
+            let active = field.carrier0_moments_count();
+            assert_eq!(active, expected_active, "planes={planes}");
+
+            // Populate field with varied positive and zero energies and non-trivial moments.
+            let mut lcg = 0x1234_5678_9ABC_DEF0_u64;
+            let mut next_f32 = || {
+                lcg = lcg
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((lcg >> 40) as f32) / 16_777_216.0
+            };
+            for c in 0..total_cells {
+                let e = if c % 37 == 0 { 0.0 } else { 0.01 + next_f32() * 5.0 };
+                field.as_mut_slice()[c] = e;
+            }
+            for p in 1..planes as usize {
+                let base = p * total_cells;
+                for c in 0..total_cells {
+                    let sign = if (p + c) % 2 == 0 { 1.0 } else { -1.0 };
+                    field.as_mut_slice()[base + c] = sign * (next_f32() * 0.25);
+                }
+            }
+
+            // Build a mixed index sequence exercising:
+            //  1) long contiguous rows (34 cells -> splits into 32 + 2 at row jump),
+            //  2) short contiguous runs (7 cells) followed by row jump (+64),
+            //  3) sparse non-contiguous cells with small gaps (2..5 apart),
+            //  4) zero-energy cells (c % 37 == 0) interleaved inside contiguous and sparse runs,
+            //  5) tail cells near total_cells - 1.
+            let mut cells: Vec<u32> = Vec::new();
+            // Dense 34-cell row without zeros (avoiding 37*k by starting at 38..72)
+            for c in 38..72 {
+                cells.push(c);
+            }
+            // Row jump to row 2 (130..164)
+            for c in 130..164 {
+                cells.push(c);
+            }
+            // 7-cell contiguous run then row jump (+64)
+            for c in 200..207 {
+                cells.push(c);
+            }
+            // Sparse gaps 2..5 apart (includes multiples of 37 -> zero-energy!)
+            let mut cur = 290_u32;
+            for step in 0..45_u32 {
+                cells.push(cur);
+                cur += 2 + (step % 4);
+            }
+            // Contiguous run containing a zero-energy cell (74 = 2*37)
+            for c in 70..82 {
+                cells.push(c);
+            }
+            // End-of-grid boundary cells
+            for c in (total_cells as u32 - 5)..(total_cells as u32) {
+                cells.push(c);
+            }
+
+            // Pre-poison output buffer to ensure active and inactive channels are written cleanly.
+            let mut got = vec![[f64::NAN; CHANNELS]; cells.len()];
+            compute_tile_compositions(&field, &cells, &mut got).expect("compute");
+
+            let all = field.as_slice();
+            for (idx, &cell_u32) in cells.iter().enumerate() {
+                let c = cell_u32 as usize;
+                let e = f64::from(all[c]);
+                let mut expected = [0.0_f64; CHANNELS];
+                if e > 0.0 {
+                    for ch in 0..active {
+                        expected[ch] = f64::from(all[(ch + 1) * total_cells + c]) / e;
+                    }
+                }
+                for ch in 0..CHANNELS {
+                    assert_eq!(
+                        got[idx][ch].to_bits(),
+                        expected[ch].to_bits(),
+                        "planes={planes} idx={idx} cell={c} ch={ch}: got={} expected={}",
+                        got[idx][ch],
+                        expected[ch]
+                    );
+                }
+            }
+        }
+    }
 }

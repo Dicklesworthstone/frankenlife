@@ -1526,6 +1526,16 @@ impl Population {
         )
     }
 
+    /// Direct O(1) occupied energy and genome read at a physical `slot`
+    /// without touching `arena_slots` (for Phase-6 spatial chemistry).
+    #[inline]
+    pub(crate) fn chemistry_slot_read(&self, slot: usize) -> Option<(f64, &Genome)> {
+        self.occupants.get(slot).copied().flatten()?;
+        let energy = *self.energies.get(slot)?;
+        let genome = self.genomes.get(slot).and_then(Option::as_ref)?;
+        Some((energy, genome))
+    }
+
     /// Whether physical slots `0..self.len()` are densely occupied in exact
     /// ascending identity order (always true under [`Arrangement::Compact`],
     /// and under [`Arrangement::FreeList`] before its first removal).

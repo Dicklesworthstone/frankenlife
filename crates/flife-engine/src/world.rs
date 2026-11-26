@@ -116,10 +116,10 @@ use flife_neural::{
     ActionDecoding, ArenaSlot, ControllerBackend, ControllerJob, ControllerScratch, DecodedActions,
     DualObservation, FlatControllerJob, FlatOutputs, Intrinsic, MAX_ACTION_WIDTH, MAX_SENSOR_WIDTH,
     MAXIMUM_RECURRENT_STATE_WIDTH, Observation, RawOutputs, ReferenceController, SENSOR_WIDTH,
-    SensorLayout, SensorScales, decode_with_layout, observe_dual_for_controller,
-    observe_dual_for_controller_f32_into, observe_dual_gradients_only_into, observe_for_controller,
-    observe_for_controller_f32_into, observe_gradients_only_into, update_recurrent_state,
-    widen_slice,
+    SensorLayout, SensorScales, decode_with_layout, decode_with_layout_f32_into,
+    observe_dual_for_controller, observe_dual_for_controller_f32_into,
+    observe_dual_gradients_only_into, observe_for_controller, observe_for_controller_f32_into,
+    observe_gradients_only_into, update_recurrent_state, widen_slice,
 };
 
 use crate::ancestry::{Ancestry, AncestryHeld, Followed};
@@ -6089,19 +6089,44 @@ fn raw_outputs<'a>(
     Ok(dst)
 }
 
+/// Decode `held` directly into `out`, avoiding per-organism `f64` widening
+/// buffers and 336-byte `DecodedActions` return copies.
+#[inline]
+fn decode_held_into(
+    rules: &Rules,
+    organism: &Organism,
+    held: &HeldOutput,
+    out: &mut DecodedActions,
+) -> Result<(), CoreError> {
+    const ZERO_OUTPUTS: [f32; MAX_ACTION_WIDTH] = [0.0; MAX_ACTION_WIDTH];
+    let outputs = held.outputs().ok_or_else(|| CoreError::StateConflict {
+        operation: "decode held output",
+        detail: format!("{} holds no valid output", organism.id),
+    })?;
+    let len = outputs.len();
+    if len > MAX_ACTION_WIDTH {
+        return Err(CoreError::LayoutMismatch {
+            buffer: "held controller output",
+            detail: format!("output width {len} exceeds maximum {MAX_ACTION_WIDTH}"),
+        });
+    }
+    let slice = if rules.variant.decides_from_zero() {
+        &ZERO_OUTPUTS[..len]
+    } else {
+        outputs
+    };
+    decode_with_layout_f32_into(slice, rules.step, &rules.decoding, &rules.v2.actions(), out)
+}
+
 /// Decode `held` into [`DecodedActions`] for this tick.
 fn decode_held(
     rules: &Rules,
     organism: &Organism,
     held: &HeldOutput,
 ) -> Result<DecodedActions, CoreError> {
-    let outputs = held.outputs().ok_or_else(|| CoreError::StateConflict {
-        operation: "decode held output",
-        detail: format!("{} holds no valid output", organism.id),
-    })?;
-    let mut raw = [0.0_f64; MAX_ACTION_WIDTH];
-    let slice = raw_outputs(rules, outputs, &mut raw)?;
-    decode_with_layout(slice, rules.step, &rules.decoding, &rules.v2.actions())
+    let mut actions = DecodedActions::default();
+    decode_held_into(rules, organism, held, &mut actions)?;
+    Ok(actions)
 }
 
 /// The rest of phase 4 from `gradients`: the held output, newly evaluated or
@@ -8274,7 +8299,7 @@ fn pass1_flat_f32<'p>(
                     )?;
                     dec.held.copy_active_from(&organism.held);
                     dec.evaluated = false;
-                    dec.actions = decode_held(rules, organism, &organism.held)?;
+                    decode_held_into(rules, organism, &organism.held, &mut dec.actions)?;
                 }
             }
             return Ok(());
@@ -8381,7 +8406,7 @@ fn pass1_flat_f32<'p>(
                     )?;
                     dec.held.copy_active_from(&organism.held);
                     dec.evaluated = false;
-                    dec.actions = decode_held(rules, organism, &organism.held)?;
+                    decode_held_into(rules, organism, &organism.held, &mut dec.actions)?;
                 }
                 Ok(())
             })?;
@@ -8447,7 +8472,7 @@ fn pass1_flat_f32<'p>(
                 encode_gradients_only_into(rules, organism, &raw, from, &mut dec.gradients)?;
                 dec.held = organism.held;
                 dec.evaluated = false;
-                dec.actions = decode_held(rules, organism, &organism.held)?;
+                decode_held_into(rules, organism, &organism.held, &mut dec.actions)?;
             }
         }
         return Ok(());
@@ -8541,7 +8566,7 @@ fn pass1_flat_f32<'p>(
                 encode_gradients_only_into(rules, organism, raw, from, &mut dec.gradients)?;
                 dec.held = organism.held;
                 dec.evaluated = false;
-                dec.actions = decode_held(rules, organism, &organism.held)?;
+                decode_held_into(rules, organism, &organism.held, &mut dec.actions)?;
             }
             Ok(())
         })?;
@@ -8749,7 +8774,7 @@ fn pass1_flat_f32_spatial<'p>(
                     )?;
                     dec.held.copy_active_from(&organism.held);
                     dec.evaluated = false;
-                    dec.actions = decode_held(rules, organism, &organism.held)?;
+                    decode_held_into(rules, organism, &organism.held, &mut dec.actions)?;
                 }
                 Ok(())
             })?;
@@ -8786,7 +8811,7 @@ fn pass1_flat_f32_spatial<'p>(
                     encode_gradients_only_into(rules, organism, raw, from, &mut dec.gradients)?;
                     dec.held.copy_active_from(&organism.held);
                     dec.evaluated = false;
-                    dec.actions = decode_held(rules, organism, &organism.held)?;
+                    decode_held_into(rules, organism, &organism.held, &mut dec.actions)?;
                 }
                 Ok(())
             })?;
@@ -9208,7 +9233,12 @@ fn decide_batched_flat_f32(
                                     )?;
                                 }
                             }
-                            decision.actions = decode_held(rules, organism, &decision.held)?;
+                            decode_held_into(
+                                rules,
+                                organism,
+                                &decision.held,
+                                &mut decision.actions,
+                            )?;
                             job_idx += 1;
                         }
                         Ok(())
@@ -9447,7 +9477,7 @@ fn decide_batched_flat_f32(
                             )?;
                         }
                     }
-                    decision.actions = decode_held(rules, organism, &decision.held)?;
+                    decode_held_into(rules, organism, &decision.held, &mut decision.actions)?;
                     job_idx += 1;
                 }
                 Ok(())

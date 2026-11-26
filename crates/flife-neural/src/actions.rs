@@ -866,3 +866,212 @@ pub fn decode_with_layout(
         wake_pump,
     })
 }
+
+/// In-place F32-input counterpart to [`decode_with_layout`], writing directly
+/// into `out` to eliminate per-organism `f64` widening buffers (`384 B`),
+/// closed-gate emission-direction norm work, and `DecodedActions` return-value
+/// copies (`336 B`).
+///
+/// Bit-identical (0 ULP) to widening `raw` to `f64` and calling
+/// [`decode_with_layout`]: because every finite `f32` satisfies
+/// `32 * f32::MAX² << f64::MAX`, the 32-channel emission norm can never
+/// overflow `f64::MAX`, so closed-gate organisms (`emission_gate <= threshold`)
+/// skip direction normalization identically.
+///
+/// # Errors
+/// As [`decode_with_layout`]. On error, `out` is left unchanged.
+#[inline]
+pub fn decode_with_layout_f32_into(
+    raw: &[f32],
+    step: TimeStep,
+    decoding: &ActionDecoding,
+    layout: &ActionLayout,
+    out: &mut DecodedActions,
+) -> Result<(), CoreError> {
+    let required = layout.action_width();
+    if raw.len() < required {
+        return Err(err_short_outputs(required, raw.len()));
+    }
+    if let Some((index, &value)) = raw.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+        return Err(err_nonfinite_output(index, f64::from(value)));
+    }
+    let output = |index: usize| raw.get(index).copied().map_or(0.0, f64::from);
+    let squash = |index: usize| sigmoid(output(index)).ok_or_else(|| err_sigmoid_undefined(index));
+    let interval = |rate: f64| {
+        expm1_neg(rate * step.seconds_per_tick()).ok_or_else(|| err_rate_out_of_range(rate))
+    };
+
+    let (sig_repro, sig_child, emission_gate, sig_spend) = match sigmoid_4([
+        output(REPRODUCTION),
+        output(CHILD_SHARE),
+        output(EMISSION_GATE),
+        output(EMISSION_SPEND),
+    ]) {
+        Some([r, c, g, s]) => (r, c, g, Some(s)),
+        None => (
+            squash(REPRODUCTION)?,
+            squash(CHILD_SHARE)?,
+            squash(EMISSION_GATE)?,
+            None,
+        ),
+    };
+
+    let attempt_rate = decoding.maximum_attempt_rate * sig_repro;
+    let attempt_probability = interval(attempt_rate)?;
+    let span = decoding.maximum_child_fraction - decoding.minimum_child_fraction;
+    let child_fraction = (decoding.minimum_child_fraction + span * sig_child).clamp(
+        decoding.minimum_child_fraction,
+        decoding.maximum_child_fraction,
+    );
+
+    let motor = match layout.motor_slots() {
+        Some(slots) => {
+            let start = slots.start;
+            Some(MotorSteering::decode([
+                output(start),
+                output(start + 1),
+                output(start + 2),
+                output(start + 3),
+            ])?)
+        }
+        None => None,
+    };
+    let budding = match layout.budding_slots() {
+        Some(slots) => {
+            let start = slots.start;
+            Some(BuddingSteering::decode([output(start), output(start + 1)])?)
+        }
+        None => None,
+    };
+    let emt_gate = match layout.emt_slot() {
+        Some(slot) => Some(squash(slot)?),
+        None => None,
+    };
+    let wake_pump = match layout.pump_slot() {
+        Some(slot) => Some(tanh(output(slot)).ok_or_else(|| err_wake_pump_undefined(slot))?),
+        None => None,
+    };
+
+    // Only compute the 32-channel norm and unit direction when the emission
+    // gate is open; finite `f32` inputs cannot overflow `f64` norm.
+    if emission_gate > decoding.gate_threshold {
+        let dir_raw = &raw[EMISSION_DIRECTION..EMISSION_DIRECTION + CHANNELS];
+        let mut squared = 0.0_f64;
+        for &raw_c in dir_raw {
+            let c = f64::from(raw_c);
+            squared += c * c;
+        }
+        let norm = squared.sqrt();
+        if !norm.is_finite() {
+            return Err(err_direction_overflow());
+        }
+        if norm > decoding.direction_zero_threshold && norm > 0.0 {
+            let spend_sig = match sig_spend {
+                Some(s) => s,
+                None => squash(EMISSION_SPEND)?,
+            };
+            let spend_fraction = interval(decoding.maximum_spend_rate * spend_sig)?;
+            let mut unit = [0.0_f64; CHANNELS];
+            for (dst, &raw_c) in unit.iter_mut().zip(dir_raw) {
+                *dst = f64::from(raw_c) / norm;
+            }
+            let shrink = 1.0 - f64::EPSILON / 2.0;
+            let mut within_unit = false;
+            for _ in 0..64 {
+                let mut sum_sq = 0.0_f64;
+                for &u in &unit {
+                    sum_sq += u * u;
+                }
+                if sum_sq <= 1.0 {
+                    within_unit = true;
+                    break;
+                }
+                for u in &mut unit {
+                    *u *= shrink;
+                }
+            }
+            if !within_unit {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "source chemical direction",
+                    detail: "could not bring ||a|| within 1".into(),
+                });
+            }
+            out.attempt_rate = attempt_rate;
+            out.attempt_probability = attempt_probability;
+            out.child_fraction = child_fraction;
+            out.emission_gate = emission_gate;
+            match out.emission.as_mut() {
+                Some(existing) => {
+                    existing.direction = unit;
+                    existing.spend_fraction = spend_fraction;
+                }
+                None => {
+                    out.emission = Some(Emission {
+                        direction: unit,
+                        spend_fraction,
+                    });
+                }
+            }
+            out.motor = motor;
+            out.budding = budding;
+            out.emt_gate = emt_gate;
+            out.wake_pump = wake_pump;
+            return Ok(());
+        }
+    }
+
+    out.attempt_rate = attempt_rate;
+    out.attempt_probability = attempt_probability;
+    out.child_fraction = child_fraction;
+    out.emission_gate = emission_gate;
+    out.emission = None;
+    out.motor = motor;
+    out.budding = budding;
+    out.emt_gate = emt_gate;
+    out.wake_pump = wake_pump;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_with_layout_f32_into_matches_decode_with_layout_bit_for_bit() {
+        let decoding = ActionDecoding::new(1.5, [0.2, 0.7], 0.5, 0.8, 1.0e-6).expect("decoding");
+        let step = TimeStep::new(1, 128).expect("step");
+        let layout = ActionLayout::v1();
+
+        let mut open = [0.0_f32; ACTION_WIDTH];
+        open[REPRODUCTION] = 0.75;
+        open[CHILD_SHARE] = -0.3;
+        open[EMISSION_GATE] = 1.2; // sigmoid(1.2) > 0.5 -> open
+        open[EMISSION_SPEND] = 0.4;
+        for c in 0..CHANNELS {
+            open[EMISSION_DIRECTION + c] = (((c as f32) * 0.61 - 3.3).sin()) * 1.7;
+        }
+        let open_f64: Vec<f64> = open.iter().copied().map(f64::from).collect();
+        let ref_open = decode_with_layout(&open_f64, step, &decoding, &layout).expect("ref open");
+        let mut out = DecodedActions::default();
+        decode_with_layout_f32_into(&open, step, &decoding, &layout, &mut out).expect("into open");
+        assert_eq!(out, ref_open);
+
+        // Now decode a closed-gate vector into the SAME `out` (which currently has Some(emission)).
+        let mut closed = open;
+        closed[EMISSION_GATE] = -1.5; // sigmoid(-1.5) < 0.5 -> closed
+        let closed_f64: Vec<f64> = closed.iter().copied().map(f64::from).collect();
+        let ref_closed =
+            decode_with_layout(&closed_f64, step, &decoding, &layout).expect("ref closed");
+        decode_with_layout_f32_into(&closed, step, &decoding, &layout, &mut out)
+            .expect("into closed");
+        assert_eq!(out, ref_closed);
+        assert!(out.emission.is_none());
+
+        // Error case leaves `out` untouched.
+        let snapshot = out;
+        let mut bad = open;
+        bad[5] = f32::NAN;
+        assert!(decode_with_layout_f32_into(&bad, step, &decoding, &layout, &mut out).is_err());
+        assert_eq!(out, snapshot);
+    }
+}

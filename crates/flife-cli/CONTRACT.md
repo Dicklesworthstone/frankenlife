@@ -74,8 +74,9 @@ texel scratch) into `MemoryAdmission::render` before creating a run directory or
 - `flife run <config> --ticks N --every K --cpu-workers W --controllers C`, with N = 1,024, K = 128, W from the
   configuration and C = `auto` by default. C is `cpu` (the reference alone), `torch` (FrankenTorch's CPU kernel on
   the world's workers, `flife-backend-cpu`), `metal` (refused without a Metal device) or `auto` (Metal where the host has it and W ≤ `AUTO_METAL_MAX_WORKERS` = 16,
-  otherwise `torch` at W ≤ `AUTO_TORCH_MAX_WORKERS` = 64 or, on Apple silicon (`TORCH_AT_SCALE`), for a world of at
-  least `AUTO_TORCH_MIN_ORGANISMS` = 25,000 organisms when its controllers are chosen, otherwise the reference). `flife
+  otherwise `torch` at W ≤ `AUTO_TORCH_MAX_WORKERS` = 64 on Apple silicon (`TORCH_AT_SCALE`) and W ≤
+  `AUTO_TORCH_MAX_WORKERS_ELSEWHERE` = 4 on other hosts, or, on Apple silicon, for a world of at least
+  `AUTO_TORCH_MIN_ORGANISMS` = 25,000 organisms when its controllers are chosen, otherwise the reference). `flife
   render` takes the same `--controllers`. The founders are made on the W workers (FL-034, `found_on`, through
   `flife_engine::World::found_on`), the same world as on one.
 - In the library, `run(config, RunOptions { ticks, every, cpu_workers, controllers }, emit)`. `emit` receives every

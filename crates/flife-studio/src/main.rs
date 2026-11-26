@@ -133,8 +133,8 @@ struct Cli {
     /// Where due controllers are evaluated: `metal`, `cpu` (the reference),
     /// `torch` (FrankenTorch's CPU kernel on the world's workers), or `auto`
     /// (the default): Metal where this host has it and the world uses at
-    /// most 16 CPU workers, else `torch` at most 64 or, on Apple silicon, from
-    /// 25,000 organisms. No result depends on it.
+    /// most 16 CPU workers, else `torch` at most 64 on Apple silicon (4
+    /// elsewhere) or, there, from 25,000 organisms. No result depends on it.
     #[arg(long, default_value = "auto")]
     controllers: ControllerChoice,
     /// What the organisms' colour means: `lineage`, `energy`, `generation`,

@@ -3475,8 +3475,9 @@ pub enum ControllerChoice {
     Metal,
     /// Metal where this host has a Metal device and the world runs on at
     /// most [`AUTO_METAL_MAX_WORKERS`] CPU workers; otherwise
-    /// [`ControllerChoice::Torch`] on at most [`AUTO_TORCH_MAX_WORKERS`], or,
-    /// where [`TORCH_AT_SCALE`], for a world of at least
+    /// [`ControllerChoice::Torch`] on at most [`AUTO_TORCH_MAX_WORKERS`] where
+    /// [`TORCH_AT_SCALE`] ([`AUTO_TORCH_MAX_WORKERS_ELSEWHERE`] on other
+    /// hosts), or, where [`TORCH_AT_SCALE`], for a world of at least
     /// [`AUTO_TORCH_MIN_ORGANISMS`]; otherwise the CPU reference.
     #[default]
     Auto,
@@ -3502,7 +3503,9 @@ pub enum ControllerChoice {
 pub const AUTO_METAL_MAX_WORKERS: usize = 16;
 
 /// The most CPU workers at which [`ControllerChoice::Auto`] takes
-/// FrankenTorch's CPU route where it does not take Metal (FL-025). With
+/// FrankenTorch's CPU route where it does not take Metal (FL-025), on a host
+/// where [`TORCH_AT_SCALE`]; other hosts use
+/// [`AUTO_TORCH_MAX_WORKERS_ELSEWHERE`]. With
 /// `ControllerBackend::evaluate_flat_f32` and the persistent private worker
 /// pool, measured on an Apple M5 Ultra (`phase_profile`, bit-exact digests,
 /// 2026-11-23), `Torch` beats the scalar CPU reference across 8, 12 and 16
@@ -3513,6 +3516,18 @@ pub const AUTO_METAL_MAX_WORKERS: usize = 16;
 /// `cpu 181.82 / 147.12 / 140.03 ms/t` (1.19x / 1.11x / 1.16x) — as well as
 /// 1–4 workers on both macOS (1.62x / 1.26x) and Linux x86-64 (1.41x / 1.11x).
 pub const AUTO_TORCH_MAX_WORKERS: usize = 64;
+
+/// [`AUTO_TORCH_MAX_WORKERS`] on a host where [`TORCH_AT_SCALE`] does not
+/// hold: there FrankenTorch's CPU route measured faster than the reference
+/// only at one and four workers (Linux x86-64, 2026-11-10: 1.41x and 1.11x,
+/// and 0.91x at eight). Measured again on Linux x86-64 at `f938485`
+/// (2026-11-26, `tick_throughput 16 16 8 32`, founding worlds, the same
+/// digests): on an AMD Threadripper PRO 5975WX at 16 workers, 0.86x and
+/// 0.84x at 100,000 organisms (no block faster, every cv at most 2.9%) and
+/// 0.93x at 25,000 (no block faster, cv 3.6% and 5.2%); 1.04x at 4,096 on
+/// 8 workers and, on an AMD EPYC 7282, 1.09x at 25,000 and 1.05x at 4,096 on
+/// 16, each with a cv above 5%, so not admissibly faster.
+pub const AUTO_TORCH_MAX_WORKERS_ELSEWHERE: usize = 4;
 
 /// The fewest organisms at which [`ControllerChoice::Auto`] takes
 /// FrankenTorch's CPU route on any number of CPU workers where it does not
@@ -3531,11 +3546,13 @@ pub const AUTO_TORCH_MAX_WORKERS: usize = 64;
 ///   cv at most 1.9%. So the floor holds only where it was measured faster.
 pub const AUTO_TORCH_MIN_ORGANISMS: usize = 25_000;
 
-/// Whether [`AUTO_TORCH_MIN_ORGANISMS`] applies on this build's host: on
-/// Apple silicon under macOS, where FrankenTorch's CPU route measured faster
-/// than the reference at scale on any number of workers. Its kernel is a
-/// CPU kernel, so this is the CPU's property, not the Metal device's. On
-/// Linux x86-64 it measured slower there, and other hosts are unmeasured.
+/// Whether [`AUTO_TORCH_MIN_ORGANISMS`] and [`AUTO_TORCH_MAX_WORKERS`] apply
+/// on this build's host: on Apple silicon under macOS, where FrankenTorch's
+/// CPU route measured faster than the reference at scale on any number of
+/// workers, and on up to 16 workers for smaller worlds. Its kernel is a CPU
+/// kernel, so this is the CPU's property, not the Metal device's. On Linux
+/// x86-64 it measured slower at scale on 16 workers, and other hosts are
+/// unmeasured; they take [`AUTO_TORCH_MAX_WORKERS_ELSEWHERE`].
 pub const TORCH_AT_SCALE: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
 
 impl ControllerChoice {
@@ -3549,8 +3566,10 @@ impl ControllerChoice {
 
     /// The rule on any kind of host: Metal up to [`AUTO_METAL_MAX_WORKERS`]
     /// where there is a device; otherwise `torch` up to
-    /// [`AUTO_TORCH_MAX_WORKERS`], or from [`AUTO_TORCH_MIN_ORGANISMS`] where
-    /// `torch_at_scale`; otherwise the CPU reference.
+    /// [`AUTO_TORCH_MAX_WORKERS`] where `torch_at_scale` and
+    /// [`AUTO_TORCH_MAX_WORKERS_ELSEWHERE`] where not, or from
+    /// [`AUTO_TORCH_MIN_ORGANISMS`] where `torch_at_scale`; otherwise the CPU
+    /// reference.
     #[must_use]
     pub const fn auto_on(
         cpu_workers: usize,
@@ -3558,9 +3577,14 @@ impl ControllerChoice {
         torch_at_scale: bool,
         organisms: usize,
     ) -> Self {
+        let torch_workers = if torch_at_scale {
+            AUTO_TORCH_MAX_WORKERS
+        } else {
+            AUTO_TORCH_MAX_WORKERS_ELSEWHERE
+        };
         if metal_device && cpu_workers <= AUTO_METAL_MAX_WORKERS {
             Self::Metal
-        } else if cpu_workers <= AUTO_TORCH_MAX_WORKERS
+        } else if cpu_workers <= torch_workers
             || (torch_at_scale && organisms >= AUTO_TORCH_MIN_ORGANISMS)
         {
             Self::Torch

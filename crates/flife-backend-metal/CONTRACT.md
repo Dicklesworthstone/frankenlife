@@ -178,12 +178,15 @@ about 1–3% of the all-Metal tick (the whole tick's frontier and profile, below
   `[7/8]` `tanh` + Phase 5–6 CPU↔GPU overlap, Metal measured faster than both scalar CPU and `torch` across 1–16
   workers on all tested presets on Apple M5 Ultra, 2026-11-26: 1.04×–1.77× over `torch` at 16 workers, 1.27×–1.65×
   at 8 workers, bit-exact digests; shared-host measurements). Above 16 workers, or without a Metal device, `auto`
-  selects `torch` up to `AUTO_TORCH_MAX_WORKERS` = 64 workers.
+  selects `torch` up to `AUTO_TORCH_MAX_WORKERS` = 64 workers on Apple silicon (`TORCH_AT_SCALE`), where it
+  measured faster than the reference on 8, 12 and 16 workers (2026-11-23), and up to
+  `AUTO_TORCH_MAX_WORKERS_ELSEWHERE` = 4 on other hosts, where it measured faster only on one and four (Linux
+  x86-64, 2026-11-10) and slower on eight and sixteen (the table below).
 - On Apple silicon (`TORCH_AT_SCALE`, a build for macOS on aarch64) it also takes `torch` on any number of workers
   for a world of at least `AUTO_TORCH_MIN_ORGANISMS` = 25,000 organisms, counted live when its controllers are
   chosen. There the controllers are most of the tick.
 - The floor was measured with `tick_throughput` on 16 workers, over ticks 32 to 160 of founding worlds, two
-  invocations each with the same digests:
+  invocations each with the same digests (2026-11-15):
 
   | Host | Route | 25,000 organisms | 100,000 organisms |
   |---|---|---|---|
@@ -194,6 +197,23 @@ about 1–3% of the all-Metal tick (the whole tick's frontier and profile, below
   On the M5 every cv was at most 2.4%. On Linux every cv was at most 1.9%, and no block was faster. FrankenTorch's
   kernel is a CPU kernel, so the floor is the CPU's property, not the Metal device's. It holds only where it was
   measured faster; other hosts are unmeasured.
+- Linux x86-64 again at `f938485` (2026-11-26, RCH workers, `tick_throughput W 16 8 32 cpu,torch` on the clean
+  tree, the same digests after every block, nothing deferred). Each row is one invocation; only the ratio within
+  a row compares. A row shows `torch` faster only if both cvs are at most 5% and the median of its 8 per-block
+  ratios is at least 1.02:
+
+  | Worker | W | World | reference | `torch` | Blocks faster | Admissible |
+  |---|---|---|---|---|---|---|
+  | ts1 (Threadripper PRO 5975WX) | 16 | Desktop ecology, 100,089 | 5.108 t/s (cv 2.84%) | 4.391 (cv 1.88%), 0.86× | 0 of 8 | yes: slower |
+  | ts1 | 16 | Desktop ecology, 100,089 | 5.190 (cv 2.09%) | 4.368 (cv 1.66%), 0.84× | 0 of 8 | yes: slower |
+  | ts1 | 16 | Interactive, 25,021 | 21.843 (cv 3.58%) | 20.301 (cv 5.2%), 0.93× | 0 of 8 | no |
+  | hz4 (EPYC 7282) | 16 | Interactive, 25,021 | 20.116 (cv 6.33%) | 21.861 (cv 8.49%), 1.09× | 6 of 8 | no |
+  | hz4 | 16 | reference preset, 4,095 | 92.695 (cv 8.45%) | 97.169 (cv 8.1%), 1.05× | 6 of 8 | no |
+  | ts1 | 8 | reference preset, 4,095 | 91.794 (cv 2.97%) | 95.821 (cv 5.65%), 1.04× | 7 of 8 | no |
+
+  So off Apple silicon `torch` is admissibly faster only at one and four workers (2026-11-10), and admissibly slower
+  at eight (2026-11-10) and at 16 on 100,000 organisms. `auto` takes it there at up to
+  `AUTO_TORCH_MAX_WORKERS_ELSEWHERE` = 4 workers.
 - `ControllerChoice::auto_on(cpu_workers, metal_device, torch_at_scale, organisms)` states the rule for any kind
   of host, and `auto_for(cpu_workers, metal_device, organisms)` applies it with this build's `TORCH_AT_SCALE`.
 - Test `tests/world.rs::auto_takes_metal_only_up_to_its_worker_ceiling` checks:
@@ -1471,9 +1491,9 @@ per-pass thread spawning (6%).
 - A command's kernels run serially, so a population past one shard per topology pays 0.1–0.2 ms a tick per extra
   shard. Dispatching shards concurrently, since they write disjoint rows, would remove that; FrankenTorch's batch has
   only a serial encoder.
-- `auto`'s Metal ceiling (8 workers) was measured against the reference, not against `torch`. On the FL-026 tree at
-  eight workers, `torch` ran 1.06× faster than Metal in one admissible row. The ceiling against `torch` is not
-  re-measured. FL-029's batched submission is now in place.
+- `auto`'s Metal ceiling (16 workers) was measured against `torch` on a shared M5 Ultra under other load
+  (2026-11-26), not held to the 5% cv bar. Between 16 and 64 workers on Apple silicon, `torch` below 25,000
+  organisms is not measured against the reference.
 - FL-029 gaps:
   - Submission is still synchronous: `submit_batch` returns once the command buffer completes, and the calling
     thread waits for it. The owner's bind/release split is where an asynchronous completion would plug in

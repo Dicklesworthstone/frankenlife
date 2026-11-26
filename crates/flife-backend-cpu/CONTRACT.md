@@ -14,8 +14,9 @@ in frankentorch, added for this item. This crate is `forbid(unsafe_code)`.
 - The composition root selects it with `--controllers torch` (`flife run`, `render`, `resume`, `experiment` and
   `flife-studio`): `flife_backend_metal::ControllerChoice::Torch`, whose `backend(cpu_workers, organisms, budget)`
   gives this backend on that many lanes, on any host. `auto` selects `torch` whenever Metal is not selected and
-  `cpu_workers <= AUTO_TORCH_MAX_WORKERS` (64), or on Apple Silicon (`TORCH_AT_SCALE`) for worlds with at least
-  `AUTO_TORCH_MIN_ORGANISMS` (25,000) live organisms.
+  `cpu_workers <= AUTO_TORCH_MAX_WORKERS` (64) on Apple Silicon (`TORCH_AT_SCALE`) or
+  `cpu_workers <= AUTO_TORCH_MAX_WORKERS_ELSEWHERE` (4) on other hosts, or on Apple Silicon for worlds with at
+  least `AUTO_TORCH_MIN_ORGANISMS` (25,000) live organisms.
 - `ControllerBackend::evaluate_flat_f32` (`supports_flat_f32() == true`) accepts pre-narrowed flat F32 inputs and
   writes directly into `FlatOutputs` with zero `f64 -> f32` narrowing and zero `Option<RawOutputs>` allocation.
 - FL-043: a `flife_neural::BackendBudget` (bytes, and the organisms the world can hold), at construction:
@@ -146,10 +147,13 @@ On Linux x86-64 (RCH workers, 2026-11-10, `tick_throughput -- W 20 8 40 cpu,torc
 | 8 | 28.97 (cv 3.47%) | 26.31 (cv 2.89%), 0.91× | hz3 (64 CPUs) |
 
 The rows ran on different workers, so only the ratio within a row compares. Every row is admissible. `torch` is
-faster at one and four workers on both hosts and slower at eight on Linux, so `auto` takes it where it does not
-take Metal, at up to `AUTO_TORCH_MAX_WORKERS` = 4 workers (`flife-backend-metal`). Two and three workers were not
-measured. The ceiling assumes that they lie between one and four, where the ratio fell from 1.41× to 1.11× on
-Linux and from 1.62× to 1.26× on macOS.
+faster at one and four workers on both hosts and slower at eight on Linux. On 16 workers at `f938485`
+(2026-11-26) it was slower again on ts1: 0.86× and 0.84× on the Desktop ecology preset's 100,089 organisms, no
+block faster and every cv at most 2.9% (`flife-backend-metal`'s contract has all six rows). So off Apple silicon
+`auto` takes it where it does not take Metal at up to `AUTO_TORCH_MAX_WORKERS_ELSEWHERE` = 4 workers
+(`flife-backend-metal`). On Apple silicon, where it measured faster on 8, 12 and 16 workers, the ceiling is
+`AUTO_TORCH_MAX_WORKERS` = 64. Two and three workers were not measured. The ceiling assumes that they lie between
+one and four, where the ratio fell from 1.41× to 1.11× on Linux and from 1.62× to 1.26× on macOS.
 
 **Validity domain.** The `dense-104-36-v1` catalog's shapes, the reference F32 profile, any CPU Rust targets.
 
@@ -161,8 +165,8 @@ Linux and from 1.62× to 1.26× on macOS.
   tick commit (FL-043, `tests/forward.rs::empty_shards_are_reclaimed_when_slots_retire`). Partially occupied shards
   remain allocated until their last occupant retires or `forget` runs.
 - Packing a newborn's parameters is a copy and a transpose, once per genome.
-- `auto` takes this backend only on a host without Metal, at up to four workers. The crossover between four and
-  eight workers is not measured more finely. The loss at eight is not profiled; the next gap gives the hypothesis
+- Off Apple silicon `auto` takes this backend at up to four workers. The crossover between four and eight workers
+  is not measured more finely. The loss at eight is not profiled; the next gap gives the hypothesis
   for many workers.
 - At 16 workers the batched path is no faster than the reference's own lanes. Observing on the lanes, building the
   jobs, evaluating and deciding each split the batch again, so a tick pays for three sets of threads.

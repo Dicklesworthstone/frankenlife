@@ -666,32 +666,35 @@ Every style renders the same world: nine styles of one 1,200-tick render all end
 
 `--controllers metal` evaluates the organisms' controllers on the Mac's GPU, `torch` on FrankenTorch's serial CPU
 population kernel on the world's own workers (FL-025, any host), and `cpu` keeps them on the CPU reference; `metal`
-refuses to run without a Metal device. `auto` (the default) takes Metal where the host has it and
-the world uses at most 8 CPU workers, where it measured faster (2.2× on one worker, 1.7× on two, 1.3× on four, 1.1×
-on eight). On a host without Metal it takes `torch` at up to 4 workers, where Linux measured it 1.41× on one worker
-and 1.11× on four (0.91× on eight). On Apple silicon it also takes `torch` on any number of workers for a world of
-at least 25,000 organisms, where the controllers are most of the tick. On 16 workers of an M5 Ultra, `torch` measured
-1.02–1.03× the reference at 25,000 and 1.09–1.15× at 100,000. Linux x86-64 measured it 0.76–0.88× at 25,000 and 0.80× at 100,000,
-so Linux keeps the reference (`flife-backend-metal`'s contract has the runs). Whatever the choice and the `--cpu-workers`
-count, the world is the same bit for bit; the run's `start` record names the backend and `end` counts what it
-evaluated. Measured over 512 ticks of the preset on an M5 Ultra under other load (median of three interleaved
-runs, cv ≤ 2.5%), with all 4,096 founders alive:
+refuses to run without a Metal device. `auto` (the default) takes Metal where the host has it and the world uses at
+most 16 CPU workers. With the F16 weights packed for the GPU (`6980c2f`) and the CPU's Phase 5 and fused chemistry
+running while the GPU evaluates (`99962d9`), Metal measured 1.04–1.77× `torch` on 16 workers across seven presets
+and 1.27–1.65× on eight (M5 Ultra under other load, 2026-11-26, not held to the 5% cv bar). Otherwise `auto` takes
+`torch` at up to 64 workers on Apple silicon, where it measured faster than the reference on 8, 12 and 16 workers,
+and at up to 4 elsewhere, where Linux x86-64 measured it faster only on one and four (below). On Apple silicon it
+also takes `torch` on any number of workers for a world of at least 25,000 organisms, where the controllers are
+most of the tick: on 16 workers of an M5 Ultra it measured 1.02–1.03× the reference at 25,000 and 1.09–1.15× at
+100,000 (`flife-backend-metal`'s contract has the runs). Whatever the choice and the `--cpu-workers` count, the
+world is the same bit for bit; the run's `start` record names the backend and `end` counts what it evaluated.
+Before `99962d9`, measured over 512 ticks of the preset on an M5 Ultra under other load (median of three
+interleaved runs, cv ≤ 2.5%), with all 4,096 founders alive:
 
 | `--cpu-workers` | `--controllers cpu` | `--controllers metal` |
 |---|---|---|
 | 1 | 41 ms per tick | 18 ms per tick |
 | 16 | 12.9 ms per tick | 13.7 ms per tick |
 
-On one worker the controllers are about three quarters of a tick, and the GPU halves it. On 16 workers they are
-already spread thin, and the tick is bound by its serial phases (chemistry, uptake, deposits, invariant checks).
-There the GPU frees CPU cores but does not shorten the tick, so `auto` stays on the CPU there. The Studio, whose
-presentation uses the same GPU, measured slower with Metal under FrankenManim `dfdc7d18` (72 against 119 ticks per
-second). With `f401a947`'s lighter Metal frames it is level: 132 against 120 at 960×540 and 152 against 161 at
-1,920×1,080, four interleaved runs each.
+On one worker the controllers are about three quarters of a tick, and the GPU halves it. On 16 workers they were
+already spread thin, and the tick was bound by its serial phases (chemistry, uptake, deposits, invariant checks).
+There the GPU freed CPU cores but did not shorten the tick until `99962d9` ran Phase 5 and the chemistry during
+its evaluation. The Studio, whose presentation uses the same GPU, measured slower with Metal under FrankenManim
+`dfdc7d18` (72 against 119 ticks per second). With `f401a947`'s lighter Metal frames it is level: 132 against 120
+at 960×540 and 152 against 161 at 1,920×1,080, four interleaved runs each.
 
-`torch` measured in one process next to the reference and Metal (`flife-backend-metal`'s `tick_throughput`
-example: eight 20-tick blocks per world in rotating order after 40 warm-up ticks, the digests equal after every
-block, nothing deferred; M5 Ultra under other load). Whole ticks against the reference:
+Before the packed weights and the overlap, `torch` measured in one process next to the reference and Metal
+(`flife-backend-metal`'s `tick_throughput` example: eight 20-tick blocks per world in rotating order after 40
+warm-up ticks, the digests equal after every block, nothing deferred; M5 Ultra under other load). Whole ticks
+against the reference:
 
 | `--cpu-workers` | `torch` | `metal` |
 |---|---|---|
@@ -703,8 +706,10 @@ block, nothing deferred; M5 Ultra under other load). Whole ticks against the ref
 At 8 and 16 workers the samples varied by more than 5%, so those rows show no admissible difference. On one
 worker Metal is clearly faster than `torch`. On four it led by 5% while its own samples varied by 5.1%. So `auto`
 keeps Metal where the host has it. On Linux x86-64 (one invocation per worker count, every row's cv at most 4.5%)
-`torch` was 1.41× on one worker, 1.11× on four and 0.91× on eight. So without Metal `auto` takes `torch` at up to
-four workers (`flife-backend-cpu`'s contract has the rows).
+`torch` was 1.41× on one worker, 1.11× on four and 0.91× on eight. On 16 workers at `f938485` (2026-11-26) it was
+0.86× and 0.84× on the Desktop ecology preset's 100,089 organisms, with no block faster and every cv at most 2.9%,
+and no run on 16 or 8 workers showed it admissibly faster. So off Apple silicon `auto` takes `torch` at up to
+four workers (`flife-backend-cpu`'s and `flife-backend-metal`'s contracts have the rows).
 
 `flife render` encodes each frame's PNG on its own thread (up to four at once) while the world steps and the next
 frame draws. The files are byte-identical to encoding them one by one, and 128 ticks at every second tick, 1,280²,

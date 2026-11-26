@@ -388,11 +388,11 @@ directory, with its pending commands and its checkpoint chain.
   the schedule again from its end. M is `lineage`, `energy`, `generation`, `motion` or
   `topology` (or a registered name such as `founder-lineage-v1`); the default is the configuration's
   `[presentation] color_mapping`. C is
-  `cpu`, `torch`, `metal` or `auto` (the default), as for `flife run`: `auto` takes the Metal controllers only at W ≤ 8, and
-  otherwise `torch` at W ≤ 4 or, on Apple silicon, for a world of at least 25,000 organisms. The Studio's default W
-  is one per core up to 16, so on a Mac with more than 8 cores a world below 25,000 organisms runs its controllers
-  on the CPU reference by default, and the Interactive and Desktop ecology presets on `torch`; on Linux with more
-  than 4 workers every world's controllers run on the reference. With 16 workers Metal
+  `cpu`, `torch`, `metal` or `auto` (the default), as for `flife run`: `auto` takes the Metal controllers at W ≤ 16, and
+  otherwise `torch` at W ≤ 64 on Apple silicon and W ≤ 4 elsewhere, or, on Apple silicon, for a world of at least
+  25,000 organisms. The Studio's default W is one per core up to 16, so on a Mac every world's controllers run on
+  Metal by default; on Linux with more than 4 workers every world's controllers run on the reference. Before the
+  Phase 5–6 overlap (`99962d9`), with 16 workers Metal
   measured slower in the Studio under FrankenManim `dfdc7d18` (72 against 119 ticks per second, one 12 s run each),
   with presentation on the same GPU, and level under `f401a947` (132 against 120 at 960×540, 152 against 161 at
   1,920×1,080, four interleaved 10 s runs each). It paces frames to `[presentation] frames_per_second` and prints `frankenlife.studio.v1` NDJSON records:

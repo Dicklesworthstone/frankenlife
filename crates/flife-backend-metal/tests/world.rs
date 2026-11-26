@@ -8,8 +8,9 @@
 //! of a few slots, and no parameter shard is rebuilt.
 
 use flife_backend_metal::{
-    AUTO_METAL_MAX_WORKERS, AUTO_TORCH_MAX_WORKERS, AUTO_TORCH_MIN_ORGANISMS, BackendBudget,
-    ControllerChoice, MetalBackend, SHARD_BYTES, TORCH_AT_SCALE,
+    AUTO_METAL_MAX_WORKERS, AUTO_TORCH_MAX_WORKERS, AUTO_TORCH_MAX_WORKERS_ELSEWHERE,
+    AUTO_TORCH_MIN_ORGANISMS, BackendBudget, ControllerChoice, MetalBackend, SHARD_BYTES,
+    TORCH_AT_SCALE,
 };
 use flife_core::ids::GenomeId;
 use flife_core::{CoreError, ValidatedConfig};
@@ -499,7 +500,8 @@ fn one_flipped_metal_output_bit_changes_the_world() {
 
 /// `auto` takes Metal up to `AUTO_METAL_MAX_WORKERS` CPU workers on a host
 /// with a device. Without one, or above that, it takes the FrankenTorch CPU
-/// route up to `AUTO_TORCH_MAX_WORKERS`, or, on a host where
+/// route up to `AUTO_TORCH_MAX_WORKERS` on a host where `TORCH_AT_SCALE` and
+/// up to `AUTO_TORCH_MAX_WORKERS_ELSEWHERE` on other hosts, or, where
 /// `TORCH_AT_SCALE`, for a world of at least `AUTO_TORCH_MIN_ORGANISMS`, and
 /// the CPU reference otherwise. `cpu` never opens a device, `torch` is the
 /// FrankenTorch CPU route on the world's workers on any host, and `metal`
@@ -521,6 +523,8 @@ fn auto_takes_metal_only_up_to_its_worker_ceiling() {
     let small = [
         (1, Metal, Torch),
         (2, Metal, Torch),
+        (AUTO_TORCH_MAX_WORKERS_ELSEWHERE, Metal, Torch),
+        (AUTO_TORCH_MAX_WORKERS_ELSEWHERE + 1, Metal, Torch),
         (8, Metal, Torch),
         (AUTO_METAL_MAX_WORKERS, Metal, Torch),
         (AUTO_METAL_MAX_WORKERS + 1, Torch, Torch),
@@ -533,6 +537,43 @@ fn auto_takes_metal_only_up_to_its_worker_ceiling() {
         let with_device = if with_device == Metal { Metal } else { Torch };
         (workers, with_device, Torch)
     });
+    // A host where torch is not faster at scale: torch only up to its own
+    // ceiling, at any size, and the reference above it.
+    let elsewhere = small.map(|(workers, with_device, _)| {
+        let torch_or_cpu = if workers <= AUTO_TORCH_MAX_WORKERS_ELSEWHERE {
+            Torch
+        } else {
+            Cpu
+        };
+        let with_device = if with_device == Metal {
+            Metal
+        } else {
+            torch_or_cpu
+        };
+        (workers, with_device, torch_or_cpu)
+    });
+    assert_eq!(
+        elsewhere.map(|(_, with_device, without)| (with_device, without)),
+        [
+            (Metal, Torch),
+            (Metal, Torch),
+            (Metal, Torch),
+            (Metal, Cpu),
+            (Metal, Cpu),
+            (Metal, Cpu),
+            (Cpu, Cpu),
+            (Cpu, Cpu),
+            (Cpu, Cpu),
+            (Cpu, Cpu),
+            (Cpu, Cpu),
+        ],
+        "the table for other hosts, spelled out"
+    );
+    let torch_workers = if TORCH_AT_SCALE {
+        AUTO_TORCH_MAX_WORKERS
+    } else {
+        AUTO_TORCH_MAX_WORKERS_ELSEWHERE
+    };
     assert_eq!(
         TORCH_AT_SCALE,
         cfg!(all(target_os = "macos", target_arch = "aarch64")),
@@ -544,8 +585,8 @@ fn auto_takes_metal_only_up_to_its_worker_ceiling() {
         (AUTO_TORCH_MIN_ORGANISMS, large),
         (100_000, large),
     ] {
-        // A host where torch is not faster at scale keeps the small rule.
-        for (torch_at_scale, rule) in [(true, at_scale), (false, small)] {
+        // A host where torch is not faster at scale has one rule at every size.
+        for (torch_at_scale, rule) in [(true, at_scale), (false, elsewhere)] {
             for (workers, with_device, without) in rule {
                 assert_eq!(
                     ControllerChoice::auto_on(workers, true, torch_at_scale, organisms),
@@ -586,14 +627,14 @@ fn auto_takes_metal_only_up_to_its_worker_ceiling() {
                 }
                 Some(name) => {
                     assert!(
-                        workers <= AUTO_TORCH_MAX_WORKERS
+                        workers <= torch_workers
                             || (TORCH_AT_SCALE && organisms >= AUTO_TORCH_MIN_ORGANISMS),
                         "auto at {workers} workers, {organisms} organisms: {name}"
                     );
                     assert_eq!(name, torch(workers));
                 }
                 None => assert!(
-                    workers > AUTO_TORCH_MAX_WORKERS
+                    workers > torch_workers
                         && !(TORCH_AT_SCALE && organisms >= AUTO_TORCH_MIN_ORGANISMS)
                         && !(device && workers <= AUTO_METAL_MAX_WORKERS),
                     "auto at {workers} workers, {organisms} organisms is the reference"

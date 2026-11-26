@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { type KeyboardEvent, useMemo, useState } from "react";
 
 import { CATALOG, DEFAULT_TOPOLOGY, parameterCount, seeded, shape, widths } from "@/components/explain/brain-math";
 import { BasisBadge, DemoFrame, Segmented } from "@/components/explain/demo";
@@ -249,7 +249,29 @@ export function IndependentWeights() {
       } · ${grouped(parameterCount(widths(CATALOG[mode === "shared" ? DEFAULT_TOPOLOGY : hovered.topology]!)))} parameters${
         mode === "own" && hovered.mutated.some(Boolean) ? " · outlined: where it differs from its lineage's founder" : ""
       }${mode === "own" && !hovered.mutated.some(Boolean) ? " · a founder" : ""}`
-    : "Point at or tap an organism to see its lineage and network; its kin light up.";
+    : "Point at or tap an organism, or focus the grid and use the arrow keys, to see its lineage and network; its kin light up.";
+
+  // The keyboard's way through the grid, in reading order (batch by batch when batched).
+  const order = mode === "batched" ? batches.flatMap((batch) => batch.members) : organisms;
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const at = hovered ? order.findIndex((organism) => organism.id === hovered.id) : -1;
+    const steps: Record<string, number> = {
+      ArrowRight: (at + 1) % order.length,
+      ArrowDown: (at + 1) % order.length,
+      ArrowLeft: (at <= 0 ? order.length : at) - 1,
+      ArrowUp: (at <= 0 ? order.length : at) - 1,
+      Home: 0,
+      End: order.length - 1,
+    };
+    const next = steps[event.key];
+    if (next !== undefined) {
+      event.preventDefault();
+      setHovered(order[next] ?? null);
+    } else if (event.key === "Escape" && hovered) {
+      event.preventDefault();
+      setHovered(null);
+    }
+  };
 
   return (
     <DemoFrame
@@ -269,15 +291,19 @@ export function IndependentWeights() {
         <Segmented label="How the controllers are held" options={MODES} value={mode} onChange={setMode} />
         <p className="min-h-[4.5rem] text-sm leading-relaxed text-slate-300">{EXPLAIN[mode]}</p>
 
+        {/* Focusable, so the keyboard reaches what pointing shows: the readout under it says each organism aloud. */}
         <div
-          role="img"
-          aria-label={
+          role="group"
+          tabIndex={0}
+          onKeyDown={onKeyDown}
+          aria-label={`${
             mode === "shared"
               ? "48 organisms in eight lineage colours, every one drawn with the same weight matrix."
               : mode === "batched"
                 ? `48 organisms grouped into ${batches.length} batches by network topology; within each batch every weight matrix differs.`
                 : "48 organisms in eight lineage colours, each with its own weight matrix; organisms of one lineage have nearly the same matrix."
-          }
+          } Arrow keys step from organism to organism; Escape clears.`}
+          className="rounded-lg focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none"
         >
           {mode === "batched" ? (
             <div className="space-y-3">
@@ -300,7 +326,7 @@ export function IndependentWeights() {
             <div className="grid grid-cols-6 gap-1.5 sm:grid-cols-8 lg:grid-cols-12">{organisms.map(tile)}</div>
           )}
         </div>
-        <p className="min-h-[1.25rem] font-mono text-[11px] text-slate-500" aria-hidden="true">
+        <p className="min-h-[1.25rem] font-mono text-[11px] text-slate-500" aria-live="polite">
           {info}
         </p>
 

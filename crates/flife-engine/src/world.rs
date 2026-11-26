@@ -9687,25 +9687,35 @@ impl Stages for Reference<'_> {
         budget: &mut EnergyBudget,
     ) -> Result<MotionSettlement, CoreError> {
         let ratio = rules.response_gain(absorbed)?;
-        let response = if rules.limits.motion_response_norm() <= rules.motion.response_norm_limit()
-        {
-            MotionResponse::trusted(*self.traits.motion_response())
-        } else {
-            MotionResponse::new(*self.traits.motion_response(), &rules.motion)?
-        };
+        let trusted = rules.limits.motion_response_norm() <= rules.motion.response_norm_limit();
         let acceleration = match (rules.v2.motor(), self.decision.actions.motor) {
-            (Some(constants), Some(motor)) => rules.motion.acceleration_v2(
+            (Some(constants), Some(motor)) => {
+                let response = if trusted {
+                    MotionResponse::trusted(*self.traits.motion_response())
+                } else {
+                    MotionResponse::new(*self.traits.motion_response(), &rules.motion)?
+                };
+                rules.motion.acceleration_v2(
+                    ratio,
+                    &response,
+                    &self.decision.gradients,
+                    organism.velocity,
+                    budget.remaining(),
+                    &constants,
+                    MotorSteeringInputs::from(motor),
+                )?
+            }
+            _ if trusted => rules.motion.acceleration_slice(
                 ratio,
-                &response,
+                self.traits.motion_response(),
                 &self.decision.gradients,
-                organism.velocity,
-                budget.remaining(),
-                &constants,
-                MotorSteeringInputs::from(motor),
             )?,
-            _ => rules
-                .motion
-                .acceleration(ratio, &response, &self.decision.gradients)?,
+            _ => {
+                let response = MotionResponse::new(*self.traits.motion_response(), &rules.motion)?;
+                rules
+                    .motion
+                    .acceleration(ratio, &response, &self.decision.gradients)?
+            }
         };
         let proposed = rules.motion.propose(organism.velocity, acceleration)?;
         rules.motion.settle(proposed, budget)

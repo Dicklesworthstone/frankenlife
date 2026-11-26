@@ -181,6 +181,26 @@ impl Motion {
         response: &MotionResponse,
         gradients: &[[f64; 2]; RESPONSE_TERMS],
     ) -> Result<[f64; 2], CoreError> {
+        self.acceleration_slice(uptake_ratio, &response.0, gradients)
+    }
+
+    /// As [`Motion::acceleration`], taking a pre-validated response array by
+    /// reference without copying 264 bytes onto the stack.
+    ///
+    /// Uses 2-lane `[gx, gy]` accumulation in exact ascending term order
+    /// `0..RESPONSE_TERMS` (0-ULP bit-identical) so LLVM emits direct `ldr q` +
+    /// `fmul.2d` + `fadd.2d` without `ld2.2d` deinterleaving or scalar lane
+    /// extractions.
+    ///
+    /// # Errors
+    /// As [`Motion::acceleration`].
+    #[inline]
+    pub fn acceleration_slice(
+        &self,
+        uptake_ratio: f64,
+        response: &[f64; RESPONSE_TERMS],
+        gradients: &[[f64; 2]; RESPONSE_TERMS],
+    ) -> Result<[f64; 2], CoreError> {
         #[cold]
         #[inline(never)]
         fn err_uptake_ratio(uptake_ratio: f64) -> CoreError {
@@ -200,15 +220,15 @@ impl Motion {
         if !(0.0..=1.0).contains(&uptake_ratio) {
             return Err(err_uptake_ratio(uptake_ratio));
         }
-        let mut sum0 = 0.0_f64;
-        let mut sum1 = 0.0_f64;
-        let mut finite_acc = 0.0_f64;
-        for (&coefficient, &gradient) in response.0.iter().zip(gradients) {
-            finite_acc += gradient[0] + gradient[1];
-            sum0 += coefficient * gradient[0];
-            sum1 += coefficient * gradient[1];
+        let mut sum = [0.0_f64; 2];
+        let mut fin = [0.0_f64; 2];
+        // Iterate via slices so LLVM keeps a tight register-only loop instead
+        // of fully unrolling all 33 terms and spilling 64 doubles to the stack.
+        for (&c, &g) in response.as_slice().iter().zip(gradients.as_slice()) {
+            fin = [fin[0] + g[0], fin[1] + g[1]];
+            sum = [sum[0] + c * g[0], sum[1] + c * g[1]];
         }
-        if !finite_acc.is_finite() {
+        if !(fin[0].is_finite() && fin[1].is_finite()) {
             for &gradient in gradients {
                 if !gradient[0].is_finite() || !gradient[1].is_finite() {
                     return Err(err_nonfinite_gradient(gradient));
@@ -217,7 +237,7 @@ impl Motion {
         }
         clamp_radius(
             "chemical acceleration",
-            [uptake_ratio * sum0, uptake_ratio * sum1],
+            [uptake_ratio * sum[0], uptake_ratio * sum[1]],
             self.maximum_acceleration,
         )
     }

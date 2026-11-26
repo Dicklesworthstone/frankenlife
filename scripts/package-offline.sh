@@ -27,7 +27,11 @@
 #        before writing any frame PNG.
 #     2. Unknown V2 feature override (`--disable nonexistent-v2-feature`) fails with typed
 #        `frankenlife.error.v1` JSON on stderr.
-#     3. On non-macOS hosts, `--controllers metal` fails with explicit missing-capability refusal.
+#     3. V2-only visual mapping (`--color cell-state`) on a V1 preset fails with typed
+#        `frankenlife.error.v1` JSON on stderr before writing any frame PNG.
+#     4. On non-macOS hosts, `--controllers metal` fails with explicit missing-capability refusal.
+#     5. On macOS with FrankenLife Studio.app, `launch-studio` verifies offline `--offscreen`
+#        rendering on its bundled preset and explicit `frankenlife.error.v1` refusal on `--color cell-state`.
 # - Never deletes user files or modifies repository tracked sources.
 
 set -euo pipefail
@@ -114,6 +118,73 @@ sha256_file() {
   fi
 }
 
+# Verify MANIFEST.json SHA-256 digests and capabilities_summary consistency.
+verify_manifest() {
+  local bundle_dir="$1"
+  local expected_smoke="${2:-any}"
+  python3 - "${bundle_dir}" "${expected_smoke}" <<'PY'
+import hashlib, json, os, sys
+root, expected_smoke = sys.argv[1], sys.argv[2]
+manifest = json.load(open(os.path.join(root, "MANIFEST.json"), "r", encoding="utf-8"))
+if manifest.get("schema") != "frankenlife.offline-package.v1":
+    sys.exit(f"unexpected manifest schema: {manifest.get('schema')}")
+if expected_smoke == "true" and manifest.get("smoke_verified") is not True:
+    sys.exit(f"expected smoke_verified=true, got {manifest.get('smoke_verified')!r}")
+if expected_smoke == "false" and manifest.get("smoke_verified") is not False:
+    sys.exit(f"expected smoke_verified=false, got {manifest.get('smoke_verified')!r}")
+
+caps = json.load(open(os.path.join(root, "capabilities.json"), "r", encoding="utf-8"))
+summary = manifest.get("capabilities_summary", {})
+pinned = caps.get("world", {}).get("pinned_digest")
+cpu_route = next((r for r in caps.get("controllers", []) if r.get("route") == "cpu"), {})
+verified_routes = [
+    r.get("route") for r in caps.get("controllers", []) if r.get("status") == "verified"
+]
+if summary.get("schema") != "frankenlife.capabilities.v1":
+    sys.exit(f"bad capabilities_summary.schema: {summary.get('schema')!r}")
+if not isinstance(summary.get("preset_digest"), str) or summary.get("preset_digest") != pinned:
+    sys.exit(f"preset_digest mismatch: manifest={summary.get('preset_digest')!r}, caps={pinned!r}")
+if not summary["preset_digest"].startswith("82e0720d"):
+    sys.exit(f"unexpected preset_digest: {summary['preset_digest']!r}")
+if summary.get("verified_cpu_digest") != cpu_route.get("digest"):
+    sys.exit(
+        f"verified_cpu_digest mismatch: manifest={summary.get('verified_cpu_digest')!r}, "
+        f"caps={cpu_route.get('digest')!r}"
+    )
+if summary.get("verified_routes") != verified_routes or "cpu" not in verified_routes:
+    sys.exit(f"verified_routes mismatch: manifest={summary.get('verified_routes')!r}, caps={verified_routes!r}")
+expected_auto = caps.get("auto", {}).get("takes")
+if not isinstance(summary.get("auto_route"), str) or summary.get("auto_route") != expected_auto:
+    sys.exit(f"auto_route mismatch: manifest={summary.get('auto_route')!r}, caps={expected_auto!r}")
+if summary.get("metal_device") != caps.get("auto", {}).get("metal_device"):
+    sys.exit(
+        f"metal_device mismatch: manifest={summary.get('metal_device')!r}, "
+        f"caps={caps.get('auto', {}).get('metal_device')!r}"
+    )
+expected_video = caps.get("video", {}).get("status")
+if summary.get("video_encoder") not in ("available", "unavailable") or summary.get("video_encoder") != expected_video:
+    sys.exit(f"video_encoder mismatch: manifest={summary.get('video_encoder')!r}, caps={expected_video!r}")
+
+files = manifest.get("files", [])
+if not files:
+    sys.exit("MANIFEST.json lists no files")
+for entry in files:
+    rel = entry["path"]
+    full = os.path.join(root, rel)
+    if not os.path.isfile(full):
+        sys.exit(f"missing packaged file: {rel}")
+    data = open(full, "rb").read()
+    digest = hashlib.sha256(data).hexdigest()
+    if len(data) != entry["bytes"] or digest != entry["sha256"]:
+        sys.exit(f"digest/size mismatch for {rel}: expected {entry['sha256']} ({entry['bytes']} B), got {digest} ({len(data)} B)")
+print(
+    f"MANIFEST verified: {len(files)} files match SHA-256; "
+    f"auto={summary['auto_route']}, verified={','.join(verified_routes)}, "
+    f"smoke_verified={manifest.get('smoke_verified')}"
+)
+PY
+}
+
 # Verify a staged offline bundle in an isolated fresh-install environment (env -i).
 verify_bundle() {
   local bundle_dir="$1"
@@ -128,28 +199,9 @@ verify_bundle() {
   [[ -f "${bundle_dir}/notices/franken-stack.lock" ]] || die "missing ${bundle_dir}/notices/franken-stack.lock"
   [[ -f "${bundle_dir}/presets/reference-small-world.toml" ]] || die "missing bundled presets/reference-small-world.toml"
 
-  # 1. Cryptographically verify every file listed in MANIFEST.json.
-  log "Verifying MANIFEST.json SHA-256 digests..."
-  python3 - "${bundle_dir}" <<'PY'
-import hashlib, json, os, sys
-root = sys.argv[1]
-manifest = json.load(open(os.path.join(root, "MANIFEST.json"), "r", encoding="utf-8"))
-if manifest.get("schema") != "frankenlife.offline-package.v1":
-    sys.exit(f"unexpected manifest schema: {manifest.get('schema')}")
-files = manifest.get("files", [])
-if not files:
-    sys.exit("MANIFEST.json lists no files")
-for entry in files:
-    rel = entry["path"]
-    full = os.path.join(root, rel)
-    if not os.path.isfile(full):
-        sys.exit(f"missing packaged file: {rel}")
-    data = open(full, "rb").read()
-    digest = hashlib.sha256(data).hexdigest()
-    if len(data) != entry["bytes"] or digest != entry["sha256"]:
-        sys.exit(f"digest/size mismatch for {rel}: expected {entry['sha256']} ({entry['bytes']} B), got {digest} ({len(data)} B)")
-print(f"MANIFEST verified: {len(files)} files match SHA-256 byte-for-byte")
-PY
+  # 1. Cryptographically verify every file listed in MANIFEST.json and its capability summary.
+  log "Verifying MANIFEST.json SHA-256 digests and capability summary..."
+  verify_manifest "${bundle_dir}" "any"
 
   # 2. Fresh-install sanitized environment (no Cargo, Rustup, repo cwd, or Homebrew PATH).
   local smoke_root
@@ -227,6 +279,28 @@ PY
   [[ "${preset_count}" -gt 0 ]] || die "no presets found in ${bundle_dir}/presets/"
   log "Validated ${preset_count} bundled presets offline."
 
+  log "Running offline fresh-install check #4: flife run hits pinned reference digest at tick 8..."
+  local run_out="${smoke_root}/run.ndjson"
+  (
+    cd "${smoke_home}"
+    env -i PATH="/usr/bin:/bin" HOME="${smoke_home}" TMPDIR="${smoke_root}" \
+      "${flife}" run "${bundle_dir}/presets/reference-small-world.toml" \
+      --ticks 8 --every 8 > "${run_out}"
+  )
+  python3 - "${run_out}" "${caps_out}" <<'PY'
+import json, sys
+records = [json.loads(line) for line in open(sys.argv[1], "r", encoding="utf-8") if line.strip()]
+caps = json.load(open(sys.argv[2], "r", encoding="utf-8"))
+pinned = caps["world"]["pinned_digest"]
+end = records[-1]
+assert end.get("record") == "end", f"expected end record, got {end}"
+assert end.get("stop", {}).get("end") == "reached", f"expected stop.end=='reached', got {end}"
+assert end.get("tick") == 8, f"expected tick==8, got {end}"
+assert end.get("digest") == pinned, f"run digest {end.get('digest')} != pinned {pinned}"
+assert end.get("tally", {}).get("normalized_residual", 1.0) <= 1.0e-5, f"residual out of budget: {end}"
+print(f"offline run OK: tick=8, digest={end['digest'][:12]}... matches pinned reference")
+PY
+
   log "Running explicit capability refusal #1: flife render --video with ffmpeg absent..."
   local no_ffmpeg_frames="${smoke_root}/no-ffmpeg-frames"
   local no_ffmpeg_err="${smoke_root}/no-ffmpeg-err.json"
@@ -275,8 +349,34 @@ assert rec.get("schema") == "frankenlife.error.v1", f"expected frankenlife.error
 print(f"typed error refusal OK: kind={rec.get('kind')}")
 PY
 
+  log "Running explicit capability refusal #3: V2 --color cell-state on V1 preset..."
+  local v2_color_frames="${smoke_root}/v2-color-frames"
+  local v2_color_err="${smoke_root}/v2-color-err.json"
+  rc=0
+  (
+    cd "${smoke_home}"
+    env -i PATH="/usr/bin:/bin" HOME="${smoke_home}" TMPDIR="${smoke_root}" \
+      "${flife}" render "${bundle_dir}/presets/reference-small-world.toml" \
+      --color cell-state --ticks 1 --every 1 --width 128 --height 128 \
+      --out "${v2_color_frames}" >/dev/null 2>"${v2_color_err}"
+  ) || rc=$?
+  if [[ "${rc}" -eq 0 ]]; then
+    die "expected non-zero refusal for --color cell-state on V1 preset"
+  fi
+  if [[ -e "${v2_color_frames}/frame-000000.png" ]]; then
+    die "render --color cell-state wrote frame-000000.png before rejecting V2-only color mapping"
+  fi
+  python3 - "${v2_color_err}" <<'PY'
+import json, sys
+text = open(sys.argv[1], "r", encoding="utf-8").read().strip().splitlines()
+assert text, "empty stderr on V2 color refusal"
+rec = json.loads(text[-1])
+assert rec.get("schema") == "frankenlife.error.v1", f"expected frankenlife.error.v1, got {rec}"
+print(f"V2 color mapping refusal OK: kind={rec.get('kind')}")
+PY
+
   if [[ "$(uname -s)" != "Darwin" ]]; then
-    log "Running explicit capability refusal #3 (non-macOS): --controllers metal refused..."
+    log "Running explicit capability refusal #4 (non-macOS): --controllers metal refused..."
     local metal_err="${smoke_root}/metal-err.json"
     rc=0
     (
@@ -311,10 +411,47 @@ PY
     fi
     (
       cd "${smoke_home}"
-      env -i PATH="/usr/bin:/bin" HOME="${smoke_home}" "${app_bin}" --version >/dev/null
-      env -i PATH="/usr/bin:/bin" HOME="${smoke_home}" "${app_bin}" --list-features >/dev/null
+      env -i PATH="/usr/bin:/bin" HOME="${smoke_home}" "${app_launcher}" --version >/dev/null
+      env -i PATH="/usr/bin:/bin" HOME="${smoke_home}" "${app_launcher}" --list-features >/dev/null
     )
-    log "macOS app bundle Info.plist + offline flife-studio binary checks PASS."
+    local studio_refusal_err="${smoke_root}/studio-v2-color-err.json"
+    rc=0
+    (
+      cd "${smoke_home}"
+      env -i PATH="/usr/bin:/bin" HOME="${smoke_home}" TMPDIR="${smoke_root}" \
+        "${app_launcher}" "${app_dir}/Contents/Resources/presets/reference-small-world.toml" \
+        --color cell-state >/dev/null 2>"${studio_refusal_err}"
+    ) || rc=$?
+    if [[ "${rc}" -eq 0 ]]; then
+      die "expected non-zero refusal for packaged Studio --color cell-state on V1 preset"
+    fi
+    python3 - "${studio_refusal_err}" <<'PY'
+import json, sys
+text = open(sys.argv[1], "r", encoding="utf-8").read().strip().splitlines()
+assert text, "empty stderr on packaged Studio V2 color refusal"
+rec = json.loads(text[-1])
+assert rec.get("schema") == "frankenlife.error.v1", f"expected frankenlife.error.v1, got {rec}"
+print(f"packaged Studio V2 refusal OK: kind={rec.get('kind')}")
+PY
+    local studio_offscreen_out="${smoke_root}/studio-offscreen.ndjson"
+    (
+      cd "${smoke_home}"
+      env -i PATH="/usr/bin:/bin" HOME="${smoke_home}" TMPDIR="${smoke_root}" \
+        "${app_launcher}" "${app_dir}/Contents/Resources/presets/reference-small-world.toml" \
+        --offscreen 0.25 --width 320 --height 240 --scale 1 > "${studio_offscreen_out}"
+    )
+    python3 - "${studio_offscreen_out}" <<'PY'
+import json, sys
+records = [json.loads(line) for line in open(sys.argv[1], "r", encoding="utf-8") if line.strip()]
+assert records and records[0].get("record") == "open", f"missing Studio open record: {records[:1]}"
+assert records[0].get("schema") == "frankenlife.studio.v1", f"bad Studio schema: {records[0]}"
+end = records[-1]
+assert end.get("record") == "end", f"missing Studio end record: {end}"
+assert end.get("rendered", 0) >= 1, f"expected >=1 offscreen rendered frame, got {end}"
+assert end.get("tick", 0) >= 1, f"expected >=1 committed tick, got {end}"
+print(f"packaged Studio offscreen launch OK: tick={end['tick']}, rendered={end['rendered']}")
+PY
+    log "macOS app bundle Info.plist + launch-studio offline + refusal checks PASS."
   fi
 
   trap - EXIT
@@ -387,7 +524,7 @@ fi
 version="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' "${REPO_ROOT}/Cargo.toml" | head -n 1)"
 version="${version:-0.0.1}"
 git_rev="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo "unknown")"
-git_dirty="$(git -C "${REPO_ROOT}" status --porcelain -- crates presets Cargo.toml Cargo.lock 2>/dev/null | wc -l | tr -d ' ')"
+git_dirty="$(git -C "${REPO_ROOT}" status --porcelain -- crates presets scripts/package-offline.sh Cargo.toml Cargo.lock 2>/dev/null | wc -l | tr -d ' ')"
 
 log "Staging offline package (version ${version}, rev ${git_rev:0:12}) into ${abs_out}..."
 mkdir -p "${abs_out}/bin" "${abs_out}/presets" "${abs_out}/fixtures" "${abs_out}/notices"
@@ -450,11 +587,14 @@ if [[ -n "${STUDIO_BIN}" ]]; then
 set -euo pipefail
 MACOS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RES_DIR="$(cd "${MACOS_DIR}/../Resources" && pwd)"
-LOG_DIR="${HOME}/Library/Logs/FrankenLife"
-mkdir -p "${LOG_DIR}"
+if [[ $# -eq 1 && "$1" == -psn_* ]]; then
+  shift
+fi
 if [[ $# -gt 0 ]]; then
   exec "${MACOS_DIR}/flife-studio" "$@"
 fi
+LOG_DIR="${HOME}/Library/Logs/FrankenLife"
+mkdir -p "${LOG_DIR}"
 exec "${MACOS_DIR}/flife-studio" \
   "${RES_DIR}/presets/reference-small-world.toml" \
   >> "${LOG_DIR}/studio.ndjson" 2>> "${LOG_DIR}/studio.err.log"
@@ -523,6 +663,10 @@ for dirpath, dirnames, filenames in os.walk(root):
         })
 
 caps = json.load(open(os.path.join(root, "capabilities.json"), "r", encoding="utf-8"))
+cpu_route = next((r for r in caps.get("controllers", []) if r.get("route") == "cpu"), {})
+verified_routes = [
+    r.get("route") for r in caps.get("controllers", []) if r.get("status") == "verified"
+]
 manifest = {
     "schema": "frankenlife.offline-package.v1",
     "version": version,
@@ -538,8 +682,11 @@ manifest = {
     "smoke_verified": smoke_flag == "true",
     "capabilities_summary": {
         "schema": caps.get("schema"),
-        "preset_digest": caps.get("world", {}).get("digest"),
-        "auto_route": caps.get("auto", {}).get("route"),
+        "preset_digest": caps.get("world", {}).get("pinned_digest"),
+        "verified_cpu_digest": cpu_route.get("digest"),
+        "verified_routes": verified_routes,
+        "auto_route": caps.get("auto", {}).get("takes"),
+        "metal_device": caps.get("auto", {}).get("metal_device"),
         "video_encoder": caps.get("video", {}).get("status"),
     },
     "files": entries,
@@ -555,6 +702,7 @@ write_manifest "false"
 if [[ "${SKIP_SMOKE}" -eq 0 ]]; then
   verify_bundle "${abs_out}"
   write_manifest "true"
+  verify_manifest "${abs_out}" "true"
 else
   log "WARNING: --skip-smoke set; MANIFEST.json honestly records smoke_verified=false."
 fi

@@ -28,10 +28,15 @@ hero's picture, not a decoration. Each chapter wears one colour of the film's li
 (`Reticle` in `components/franken.tsx`) frame anything that is a specimen or a figure. Surfaces are
 `panel`s; blurred glass is kept for the floating header and dock. Lists are ruled rather than boxed.
 `app/globals.css` holds the tokens, the display sizes and the muted text tone, which is raised from
-Tailwind's slate-500 to meet WCAG AA contrast on the ink. A box that scrolls sideways with nothing focusable
-in it takes `tabIndex={0}`, so a keyboard can scroll it, and a control's accessible name contains the words
-it shows, so a voice command finds it. axe-core 4.14 found no violations on 2026-11-25 at 320, 390 and
-1,440 px, in every tab, view and opened `<details>`.
+Tailwind's slate-500 to meet WCAG AA contrast (4.5:1) on every panel, not only the ink; SVG labels take
+the same grey as `TONE.muted`, and the film's violet takes `VIOLET_TEXT` as words (`lib/palette.ts`).
+Something dimmed to show what is not chosen keeps its words at 4.5:1: an arrow can fade, its label only
+to 0.7, and a key outside the chosen group loses its colour, not its legibility. A box that scrolls
+sideways with nothing focusable in it takes `tabIndex={0}`, so a keyboard can scroll it, and a control's
+accessible name contains the words it shows, so a voice command finds it. axe-core 4.14 found no
+violations on 2026-11-25 at 320, 390 and 1,440 px, in every tab, view and opened `<details>`; measured
+from pixels (axe leaves text over gradients and other text undecided), every line of text met AA at 390
+and 1,440 px in 81 states, apart from disabled controls and the keyboard picture's dead keys.
 
 ## The explainers
 

@@ -43,6 +43,7 @@ import {
   TORUS,
   viewAt,
 } from "@/components/explain/zoom-ladder-geometry";
+import { PHONE } from "@/components/film";
 import { GreenTitle, MicroLabel } from "@/components/franken";
 import { useInView, useReducedMotion } from "@/lib/hooks";
 import { filmById } from "@/lib/media";
@@ -506,6 +507,13 @@ export function ZoomLadder({ index }: { index?: string }) {
   const touch = useMedia("(pointer: coarse)");
   const track = useRef<HTMLDivElement>(null);
   const near = useInView(track, "300px");
+  // Once the ladder has been on screen, its stage loads what zooming in needs: the poster JPEG and the card (the
+  // stage, below). Not once near: at 1,440 × 900 the ladder starts within 300 px of the first screen.
+  const onScreen = useInView(track, "0px");
+  const [seen, setSeen] = useState(false);
+  useEffect(() => {
+    if (onScreen) setSeen(true);
+  }, [onScreen]);
   const [stop, setStop] = useState(0);
   const progress = useRef(0);
   const stopRef = useRef(0);
@@ -793,25 +801,36 @@ export function ZoomLadder({ index }: { index?: string }) {
                 className="@container relative aspect-square w-full touch-pan-y overflow-hidden contain-strict rounded-[1.75rem] border border-white/10 bg-black shadow-[0_0_90px_-30px_rgba(74,222,128,0.35)] select-none focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none lg:mx-auto lg:w-[min(100%,calc(100svh-8.5rem),46rem)]"
               >
                 {/* Real pixels: the poster, then the card. Each is the stage's width and placed on the torus by transform. */}
-                {/* eslint-disable-next-line @next/next/no-img-element -- a static export; the manifest names the file */}
-                <img
-                  ref={posterRef}
-                  src={film.poster.src}
-                  alt={`The confluent film's first frame: the whole torus at tick ${grouped(POSTER.tick)}, ${grouped(LIVE_POSTER)} organisms coloured by founder lineage.`}
-                  width={film.video.width}
-                  height={film.video.height}
-                  // Lazy: the hero shows the poster as an AVIF, so this 3 MB JPEG (sharp enough to zoom into) is not
-                  // already loaded.
-                  loading="lazy"
-                  decoding="async"
-                  draggable={false}
-                  className="absolute top-0 left-0 w-full max-w-none origin-top-left will-change-transform"
-                  style={{ opacity: INITIAL.poster, transform: placement(POSTER, INITIAL.view) }}
-                />
+                {/* Until the ladder is seen, the poster is the AVIF the hero already loaded (the same choice as the
+                    hero's); then the 3 MB JPEG, sharp enough to zoom into, takes its place once it has loaded. Lazy
+                    alone did not hold the JPEG back: on a 1,440 px desktop, Chrome fetched it with the page, and
+                    the hero's poster painted 0.5 s later (1.5 s against 1.1 s with the JPEG blocked, 10 Mbps).
+                    The card, hidden until the second step, waits likewise (444 KB, fetched with the page at 1,024). */}
+                <picture>
+                  {seen ? null : (
+                    <>
+                      {film.poster.small ? <source media={PHONE} type="image/avif" srcSet={film.poster.small.src} /> : null}
+                      {film.poster.avif ? <source type="image/avif" srcSet={film.poster.avif.src} /> : null}
+                    </>
+                  )}
+                  {/* eslint-disable-next-line @next/next/no-img-element -- a static export; the manifest names the file */}
+                  <img
+                    ref={posterRef}
+                    src={film.poster.src}
+                    alt={`The confluent film's first frame: the whole torus at tick ${grouped(POSTER.tick)}, ${grouped(LIVE_POSTER)} organisms coloured by founder lineage.`}
+                    width={film.video.width}
+                    height={film.video.height}
+                    loading="lazy"
+                    decoding="async"
+                    draggable={false}
+                    className="absolute top-0 left-0 w-full max-w-none origin-top-left will-change-transform"
+                    style={{ opacity: INITIAL.poster, transform: placement(POSTER, INITIAL.view) }}
+                  />
+                </picture>
                 {/* eslint-disable-next-line @next/next/no-img-element -- a static export; the manifest names the file */}
                 <img
                   ref={cardRef}
-                  src={film.social.src}
+                  src={seen ? film.social.src : undefined}
                   alt={`A patch of the confluent film's closest shot at tick ${grouped(CARD.tick)}: single bodies, each a sphere, coloured by lineage.`}
                   width={film.social.width}
                   height={film.social.height}

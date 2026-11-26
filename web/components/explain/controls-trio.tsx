@@ -15,10 +15,10 @@ import { BasisBadge, DemoFrame, fixed } from "@/components/explain/demo";
 import { siteConfig } from "@/lib/content";
 import { type ControlStill, controls, filmById } from "@/lib/media";
 import { TONE } from "@/lib/palette";
+import { cn, grouped } from "@/lib/utils";
 
 // The controls are the confluent world's, drawn as the confluent film is.
 const film = filmById("confluent");
-import { cn, grouped } from "@/lib/utils";
 
 /**
  * The film's world beside its model's two controls (plan §5.4), each drawn by

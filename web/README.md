@@ -112,8 +112,11 @@ against the 2160² JPEG's 3 MB, which stays for a browser without AVIF and for t
 mobile throttling the JPEG took more than 16 s on a phone, and the page's largest paint waited 10 s for the
 video. A picture under the video chooses the poster, since a video's own poster attribute names one file for
 every screen, and the video waits for it (`preload="none"` until then): streaming at once, it slowed the
-poster by about 1.3 s. Nothing below the hero loads with the page: an image that is also a CSS background
-(the controls' loupe) waits for its lazy `<img>`. Measured on frankenlife.org on 2026-11-26, cold, three runs
+poster by about 1.3 s. Nothing below the hero loads with the page (checked at 390, 768, 1,024, 1,440 and
+1,920 px). `loading="lazy"` was not enough for that: Chrome fetches a lazy image well before it is on screen,
+and on desktops the zoom ladder's 3 MB JPEG and its 444 KB card came with the page, so the ladder shows the
+hero's AVIF until it is on screen and loads them then. An image that is also a CSS background (the controls'
+loupe) waits for its lazy `<img>`. Measured on frankenlife.org on 2026-11-26, cold, three runs
 each: the largest paint (the poster) now comes at 3.8 s on a 390 px phone under that throttling (10.1 s
 before), and at 1.5–1.8 s on a 1,440 px desktop over 10 Mbps with 40 ms round trips (3.0–3.1 s before).
 

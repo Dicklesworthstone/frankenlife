@@ -267,8 +267,8 @@ body::before {
 }
 
 /* Focus: one visible ring everywhere, in the life colour. Unlayered, so it outranks every Tailwind utility (those
-   sit in @layer utilities): a control's `focus-visible:outline-none` does not remove it, and its `ring-*` only
-   thickens it. That is deliberate: Windows' forced colours drop box-shadow rings but keep outlines. */
+   sit in @layer utilities): a control's `focus-visible:outline-none` does not remove it, and its `ring-*` draws a
+   second ring inside it. That is deliberate: Windows' forced colours drop box-shadow rings but keep outlines. */
 :where(a, button, input, select, textarea, [tabindex]):focus-visible {
   outline: 2px solid var(--life);
   outline-offset: 2px;

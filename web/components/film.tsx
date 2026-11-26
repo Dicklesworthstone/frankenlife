@@ -208,6 +208,8 @@ export function Film({
   const seekRef = useRef<HTMLInputElement>(null);
   const seekAt = useRef(0);
   const pausedOffScreen = useRef(false);
+  // Whether the reader has pressed play or pause: autoplay, which waits for the poster, then leaves the film be.
+  const readerChose = useRef(false);
 
   /** Bring the seek control up to the frame on screen: late while the film plays, at once before it is used. */
   const syncSeek = useCallback(() => {
@@ -263,6 +265,7 @@ export function Film({
         // Not playing: load its first frame and length, as preload="metadata" would have from the start.
         if ((still || saving) && element.paused && element.readyState === HTMLMediaElement.HAVE_NOTHING) element.load();
       }
+      if (readerChose.current) return;
       if (!still && !saving) {
         // Scrolled past before the poster came: it plays when it is back in view (the observer below).
         const box = containerRef.current?.getBoundingClientRect();
@@ -348,6 +351,7 @@ export function Film({
     const element = videoRef.current;
     if (!element) return;
     pausedOffScreen.current = false;
+    readerChose.current = true;
     if (element.paused) element.play().catch(() => {});
     else element.pause();
   };

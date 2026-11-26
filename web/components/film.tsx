@@ -189,6 +189,7 @@ export function Film({
   } = modelOf(manifest);
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const posterRef = useRef<HTMLImageElement>(null);
   const [playing, setPlaying] = useState(false);
   // Whether the film's own frames drive the readout and the live dot (`requestVideoFrameCallback`).
   const [perFrame, setPerFrame] = useState(false);
@@ -246,18 +247,45 @@ export function Film({
     [syncSeek],
   );
 
-  // Autoplay, unless the reader asks for less motion or less data: they get the poster and the button.
+  // The film waits for its poster (preload="none" until then): streaming from the start, it took the bandwidth the
+  // poster needed, and a phone on a slow network painted the poster later (a median 5.1 s against 3.8 s with the
+  // video held back, frankenlife.org at 390 px under Lighthouse's mobile throttling). Then it autoplays, unless the
+  // reader asks for less motion or less data: they get the poster and the button.
   useEffect(() => {
     const element = videoRef.current;
     if (!element) return;
-    // The film is one MP4 (4K, or on a phone its smaller encode), streamed by range as it plays.
-    const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const saving = (navigator as { connection?: { saveData?: boolean } }).connection?.saveData === true;
-    if (!still && !saving) {
-      element.play().catch(() => {
-        // Autoplay refused (a data saver, say): the poster stays, and the button plays it.
-      });
+    const start = () => {
+      // The film is one MP4 (4K, or on a phone its smaller encode), streamed by range as it plays.
+      const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const saving = (navigator as { connection?: { saveData?: boolean } }).connection?.saveData === true;
+      if (element.preload === "none") {
+        element.preload = "metadata";
+        // Not playing: load its first frame and length, as preload="metadata" would have from the start.
+        if ((still || saving) && element.paused && element.readyState === HTMLMediaElement.HAVE_NOTHING) element.load();
+      }
+      if (!still && !saving) {
+        // Scrolled past before the poster came: it plays when it is back in view (the observer below).
+        const box = containerRef.current?.getBoundingClientRect();
+        if (box && (box.bottom <= 0 || box.top >= window.innerHeight)) {
+          pausedOffScreen.current = true;
+          return;
+        }
+        element.play().catch(() => {
+          // Autoplay refused (a data saver, say): the poster stays, and the button plays it.
+        });
+      }
+    };
+    const image = posterRef.current;
+    if (!image || (image.complete && image.naturalWidth > 0)) {
+      start();
+      return;
     }
+    image.addEventListener("load", start, { once: true });
+    image.addEventListener("error", start, { once: true });
+    return () => {
+      image.removeEventListener("load", start);
+      image.removeEventListener("error", start);
+    };
   }, []);
 
   // A frame-accurate readout, from the video's own frames.
@@ -328,7 +356,14 @@ export function Film({
     const clamped = Math.min(last, Math.max(0, target));
     show(clamped, true);
     const element = videoRef.current;
-    if (element) element.currentTime = (clamped + 0.5) / video.fps;
+    if (!element) return;
+    // A seek before the film has started (it waits for its poster) loads it: a time set on a video that has
+    // loaded nothing only takes effect once something loads it.
+    if (element.preload === "none" && element.readyState === HTMLMediaElement.HAVE_NOTHING) {
+      element.preload = "metadata";
+      element.load();
+    }
+    element.currentTime = (clamped + 0.5) / video.fps;
   };
 
   return (
@@ -347,6 +382,7 @@ export function Film({
           {poster.small ? <source media={PHONE} type="image/avif" srcSet={poster.small.src} /> : null}
           {/* eslint-disable-next-line @next/next/no-img-element -- a static export; the manifest names the file */}
           <img
+            ref={posterRef}
             src={poster.src}
             alt=""
             width={video.width}
@@ -363,7 +399,8 @@ export function Film({
           muted
           loop
           playsInline
-          preload="metadata"
+          // "metadata" once the poster has loaded (the effect above); React leaves the attribute alone after that.
+          preload="none"
           onPlay={() => setPlaying(true)}
           onPause={() => {
             setPlaying(false);

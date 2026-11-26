@@ -377,6 +377,7 @@ impl SourceKernel {
         support.runs.clear();
         support.max_cell = 0;
         support.weight_sum = 0.0;
+        support.prepared = None;
         let columns = axis_candidates(
             center[0],
             self.radius,
@@ -426,6 +427,7 @@ impl SourceKernel {
             weight_sum,
             columns,
             rows,
+            prepared,
             ..
         } = support;
         cell_indices.clear();
@@ -433,6 +435,7 @@ impl SourceKernel {
         runs.clear();
         *max_cell = 0;
         *weight_sum = 0.0;
+        *prepared = None;
         for &row in rows.iter() {
             for &column in columns.iter() {
                 let Some(weight) = weigh(column, row)? else {
@@ -585,6 +588,9 @@ pub struct SourceSupport {
     rows: Vec<u32>,
     /// Each cell's deposited energy this tick, in `cell_indices` order.
     amounts: Vec<f64>,
+    /// Cached `(declared, normalized_total)` when [`Self::prepare_amounts`]
+    /// precomputed `amounts` in parallel right after [`SourceKernel::support_into`].
+    prepared: Option<(f64, f64)>,
 }
 
 impl SourceSupport {
@@ -698,6 +704,33 @@ impl SourceSupport {
         self.max_cell = 0;
         self.weight_sum = 0.0;
         self.amounts.clear();
+        self.prepared = None;
+    }
+
+    /// Precompute per-cell deposited energy `amounts` and their exact
+    /// left-to-right `normalized_total` while `cell_weights` is still hot in
+    /// the support worker's L1/L2 cache (bit-identical to [`deposit_energy`]).
+    pub(crate) fn prepare_amounts(&mut self, source: &Source, step: TimeStep) {
+        if source.power == 0.0 {
+            self.amounts.clear();
+            self.prepared = Some((0.0, 0.0));
+            return;
+        }
+        let declared = source.power * f64::from(step.numerator()) / f64::from(step.denominator());
+        let weight_sum = self.weight_sum;
+        let len = self.cell_weights.len();
+        if self.amounts.len() >= len {
+            self.amounts.truncate(len);
+        } else {
+            self.amounts.resize(len, 0.0);
+        }
+        let mut normalized_total = 0.0;
+        for (dst, &weight) in self.amounts.iter_mut().zip(&self.cell_weights) {
+            let amount = declared * (weight / weight_sum);
+            *dst = amount;
+            normalized_total += amount;
+        }
+        self.prepared = Some((declared, normalized_total));
     }
 
     /// Whether any support cell lies at or beyond `cells`.
@@ -1156,6 +1189,7 @@ pub fn deposit_energy(
 ) -> Result<DepositReport, CoreError> {
     if source.power == 0.0 {
         support.amounts.clear();
+        support.prepared = None;
         return Ok(DepositReport {
             source: source.id,
             support_cells: 0,
@@ -1165,29 +1199,70 @@ pub fn deposit_energy(
         });
     }
     let declared = source.power * f64::from(step.numerator()) / f64::from(step.denominator());
+    let energy = state.energy_mut();
+    if let Some((prep_decl, prep_norm)) = support.prepared
+        && prep_decl.to_bits() == declared.to_bits()
+        && support.amounts.len() == support.cell_indices.len()
+    {
+        let mut applied = 0.0;
+        if !support.runs.is_empty() && support.max_cell < energy.len() {
+            for &run in &support.runs {
+                let e_slice = &mut energy[run.cell_start..run.cell_start + run.len];
+                let a_slice = &support.amounts[run.offset..run.offset + run.len];
+                for (slot, &amount) in e_slice.iter_mut().zip(a_slice) {
+                    let before = f64::from(*slot);
+                    let after = (before + amount) as f32;
+                    applied += f64::from(after) - before;
+                    *slot = after;
+                }
+            }
+        } else {
+            for (&index, &amount) in support.cell_indices.iter().zip(&support.amounts) {
+                let slot = energy.get_mut(index).ok_or_else(outside)?;
+                let before = f64::from(*slot);
+                let after = (before + amount) as f32;
+                applied += f64::from(after) - before;
+                *slot = after;
+            }
+        }
+        return Ok(DepositReport {
+            source: source.id,
+            support_cells: support.len(),
+            declared,
+            normalized_total: prep_norm,
+            applied,
+        });
+    }
     let mut normalized_total = 0.0;
     let mut applied = 0.0;
-    support.amounts.clear();
-    let energy = state.energy_mut();
     let weight_sum = support.weight_sum;
+    support.prepared = None;
     if !support.runs.is_empty()
         && support.max_cell < energy.len()
         && support.cell_weights.len() >= support.cell_indices.len()
     {
+        let len = support.cell_indices.len();
+        if support.amounts.len() >= len {
+            support.amounts.truncate(len);
+        } else {
+            support.amounts.resize(len, 0.0);
+        }
         for &run in &support.runs {
             let e_slice = &mut energy[run.cell_start..run.cell_start + run.len];
             let w_slice = &support.cell_weights[run.offset..run.offset + run.len];
-            for (slot, &weight) in e_slice.iter_mut().zip(w_slice) {
+            let a_slice = &mut support.amounts[run.offset..run.offset + run.len];
+            for ((slot, &weight), dst) in e_slice.iter_mut().zip(w_slice).zip(a_slice) {
                 let amount = declared * (weight / weight_sum);
                 normalized_total += amount;
                 let before = f64::from(*slot);
                 let after = (before + amount) as f32;
                 applied += f64::from(after) - before;
                 *slot = after;
-                support.amounts.push(amount);
+                *dst = amount;
             }
         }
     } else {
+        support.amounts.clear();
         for (&index, &weight) in support.cell_indices.iter().zip(&support.cell_weights) {
             let amount = declared * (weight / weight_sum);
             normalized_total += amount;

@@ -1613,6 +1613,7 @@ fn apply_grants_parallel_band_groups_match_serial_bit_for_bit() {
         "test must exercise parallel apply_grants_on threshold (got {})",
         serial_grants.debits().len()
     );
+    let serial_totals: Vec<u64> = serial_grants.totals().iter().map(|v| v.to_bits()).collect();
     let mut serial_field = base.clone();
     let serial_applied = apply_grants(&mut serial_field, &mut serial_grants).expect("apply 1");
     assert_eq!(serial_applied.to_bits(), expected_summary.granted.to_bits());
@@ -1625,6 +1626,11 @@ fn apply_grants_parallel_band_groups_match_serial_bit_for_bit() {
         assert_eq!(
             summary.granted.to_bits(),
             expected_summary.granted.to_bits()
+        );
+        let par_totals: Vec<u64> = grants.totals().iter().map(|v| v.to_bits()).collect();
+        assert_eq!(
+            par_totals, serial_totals,
+            "workers={workers}: parallel uptake totals differ from serial"
         );
         let mut state = base.clone();
         let applied = apply_grants_on(&mut state, &mut grants, workers).expect("apply parallel");

@@ -1707,3 +1707,233 @@ fn metal_backend_flat_f32_matches_evaluate_bit_for_bit_across_full_and_partial_b
     }
     Ok(())
 }
+
+/// Round-3 regression: parallel `place_and_stage_parallel` (`staging_workers > 1`
+/// and `jobs.len() >= 4_096`) must match serial `staging_workers = 1` bit-for-bit
+/// across steady-state ticks, small empty-slot newborn uploads, nonfinite input
+/// fallback, and same-batch duplicate-slot overwrite fallback, while keeping
+/// `uploads()`, `resident_genomes()`, and `resident_bytes()` identical.
+#[test]
+fn parallel_place_and_stage_matches_serial_across_steady_newborns_and_fallback()
+-> Result<(), CoreError> {
+    let (Some(mut serial), Some(mut parallel)) = (backend(1_024), backend(1_024)) else {
+        return Ok(());
+    };
+    serial.set_staging_workers(std::num::NonZeroUsize::MIN);
+    parallel.set_staging_workers(std::num::NonZeroUsize::MIN.saturating_add(7));
+
+    // 4,200 genomes across 2 topologies (> 4,096 threshold and multi-shard per
+    // topology with 1,024 slots/shard), leaving empty slots at the tail of each
+    // shard for the newborn upload check.
+    let topos = [DenseTopology::new(&[8])?, DenseTopology::new(&[16])?];
+    let total = 4_200_usize;
+    let mut draws = Draws(20_261_125);
+    let mut params_f16: Vec<Vec<F16>> = Vec::with_capacity(total + 4);
+    let mut topo_of: Vec<usize> = Vec::with_capacity(total + 4);
+    let mut inputs_f32: Vec<f32> = Vec::with_capacity((total + 4) * SENSOR_WIDTH);
+    for idx in 0..(total + 4) {
+        let t = idx % topos.len();
+        topo_of.push(t);
+        let mut p = vec![F16::ZERO; topos[t].parameter_count()];
+        for layer in topos[t].layers() {
+            let scale = 1.0 / (layer.inputs as f64).sqrt();
+            for value in &mut p[layer.weights..layer.biases + layer.outputs] {
+                *value = F16::from_f64(draws.symmetric() * scale);
+            }
+        }
+        params_f16.push(p);
+        for _ in 0..SENSOR_WIDTH {
+            inputs_f32.push((draws.symmetric() * 1.5) as f32);
+        }
+    }
+
+    let mut next_slot = [0_u64; 2];
+    let mut base_jobs: Vec<FlatControllerJob<'_>> = Vec::with_capacity(total);
+    for idx in 0..total {
+        let t = topo_of[idx];
+        let s = next_slot[t];
+        next_slot[t] += 1;
+        base_jobs.push(FlatControllerJob {
+            genome: GenomeId::new(idx as u64 + 1),
+            slot: ArenaSlot::new(t as u32, s, 1),
+            controller: ReferenceController::new(&topos[t], &params_f16[idx], BOUND)?,
+        });
+    }
+    let finite_all = vec![1_u8; total];
+
+    let assert_same_outputs = |label: &str, a: &FlatOutputs, b: &FlatOutputs| {
+        assert_eq!(a.output_width, b.output_width, "{label} width");
+        assert_eq!(a.valid, b.valid, "{label} valid");
+        let a_bits: Vec<u32> = a.values.iter().map(|v| v.to_bits()).collect();
+        let b_bits: Vec<u32> = b.values.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(a_bits, b_bits, "{label} values");
+    };
+
+    let mut out_s = FlatOutputs::default();
+    let mut out_p = FlatOutputs::default();
+
+    // 1. Cold initial upload (both fall through to serial bulk upload).
+    serial.evaluate_flat_f32(
+        &base_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32[..total * SENSOR_WIDTH],
+        &finite_all,
+        &mut out_s,
+    )?;
+    parallel.evaluate_flat_f32(
+        &base_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32[..total * SENSOR_WIDTH],
+        &finite_all,
+        &mut out_p,
+    )?;
+    assert_same_outputs("initial", &out_s, &out_p);
+    assert_eq!(parallel.uploads(), serial.uploads());
+    assert_eq!(parallel.resident_genomes(), serial.resident_genomes());
+    let resident_before = parallel.resident_bytes();
+
+    // 2. Steady-state tick (hits parallel Pass A + Pass B with 0 newborns,
+    //    0 new uploads, and unchanged resident bytes).
+    let mut steady_jobs = base_jobs.clone();
+    // Shuffle order across topologies & shards as spatial ordering does.
+    steady_jobs.reverse();
+    serial.evaluate_flat_f32(
+        &steady_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32[..total * SENSOR_WIDTH],
+        &finite_all,
+        &mut out_s,
+    )?;
+    parallel.evaluate_flat_f32(
+        &steady_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32[..total * SENSOR_WIDTH],
+        &finite_all,
+        &mut out_p,
+    )?;
+    assert_same_outputs("steady", &out_s, &out_p);
+    assert_eq!(parallel.uploads(), serial.uploads());
+    assert_eq!(parallel.resident_genomes(), serial.resident_genomes());
+    assert_eq!(parallel.resident_bytes(), resident_before);
+    assert_eq!(parallel.resident_bytes(), serial.resident_bytes());
+
+    // 3. Steady tick + 4 empty-slot newborns inside already-allocated shards
+    //    (exercises parallel Pass A -> serial newborn upload -> parallel Pass B).
+    let mut with_newborns = steady_jobs.clone();
+    let mut nb_finite = finite_all.clone();
+    for idx in total..(total + 4) {
+        let t = topo_of[idx];
+        let s = next_slot[t];
+        next_slot[t] += 1;
+        with_newborns.push(FlatControllerJob {
+            genome: GenomeId::new(idx as u64 + 1),
+            slot: ArenaSlot::new(t as u32, s, 1),
+            controller: ReferenceController::new(&topos[t], &params_f16[idx], BOUND)?,
+        });
+        nb_finite.push(1);
+    }
+    serial.evaluate_flat_f32(
+        &with_newborns,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &nb_finite,
+        &mut out_s,
+    )?;
+    parallel.evaluate_flat_f32(
+        &with_newborns,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &nb_finite,
+        &mut out_p,
+    )?;
+    assert_same_outputs("newborns", &out_s, &out_p);
+    assert_eq!(parallel.uploads(), serial.uploads());
+    assert_eq!(parallel.resident_genomes(), serial.resident_genomes());
+    assert_eq!(parallel.shards(), serial.shards());
+    assert_eq!(parallel.resident_bytes(), serial.resident_bytes());
+
+    // 3b. Constant-population turnover (release 4 slots, fill them with 4 fresh
+    //     newborns at the same batch size) must keep `resident_bytes()` exact.
+    let resident_at_4204 = parallel.resident_bytes();
+    let retired: Vec<ArenaSlot> = with_newborns[..4].iter().map(|j| j.slot).collect();
+    serial.release_slots(&retired);
+    parallel.release_slots(&retired);
+    for (i, job) in with_newborns.iter_mut().enumerate().take(4) {
+        let old = job.slot;
+        job.slot = ArenaSlot::new(old.topology(), old.slot(), old.generation() + 1);
+        job.genome = GenomeId::new(8_000_000 + i as u64);
+    }
+    serial.evaluate_flat_f32(
+        &with_newborns,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &nb_finite,
+        &mut out_s,
+    )?;
+    parallel.evaluate_flat_f32(
+        &with_newborns,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &nb_finite,
+        &mut out_p,
+    )?;
+    assert_same_outputs("turnover-newborns", &out_s, &out_p);
+    assert_eq!(parallel.uploads(), serial.uploads());
+    assert_eq!(parallel.resident_genomes(), serial.resident_genomes());
+    assert_eq!(parallel.resident_bytes(), resident_at_4204);
+
+    // 4. Nonfinite input fallback (must return Ok(None) cleanly without mutating
+    //    state and produce identical partial results via serial fallback).
+    let mut partial_finite = nb_finite.clone();
+    partial_finite[0] = 0;
+    partial_finite[2_048] = 0;
+    partial_finite[with_newborns.len() - 1] = 0;
+    serial.evaluate_flat_f32(
+        &with_newborns,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &partial_finite,
+        &mut out_s,
+    )?;
+    parallel.evaluate_flat_f32(
+        &with_newborns,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &partial_finite,
+        &mut out_p,
+    )?;
+    assert_same_outputs("nonfinite-fallback", &out_s, &out_p);
+
+    // 5. Same-batch overwrite fallback (evicting a live resident slot triggers
+    //    Pass A fallback and matches serial eviction/reconciliation bit-for-bit).
+    let mut overwrite_jobs = with_newborns.clone();
+    let mut overwrite_inputs = inputs_f32.clone();
+    let mut overwrite_finite = nb_finite.clone();
+    let victim = overwrite_jobs[17].slot;
+    overwrite_jobs.push(FlatControllerJob {
+        genome: GenomeId::new(9_999_999),
+        slot: ArenaSlot::new(victim.topology(), victim.slot(), victim.generation() + 1),
+        controller: overwrite_jobs[19].controller,
+    });
+    overwrite_inputs.extend_from_slice(&inputs_f32[..SENSOR_WIDTH]);
+    overwrite_finite.push(1);
+    serial.evaluate_flat_f32(
+        &overwrite_jobs,
+        SENSOR_WIDTH,
+        &overwrite_inputs,
+        &overwrite_finite,
+        &mut out_s,
+    )?;
+    parallel.evaluate_flat_f32(
+        &overwrite_jobs,
+        SENSOR_WIDTH,
+        &overwrite_inputs,
+        &overwrite_finite,
+        &mut out_p,
+    )?;
+    assert_same_outputs("overwrite-fallback", &out_s, &out_p);
+    assert_eq!(out_p.valid[17], 0);
+    assert_eq!(parallel.uploads(), serial.uploads());
+    assert_eq!(parallel.resident_genomes(), serial.resident_genomes());
+    Ok(())
+}

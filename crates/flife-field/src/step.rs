@@ -964,18 +964,19 @@ pub fn advance_field_wave2_on(
     }
     let supports = &mut supports[..sources.len()];
     let grid = *next.grid();
+    let fused = kernel.is_fused();
     let refused = supports_on(
         kernel,
         phase2.source_kernels,
         &grid,
         sources,
         supports,
+        (!fused).then_some(step),
         scratches.len(),
     )?;
     let supported = refused.as_ref().map_or(sources.len(), |(index, _)| *index);
     let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
     let channels = next.carrier0_moments_count();
-    let fused = kernel.is_fused();
 
     let deposits = if fused {
         if let Some((_, error)) = refused {
@@ -1107,6 +1108,7 @@ fn supports_on(
     grid: &FieldGrid,
     sources: &[Source],
     supports: &mut [SourceSupport],
+    prepare_step: Option<TimeStep>,
     workers: usize,
 ) -> Result<Option<(usize, CoreError)>, CoreError> {
     if sources.is_empty() {
@@ -1121,9 +1123,13 @@ fn supports_on(
             let active_kernel = per_source
                 .and_then(|kernels| kernels.get(index))
                 .unwrap_or(kernel);
-            active_kernel
-                .support_into(grid, source.center(), support)
-                .err()
+            if let Err(err) = active_kernel.support_into(grid, source.center(), support) {
+                return Some(err);
+            }
+            if let Some(step) = prepare_step {
+                support.prepare_amounts(source, step);
+            }
+            None
         };
     if workers <= 1 || sources.len() == 1 {
         for (index, (source, support)) in sources.iter().zip(supports.iter_mut()).enumerate() {

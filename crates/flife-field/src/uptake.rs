@@ -730,7 +730,7 @@ fn resolve_into(
             tally.record(debit, len);
         }
     }
-    Ok(finish(grid, demands.len(), grants, tally))
+    finish(grid, demands.len(), grants, tally, workers)
 }
 
 /// Check `demands` and stage their packets in identity order, using up to
@@ -1025,18 +1025,61 @@ impl Tally {
 }
 
 /// Each demand's total and the summary, once every cell is resolved.
-fn finish(grid: FieldGrid, demands: usize, grants: &mut Grants, tally: Tally) -> UptakeSummary {
+///
+/// When `workers > 1` on large worlds, partitions `grants.totals` into
+/// L1D-resident demand bands and scans `&grants.packets` in ascending (cell)
+/// order per band, preserving bit-identical `add_down` order with zero extra
+/// allocation.
+fn finish(
+    grid: FieldGrid,
+    demands: usize,
+    grants: &mut Grants,
+    tally: Tally,
+    workers: usize,
+) -> Result<UptakeSummary, CoreError> {
     let mut summary = tally.summary;
     summary.requested = tally.requested.value();
     summary.granted = tally.granted.value();
-    grants.totals.resize(demands, 0.0);
-    for packet in &grants.packets {
-        let total = &mut grants.totals[packet.demand];
-        *total = add_down(*total, packet.granted);
+    let parallel_workers = workers.min(8);
+    if parallel_workers > 1 && demands >= 4_096 && grants.packets.len() >= 8_192 {
+        if grants.totals.len() >= demands {
+            grants.totals.truncate(demands);
+        } else {
+            grants.totals.resize(demands, 0.0);
+        }
+        let packets: &[GrantPacket] = &grants.packets;
+        let band_len = demands.div_ceil(parallel_workers);
+        let mut bands: Vec<(usize, &mut [f64])> = grants
+            .totals
+            .chunks_mut(band_len)
+            .enumerate()
+            .map(|(i, slice)| (i * band_len, slice))
+            .collect();
+        flife_core::pool::parallel_tasks(
+            parallel_workers,
+            "sum uptake totals",
+            &mut bands,
+            |_, (d_start, dst)| {
+                let start = *d_start;
+                dst.fill(0.0);
+                for packet in packets {
+                    if let Some(slot) = dst.get_mut(packet.demand.wrapping_sub(start)) {
+                        *slot = add_down(*slot, packet.granted);
+                    }
+                }
+            },
+        )?;
+    } else {
+        grants.totals.clear();
+        grants.totals.resize(demands, 0.0);
+        for packet in &grants.packets {
+            let total = &mut grants.totals[packet.demand];
+            *total = add_down(*total, packet.granted);
+        }
     }
     grants.summary = summary;
     grants.grid = Some(grid);
-    summary
+    Ok(summary)
 }
 
 /// A cell's grant under `cell-quantum-largest-remainder-v1`, from its
@@ -1979,5 +2022,5 @@ fn resolve_on(
         tally.record(&debit, group.len());
         debits.push(debit);
     }
-    Ok(finish(grid, demands.len(), grants, tally))
+    finish(grid, demands.len(), grants, tally, 1)
 }

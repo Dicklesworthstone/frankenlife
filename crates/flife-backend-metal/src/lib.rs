@@ -1502,7 +1502,7 @@ impl MetalBackend {
         clippy::too_many_lines,
         reason = "single-pass placement and staging with duplicate-slot fallback and cached shard lease"
     )]
-    fn place_and_stage<J: JobView>(
+    fn place_and_stage<J: JobView + Sync>(
         &mut self,
         jobs: &[J],
         external_finite: Option<&[u8]>,
@@ -1513,6 +1513,14 @@ impl MetalBackend {
                 buffer: "metal controller batch",
                 detail: format!("batch size {} exceeds u32", jobs.len()),
             });
+        }
+        if self.staging_workers > 1
+            && jobs.len() >= 4_096
+            && self.shard_count > 0
+            && self.buckets.len() <= TOPO_CACHE_SLOTS
+            && let Some(done) = self.place_and_stage_parallel(jobs, external_finite, batch_dims)?
+        {
+            return Ok(done);
         }
         let Self {
             controllers,
@@ -2101,6 +2109,506 @@ impl MetalBackend {
             touched.sort_unstable();
         }
         Ok((all_dispatched, dispatched_count))
+    }
+
+    /// Steady-state parallel fast path for [`Self::place_and_stage`]: splits
+    /// read-only occupant verification (Pass A) and per-shard `JOB_WORDS`
+    /// emission (Pass B) across `self.staging_workers` on `flife_core::pool`,
+    /// handling small batches of empty-slot newborns serially in between.
+    ///
+    /// Produces word-for-word identical `shard.staged` and `touched` lists to
+    /// the serial loop with zero persistent memory overhead, and returns
+    /// `Ok(None)` without mutating state whenever any non-steady edge case
+    /// (nonfinite input, unallocated/undersized shard, eviction overwrite,
+    /// mismatched dtype/dims, or bulk initial upload) requires the serial path.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "two-pass parallel resident placement and shard staging with zero-mutation fallback"
+    )]
+    fn place_and_stage_parallel<J: JobView + Sync>(
+        &mut self,
+        jobs: &[J],
+        external_finite: Option<&[u8]>,
+        batch_dims: (usize, usize),
+    ) -> Result<Option<(bool, usize)>, CoreError> {
+        const MAX_FAST_SHARDS: usize = 32;
+        const MAX_FAST_DENSE_SHARDS: usize = 32;
+        const MAX_FAST_NEWBORNS: usize = 64;
+
+        #[derive(Clone, Copy)]
+        struct FastTopoInfo {
+            geometry: ShardGeometry,
+            dtype: WeightDtype,
+            shape_words: [u32; 3],
+            params: u64,
+            slots_per_shard: u64,
+            stride: u64,
+        }
+
+        #[derive(Clone, Copy)]
+        struct NewbornJob {
+            job_idx: usize,
+            active_shard: usize,
+            local: usize,
+            offset: u64,
+        }
+
+        let finite_flags = external_finite.unwrap_or(self.input_finite.as_slice());
+        if finite_flags.len() < jobs.len() {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "metal controller input flags",
+                detail: format!(
+                    "expected at least {} finite flags, got {}",
+                    jobs.len(),
+                    finite_flags.len()
+                ),
+            });
+        }
+
+        let mut active_shards = [(0_usize, 0_usize); MAX_FAST_SHARDS];
+        let mut active_len = 0_usize;
+        let mut shard_map = [[u8::MAX; MAX_FAST_DENSE_SHARDS]; TOPO_CACHE_SLOTS];
+        let mut topo_info: [Option<FastTopoInfo>; TOPO_CACHE_SLOTS] = [None; TOPO_CACHE_SLOTS];
+
+        for (topology, bucket_opt) in self.buckets.iter().enumerate() {
+            let Some(bucket) = bucket_opt.as_ref() else {
+                continue;
+            };
+            if !bucket.shards.sparse.is_empty() {
+                return Ok(None);
+            }
+            let (Some(geometry), Some(shape_words)) = (bucket.geometry, bucket.shape_words) else {
+                if bucket.shards.dense.iter().any(Option::is_some) {
+                    return Ok(None);
+                }
+                continue;
+            };
+            topo_info[topology] = Some(FastTopoInfo {
+                geometry,
+                dtype: bucket.dtype,
+                shape_words,
+                params: geometry.parameters(),
+                slots_per_shard: geometry.slots_per_shard(),
+                stride: geometry.slot_stride_elements(),
+            });
+            for (shard_idx, shard_opt) in bucket.shards.dense.iter().enumerate() {
+                if shard_opt.is_none() {
+                    continue;
+                }
+                if shard_idx >= MAX_FAST_DENSE_SHARDS || active_len >= MAX_FAST_SHARDS {
+                    return Ok(None);
+                }
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "active_len < MAX_FAST_SHARDS (32) <= u8::MAX"
+                )]
+                {
+                    shard_map[topology][shard_idx] = active_len as u8;
+                }
+                active_shards[active_len] = (topology, shard_idx);
+                active_len += 1;
+            }
+        }
+        if active_len == 0 {
+            return Ok(None);
+        }
+
+        let workers = self.staging_workers.max(1);
+        let chunk_count = workers
+            .saturating_mul(2)
+            .min(32)
+            .min(jobs.len().div_ceil(512))
+            .max(1);
+        let chunk_len = jobs.len().div_ceil(chunk_count);
+
+        // Pass A (read-only on `&self.buckets`): verify inputs, topology, and
+        // shard residency, count staged jobs per active shard, and collect any
+        // empty-slot newborns.
+        let (chunk_counts, newborns): (Vec<[usize; MAX_FAST_SHARDS]>, Vec<NewbornJob>) = {
+            let mut topo_refs: [Option<&DenseTopology>; TOPO_CACHE_SLOTS] =
+                [None; TOPO_CACHE_SLOTS];
+            for (topology, bucket_opt) in self.buckets.iter().enumerate() {
+                if let Some(bucket) = bucket_opt.as_ref() {
+                    topo_refs[topology] = Some(&bucket.topology);
+                }
+            }
+            let mut occupant_slices: [&[Option<(u32, GenomeId)>]; MAX_FAST_SHARDS] =
+                [&[]; MAX_FAST_SHARDS];
+            for s in 0..active_len {
+                let (topology, shard_idx) = active_shards[s];
+                if let Some(shard) = self.buckets[topology]
+                    .as_ref()
+                    .and_then(|b| b.shards.dense.get(shard_idx))
+                    .and_then(Option::as_ref)
+                {
+                    occupant_slices[s] = shard.occupants.as_slice();
+                } else {
+                    return Ok(None);
+                }
+            }
+
+            struct VerifyChunk<'a, J> {
+                base: usize,
+                jobs: &'a [J],
+                finite: &'a [u8],
+                counts: [usize; MAX_FAST_SHARDS],
+                newborns: Vec<NewbornJob>,
+                fallback: bool,
+            }
+            let mut tasks: Vec<VerifyChunk<'_, J>> = jobs
+                .chunks(chunk_len)
+                .zip(finite_flags.chunks(chunk_len))
+                .enumerate()
+                .map(|(idx, (j_chunk, f_chunk))| VerifyChunk {
+                    base: idx * chunk_len,
+                    jobs: j_chunk,
+                    finite: f_chunk,
+                    counts: [0; MAX_FAST_SHARDS],
+                    newborns: Vec::new(),
+                    fallback: false,
+                })
+                .collect();
+
+            pool::parallel_tasks(workers, "metal place verify", &mut tasks, |_, task| {
+                let mut cached_topos: [Option<(*const DenseTopology, WeightDtype, u64)>;
+                    TOPO_CACHE_SLOTS] = [None; TOPO_CACHE_SLOTS];
+                for (local_i, (job, &is_finite)) in
+                    task.jobs.iter().zip(task.finite.iter()).enumerate()
+                {
+                    if is_finite == 0 {
+                        task.fallback = true;
+                        return;
+                    }
+                    let slot = job.slot();
+                    let topology = slot.topology() as usize;
+                    if topology >= TOPO_CACHE_SLOTS {
+                        task.fallback = true;
+                        return;
+                    }
+                    let Some(info) = topo_info[topology] else {
+                        task.fallback = true;
+                        return;
+                    };
+                    let controller = job.controller();
+                    let job_topo = controller.topology();
+                    if (job_topo.input_width(), job_topo.raw_output_width()) != batch_dims {
+                        task.fallback = true;
+                        return;
+                    }
+                    let job_dtype = controller.parameters().dtype();
+                    let job_len = controller.parameters().len() as u64;
+                    let job_ptr = std::ptr::from_ref(job_topo);
+                    let hit = matches!(
+                        cached_topos[topology],
+                        Some((ptr, dt, len))
+                            if std::ptr::eq(ptr, job_ptr) && dt == job_dtype && len == job_len
+                    );
+                    if !hit {
+                        let Some(bucket_topo) = topo_refs[topology] else {
+                            task.fallback = true;
+                            return;
+                        };
+                        if job_dtype != info.dtype
+                            || job_len != info.params
+                            || job_topo != bucket_topo
+                        {
+                            task.fallback = true;
+                            return;
+                        }
+                        cached_topos[topology] = Some((job_ptr, job_dtype, job_len));
+                    }
+                    let raw_slot = slot.slot();
+                    let (shard_idx_u64, local_u64, offset_u64) = if raw_slot < info.slots_per_shard
+                    {
+                        (0_u64, raw_slot, raw_slot * info.stride)
+                    } else {
+                        let at = info.geometry.locate(raw_slot);
+                        (at.shard, at.slot_in_shard, at.offset)
+                    };
+                    if shard_idx_u64 >= MAX_FAST_DENSE_SHARDS as u64
+                        || u32::try_from(offset_u64).is_err()
+                    {
+                        task.fallback = true;
+                        return;
+                    }
+                    let active_id = shard_map[topology][shard_idx_u64 as usize];
+                    if active_id == u8::MAX {
+                        task.fallback = true;
+                        return;
+                    }
+                    let s = active_id as usize;
+                    let Ok(local) = usize::try_from(local_u64) else {
+                        task.fallback = true;
+                        return;
+                    };
+                    let Some(&occupant) = occupant_slices[s].get(local) else {
+                        task.fallback = true;
+                        return;
+                    };
+                    let own = Some((slot.generation(), job.genome()));
+                    if occupant == own {
+                        task.counts[s] += 1;
+                    } else if occupant.is_none() {
+                        if task.newborns.len() >= MAX_FAST_NEWBORNS {
+                            task.fallback = true;
+                            return;
+                        }
+                        task.newborns.push(NewbornJob {
+                            job_idx: task.base + local_i,
+                            active_shard: s,
+                            local,
+                            offset: offset_u64,
+                        });
+                        task.counts[s] += 1;
+                    } else {
+                        task.fallback = true;
+                        return;
+                    }
+                }
+            })?;
+
+            if tasks.iter().any(|task| task.fallback) {
+                return Ok(None);
+            }
+            let total_newborns: usize = tasks.iter().map(|t| t.newborns.len()).sum();
+            if total_newborns > MAX_FAST_NEWBORNS {
+                return Ok(None);
+            }
+            let mut all_counts = Vec::with_capacity(tasks.len());
+            let mut all_newborns = Vec::with_capacity(total_newborns);
+            for mut task in tasks {
+                all_counts.push(task.counts);
+                all_newborns.append(&mut task.newborns);
+            }
+            (all_counts, all_newborns)
+        };
+
+        // Pre-validate every newborn before mutating any shard state.
+        if !newborns.is_empty() {
+            for (i, nb) in newborns.iter().enumerate() {
+                if newborns[..i]
+                    .iter()
+                    .any(|prev| prev.active_shard == nb.active_shard && prev.local == nb.local)
+                {
+                    return Ok(None);
+                }
+                if usize::try_from(nb.offset).is_err() {
+                    return Ok(None);
+                }
+                let (topology, shard_idx) = active_shards[nb.active_shard];
+                let Some(shard) = self.buckets[topology]
+                    .as_ref()
+                    .and_then(|b| b.shards.dense.get(shard_idx))
+                    .and_then(Option::as_ref)
+                else {
+                    return Ok(None);
+                };
+                if shard.occupants.get(nb.local).copied().flatten().is_some() {
+                    return Ok(None);
+                }
+                let dtype_matches = matches!(
+                    (
+                        &shard.parameters,
+                        jobs[nb.job_idx].controller().parameters()
+                    ),
+                    (ShardParameters::F32(_), Weights::F32(_))
+                        | (ShardParameters::F16(_), Weights::F16(_))
+                );
+                if !dtype_matches {
+                    return Ok(None);
+                }
+            }
+            let owner = &self.controllers.owner;
+            let mut active_lease: Option<(usize, ShardWriteLease)> = None;
+            for nb in &newborns {
+                let (topology, shard_idx) = active_shards[nb.active_shard];
+                let Some(shard) = self.buckets[topology]
+                    .as_mut()
+                    .and_then(|b| b.shards.dense.get_mut(shard_idx))
+                    .and_then(Option::as_mut)
+                else {
+                    return Ok(None);
+                };
+                let offset = usize::try_from(nb.offset).map_err(|_| CoreError::Overflow {
+                    quantity: "arena offset",
+                })?;
+                if !matches!(active_lease, Some((ls, _)) if ls == nb.active_shard) {
+                    drop(active_lease.take());
+                    let lease = match &shard.parameters {
+                        ShardParameters::F32(buffer) => {
+                            ShardWriteLease::F32(owner.write(buffer.buffer())?)
+                        }
+                        ShardParameters::F16(words) => {
+                            ShardWriteLease::F16(owner.write(words.buffer())?)
+                        }
+                    };
+                    active_lease = Some((nb.active_shard, lease));
+                }
+                let job = &jobs[nb.job_idx];
+                match (
+                    active_lease.as_mut().map(|(_, lease)| lease),
+                    job.controller().parameters(),
+                ) {
+                    (Some(ShardWriteLease::F32(lease)), Weights::F32(values)) => {
+                        lease.write(offset, values)?;
+                    }
+                    (Some(ShardWriteLease::F16(lease)), Weights::F16(values)) => {
+                        self.packed_f16.clear();
+                        let word_count = values.len().div_ceil(2);
+                        if self.packed_f16.capacity() < word_count {
+                            reserve(&mut self.packed_f16, word_count, "metal binary16 words")?;
+                        }
+                        let (pairs, remainder) = values.as_chunks::<2>();
+                        self.packed_f16.extend(pairs.iter().map(|[low, high]| {
+                            u32::from(low.to_bits()) | (u32::from(high.to_bits()) << 16)
+                        }));
+                        if let Some(&last) = remainder.first() {
+                            self.packed_f16.push(u32::from(last.to_bits()));
+                        }
+                        lease.write(offset / 2, &self.packed_f16)?;
+                    }
+                    _ => return Ok(None),
+                }
+                let slot = job.slot();
+                shard.occupants[nb.local] = Some((slot.generation(), job.genome()));
+                shard.live_count += 1;
+                self.uploads += 1;
+            }
+            drop(active_lease);
+        }
+
+        // Compute per-shard totals, size each `shard.staged` once without
+        // reallocation in steady state, and populate `touched` in ascending
+        // `(topology, shard_idx)` order.
+        let mut shard_totals = [0_usize; MAX_FAST_SHARDS];
+        for counts in &chunk_counts {
+            for s in 0..active_len {
+                shard_totals[s] += counts[s];
+            }
+        }
+        self.dispatched.clear();
+        self.touched.clear();
+        let touched_count = shard_totals[..active_len]
+            .iter()
+            .filter(|&&c| c > 0)
+            .count();
+        if self.touched.capacity() < touched_count {
+            reserve(&mut self.touched, touched_count, "metal controller shards")?;
+        }
+
+        for s in 0..active_len {
+            let (topology, shard_idx) = active_shards[s];
+            let Some(shard) = self.buckets[topology]
+                .as_mut()
+                .and_then(|b| b.shards.dense.get_mut(shard_idx))
+                .and_then(Option::as_mut)
+            else {
+                return Ok(None);
+            };
+            let count = shard_totals[s];
+            if count == 0 {
+                shard.staged.clear();
+                continue;
+            }
+            self.touched.push((topology, shard_idx as u64));
+            let needed_words = count.checked_mul(JOB_WORDS).ok_or(CoreError::Overflow {
+                quantity: "metal jobs",
+            })?;
+            if shard.staged.capacity() < needed_words {
+                let extra = needed_words.saturating_sub(shard.staged.len());
+                reserve(&mut shard.staged, extra, "metal jobs")?;
+            }
+            if shard.staged.len() >= needed_words {
+                shard.staged.truncate(needed_words);
+            } else {
+                shard.staged.resize(needed_words, 0);
+            }
+        }
+
+        // Split every active shard's `staged` buffer into disjoint per-chunk
+        // mutable slices so Pass B emits `JOB_WORDS` in exact ascending `row`
+        // order across all workers with zero synchronization.
+        let actual_chunks = chunk_counts.len();
+        struct EmitChunk<'a, J> {
+            base: usize,
+            jobs: &'a [J],
+            shard_outs: [&'a mut [u32]; MAX_FAST_SHARDS],
+        }
+        let mut emit_tasks: Vec<EmitChunk<'_, J>> = jobs
+            .chunks(chunk_len)
+            .enumerate()
+            .map(|(idx, j_chunk)| EmitChunk {
+                base: idx * chunk_len,
+                jobs: j_chunk,
+                shard_outs: std::array::from_fn(|_| <&mut [u32]>::default()),
+            })
+            .collect();
+
+        let mut shard_slices: [&mut [u32]; MAX_FAST_SHARDS] =
+            std::array::from_fn(|_| <&mut [u32]>::default());
+        {
+            let mut active_cursor = 0_usize;
+            for bucket in self.buckets.iter_mut().flatten() {
+                for shard in bucket.shards.dense.iter_mut().flatten() {
+                    if active_cursor < active_len {
+                        shard_slices[active_cursor] = shard.staged.as_mut_slice();
+                        active_cursor += 1;
+                    }
+                }
+            }
+        }
+        for (s, slice) in shard_slices.iter_mut().take(active_len).enumerate() {
+            if shard_totals[s] == 0 {
+                continue;
+            }
+            let mut rem = std::mem::take(slice);
+            for t in 0..actual_chunks {
+                let words = chunk_counts[t][s] * JOB_WORDS;
+                let Some((head, tail)) = rem.split_at_mut_checked(words) else {
+                    return Err(CoreError::LayoutMismatch {
+                        buffer: "metal jobs",
+                        detail: format!("shard {s} staging slice underrun for chunk {t}"),
+                    });
+                };
+                rem = tail;
+                emit_tasks[t].shard_outs[s] = head;
+            }
+        }
+
+        pool::parallel_tasks(workers, "metal place stage", &mut emit_tasks, |_, task| {
+            let mut cursors = [0_usize; MAX_FAST_SHARDS];
+            for (local_i, job) in task.jobs.iter().enumerate() {
+                let slot = job.slot();
+                let topology = slot.topology() as usize;
+                let Some(info) = topo_info[topology] else {
+                    continue;
+                };
+                let raw_slot = slot.slot();
+                let (shard_idx, offset_u64) = if raw_slot < info.slots_per_shard {
+                    (0_usize, raw_slot * info.stride)
+                } else {
+                    let at = info.geometry.locate(raw_slot);
+                    (at.shard as usize, at.offset)
+                };
+                let s = shard_map[topology][shard_idx] as usize;
+                let pos = cursors[s];
+                cursors[s] = pos + JOB_WORDS;
+                let out = &mut task.shard_outs[s][pos..pos + JOB_WORDS];
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "jobs.len() <= u32::MAX and offset_u64 <= u32::MAX verified in Pass A"
+                )]
+                {
+                    out[0] = (task.base + local_i) as u32;
+                    out[1] = offset_u64 as u32;
+                }
+                out[2] = info.shape_words[0];
+                out[3] = info.shape_words[1];
+                out[4] = info.shape_words[2];
+            }
+        })?;
+
+        Ok(Some((true, jobs.len())))
     }
 
     /// Grow the per-organism buffers to hold `count` organisms of

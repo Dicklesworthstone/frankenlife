@@ -59,13 +59,14 @@ const DEPOSIT_PACKETS: &str = "deposit packets";
 /// cells.
 const PACKETS_PER_DEPOSIT: u64 = 4;
 
-/// One organism's staged deposit.
+/// One organism's staged deposit metadata (kept compact at 40 B so
+/// `prepare_for_carrier` scans metadata without touching the 256 B per-entry
+/// chemical directions stored in `Deposits::directions`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Entry {
     organism: OrganismId,
     paid: f64,
     offered: f64,
-    direction: [f64; CHANNELS],
     /// Its packets: `packets[first..first + count]`.
     first: usize,
     count: usize,
@@ -120,6 +121,10 @@ impl DepositSummary {
 pub struct Deposits {
     grid: Option<FieldGrid>,
     entries: Vec<Entry>,
+    /// Chemical direction for `entries[i]`, stored in a parallel array so
+    /// metadata scans (`prepare_for_carrier`) touch 40 B/entry instead of
+    /// 296 B/entry, and reduction reads 256 B-aligned direction rows directly.
+    directions: Vec<[f64; CHANNELS]>,
     packets: Vec<Packet>,
     /// What each occupied cell of the last reduction received: a slot a
     /// packet, so that each run of cells has its own.
@@ -153,6 +158,7 @@ impl Deposits {
     pub fn allocated_bytes(&self) -> u64 {
         total([
             capacity_bytes(&self.entries),
+            capacity_bytes(&self.directions),
             capacity_bytes(&self.packets),
             capacity_bytes(&self.received),
             capacity_bytes(&self.identities),
@@ -170,6 +176,7 @@ impl Deposits {
         Self {
             grid: None,
             entries: Vec::new(),
+            directions: Vec::new(),
             packets: Vec::new(),
             received: Vec::new(),
             identities: Vec::new(),
@@ -220,8 +227,10 @@ impl Deposits {
         let packets = organisms
             .checked_mul(packets_per_deposit)
             .ok_or_else(overflow)?;
+        let per_entry_bytes =
+            (std::mem::size_of::<Entry>() + std::mem::size_of::<[f64; CHANNELS]>()) as u64;
         let entry_bytes = organisms
-            .checked_mul(std::mem::size_of::<Entry>() as u64)
+            .checked_mul(per_entry_bytes)
             .ok_or_else(overflow)?;
         let received_bytes = packets
             .checked_mul(std::mem::size_of::<f64>() as u64)
@@ -239,6 +248,7 @@ impl Deposits {
         let packets = usize::try_from(packets).map_err(|_| overflow())?;
         Ok(Self {
             entries: Vec::with_capacity(organisms),
+            directions: Vec::with_capacity(organisms),
             packets: Vec::with_capacity(packets),
             received: Vec::with_capacity(packets),
             identities: Vec::with_capacity(organisms),
@@ -255,6 +265,7 @@ impl Deposits {
     pub fn clear(&mut self) {
         self.grid = None;
         self.entries.clear();
+        self.directions.clear();
         self.packets.clear();
         self.received.clear();
         self.identities.clear();
@@ -418,10 +429,10 @@ impl Deposits {
                     organism,
                     paid: paid + 0.0,
                     offered: offered + 0.0,
-                    direction: *direction,
                     first,
                     count: self.packets.len() - first,
                 });
+                self.directions.push(*direction);
             }
         }
         Ok(())
@@ -511,10 +522,10 @@ impl Deposits {
             organism,
             paid: paid + 0.0,
             offered: offered + 0.0,
-            direction: *direction,
             first,
             count: self.packets.len() - first,
         });
+        self.directions.push(*direction);
         Ok(())
     }
 
@@ -663,10 +674,10 @@ impl Deposits {
             organism,
             paid: paid + 0.0,
             offered: offered + 0.0,
-            direction: *direction,
             first,
             count: self.packets.len() - first,
         });
+        self.directions.push(*direction);
     }
 
     /// Forget every staged deposit and give these deposits room to stage
@@ -717,6 +728,7 @@ impl Deposits {
                     quantity: DEPOSIT_PACKETS,
                 })?;
         fit(&mut self.entries, organisms)?;
+        fit(&mut self.directions, organisms)?;
         fit(&mut self.packets, packets)?;
         if max_packets_per_deposit > PACKETS_PER_DEPOSIT as usize {
             fit(&mut self.shares, max_packets_per_deposit)?;
@@ -773,6 +785,7 @@ impl Deposits {
         }
         if !other.entries.is_empty() {
             self.entries.extend_from_slice(&other.entries);
+            self.directions.extend_from_slice(&other.directions);
             if packets > 0 {
                 for entry in &mut self.entries[entries..] {
                     entry.first += packets;
@@ -1183,7 +1196,7 @@ pub fn apply_deposit_streams_to_carrier_on(
                     stream.bins.order(),
                     seq,
                     &stream.packets,
-                    &stream.entries,
+                    &stream.directions,
                 )
             };
             let mut applied = CompensatedSum::ZERO;
@@ -1250,7 +1263,7 @@ pub fn apply_deposit_streams_to_carrier_on(
         order: &'a [u32],
         sequence: Option<&'a [u32]>,
         packets: &'a [Packet],
-        entries: &'a [Entry],
+        directions: &'a [[f64; CHANNELS]],
     }
     struct StreamLane<'a> {
         occupied_cells: &'a [u32],
@@ -1267,7 +1280,7 @@ pub fn apply_deposit_streams_to_carrier_on(
         stream.received.clear();
         stream.received.resize(occ_len, 0.0);
         let Deposits {
-            entries,
+            directions,
             packets,
             received,
             sequence,
@@ -1281,7 +1294,7 @@ pub fn apply_deposit_streams_to_carrier_on(
             order: bins.order(),
             sequence: (!*identity_sequence).then_some(sequence.as_slice()),
             packets: packets.as_slice(),
-            entries: entries.as_slice(),
+            directions: directions.as_slice(),
         });
         let mut rem_received = received.as_mut_slice();
         let mut occ_cursor = 0_usize;
@@ -1326,7 +1339,7 @@ pub fn apply_deposit_streams_to_carrier_on(
                 s_read.order,
                 s_read.sequence,
                 s_read.packets,
-                s_read.entries,
+                s_read.directions,
             );
         }
     };
@@ -1378,7 +1391,7 @@ pub fn apply_deposits_to_carrier_on(
 ) -> Result<DepositSummary, CoreError> {
     let (mut summary, buckets) = deposits.prepare_for_carrier(field, carrier, workers)?;
     let Deposits {
-        entries,
+        directions,
         packets,
         received,
         sequence,
@@ -1429,7 +1442,7 @@ pub fn apply_deposits_to_carrier_on(
     };
     received.resize(occupied_buckets.len(), 0.0);
     let seq = (!*identity_sequence).then_some(sequence.as_slice());
-    let (packets, entries) = (&**packets, &**entries);
+    let (packets, directions) = (&**packets, &**directions);
 
     if runs == 1 {
         let mut run = Run {
@@ -1447,7 +1460,7 @@ pub fn apply_deposits_to_carrier_on(
                 }
             }
         }
-        let count = reduce_run(&mut run, offsets, order, seq, packets, entries);
+        let count = reduce_run(&mut run, offsets, order, seq, packets, directions);
         let mut applied = CompensatedSum::ZERO;
         for &value in run.received.get(..count).unwrap_or(&[]) {
             applied.add(value);
@@ -1511,7 +1524,7 @@ pub fn apply_deposits_to_carrier_on(
         }
     }
 
-    let reduce = |run: &mut Run<'_>| reduce_run(run, offsets, order, seq, packets, entries);
+    let reduce = |run: &mut Run<'_>| reduce_run(run, offsets, order, seq, packets, directions);
     let mut occupied = vec![0_usize; lanes.len()];
     let mut work_tiles: Vec<(&mut Run<'_>, &mut usize)> =
         lanes.iter_mut().zip(occupied.iter_mut()).collect();
@@ -1557,9 +1570,10 @@ impl Deposits {
                 "these deposits were staged for another grid".into(),
             ));
         }
-        // Single pass over `self.entries` (296 B/entry) checks ascending
+        // Single pass over compact `self.entries` (40 B/entry; 256 B
+        // chemical directions live in `self.directions`) checks ascending
         // identity order, contiguous packet spans, and compensated paid/offered
-        // totals simultaneously (3× less serial memory traffic, bit-identical).
+        // totals simultaneously (7.4× less serial memory traffic, bit-identical).
         let mut strictly_ascending = true;
         let mut contiguous_spans = true;
         let mut prev_org: Option<OrganismId> = None;
@@ -1776,10 +1790,7 @@ impl DepositReduction<'_> {
     /// Deposit `index`'s chemical direction.
     #[must_use]
     pub fn direction(&self, index: usize) -> Option<&[f64; CHANNELS]> {
-        self.deposits
-            .entries
-            .get(index)
-            .map(|entry| &entry.direction)
+        self.deposits.directions.get(index)
     }
 
     /// The reduction's summary, given `received[c]` for every cell `c`, of
@@ -1869,7 +1880,7 @@ fn reduce_run_const<const M: usize>(
     order: &[u32],
     sequence: Option<&[u32]>,
     packets: &[Packet],
-    entries: &[Entry],
+    directions: &[[f64; CHANNELS]],
 ) -> usize {
     let mut occupied = 0_usize;
     let mut batch_len = 0_usize;
@@ -1902,7 +1913,7 @@ fn reduce_run_const<const M: usize>(
                 Some(seq_slice) => seq_slice[slice[0] as usize] as usize,
             };
             let packet = &packets[pkt_idx];
-            if let Some(dir) = entries[packet.entry].direction.first_chunk::<M>() {
+            if let Some(dir) = directions[packet.entry].first_chunk::<M>() {
                 let amount = packet.amount;
                 for (slot, &component) in moment.iter_mut().zip(dir) {
                     *slot = amount * component;
@@ -1919,7 +1930,7 @@ fn reduce_run_const<const M: usize>(
                     for &ord in slice {
                         let packet = &packets[ord as usize];
                         total = add_down(total, packet.amount);
-                        if let Some(dir) = entries[packet.entry].direction.first_chunk::<M>() {
+                        if let Some(dir) = directions[packet.entry].first_chunk::<M>() {
                             let amount = packet.amount;
                             for (slot, &component) in moment.iter_mut().zip(dir) {
                                 *slot += amount * component;
@@ -1932,7 +1943,7 @@ fn reduce_run_const<const M: usize>(
                         let seq = sequence[ord as usize];
                         let packet = &packets[seq as usize];
                         total = add_down(total, packet.amount);
-                        if let Some(dir) = entries[packet.entry].direction.first_chunk::<M>() {
+                        if let Some(dir) = directions[packet.entry].first_chunk::<M>() {
                             let amount = packet.amount;
                             for (slot, &component) in moment.iter_mut().zip(dir) {
                                 *slot += amount * component;
@@ -1985,13 +1996,15 @@ fn reduce_run(
     order: &[u32],
     sequence: Option<&[u32]>,
     packets: &[Packet],
-    entries: &[Entry],
+    directions: &[[f64; CHANNELS]],
 ) -> usize {
     let moment_count = run.moment_count.min(CHANNELS);
     match moment_count {
-        CHANNELS => reduce_run_const::<CHANNELS>(run, offsets, order, sequence, packets, entries),
-        24 => reduce_run_const::<24>(run, offsets, order, sequence, packets, entries),
-        8 => reduce_run_const::<8>(run, offsets, order, sequence, packets, entries),
+        CHANNELS => {
+            reduce_run_const::<CHANNELS>(run, offsets, order, sequence, packets, directions)
+        }
+        24 => reduce_run_const::<24>(run, offsets, order, sequence, packets, directions),
+        8 => reduce_run_const::<8>(run, offsets, order, sequence, packets, directions),
         _ => {
             let mut occupied = 0_usize;
             let mut batch_len = 0_usize;
@@ -2030,11 +2043,9 @@ fn reduce_run(
                         continue;
                     };
                     total = add_down(total, packet.amount);
-                    if let Some(entry) = entries.get(packet.entry) {
+                    if let Some(dir) = directions.get(packet.entry) {
                         let amount = packet.amount;
-                        for (slot, &component) in
-                            moment.iter_mut().zip(&entry.direction).take(moment_count)
-                        {
+                        for (slot, &component) in moment.iter_mut().zip(dir).take(moment_count) {
                             *slot += amount * component;
                         }
                     }

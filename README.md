@@ -491,9 +491,11 @@ settle at about 22,000 to 25,000 after an early bottleneck. Open it the same way
 `presets/desktop-world.toml` is the Desktop ecology profile's: 100,000 founders on 512 × 512 × 33 with F16
 weights, at the Interactive preset's energy per area, which FL-034's experiment E2 tested and adopted. All 8
 of E2's runs at its power settled at 91,664 to 99,361 live by tick 8,192. With all 100,000 founders alive, on
-16 workers of an M5 Ultra, it steps at 9.8–10.2 ticks per second on `torch`, which `auto` takes there, against
-8.9–9.0 on the CPU reference (`tick_throughput`, ticks 32–160). So it is a world to study, not yet one to watch at
-frame rate.
+16 workers of an M5 Ultra, it stepped at 9.8–10.2 ticks per second on `torch`, which `auto` takes there, against
+8.9–9.0 on the CPU reference (`tick_throughput`, ticks 32–160). Three rounds of host-side work (commits cb48588,
+31ea27b and c1ab2f8, each reaching the same tick-160 digest) then took it to 23.3–24.2 ticks per second with
+`--controllers metal` on 16 workers, over the same ticks on a shared host (bead flife-2je), from 8.7 before them.
+That is still short of 30, so it is a world to study, not yet one to watch at frame rate.
 
 `presets/confluent-world.toml` is the world the website's film shows: the contact model, below, at a finer
 scale than `contact-world`. Its field cells are a quarter of `contact-world`'s width (320 × 320 on an 80-unit

@@ -792,7 +792,7 @@ export const gates: { id: string; name: string; state: GateState; detail: string
     id: "G7",
     name: "400,000 organisms at 30 ticks/s",
     state: "open",
-    detail: "Not reached. The 100,000-organism Desktop world runs at about 10 ticks/s on an M5 Ultra.",
+    detail: "Not reached. The 100,000-organism Desktop world steps at 23 to 24 ticks/s on an M5 Ultra, with a quarter of the organisms G7 asks for.",
   },
   {
     id: "G8",
@@ -948,7 +948,7 @@ export const presets: {
     dt: "1/128",
     kind: "profile",
     chosen: "Desktop profile · FL-034 E2",
-    body: "F16 weights; settles at 91,664 to 99,361 alive. About 10 ticks a second on an M5 Ultra.",
+    body: "F16 weights; settles at 91,664 to 99,361 alive. 23 to 24 ticks a second on an M5 Ultra with Metal controllers.",
   },
   {
     file: "showcase-world",

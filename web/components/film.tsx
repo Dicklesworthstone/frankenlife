@@ -275,8 +275,9 @@ export function Film({
         });
       }
     };
+    // `complete` holds for a poster that loaded and for one that failed: either way the film goes on.
     const image = posterRef.current;
-    if (!image || (image.complete && image.naturalWidth > 0)) {
+    if (!image || image.complete) {
       start();
       return;
     }

@@ -6223,14 +6223,16 @@ fn evaluate_reference_held_from_f32(
     }
 }
 
-/// Build `HeldOutput` from one backend's raw F32 slice, applying the canonical
-/// host `update_recurrent_state` when `state_width > 0`.
-fn held_from_raw_slice(
+/// Write one backend's raw F32 slice directly into `out`, avoiding a 280-byte
+/// stack `HeldOutput` temporary and copy in Pass 2 controller decode loops.
+#[inline]
+fn held_from_raw_slice_into(
     rules: &Rules,
     organism: &Organism,
     to: Tick,
     raw: &[f32],
-) -> Result<HeldOutput, CoreError> {
+    out: &mut HeldOutput,
+) -> Result<(), CoreError> {
     let actions = rules.v2.actions();
     let action_width = actions.action_width();
     let state_width = rules.recurrent_state_width;
@@ -6263,10 +6265,23 @@ fn held_from_raw_slice(
             organism.last_neighbor_h0,
             &mut next_state[..state_width],
         );
-        HeldOutput::evaluated_recurrent_slice(to, action_slice, &next_state[..state_width])
+        out.write_evaluated_recurrent_slice(to, action_slice, &next_state[..state_width])
     } else {
-        HeldOutput::evaluated_slice(to, action_slice)
+        out.write_evaluated_slice(to, action_slice)
     }
+}
+
+/// Build `HeldOutput` from one backend's raw F32 slice, applying the canonical
+/// host `update_recurrent_state` when `state_width > 0`.
+fn held_from_raw_slice(
+    rules: &Rules,
+    organism: &Organism,
+    to: Tick,
+    raw: &[f32],
+) -> Result<HeldOutput, CoreError> {
+    let mut held = HeldOutput::INVALID;
+    held_from_raw_slice_into(rules, organism, to, raw, &mut held)?;
+    Ok(held)
 }
 
 /// Build `HeldOutput` from one backend's full `RawOutputs`, applying the
@@ -7685,7 +7700,7 @@ fn pass1_flat_f32<'p>(
                     finish_due_row(dst, finite_slot, start + index, organism, Some(trail_f32));
                     jobs_out.push(build_job(organism, genome, slot)?);
                     local_due += 1;
-                    dec.held = organism.held;
+                    // Pass 2 overwrites `dec.held` for every evaluated organism.
                     dec.evaluated = true;
                 } else {
                     encode_dual_gradients_only_into(
@@ -7792,7 +7807,7 @@ fn pass1_flat_f32<'p>(
                         Some(trail_f32),
                     );
                     chunk_jobs[d] = Some(build_job(organism, genome, slot)?);
-                    dec.held = organism.held;
+                    // Pass 2 overwrites `dec.held` for every evaluated organism.
                     dec.evaluated = true;
                 } else {
                     encode_dual_gradients_only_into(
@@ -7864,7 +7879,7 @@ fn pass1_flat_f32<'p>(
                 finish_due_row(dst, finite_slot, start + index, organism, None);
                 jobs_out.push(build_job(organism, genome, slot)?);
                 local_due += 1;
-                dec.held = organism.held;
+                // Pass 2 overwrites `dec.held` for every evaluated organism.
                 dec.evaluated = true;
             } else {
                 encode_gradients_only_into(rules, organism, &raw, from, &mut dec.gradients)?;
@@ -7958,7 +7973,7 @@ fn pass1_flat_f32<'p>(
                 )?;
                 finish_due_row(dst, &mut chunk_in_fin[d], base + i, organism, None);
                 chunk_jobs[d] = Some(build_job(organism, genome, slot)?);
-                dec.held = organism.held;
+                // Pass 2 overwrites `dec.held` for every evaluated organism.
                 dec.evaluated = true;
             } else {
                 encode_gradients_only_into(rules, organism, raw, from, &mut dec.gradients)?;
@@ -8160,7 +8175,7 @@ fn pass1_flat_f32_spatial<'p>(
                         Some(trail_f32),
                     );
                     chunk_jobs[d] = Some(build_job(organism, genome, slot)?);
-                    dec.held = organism.held;
+                    // Pass 2 overwrites `dec.held` for every evaluated organism.
                     dec.evaluated = true;
                 } else {
                     encode_dual_gradients_only_into(
@@ -8203,7 +8218,7 @@ fn pass1_flat_f32_spatial<'p>(
                     )?;
                     finish_due_row(dst, &mut chunk_in_fin[d], row_idx, organism, None);
                     chunk_jobs[d] = Some(build_job(organism, genome, slot)?);
-                    dec.held = organism.held;
+                    // Pass 2 overwrites `dec.held` for every evaluated organism.
                     dec.evaluated = true;
                 } else {
                     encode_gradients_only_into(rules, organism, raw, from, &mut dec.gradients)?;
@@ -8595,9 +8610,15 @@ fn decide_batched_flat_f32(
                                 continue;
                             }
                             let organism = &rows[row_u32 as usize];
-                            let held = match flat_out_ref.row(job_idx) {
+                            match flat_out_ref.row(job_idx) {
                                 Some(raw_slice) => {
-                                    held_from_raw_slice(rules, organism, to, raw_slice)?
+                                    held_from_raw_slice_into(
+                                        rules,
+                                        organism,
+                                        to,
+                                        raw_slice,
+                                        &mut decision.held,
+                                    )?;
                                 }
                                 None => {
                                     let job = flat_jobs_slice.get(job_idx).ok_or_else(|| {
@@ -8615,18 +8636,17 @@ fn decide_batched_flat_f32(
                                                 "missing flat inputs for deferred job {job_idx}"
                                             ),
                                         })?;
-                                    evaluate_reference_held_from_f32(
+                                    decision.held = evaluate_reference_held_from_f32(
                                         rules,
                                         job.controller,
                                         organism,
                                         in_row,
                                         to,
                                         &mut lane.controller,
-                                    )?
+                                    )?;
                                 }
-                            };
-                            decision.actions = decode_held(rules, organism, &held)?;
-                            decision.held = held;
+                            }
+                            decision.actions = decode_held(rules, organism, &decision.held)?;
                             job_idx += 1;
                         }
                         Ok(())
@@ -8829,8 +8849,16 @@ fn decide_batched_flat_f32(
                     if !decision.evaluated {
                         continue;
                     }
-                    let held = match flat_out_ref.row(job_idx) {
-                        Some(raw_slice) => held_from_raw_slice(rules, organism, to, raw_slice)?,
+                    match flat_out_ref.row(job_idx) {
+                        Some(raw_slice) => {
+                            held_from_raw_slice_into(
+                                rules,
+                                organism,
+                                to,
+                                raw_slice,
+                                &mut decision.held,
+                            )?;
+                        }
                         None => {
                             let job = flat_jobs_slice.get(job_idx).ok_or_else(|| {
                                 CoreError::StateConflict {
@@ -8847,18 +8875,17 @@ fn decide_batched_flat_f32(
                                         "missing flat inputs for deferred job {job_idx}"
                                     ),
                                 })?;
-                            evaluate_reference_held_from_f32(
+                            decision.held = evaluate_reference_held_from_f32(
                                 rules,
                                 job.controller,
                                 organism,
                                 in_row,
                                 to,
                                 &mut lane.controller,
-                            )?
+                            )?;
                         }
-                    };
-                    decision.actions = decode_held(rules, organism, &held)?;
-                    decision.held = held;
+                    }
+                    decision.actions = decode_held(rules, organism, &decision.held)?;
                     job_idx += 1;
                 }
                 Ok(())

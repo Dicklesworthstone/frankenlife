@@ -228,6 +228,101 @@ impl HeldOutput {
         Ok(base)
     }
 
+    /// Overwrite `self` in place with variable-width stateless `outputs`
+    /// (`ACTION_WIDTH..=MAX_ACTION_WIDTH`), avoiding a 280-byte stack temporary
+    /// and copy in hot controller decode loops.
+    ///
+    /// # Errors
+    /// As [`HeldOutput::evaluated_slice`].
+    #[inline]
+    pub fn write_evaluated_slice(&mut self, tick: Tick, outputs: &[f32]) -> Result<(), CoreError> {
+        if outputs.len() < ACTION_WIDTH || outputs.len() > MAX_ACTION_WIDTH {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "held controller output",
+                detail: format!(
+                    "expected {ACTION_WIDTH}..={MAX_ACTION_WIDTH} outputs, got {}",
+                    outputs.len()
+                ),
+            });
+        }
+        if let Some(index) = outputs.iter().position(|value| !value.is_finite()) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "held controller output",
+                detail: format!("output {index} is {}", outputs[index]),
+            });
+        }
+        let output_len = u8::try_from(outputs.len()).map_err(|_| CoreError::Overflow {
+            quantity: "held controller output width",
+        })?;
+        self.evaluated_at = Some(tick);
+        self.output_len = output_len;
+        self.outputs[..outputs.len()].copy_from_slice(outputs);
+        self.outputs[outputs.len()..].fill(0.0);
+        self.state_len = 0;
+        self.state = [0.0; MAXIMUM_RECURRENT_STATE_WIDTH];
+        Ok(())
+    }
+
+    /// Overwrite `self` in place with variable-width `outputs` and bounded
+    /// recurrent `state ∈ [-1, 1]^S`.
+    ///
+    /// # Errors
+    /// As [`HeldOutput::evaluated_recurrent_slice`].
+    #[inline]
+    pub fn write_evaluated_recurrent_slice(
+        &mut self,
+        tick: Tick,
+        outputs: &[f32],
+        state: &[f32],
+    ) -> Result<(), CoreError> {
+        if state.is_empty() || state.len() > MAXIMUM_RECURRENT_STATE_WIDTH {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "recurrent controller state",
+                detail: format!(
+                    "expected 1..={MAXIMUM_RECURRENT_STATE_WIDTH} state values, got {}",
+                    state.len()
+                ),
+            });
+        }
+        if outputs.len() < ACTION_WIDTH || outputs.len() > MAX_ACTION_WIDTH {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "held controller output",
+                detail: format!(
+                    "expected {ACTION_WIDTH}..={MAX_ACTION_WIDTH} outputs, got {}",
+                    outputs.len()
+                ),
+            });
+        }
+        if let Some(index) = outputs.iter().position(|value| !value.is_finite()) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "held controller output",
+                detail: format!("output {index} is {}", outputs[index]),
+            });
+        }
+        for (index, &value) in state.iter().enumerate() {
+            if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "recurrent controller state",
+                    detail: format!("state[{index}] is {value}, outside [-1, 1]"),
+                });
+            }
+        }
+        let output_len = u8::try_from(outputs.len()).map_err(|_| CoreError::Overflow {
+            quantity: "held controller output width",
+        })?;
+        let state_len = u8::try_from(state.len()).map_err(|_| CoreError::Overflow {
+            quantity: "recurrent controller state width",
+        })?;
+        self.evaluated_at = Some(tick);
+        self.output_len = output_len;
+        self.outputs[..outputs.len()].copy_from_slice(outputs);
+        self.outputs[outputs.len()..].fill(0.0);
+        self.state_len = state_len;
+        self.state[..state.len()].copy_from_slice(state);
+        self.state[state.len()..].fill(0.0);
+        Ok(())
+    }
+
     /// Whether an output is held.
     #[must_use]
     pub const fn is_valid(&self) -> bool {

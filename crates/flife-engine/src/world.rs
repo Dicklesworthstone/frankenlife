@@ -1327,14 +1327,50 @@ const MINIMUM_ROWS_PER_LANE: usize = 128;
 
 /// One organism's state during a candidate tick.
 ///
+/// Compact committed organism metadata held inside [`Working`], omitting the
+/// 280-byte `HeldOutput` (already stored in `Scratch::decisions` / `rows`) and
+/// fields copied into `Working`'s mutable state. Shrinks `Working` by >2.2×
+/// and removes 280-byte `_platform_memmove` copies from `GatherTile`.
+#[derive(Debug, Clone, Copy)]
+struct CommittedRow {
+    id: OrganismId,
+    genome: GenomeId,
+    parent: Option<OrganismId>,
+    lineage: LineageId,
+    generation: Generation,
+    birth_tick: Tick,
+    position: [f64; 2],
+    energy: f64,
+    phase: u32,
+    polarity: [f64; 2],
+}
+
+impl CommittedRow {
+    #[inline]
+    const fn from_organism(organism: &Organism) -> Self {
+        Self {
+            id: organism.id,
+            genome: organism.genome,
+            parent: organism.parent,
+            lineage: organism.lineage,
+            generation: organism.generation,
+            birth_tick: organism.birth_tick,
+            position: organism.position,
+            energy: organism.energy,
+            phase: organism.phase,
+            polarity: organism.polarity,
+        }
+    }
+}
+
 /// Read-only Phase-3/4 outputs (`held`, `evaluated`, `actions`, `gradients` —
 /// ~1.2 KiB per organism) stay in `Scratch::decisions[decision_index]` instead
 /// of being copied into `Working`, shrinking `Working` by ~2.7× and eliminating
 /// random 1.2 KiB gathers from `decisions` during `GatherTile`.
 #[derive(Debug, Clone, Copy)]
 struct Working {
-    /// Its committed row at tick `n`.
-    committed: Organism,
+    /// Its committed metadata at tick `n` (without the 280-byte `HeldOutput`).
+    committed: CommittedRow,
     budget: EnergyBudget,
     vitality: Vitality,
     /// Index into `Scratch::decisions` for this organism's read-only `Decision`.
@@ -3217,7 +3253,7 @@ impl World {
         let decision_count = decisions.len();
         if rows.len() >= 512 && lanes.len() > 1 {
             let placeholder = Working {
-                committed: rows[0],
+                committed: CommittedRow::from_organism(&rows[0]),
                 budget: EnergyBudget::new(0.0)?,
                 vitality: Vitality::new(),
                 decision_index: 0,
@@ -3272,7 +3308,7 @@ impl World {
                 &mut tiles,
                 |_, tile| {
                     let mapped = !tile.spatial_map.is_empty();
-                    for (i, (&organism, slot)) in
+                    for (i, (organism, slot)) in
                         tile.rows.iter().zip(tile.out.iter_mut()).enumerate()
                     {
                         let dec_idx = if mapped {
@@ -3300,30 +3336,28 @@ impl World {
                                 .basal_multiplier(organism.birth_tick, from, rules.step)?;
                         let local_crowding =
                             crowding_counts.get(tile.start + i).copied().unwrap_or(0);
-                        *slot = Working {
-                            committed: organism,
-                            budget: EnergyBudget::new(organism.energy)?,
-                            vitality: Vitality::new(),
-                            decision_index: dec_idx,
-                            basal_multiplier,
-                            local_crowding,
-                            position: organism.position,
-                            velocity: organism.velocity,
-                            cooldown_deadline: organism.cooldown_deadline,
-                            secretory_readiness: organism.secretory_readiness,
-                            emission_cooldown_deadline: organism.emission_cooldown_deadline,
-                            emitted: false,
-                            emission_paid: 0.0,
-                            lysed_residual: 0.0,
-                            intent: None,
-                        };
+                        slot.committed = CommittedRow::from_organism(organism);
+                        slot.budget = EnergyBudget::new(organism.energy)?;
+                        slot.vitality = Vitality::new();
+                        slot.decision_index = dec_idx;
+                        slot.basal_multiplier = basal_multiplier;
+                        slot.local_crowding = local_crowding;
+                        slot.position = organism.position;
+                        slot.velocity = organism.velocity;
+                        slot.cooldown_deadline = organism.cooldown_deadline;
+                        slot.secretory_readiness = organism.secretory_readiness;
+                        slot.emission_cooldown_deadline = organism.emission_cooldown_deadline;
+                        slot.emitted = false;
+                        slot.emission_paid = 0.0;
+                        slot.lysed_residual = 0.0;
+                        slot.intent = None;
                     }
                     Ok(())
                 },
             )?;
         } else {
             working.clear();
-            for (row_index, &organism) in rows.iter().enumerate() {
+            for (row_index, organism) in rows.iter().enumerate() {
                 let dec_idx = if spatial_decisions {
                     row_to_spatial[row_index]
                 } else {
@@ -3349,7 +3383,7 @@ impl World {
                         .basal_multiplier(organism.birth_tick, from, rules.step)?;
                 let local_crowding = crowding_counts.get(row_index).copied().unwrap_or(0);
                 working.push(Working {
-                    committed: organism,
+                    committed: CommittedRow::from_organism(organism),
                     budget: EnergyBudget::new(organism.energy)?,
                     vitality: Vitality::new(),
                     decision_index: dec_idx,
@@ -3865,7 +3899,7 @@ impl World {
             if total_survivors == 0 {
                 survivors.clear();
             } else {
-                set_len_reuse(survivors, total_survivors, working[0].committed);
+                set_len_reuse(survivors, total_survivors, rows[0]);
                 set_len_reuse(survivor_energies, total_survivors, 0.0);
                 struct BuildTile<'a> {
                     base: usize,
@@ -4096,7 +4130,7 @@ impl World {
                 let recurrent_h0 = organism.decision(decisions).held.recurrent_state_array()[0];
                 let (death, corpse_dir) = if organism.lysed_residual > 0.0 {
                     let death = Death::lysed(
-                        &organism.committed,
+                        &rows[index],
                         to,
                         organism.position,
                         stage,
@@ -4122,8 +4156,7 @@ impl World {
                     )?;
                     (death, corpse_dir)
                 } else {
-                    let death =
-                        Death::exhausted(&organism.committed, to, organism.position, stage)?;
+                    let death = Death::exhausted(&rows[index], to, organism.position, stage)?;
                     (death, *genome.traits().affinity())
                 };
                 rules
@@ -4194,18 +4227,25 @@ impl World {
                             .copied()
                             .unwrap_or(organism.committed.polarity);
                         let last_neighbor_h0 = next_neighbor_h0.get(index).copied().unwrap_or(0.0);
+                        let committed = &organism.committed;
                         survivors.push(Organism {
+                            id: committed.id,
+                            genome: committed.genome,
+                            parent: committed.parent,
+                            lineage: committed.lineage,
+                            generation: committed.generation,
+                            birth_tick: committed.birth_tick,
                             position,
                             velocity,
                             energy,
-                            energy_change_rate: (energy - organism.committed.energy) / seconds,
+                            energy_change_rate: (energy - committed.energy) / seconds,
                             held: organism.decision(decisions).held,
+                            phase: committed.phase,
                             cooldown_deadline: organism.cooldown_deadline,
                             secretory_readiness: organism.secretory_readiness,
                             emission_cooldown_deadline: organism.emission_cooldown_deadline,
                             polarity,
                             last_neighbor_h0,
-                            ..organism.committed
                         });
                     }
                     Fate::Dies(stage) => {
@@ -4220,7 +4260,7 @@ impl World {
                             organism.decision(decisions).held.recurrent_state_array()[0];
                         let (death, corpse_dir) = if organism.lysed_residual > 0.0 {
                             let death = Death::lysed(
-                                &organism.committed,
+                                &rows[index],
                                 to,
                                 organism.position,
                                 stage,
@@ -4246,12 +4286,8 @@ impl World {
                             )?;
                             (death, corpse_dir)
                         } else {
-                            let death = Death::exhausted(
-                                &organism.committed,
-                                to,
-                                organism.position,
-                                stage,
-                            )?;
+                            let death =
+                                Death::exhausted(&rows[index], to, organism.position, stage)?;
                             (death, *genome.traits().affinity())
                         };
                         rules

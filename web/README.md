@@ -130,7 +130,10 @@ Safari's and Firefox's engines behave the same, checked on the live site in head
 
 Playwright's Firefox has no phone emulation, so there 390 px is only a narrow window; the phone poster and
 encode were still the ones chosen, since the page picks them by the viewport's size. Firefox did not start
-the ladder's lazy image before it neared the screen.
+the ladder's lazy image before it neared the screen. Scrolled through a screen at a time at both widths,
+the whole page logged no errors in either engine, did not overflow sideways, and left the same elements
+hidden in both. At 390 px Firefox counted 7 more of the ladder's hidden network lines; it measures them as
+larger boxes.
 
 Three v2 films of denser worlds (`presets/morphogenesis-tissue-v2-dense.toml`,
 `presets/supercolony-v2-dense.toml`, rendered 2026-11-24) were taken down the same day: in motion they

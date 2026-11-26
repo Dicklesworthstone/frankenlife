@@ -1851,10 +1851,9 @@ struct Run<'a> {
 const REDUCE_BATCH: usize = 64;
 
 /// Flush `count` pre-scaled cell updates into `moments`, one plane at a time.
-/// Rebinding `plane` once per channel lets LLVM hoist its pointer and length
-/// out of the inner cell loop; the 4-cell fast path proves strict ascending
-/// distinctness and in-bounds indices in one branch so NEON pairs F64 adds
-/// while preserving exact `-0.0` semantics (`added != 0.0`).
+/// Classifies contiguous 4-cell quads once before the plane loop so dense
+/// runs emit contiguous 16-byte NEON `ldr q` / `fcvtl` / `fadd.2d` / `fcvtn`
+/// / `str q` updates while preserving exact `-0.0` semantics (`added != 0.0`).
 #[inline]
 fn flush_moment_batch_const<const M: usize>(
     moments: &mut [&mut [f32]],
@@ -1864,42 +1863,63 @@ fn flush_moment_batch_const<const M: usize>(
 ) {
     let quads = count / 4;
     let tail_start = quads * 4;
+    // Classify each 4-cell quad once across all `M` planes:
+    // `2` = 4 contiguous cells (`i0..i0+4`), `1` = strictly ascending distinct, `0` = general.
+    let mut quad_kind = [0_u8; REDUCE_BATCH / 4];
+    for (q, kind) in quad_kind.iter_mut().enumerate().take(quads) {
+        let b = q * 4;
+        let i0 = cell_at[b];
+        let i1 = cell_at[b + 1];
+        let i2 = cell_at[b + 2];
+        let i3 = cell_at[b + 3];
+        if i0 + 1 == i1 && i1 + 1 == i2 && i2 + 1 == i3 {
+            *kind = 2;
+        } else if i0 < i1 && i1 < i2 && i2 < i3 {
+            *kind = 1;
+        }
+    }
     for (channel, plane_slot) in moments.iter_mut().take(M).enumerate() {
         let plane: &mut [f32] = plane_slot;
         let plane_len = plane.len();
-        for q in 0..quads {
+        for (q, &kind) in quad_kind.iter().enumerate().take(quads) {
             let b = q * 4;
-            let i0 = cell_at[b];
-            let i1 = cell_at[b + 1];
-            let i2 = cell_at[b + 2];
-            let i3 = cell_at[b + 3];
             let a0 = accum[b][channel];
             let a1 = accum[b + 1][channel];
             let a2 = accum[b + 2][channel];
             let a3 = accum[b + 3][channel];
-            if (i0 < i1)
-                & (i1 < i2)
-                & (i2 < i3)
-                & (i3 < plane_len)
-                & (a0 != 0.0)
-                & (a1 != 0.0)
-                & (a2 != 0.0)
-                & (a3 != 0.0)
-            {
-                let v01 = [f64::from(plane[i0]) + a0, f64::from(plane[i1]) + a1];
-                let v23 = [f64::from(plane[i2]) + a2, f64::from(plane[i3]) + a3];
-                plane[i0] = v01[0] as f32;
-                plane[i1] = v01[1] as f32;
-                plane[i2] = v23[0] as f32;
-                plane[i3] = v23[1] as f32;
-            } else {
-                for k in 0..4 {
-                    let added = accum[b + k][channel];
-                    if added != 0.0
-                        && let Some(slot) = plane.get_mut(cell_at[b + k])
-                    {
-                        *slot = (f64::from(*slot) + added) as f32;
-                    }
+            let all_nonzero = (a0 != 0.0) & (a1 != 0.0) & (a2 != 0.0) & (a3 != 0.0);
+            if kind == 2 && all_nonzero {
+                let i0 = cell_at[b];
+                if let Some(chunk) = plane.get_mut(i0..i0 + 4) {
+                    let s0 = [f64::from(chunk[0]) + a0, f64::from(chunk[1]) + a1];
+                    let s1 = [f64::from(chunk[2]) + a2, f64::from(chunk[3]) + a3];
+                    chunk[0] = s0[0] as f32;
+                    chunk[1] = s0[1] as f32;
+                    chunk[2] = s1[0] as f32;
+                    chunk[3] = s1[1] as f32;
+                    continue;
+                }
+            } else if kind == 1 && all_nonzero {
+                let i0 = cell_at[b];
+                let i1 = cell_at[b + 1];
+                let i2 = cell_at[b + 2];
+                let i3 = cell_at[b + 3];
+                if (i0 < i1) & (i1 < i2) & (i2 < i3) & (i3 < plane_len) {
+                    let v01 = [f64::from(plane[i0]) + a0, f64::from(plane[i1]) + a1];
+                    let v23 = [f64::from(plane[i2]) + a2, f64::from(plane[i3]) + a3];
+                    plane[i0] = v01[0] as f32;
+                    plane[i1] = v01[1] as f32;
+                    plane[i2] = v23[0] as f32;
+                    plane[i3] = v23[1] as f32;
+                    continue;
+                }
+            }
+            for k in 0..4 {
+                let added = accum[b + k][channel];
+                if added != 0.0
+                    && let Some(slot) = plane.get_mut(cell_at[b + k])
+                {
+                    *slot = (f64::from(*slot) + added) as f32;
                 }
             }
         }

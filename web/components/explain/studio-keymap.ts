@@ -100,7 +100,7 @@ export const KEYS: Record<string, StudioKey> = {
   },
 };
 
-/** One cap on the drawing: its label and its width in half-key columns of a 30-column row. */
+/** One cap on the drawing: its label and its width in half-key columns (a whole row is 30, a split half 16). */
 export type Cap = { label: string; span: number };
 
 const cap = (label: string, span = 2): Cap => ({ label, span });
@@ -113,6 +113,31 @@ export const ROWS: Cap[][] = [
   [cap("Caps", 4), ...caps("ASDFGHJKL;'")],
   [cap("Shift", 5), ...caps("ZXCVBNM,./")],
   [cap("", 3), cap("⌘", 3), cap("Space", 12), cap("⌘", 3), cap("", 2), cap("←"), cap("↓"), cap("→")],
+];
+
+/** Columns in each half of the split keyboard. */
+export const SPLIT_COLUMNS = 16;
+
+/**
+ * The same keyboard split in two, as a split keyboard is (at 5|6, T|Y, G|H, B|N), for a phone: whole, a key
+ * there is 16 px wide, under WCAG 2.5.8's 24 px target; a half is 16 columns, so a key is about 34 px. The blank
+ * caps at the start of the right half's rows keep the stagger the rows have on the whole keyboard.
+ */
+export const SPLIT_ROWS: [Cap[][], Cap[][]] = [
+  [
+    [cap("Esc"), ...caps("12345")],
+    [cap("Tab", 3), ...caps("QWERT")],
+    [cap("Caps", 4), ...caps("ASDFG")],
+    [cap("Shift", 5), ...caps("ZXCVB")],
+    [cap("", 3), cap("⌘", 3), cap("Space", 10)],
+  ],
+  [
+    [...caps("67890"), cap("-"), cap("=")],
+    [cap("", 1), ...caps("YUIOP"), cap("["), cap("]")],
+    [cap("", 2), ...caps("HJKL;'")],
+    [cap("", 3), ...caps("NM,./")],
+    [cap("", 2), cap("⌘", 3), cap("", 1), cap("←"), cap("↓"), cap("→")],
+  ],
 ];
 
 /** The pointer's gestures (controls.rs's table). */

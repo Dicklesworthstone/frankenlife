@@ -36,7 +36,9 @@ sideways with nothing focusable in it takes `tabIndex={0}`, so a keyboard can sc
 accessible name contains the words it shows, so a voice command finds it. axe-core 4.14 found no
 violations on 2026-11-25 at 320, 390 and 1,440 px, in every tab, view and opened `<details>`; measured
 from pixels (axe leaves text over gradients and other text undecided), every line of text met AA at 390
-and 1,440 px in 81 states, apart from disabled controls and the keyboard picture's dead keys.
+and 1,440 px in 81 states, apart from disabled controls and the keyboard picture's dead keys. Every
+control is at least 24 px square on a phone (WCAG 2.5.8; axe ships the rule off, so run it by name):
+below 640 px the Studio's keyboard splits in two halves, which is what keeps its keys wide enough.
 
 ## The explainers
 

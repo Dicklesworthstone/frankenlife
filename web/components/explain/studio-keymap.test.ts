@@ -3,7 +3,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { GROUPS, KEYS, ROWS } from "./studio-keymap";
+import { GROUPS, KEYS, ROWS, SPLIT_COLUMNS, SPLIT_ROWS } from "./studio-keymap";
 
 describe("studio-keymap", () => {
   test("defines all nine colour-mapping digit keys 1..9 matching controls.rs KEY_DIGITS", () => {
@@ -37,5 +37,20 @@ describe("studio-keymap", () => {
       expect(drawn.has(label)).toBe(true);
       expect(groupIds.has(entry.group)).toBe(true);
     }
+  });
+
+  test("the phone's split keyboard has the whole keyboard's caps, each row within its half", () => {
+    const labels = (rows: { label: string }[][]) =>
+      rows
+        .flat()
+        .map((cap) => cap.label)
+        .filter(Boolean)
+        .sort();
+    expect(labels([...SPLIT_ROWS[0], ...SPLIT_ROWS[1]])).toEqual(labels(ROWS));
+    for (const half of SPLIT_ROWS) {
+      expect(half.length).toBe(ROWS.length);
+      for (const row of half) expect(row.reduce((sum, cap) => sum + cap.span, 0)).toBeLessThanOrEqual(SPLIT_COLUMNS);
+    }
+    for (const row of ROWS) expect(row.reduce((sum, cap) => sum + cap.span, 0)).toBeLessThanOrEqual(30);
   });
 });

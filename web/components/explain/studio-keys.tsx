@@ -4,7 +4,7 @@ import { Monitor, MousePointerClick } from "lucide-react";
 import { useState } from "react";
 
 import { DemoFrame } from "@/components/explain/demo";
-import { GESTURES, GROUPS, KEYS, type KeyGroup, ROWS } from "@/components/explain/studio-keymap";
+import { type Cap, GESTURES, GROUPS, KEYS, type KeyGroup, ROWS, SPLIT_ROWS } from "@/components/explain/studio-keymap";
 import { TONE } from "@/lib/palette";
 import { cn } from "@/lib/utils";
 
@@ -20,6 +20,58 @@ export function StudioKeys() {
   const shown = KEYS[selected] ?? KEYS.Space!;
   const shownGroup = GROUPS.find((group) => group.id === shown.group);
 
+  const renderCap = (cap: Cap, key: string) => {
+    const live = KEYS[cap.label];
+    const style = { gridColumn: `span ${cap.span} / span ${cap.span}` };
+    if (!live) {
+      return (
+        <div key={key} style={style} className="p-[2px]" aria-hidden="true">
+          <div
+            className={cn(
+              "flex h-8 items-center justify-center rounded-md text-[11px] text-slate-600 sm:h-10",
+              cap.label && "border border-white/[0.05] bg-white/[0.02]",
+            )}
+          >
+            {cap.label}
+          </div>
+        </div>
+      );
+    }
+    const color = COLOR[live.group];
+    const on = selected === cap.label;
+    // A key outside the chosen group loses its colour, not its legibility: its label stays 6:1
+    // (opacity alone could not keep magenta or coral at WCAG AA's 4.5:1 and still read as dimmed).
+    const dimmed = !on && focusGroup !== null && focusGroup !== live.group;
+    return (
+      <div key={key} style={style} className="p-[2px]">
+        <button
+          type="button"
+          aria-pressed={on}
+          aria-label={`${live.name}: ${live.action}`}
+          onMouseEnter={() => setSelected(cap.label)}
+          onFocus={() => setSelected(cap.label)}
+          onClick={() => setSelected(cap.label)}
+          className={cn(
+            "flex h-8 w-full items-center justify-center rounded-md border font-mono text-xs font-bold transition sm:h-10",
+            "focus-visible:ring-2 focus-visible:ring-white/80 focus-visible:outline-none",
+          )}
+          style={
+            dimmed
+              ? { color: TONE.muted, background: "transparent", borderColor: "rgba(255,255,255,0.1)" }
+              : {
+                  color: on ? "#020a02" : color,
+                  background: on ? color : `${color}1f`,
+                  borderColor: `${color}${on ? "" : "66"}`,
+                  boxShadow: on ? `0 0 18px -2px ${color}` : undefined,
+                }
+          }
+        >
+          {cap.label}
+        </button>
+      </div>
+    );
+  };
+
   return (
     <DemoFrame
       eyebrow="flife-studio · macOS"
@@ -33,62 +85,24 @@ export function StudioKeys() {
       }
     >
       <div className="space-y-5">
-        {/* The keyboard. Each row is 30 half-key columns. */}
+        {/* The keyboard: whole from 640 px, each row 30 half-key columns; below, in two halves of 16 columns
+            (SPLIT_COLUMNS), so each key is wide enough to tap. The layout not shown is display: none. */}
         <div className="rounded-2xl border border-white/10 bg-black/40 p-2 sm:p-3">
-          <div className="space-y-0">
+          <div className="max-sm:hidden">
             {ROWS.map((row, rowIndex) => (
               <div key={rowIndex} className="grid grid-cols-[repeat(30,minmax(0,1fr))]">
-                {row.map((cap, capIndex) => {
-                  const live = KEYS[cap.label];
-                  const style = { gridColumn: `span ${cap.span} / span ${cap.span}` };
-                  if (!live) {
-                    return (
-                      <div key={`${rowIndex}-${capIndex}`} style={style} className="p-[2px]" aria-hidden="true">
-                        <div
-                          className={cn(
-                            "flex h-8 items-center justify-center rounded-md text-[9px] text-slate-600 sm:h-10 sm:text-[11px]",
-                            cap.label && "border border-white/[0.05] bg-white/[0.02]",
-                          )}
-                        >
-                          {cap.label}
-                        </div>
-                      </div>
-                    );
-                  }
-                  const color = COLOR[live.group];
-                  const on = selected === cap.label;
-                  // A key outside the chosen group loses its colour, not its legibility: its label stays 6:1
-                  // (opacity alone could not keep magenta or coral at WCAG AA's 4.5:1 and still read as dimmed).
-                  const dimmed = !on && focusGroup !== null && focusGroup !== live.group;
-                  return (
-                    <div key={`${rowIndex}-${capIndex}`} style={style} className="p-[2px]">
-                      <button
-                        type="button"
-                        aria-pressed={on}
-                        aria-label={`${live.name}: ${live.action}`}
-                        onMouseEnter={() => setSelected(cap.label)}
-                        onFocus={() => setSelected(cap.label)}
-                        onClick={() => setSelected(cap.label)}
-                        className={cn(
-                          "flex h-8 w-full items-center justify-center rounded-md border font-mono text-[10px] font-bold transition sm:h-10 sm:text-xs",
-                          "focus-visible:ring-2 focus-visible:ring-white/80 focus-visible:outline-none",
-                        )}
-                        style={
-                          dimmed
-                            ? { color: TONE.muted, background: "transparent", borderColor: "rgba(255,255,255,0.1)" }
-                            : {
-                                color: on ? "#020a02" : color,
-                                background: on ? color : `${color}1f`,
-                                borderColor: `${color}${on ? "" : "66"}`,
-                                boxShadow: on ? `0 0 18px -2px ${color}` : undefined,
-                              }
-                        }
-                      >
-                        {cap.label}
-                      </button>
-                    </div>
-                  );
-                })}
+                {row.map((cap, capIndex) => renderCap(cap, `${rowIndex}-${capIndex}`))}
+              </div>
+            ))}
+          </div>
+          <div className="space-y-3 sm:hidden">
+            {SPLIT_ROWS.map((half, halfIndex) => (
+              <div key={halfIndex}>
+                {half.map((row, rowIndex) => (
+                  <div key={rowIndex} className="grid grid-cols-[repeat(16,minmax(0,1fr))]">
+                    {row.map((cap, capIndex) => renderCap(cap, `${halfIndex}-${rowIndex}-${capIndex}`))}
+                  </div>
+                ))}
               </div>
             ))}
           </div>

@@ -317,18 +317,17 @@ export default function Home() {
                     </li>
                   ))}
                 </ol>
-                <p className="mt-5 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                  <span>Related work:</span>
-                  {priorWork.map((entry) => (
-                    <span
-                      key={entry.name}
-                      title={entry.shows}
-                      className="rounded-full border border-white/10 px-2.5 py-0.5 font-mono text-[11px] text-slate-400"
-                    >
-                      {entry.name}
-                    </span>
-                  ))}
-                </p>
+                {/* What each shows is set out in words: a hover title never reached a phone or the keyboard. */}
+                <div className="mt-5 border-t border-white/[0.06] pt-4">
+                  <p className="text-xs text-slate-500">Related work</p>
+                  <ul className="mt-2 grid grid-cols-1 gap-x-6 gap-y-1.5 text-xs leading-snug text-slate-400 md:grid-cols-2">
+                    {priorWork.map((entry) => (
+                      <li key={entry.name}>
+                        <span className="font-mono text-[11px] text-slate-200">{entry.name}</span> {entry.shows}.
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               </div>
             </Reveal>
           </Section>
@@ -892,7 +891,7 @@ export default function Home() {
                   <li key={part.name}>
                     <a
                       href={part.href}
-                      className="group grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-4 gap-y-1 p-5 transition-colors hover:bg-green-500/[0.04] sm:grid-cols-[13rem_minmax(0,1fr)_auto] sm:p-6"
+                      className="group focus-inset grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-4 gap-y-1 p-5 transition-colors hover:bg-green-500/[0.04] sm:grid-cols-[13rem_minmax(0,1fr)_auto] sm:p-6"
                     >
                       <span className="text-base font-extrabold text-white group-hover:text-green-200">{part.name}</span>
                       <ExternalLink className="h-4 w-4 text-slate-500 group-hover:text-green-300 sm:order-last" aria-hidden="true" />

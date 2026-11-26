@@ -620,11 +620,11 @@ function RulePanel({ entry, toggle }: { entry: AtlasEntry; toggle: boolean }) {
   );
 }
 
-/** One step's picture: the still drawn with the view that shows its state, or else its rule. */
 /** A still's provenance, as its badge shows it and its link's name says it. */
 const stillBadge = (still: V2Still) =>
   `flife render · tick ${grouped(still.tick)} · seed ${still.seed}${still.view.zoom > 1.01 ? ` · ×${still.view.zoom}` : ""}`;
 
+/** One step's picture: the still drawn with the view that shows its state, or else its rule. */
 function Stage({ entry, view, setView }: { entry: AtlasEntry; view: "world" | "rule"; setView: (view: "world" | "rule") => void }) {
   const still = entry.still ? stillById(entry.still) : null;
   const showStill = still !== null && view === "world";
@@ -650,10 +650,11 @@ function Stage({ entry, view, setView }: { entry: AtlasEntry; view: "world" | "r
       ) : null}
       {showStill ? (
         <>
-          {/* The name holds the badge's visible words, so a voice command that reads them finds the link. */}
+          {/* The name holds the badge's visible words, so a voice command that reads them finds the link. Its focus
+              ring is drawn inside: outside, the figure's overflow-hidden cut off all but its bottom edge. */}
           <a
             href={still.src}
-            className="relative block aspect-square bg-black"
+            className="focus-inset relative block aspect-square rounded-t-[1.75rem] bg-black"
             aria-label={`${still.label}, ${stillBadge(still)}: open the ${still.width} × ${still.height} still`}
           >
             {/* eslint-disable-next-line @next/next/no-img-element -- a static export; the manifest names the file */}

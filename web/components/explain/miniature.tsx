@@ -766,7 +766,8 @@ export function Miniature() {
                   repaint();
                 }}
                 className={cn(
-                  "absolute inset-0 h-full w-full touch-manipulation rounded-2xl focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none",
+                  // Its frame clips outside it, so the focus ring is drawn inside (focus-inset, app/globals.css).
+                  "focus-inset absolute inset-0 h-full w-full touch-manipulation rounded-2xl",
                   pointer === "brush" ? "cursor-crosshair" : "cursor-pointer",
                 )}
               />

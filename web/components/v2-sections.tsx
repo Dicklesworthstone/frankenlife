@@ -94,10 +94,11 @@ export function BundlePanels() {
 function StillFigure({ still }: { still: V2Still }) {
   return (
     <figure className="panel relative h-full overflow-hidden rounded-[1.5rem]">
-      {/* The name holds the badge's visible "N alive", so a voice command that reads it finds the link. */}
+      {/* The name holds the badge's visible "N alive", so a voice command that reads it finds the link. Its focus ring
+          is drawn inside: outside, the figure's overflow-hidden cut it off entirely. */}
       <a
         href={still.src}
-        className="relative block aspect-square bg-black"
+        className="focus-inset relative block aspect-square rounded-t-[1.5rem] bg-black"
         aria-label={`${still.label}, ${grouped(still.live)} alive: open the ${still.width} × ${still.height} still`}
       >
         {/* eslint-disable-next-line @next/next/no-img-element -- a static export; the manifest names the file */}

@@ -266,10 +266,18 @@ body::before {
   }
 }
 
-/* Focus: one visible ring everywhere, in the life colour. */
+/* Focus: one visible ring everywhere, in the life colour. Unlayered, so it outranks every Tailwind utility (those
+   sit in @layer utilities): a control's `focus-visible:outline-none` does not remove it, and its `ring-*` only
+   thickens it. That is deliberate: Windows' forced colours drop box-shadow rings but keep outlines. */
 :where(a, button, input, select, textarea, [tabindex]):focus-visible {
   outline: 2px solid var(--life);
   outline-offset: 2px;
+}
+
+/* The same ring drawn inside, for a control that fills an overflow-hidden frame, which cuts off a ring outside it
+   (2026-11-25: the V2 stills showed none at all, the stack links only a sliver). A utility could not do this. */
+.focus-inset:focus-visible {
+  outline-offset: -4px;
 }
 
 /* The dock (below 1,024 px, components/site-header.tsx; 74 px tall, more over a home indicator) keeps the page's

@@ -6907,12 +6907,18 @@ fn spatial_chemistry_prepass_fused(
                 )?;
             }
 
-            // Step 3: Settle chemistry in one pass over the tile's organisms
-            // while `lane.comps[..tile_distinct]` stays hot in L2 cache.
+            // Step 3: Settle chemistry in pairs of organisms while
+            // `lane.comps[..tile_distinct]` stays hot in L2 cache so
+            // `dot4_channels_pair` saturates all 4 FP add pipelines.
             let comps_ready = &lane.comps[..tile_distinct];
             let halo_map = &lane.halo_to_local[..halo_cells];
-            let mut stack_packets = [(0.0_f64, 0_u32); PACKETS_PER_ORGANISM];
-            for (&row_u32, out_slot) in tile.row_indices.iter().zip(tile.out.iter_mut()) {
+            struct LoadedOrg<'a> {
+                aff: &'a [f64; CHANNELS],
+                budget: EnergyBudget,
+                pkts: [(f64, u32); PACKETS_PER_ORGANISM],
+                n: usize,
+            }
+            let load_org = |row_u32: u32| -> Result<LoadedOrg<'_>, CoreError> {
                 let row_idx = row_u32 as usize;
                 let phys_slot = ordered_slots[row_idx] as usize;
                 let Some(energy) = population.energy_at_slot(phys_slot) else {
@@ -6939,6 +6945,7 @@ fn spatial_chemistry_prepass_fused(
                         detail: "bucket exceeded grid-cic packet count".to_owned(),
                     });
                 }
+                let mut pkts = [(0.0_f64, 0_u32); PACKETS_PER_ORGANISM];
                 let mut n = 0_usize;
                 for &at in bucket {
                     let packet =
@@ -6970,17 +6977,61 @@ fn spatial_chemistry_prepass_fused(
                             detail: "grant cell missing from halo composition map".to_owned(),
                         });
                     }
-                    stack_packets[n] = (packet.granted, local_idx);
+                    pkts[n] = (packet.granted, local_idx);
                     n += 1;
                 }
-                let mut budget = EnergyBudget::new(energy)?;
+                let budget = EnergyBudget::new(energy)?;
+                Ok(LoadedOrg {
+                    aff: genome.traits().affinity(),
+                    budget,
+                    pkts,
+                    n,
+                })
+            };
+
+            let (row_pairs, row_rem) = tile.row_indices.as_chunks::<2>();
+            let (out_pairs, out_rem) = tile.out.as_chunks_mut::<2>();
+            for (&[row_a, row_b], [out_a, out_b]) in row_pairs.iter().zip(out_pairs.iter_mut()) {
+                let mut a = load_org(row_a)?;
+                let mut b = load_org(row_b)?;
+                if a.n == PACKETS_PER_ORGANISM && b.n == PACKETS_PER_ORGANISM {
+                    let (sa, sb) = rules.chemistry.settle_indexed_pair_4(
+                        a.aff,
+                        a.pkts,
+                        &mut a.budget,
+                        b.aff,
+                        b.pkts,
+                        &mut b.budget,
+                        comps_ready,
+                    )?;
+                    *out_a = (sa, a.budget);
+                    *out_b = (sb, b.budget);
+                } else {
+                    let sa = rules.chemistry.settle_indexed_slice(
+                        a.aff,
+                        &a.pkts[..a.n],
+                        comps_ready,
+                        &mut a.budget,
+                    )?;
+                    let sb = rules.chemistry.settle_indexed_slice(
+                        b.aff,
+                        &b.pkts[..b.n],
+                        comps_ready,
+                        &mut b.budget,
+                    )?;
+                    *out_a = (sa, a.budget);
+                    *out_b = (sb, b.budget);
+                }
+            }
+            for (&row_u32, out_slot) in row_rem.iter().zip(out_rem.iter_mut()) {
+                let mut org = load_org(row_u32)?;
                 let settlement = rules.chemistry.settle_indexed_slice(
-                    genome.traits().affinity(),
-                    &stack_packets[..n],
+                    org.aff,
+                    &org.pkts[..org.n],
                     comps_ready,
-                    &mut budget,
+                    &mut org.budget,
                 )?;
-                *out_slot = (settlement, budget);
+                *out_slot = (settlement, org.budget);
             }
 
             Ok(())

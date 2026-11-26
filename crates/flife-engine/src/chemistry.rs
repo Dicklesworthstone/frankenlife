@@ -88,6 +88,70 @@ fn err_invalid_efficiency(efficiency: f64) -> CoreError {
     }
 }
 
+/// Paired four-packet exact channel-order (`0..32`) dot products for two
+/// organisms simultaneously: `([a·x0..a·x3], [b·y0..b·y3])`.
+///
+/// Interleaving two organisms' 4-packet dot products exposes 4 independent
+/// NEON `fadd.2d` dependency chains (saturating all 4 FP add pipelines on
+/// Apple Silicon while overlapping both organisms' L2 composition loads) while
+/// summing every single dot product strictly in channel order `0..32`
+/// (0-ULP bit-identical to two separate [`dot4_channels`] calls).
+#[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "private 2-organism × 4-packet exact channel-order dot product kernel"
+)]
+fn dot4_channels_pair(
+    aff_a: &[f64; CHANNELS],
+    a0: &[f64; CHANNELS],
+    a1: &[f64; CHANNELS],
+    a2: &[f64; CHANNELS],
+    a3: &[f64; CHANNELS],
+    aff_b: &[f64; CHANNELS],
+    b0: &[f64; CHANNELS],
+    b1: &[f64; CHANNELS],
+    b2: &[f64; CHANNELS],
+    b3: &[f64; CHANNELS],
+) -> ([f64; 4], [f64; 4]) {
+    let mut da = [0.0_f64; 4];
+    let mut db = [0.0_f64; 4];
+    for ((((&aa, &x0), &x1), (&x2, &x3)), (((&ab, &y0), &y1), (&y2, &y3))) in aff_a
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(a0.as_chunks::<2>().0)
+        .zip(a1.as_chunks::<2>().0)
+        .zip(a2.as_chunks::<2>().0.iter().zip(a3.as_chunks::<2>().0))
+        .zip(
+            aff_b
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(b0.as_chunks::<2>().0)
+                .zip(b1.as_chunks::<2>().0)
+                .zip(b2.as_chunks::<2>().0.iter().zip(b3.as_chunks::<2>().0)),
+        )
+    {
+        for k in 0..2 {
+            let a_k = aa[k];
+            let b_k = ab[k];
+            da = [
+                da[0] + a_k * x0[k],
+                da[1] + a_k * x1[k],
+                da[2] + a_k * x2[k],
+                da[3] + a_k * x3[k],
+            ];
+            db = [
+                db[0] + b_k * y0[k],
+                db[1] + b_k * y1[k],
+                db[2] + b_k * y2[k],
+                db[3] + b_k * y3[k],
+            ];
+        }
+    }
+    (da, db)
+}
+
 /// Four-packet exact channel-order (`0..32`) dot products `a · c_k` for
 /// `k ∈ 0..4`. Chunking by 4 channels lets LLVM's SLP vectorizer emit pure
 /// 2-wide NEON `fmul.2d` + `fadd.2d` across packets `(c0, c1)` and `(c2, c3)`
@@ -377,19 +441,14 @@ impl Chemistry {
         compositions: &[[f64; CHANNELS]],
         budget: &mut EnergyBudget,
     ) -> Result<UptakeSettlement, CoreError> {
-        let mut efficiencies = [(0.0, 0.0); 4];
-        let mut scored = Vec::new();
-        let list: &mut [(f64, f64)] = if packets.len() == 4
+        if let &[p0, p1, p2, p3] = packets
             && let (Some(c0), Some(c1), Some(c2), Some(c3)) = (
-                compositions.get(packets[0].1 as usize),
-                compositions.get(packets[1].1 as usize),
-                compositions.get(packets[2].1 as usize),
-                compositions.get(packets[3].1 as usize),
-            ) {
-            // Fused 4-packet channel-order dot product + 4-lane SIMD `tanh_4`:
-            // reads `aff` once and pairs `(d0, d1)` / `(d2, d3)` via 2-wide
-            // NEON `fmul.2d` + `fadd.2d` so each packet sums strictly in
-            // channel order `0..32` (bit-identical to four sequential calls).
+                compositions.get(p0.1 as usize),
+                compositions.get(p1.1 as usize),
+                compositions.get(p2.1 as usize),
+                compositions.get(p3.1 as usize),
+            )
+        {
             let [d0, d1, d2, d3] = dot4_channels(aff, c0, c1, c2, c3);
             let args = [
                 self.gain * d0 - self.threshold,
@@ -407,14 +466,32 @@ impl Chemistry {
                 ],
             };
             let max_eff = self.maximum_efficiency;
-            efficiencies = [
-                (packets[0].0, max_eff * responses[0]),
-                (packets[1].0, max_eff * responses[1]),
-                (packets[2].0, max_eff * responses[2]),
-                (packets[3].0, max_eff * responses[3]),
-            ];
-            &mut efficiencies
-        } else if packets.len() <= efficiencies.len() {
+            return settle_4_efficiencies_trusted(
+                self.toxicity_sensitivity,
+                [p0.0, p1.0, p2.0, p3.0],
+                [
+                    max_eff * responses[0],
+                    max_eff * responses[1],
+                    max_eff * responses[2],
+                    max_eff * responses[3],
+                ],
+                budget,
+            );
+        }
+        self.settle_indexed_slice_general(aff, packets, compositions, budget)
+    }
+
+    #[cold]
+    fn settle_indexed_slice_general(
+        &self,
+        aff: &[f64; CHANNELS],
+        packets: &[(f64, u32)],
+        compositions: &[[f64; CHANNELS]],
+        budget: &mut EnergyBudget,
+    ) -> Result<UptakeSettlement, CoreError> {
+        let mut efficiencies = [(0.0, 0.0); 4];
+        let mut scored = Vec::new();
+        let list: &mut [(f64, f64)] = if packets.len() <= efficiencies.len() {
             for (slot, &(granted, comp_idx)) in efficiencies.iter_mut().zip(packets) {
                 let comp = compositions
                     .get(comp_idx as usize)
@@ -435,6 +512,124 @@ impl Chemistry {
             &mut scored
         };
         settle_efficiencies_trusted(self.toxicity_sensitivity, list, budget)
+    }
+
+    /// Settle two 4-packet organisms simultaneously against a deduplicated
+    /// `compositions` table, interleaving their exact channel-order dot
+    /// products via [`dot4_channels_pair`] to saturate all 4 FP add pipelines
+    /// while preserving 0-ULP bit-exact identity with two sequential
+    /// [`Chemistry::settle_indexed_slice`] calls.
+    ///
+    /// # Errors
+    /// Returns the first error encountered in organism A before organism B,
+    /// matching sequential evaluation.
+    #[inline]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "paired 2-organism chemistry settlement taking both organisms' affinities, packets, and budgets"
+    )]
+    pub(crate) fn settle_indexed_pair_4(
+        &self,
+        aff_a: &[f64; CHANNELS],
+        packets_a: [(f64, u32); 4],
+        budget_a: &mut EnergyBudget,
+        aff_b: &[f64; CHANNELS],
+        packets_b: [(f64, u32); 4],
+        budget_b: &mut EnergyBudget,
+        compositions: &[[f64; CHANNELS]],
+    ) -> Result<(UptakeSettlement, UptakeSettlement), CoreError> {
+        let a0 = compositions
+            .get(packets_a[0].1 as usize)
+            .ok_or_else(|| err_comp_oob(packets_a[0].1, compositions.len()))?;
+        let a1 = compositions
+            .get(packets_a[1].1 as usize)
+            .ok_or_else(|| err_comp_oob(packets_a[1].1, compositions.len()))?;
+        let a2 = compositions
+            .get(packets_a[2].1 as usize)
+            .ok_or_else(|| err_comp_oob(packets_a[2].1, compositions.len()))?;
+        let a3 = compositions
+            .get(packets_a[3].1 as usize)
+            .ok_or_else(|| err_comp_oob(packets_a[3].1, compositions.len()))?;
+        let b0 = compositions
+            .get(packets_b[0].1 as usize)
+            .ok_or_else(|| err_comp_oob(packets_b[0].1, compositions.len()))?;
+        let b1 = compositions
+            .get(packets_b[1].1 as usize)
+            .ok_or_else(|| err_comp_oob(packets_b[1].1, compositions.len()))?;
+        let b2 = compositions
+            .get(packets_b[2].1 as usize)
+            .ok_or_else(|| err_comp_oob(packets_b[2].1, compositions.len()))?;
+        let b3 = compositions
+            .get(packets_b[3].1 as usize)
+            .ok_or_else(|| err_comp_oob(packets_b[3].1, compositions.len()))?;
+
+        let (da, db) = dot4_channels_pair(aff_a, a0, a1, a2, a3, aff_b, b0, b1, b2, b3);
+        let args_a = [
+            self.gain * da[0] - self.threshold,
+            self.gain * da[1] - self.threshold,
+            self.gain * da[2] - self.threshold,
+            self.gain * da[3] - self.threshold,
+        ];
+        let resp_a = match tanh_4(args_a) {
+            Some(r) => r,
+            None => [
+                tanh(args_a[0]).ok_or_else(|| err_nonfinite_dot(da[0]))?,
+                tanh(args_a[1]).ok_or_else(|| err_nonfinite_dot(da[1]))?,
+                tanh(args_a[2]).ok_or_else(|| err_nonfinite_dot(da[2]))?,
+                tanh(args_a[3]).ok_or_else(|| err_nonfinite_dot(da[3]))?,
+            ],
+        };
+        let max_eff = self.maximum_efficiency;
+        let settle_a = settle_4_efficiencies_trusted(
+            self.toxicity_sensitivity,
+            [
+                packets_a[0].0,
+                packets_a[1].0,
+                packets_a[2].0,
+                packets_a[3].0,
+            ],
+            [
+                max_eff * resp_a[0],
+                max_eff * resp_a[1],
+                max_eff * resp_a[2],
+                max_eff * resp_a[3],
+            ],
+            budget_a,
+        )?;
+
+        let args_b = [
+            self.gain * db[0] - self.threshold,
+            self.gain * db[1] - self.threshold,
+            self.gain * db[2] - self.threshold,
+            self.gain * db[3] - self.threshold,
+        ];
+        let resp_b = match tanh_4(args_b) {
+            Some(r) => r,
+            None => [
+                tanh(args_b[0]).ok_or_else(|| err_nonfinite_dot(db[0]))?,
+                tanh(args_b[1]).ok_or_else(|| err_nonfinite_dot(db[1]))?,
+                tanh(args_b[2]).ok_or_else(|| err_nonfinite_dot(db[2]))?,
+                tanh(args_b[3]).ok_or_else(|| err_nonfinite_dot(db[3]))?,
+            ],
+        };
+        let settle_b = settle_4_efficiencies_trusted(
+            self.toxicity_sensitivity,
+            [
+                packets_b[0].0,
+                packets_b[1].0,
+                packets_b[2].0,
+                packets_b[3].0,
+            ],
+            [
+                max_eff * resp_b[0],
+                max_eff * resp_b[1],
+                max_eff * resp_b[2],
+                max_eff * resp_b[3],
+            ],
+            budget_b,
+        )?;
+
+        Ok((settle_a, settle_b))
     }
 }
 
@@ -597,6 +792,44 @@ pub fn settle_efficiencies(
 }
 
 #[inline]
+fn settle_4_efficiencies_trusted(
+    toxicity_sensitivity: f64,
+    grants: [f64; 4],
+    efficiencies: [f64; 4],
+    budget: &mut EnergyBudget,
+) -> Result<UptakeSettlement, CoreError> {
+    let (mut absorbed, mut gain, mut harm) = (
+        CompensatedSum::ZERO,
+        CompensatedSum::ZERO,
+        CompensatedSum::ZERO,
+    );
+    for k in 0..4 {
+        let granted = grants[k];
+        let efficiency = efficiencies[k];
+        if !granted.is_finite() || granted < 0.0 {
+            return Err(err_invalid_grant(granted));
+        }
+        if !(-1.0..=1.0).contains(&efficiency) {
+            return Err(err_invalid_efficiency(efficiency));
+        }
+        absorbed.add(granted);
+        gain.add(efficiency.max(0.0) * granted);
+        harm.add((-efficiency).max(0.0) * granted);
+    }
+    let gain = gain.value();
+    let requested_toxicity = toxicity_sensitivity * harm.value();
+    if gain > 0.0 {
+        budget.credit(gain)?;
+    }
+    let toxicity = budget.pay(requested_toxicity)?;
+    Ok(UptakeSettlement {
+        absorbed: absorbed.value(),
+        gain,
+        toxicity,
+    })
+}
+
+#[inline]
 fn settle_efficiencies_trusted(
     toxicity_sensitivity: f64,
     packets: &[(f64, f64)],
@@ -750,4 +983,119 @@ pub fn symplectic_waste_direction(
     affinity_norm_limit: f64,
 ) -> Result<[f64; CHANNELS], CoreError> {
     symplectic_rotate_channels(affinity, active_carrier0_channels, affinity_norm_limit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settle_indexed_pair_4_matches_scalar_settle_bit_for_bit() {
+        let chem = Chemistry::new(0.85, 3.2, 0.25, 1.4, 1.0).expect("valid chemistry");
+        let mut aff_a = [0.0_f64; CHANNELS];
+        let mut aff_b = [0.0_f64; CHANNELS];
+        let mut norm_a = 0.0_f64;
+        let mut norm_b = 0.0_f64;
+        for c in 0..CHANNELS {
+            aff_a[c] = ((c as f64) * 0.37 - 5.1).sin();
+            aff_b[c] = ((c as f64) * 0.71 + 1.3).cos();
+            norm_a += aff_a[c] * aff_a[c];
+            norm_b += aff_b[c] * aff_b[c];
+        }
+        let scale_a = 0.9 / norm_a.sqrt();
+        let scale_b = 0.85 / norm_b.sqrt();
+        for c in 0..CHANNELS {
+            aff_a[c] *= scale_a;
+            aff_b[c] *= scale_b;
+        }
+        let affinity_a = Affinity::new(aff_a, &chem).expect("aff_a");
+        let affinity_b = Affinity::new(aff_b, &chem).expect("aff_b");
+
+        let mut comps = [[0.0_f64; CHANNELS]; 6];
+        for (idx, comp) in comps.iter_mut().enumerate() {
+            if idx == 0 {
+                continue; // neutral zero cell
+            }
+            for (c, slot) in comp.iter_mut().enumerate() {
+                *slot = (((idx * 31 + c * 17) as f64) * 0.23).sin() * 0.15;
+            }
+        }
+
+        let pkts_a = [(0.125, 1_u32), (0.0, 0_u32), (0.375, 2_u32), (0.5, 3_u32)];
+        let pkts_b = [(0.4, 4_u32), (0.2, 5_u32), (0.1, 1_u32), (0.3, 0_u32)];
+        let chem_pkts_a: Vec<ChemicalPacket> = pkts_a
+            .iter()
+            .map(|&(granted, idx)| ChemicalPacket {
+                granted,
+                composition: comps[idx as usize],
+            })
+            .collect();
+        let chem_pkts_b: Vec<ChemicalPacket> = pkts_b
+            .iter()
+            .map(|&(granted, idx)| ChemicalPacket {
+                granted,
+                composition: comps[idx as usize],
+            })
+            .collect();
+
+        // Check both unclipped and toxicity-clipped budgets.
+        for &(start_a, start_b) in &[(10.0, 10.0), (0.01, 5.0), (5.0, 0.005)] {
+            let mut ref_ba = EnergyBudget::new(start_a).expect("ba");
+            let mut ref_bb = EnergyBudget::new(start_b).expect("bb");
+            let ref_sa = chem
+                .settle(&affinity_a, &chem_pkts_a, &mut ref_ba)
+                .expect("ref_sa");
+            let ref_sb = chem
+                .settle(&affinity_b, &chem_pkts_b, &mut ref_bb)
+                .expect("ref_sb");
+
+            let mut pair_ba = EnergyBudget::new(start_a).expect("pba");
+            let mut pair_bb = EnergyBudget::new(start_b).expect("pbb");
+            let (pair_sa, pair_sb) = chem
+                .settle_indexed_pair_4(
+                    &aff_a,
+                    pkts_a,
+                    &mut pair_ba,
+                    &aff_b,
+                    pkts_b,
+                    &mut pair_bb,
+                    &comps,
+                )
+                .expect("pair");
+
+            assert_eq!(pair_sa.absorbed.to_bits(), ref_sa.absorbed.to_bits());
+            assert_eq!(pair_sa.gain.to_bits(), ref_sa.gain.to_bits());
+            assert_eq!(
+                pair_sa.toxicity.requested.to_bits(),
+                ref_sa.toxicity.requested.to_bits()
+            );
+            assert_eq!(
+                pair_sa.toxicity.paid.to_bits(),
+                ref_sa.toxicity.paid.to_bits()
+            );
+            assert_eq!(pair_ba.remaining().to_bits(), ref_ba.remaining().to_bits());
+
+            assert_eq!(pair_sb.absorbed.to_bits(), ref_sb.absorbed.to_bits());
+            assert_eq!(pair_sb.gain.to_bits(), ref_sb.gain.to_bits());
+            assert_eq!(
+                pair_sb.toxicity.requested.to_bits(),
+                ref_sb.toxicity.requested.to_bits()
+            );
+            assert_eq!(
+                pair_sb.toxicity.paid.to_bits(),
+                ref_sb.toxicity.paid.to_bits()
+            );
+            assert_eq!(pair_bb.remaining().to_bits(), ref_bb.remaining().to_bits());
+        }
+
+        // Verify out-of-bounds index refusal reports organism A before organism B.
+        let mut ba = EnergyBudget::new(1.0).expect("ba");
+        let mut bb = EnergyBudget::new(1.0).expect("bb");
+        let bad_a = [(0.1, 99_u32), (0.1, 0), (0.1, 0), (0.1, 0)];
+        let bad_b = [(0.1, 88_u32), (0.1, 0), (0.1, 0), (0.1, 0)];
+        let err = chem
+            .settle_indexed_pair_4(&aff_a, bad_a, &mut ba, &aff_b, bad_b, &mut bb, &comps)
+            .expect_err("oob must fail");
+        assert!(format!("{err}").contains("99"));
+    }
 }

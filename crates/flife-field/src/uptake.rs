@@ -389,16 +389,17 @@ impl Grants {
 
     fn reset(&mut self) {
         self.begin_resolve();
+        self.debits.clear();
         self.packets.clear();
         self.staged.clear();
     }
 
-    /// Prepare for a new resolution while preserving `packets` and `staged`
-    /// lengths so parallel overwrite paths avoid redundant single-threaded
-    /// zero-fills; every error path still calls [`Self::reset`].
+    /// Prepare for a new resolution while preserving `debits`, `packets` and
+    /// `staged` lengths so parallel overwrite paths avoid redundant
+    /// single-threaded zero-fills; every error path still calls
+    /// [`Self::reset`].
     fn begin_resolve(&mut self) {
         self.grid = None;
-        self.debits.clear();
         self.totals.clear();
         self.summary = UptakeSummary::default();
         self.applied = false;
@@ -603,6 +604,7 @@ fn resolve_into(
     let mut tally = Tally::default();
 
     if runs == 1 {
+        debits.clear();
         for (cell, range) in bins.occupied() {
             let value = cell_energy(energy, cell)?;
             let length = range.len();
@@ -631,17 +633,21 @@ fn resolve_into(
                 cell_bounds.push(cell);
             }
         }
-        debits.resize(
-            occupied_buckets.len(),
-            CellDebit {
-                cell: 0,
-                energy_before: 0.0,
-                energy_after: 0.0,
-                demanded: 0.0,
-                granted: 0.0,
-                contended: false,
-            },
-        );
+        if debits.len() >= occupied_buckets.len() {
+            debits.truncate(occupied_buckets.len());
+        } else {
+            debits.resize(
+                occupied_buckets.len(),
+                CellDebit {
+                    cell: 0,
+                    energy_before: 0.0,
+                    energy_after: 0.0,
+                    demanded: 0.0,
+                    granted: 0.0,
+                    contended: false,
+                },
+            );
+        }
         // Split `packets`, `occupied_buckets`, and `debits` into disjoint
         // per-tile slices for dynamic work-stealing.
         struct Slice<'a> {

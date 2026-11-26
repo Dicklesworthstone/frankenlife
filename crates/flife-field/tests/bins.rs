@@ -1521,3 +1521,53 @@ fn sample_batch_detects_nonfinite_across_all_packed_buckets() {
         }
     }
 }
+
+/// When every query in a `sample_batch_each` chunk already sits inside one
+/// coarse macro-tile (as in spatial Pass 1), `sort_by_tile` switches to the
+/// 2-row fine-strip key (`fine_tile`) and interleaved `[value, dx, dy]`
+/// staging must still reproduce scalar `sample` bit-for-bit on both level-0
+/// and level-0/1 blended queries.
+#[test]
+fn sample_batch_single_macro_tile_fine_strip_sort_matches_scalar_bit_for_bit() {
+    let g = grid(128, 128);
+    let snap = field(g, 1984);
+    let mut pyr = SensorPyramid::new(g, 4, &BufferLimits::host()).expect("pyramid");
+    let view = pyr.build_on(&snap, 4).expect("build");
+
+    let mut rng = lcg(2026);
+    // All 128 queries lie inside coarse macro-tile (tx=0, ty=0): x in [0, 16), y in [0, 32).
+    let queries: Vec<SensorQuery> = (0..128)
+        .map(|i| SensorQuery {
+            position: [rng() * 15.5, rng() * 31.5],
+            scale: if i % 2 == 0 { 1.0 } else { 1.05 + rng() * 0.9 },
+        })
+        .collect();
+    let want: Vec<RawSample> = queries
+        .iter()
+        .map(|q| view.sample(q.position, q.scale).expect("scalar"))
+        .collect();
+    let zero = RawSample {
+        values: [0.0; PLANES],
+        dx: [0.0; PLANES],
+        dy: [0.0; PLANES],
+    };
+    let mut got = vec![zero; queries.len()];
+    view.sample_batch(&queries, &mut got).expect("batch");
+    for (i, (g_row, w_row)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(
+            g_row.values.map(f64::to_bits),
+            w_row.values.map(f64::to_bits),
+            "values[{i}]"
+        );
+        assert_eq!(
+            g_row.dx.map(f64::to_bits),
+            w_row.dx.map(f64::to_bits),
+            "dx[{i}]"
+        );
+        assert_eq!(
+            g_row.dy.map(f64::to_bits),
+            w_row.dy.map(f64::to_bits),
+            "dy[{i}]"
+        );
+    }
+}

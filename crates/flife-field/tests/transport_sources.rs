@@ -1598,3 +1598,98 @@ fn pyramid_sample_batch_each_matches_scalar_and_preserves_canonical_error_order(
         "expected NumericalInvalid on NaN field, got: {nan_err:?}"
     );
 }
+
+/// Band-grouped 4-plane moment deposition (`cells >= 16_384`, `workers > 1`)
+/// must match the serial path bit-for-bit across toroidal seams, zero-component
+/// directions (preserving `-0.0` sign bits), and zero-power sources, with zero
+/// steady-state `FieldWork` footprint drift.
+#[test]
+fn band_grouped_moment_deposition_matches_serial_bit_for_bit_including_signed_zero() {
+    let world = grid(128, 128, 128.0, 128.0);
+    let limits = BufferLimits::host();
+    let step = tick();
+    let plan = TransportPlan::new(&world, step, 0.35, 0.02).expect("plan");
+    let kernel = SourceKernel::new(3.2, 3.5).expect("kernel");
+    let mut draw = lcg(7331);
+    let mut sources = Vec::new();
+    for id in 0..8_u32 {
+        let mut dir = [0.0_f64; CHANNELS];
+        if id == 0 {
+            // Exact zeros on channels 1, 3, 4..31 to test signed-zero preservation
+            // across all four slots of 4-plane band groups.
+            dir[0] = 0.6;
+            dir[2] = -0.8;
+        } else {
+            let normals = [(); CHANNELS].map(|()| draw() * 2.0 - 1.0);
+            dir = unit_direction(&normals).expect("dir");
+        }
+        let center = match id {
+            0 => [0.25, 127.75], // toroidal seam wrap
+            1 => [127.6, 0.4],
+            _ => [draw() * 128.0, draw() * 128.0],
+        };
+        let power = if id == 7 { 0.0 } else { 25.0 };
+        sources.push(Source::new(SourceId::new(id), center, dir, power).expect("source"));
+    }
+
+    let seed_pair = || {
+        let mut pair = FieldPair::zeroed(world, &limits).expect("pair");
+        let cells = world.cell_count() as usize;
+        // Inject explicit `-0.0` in moment planes so any skipped zero-component
+        // plane preserves `-0.0` identically between serial and band-grouped paths.
+        let planes = pair.current().planes() as usize;
+        for plane in 1..planes {
+            let slice = &mut pair.current_mut().as_mut_slice()[plane * cells..(plane + 1) * cells];
+            for (idx, cell) in slice.iter_mut().enumerate() {
+                if idx % 17 == 0 {
+                    *cell = -0.0_f32;
+                }
+            }
+        }
+        pair
+    };
+    let bits = |pair: &FieldPair| -> Vec<u32> {
+        pair.current()
+            .as_slice()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    };
+
+    let mut serial = seed_pair();
+    let mut work1 =
+        FieldWork::new(&world, &limits, std::num::NonZeroUsize::new(1).expect("1")).expect("w1");
+    let rep1 =
+        advance_field_on(&mut serial, &plan, &kernel, &sources, step, &mut work1).expect("serial");
+    serial.commit();
+    let want_bits = bits(&serial);
+    let want_rep = format!("{rep1:?}");
+
+    for workers in [2, 4, 8] {
+        let mut par = seed_pair();
+        let mut work = FieldWork::new(
+            &world,
+            &limits,
+            std::num::NonZeroUsize::new(workers).expect("workers"),
+        )
+        .expect("work");
+        let before_bytes = work.allocated_bytes();
+        let rep = advance_field_on(&mut par, &plan, &kernel, &sources, step, &mut work)
+            .expect("parallel");
+        par.commit();
+        assert_eq!(format!("{rep:?}"), want_rep, "{workers} workers report");
+        assert!(bits(&par) == want_bits, "{workers} workers field bits");
+        assert!(
+            work.allocated_bytes() >= before_bytes,
+            "FieldWork accounts for run buffers"
+        );
+        let steady = work.allocated_bytes();
+        let _ = advance_field_on(&mut par, &plan, &kernel, &sources, step, &mut work)
+            .expect("second tick");
+        assert_eq!(
+            work.allocated_bytes(),
+            steady,
+            "{workers} workers steady-state FieldWork footprint"
+        );
+    }
+}

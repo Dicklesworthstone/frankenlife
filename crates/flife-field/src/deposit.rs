@@ -1547,10 +1547,29 @@ impl Deposits {
                 "these deposits were staged for another grid".into(),
             ));
         }
-        let strictly_ascending = self
-            .entries
-            .windows(2)
-            .all(|pair| pair[0].organism < pair[1].organism);
+        // Single pass over `self.entries` (296 B/entry) checks ascending
+        // identity order, contiguous packet spans, and compensated paid/offered
+        // totals simultaneously (3× less serial memory traffic, bit-identical).
+        let mut strictly_ascending = true;
+        let mut contiguous_spans = true;
+        let mut prev_org: Option<OrganismId> = None;
+        let mut cursor = 0_usize;
+        let mut paid = CompensatedSum::ZERO;
+        let mut offered = CompensatedSum::ZERO;
+        for entry in &self.entries {
+            if let Some(prev) = prev_org
+                && !(prev < entry.organism)
+            {
+                strictly_ascending = false;
+            }
+            prev_org = Some(entry.organism);
+            if entry.first != cursor {
+                contiguous_spans = false;
+            }
+            cursor = cursor.saturating_add(entry.count);
+            paid.add(entry.paid);
+            offered.add(entry.offered);
+        }
         if !strictly_ascending {
             self.identities.clear();
             self.identities.extend(
@@ -1602,12 +1621,6 @@ impl Deposits {
             organisms: self.entries.len(),
             ..DepositSummary::default()
         };
-        let mut paid = CompensatedSum::ZERO;
-        let mut offered = CompensatedSum::ZERO;
-        for entry in &self.entries {
-            paid.add(entry.paid);
-            offered.add(entry.offered);
-        }
         summary.paid = paid.value();
         summary.offered = offered.value();
         if !summary.paid.is_finite() || !summary.offered.is_finite() {
@@ -1638,7 +1651,7 @@ impl Deposits {
             usize::try_from(field.grid().cell_count()).map_err(|_| CoreError::Overflow {
                 quantity: DEPOSIT_PACKETS,
             })?;
-        let contiguous = strictly_ascending && entries_are_contiguous(entries, packets.len());
+        let contiguous = strictly_ascending && contiguous_spans && cursor == packets.len();
         sequence.clear();
         if contiguous {
             *identity_sequence = true;
@@ -1834,19 +1847,6 @@ fn flush_moment_batch_const<const M: usize>(
             }
         }
     }
-}
-
-/// True when `entries` cover `0..packet_len` contiguously in order, allowing
-/// `prepare_for_carrier` to bypass the `sequence` indirection array.
-fn entries_are_contiguous(entries: &[Entry], packet_len: usize) -> bool {
-    let mut cursor = 0_usize;
-    for entry in entries {
-        if entry.first != cursor {
-            return false;
-        }
-        cursor = cursor.saturating_add(entry.count);
-    }
-    cursor == packet_len
 }
 
 /// Fixed-channel specialization of [`reduce_run`] iterating only occupied cells

@@ -16,7 +16,7 @@ use crate::invariants::{ConeTolerance, FieldScan};
 use crate::layout::overflow;
 use crate::sources::{
     DepositReport, Source, SourceKernel, SourceSupport, component, deposit, deposit_energy,
-    deposit_energy_fused, deposit_moment, deposit_moments_fused,
+    deposit_energy_fused, deposit_moment, deposit_moment_band_group, deposit_moments_fused,
 };
 use crate::state::{FieldPair, FieldState};
 use crate::transport::{
@@ -1018,6 +1018,63 @@ pub fn advance_field_wave2_on(
             &mut plane_tasks,
             |channel, plane, accum| deposit_moments_fused(plane, sources, channel, supports, accum),
         )?;
+    } else if worker_budget > 1
+        && cells >= 16_384
+        && channels >= 4
+        && supports.iter().all(|s| !s.has_cell_out_of_bounds(cells))
+    {
+        // Partition moment planes into 4-plane groups and each plane into
+        // L2-resident cell bands so every worker shares `support.amounts`
+        // across 4 planes with zero `cell_indices` traffic and balanced
+        // P/E-core work stealing (0-ulp bit-identical to per-plane deposit).
+        const GROUP_PLANES: usize = 4;
+        let bands = (cells / 32_768).clamp(4, 16);
+        let band_len = cells.div_ceil(bands);
+        struct BandGroupTask<'a> {
+            band_start: usize,
+            band_end: usize,
+            channel_base: usize,
+            planes: Vec<&'a mut [f32]>,
+        }
+        let group_count = channels.div_ceil(GROUP_PLANES);
+        let mut tasks: Vec<BandGroupTask<'_>> = Vec::with_capacity(group_count * bands);
+        for (group_idx, group_buf) in moments.chunks_mut(GROUP_PLANES * cells).enumerate() {
+            let channel_base = group_idx * GROUP_PLANES;
+            let group_planes = group_buf.len() / cells;
+            let mut plane_iters: Vec<_> = group_buf
+                .chunks_exact_mut(cells)
+                .map(|p| p.chunks_mut(band_len))
+                .collect();
+            for band_idx in 0..bands {
+                let band_start = (band_idx * band_len).min(cells);
+                let band_end = (band_start + band_len).min(cells);
+                if band_start >= band_end {
+                    break;
+                }
+                let mut band_planes = Vec::with_capacity(group_planes);
+                for iter in &mut plane_iters {
+                    if let Some(slice) = iter.next() {
+                        band_planes.push(slice);
+                    }
+                }
+                tasks.push(BandGroupTask {
+                    band_start,
+                    band_end,
+                    channel_base,
+                    planes: band_planes,
+                });
+            }
+        }
+        flife_core::pool::try_parallel_tasks(worker_budget, "deposit", &mut tasks, |_, task| {
+            deposit_moment_band_group(
+                task.band_start,
+                task.band_end,
+                task.channel_base,
+                &mut task.planes,
+                sources,
+                supports,
+            )
+        })?;
     } else {
         let mut plane_tasks: Vec<&mut [f32]> = moments.chunks_exact_mut(cells).collect();
         flife_core::pool::try_parallel_tasks(

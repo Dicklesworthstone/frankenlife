@@ -429,12 +429,13 @@ impl Candidate<'_> {
             .backend
             .is_some()
             .then_some(&mut released_slots);
-        world.population.apply_checked_tick(
+        world.population.apply_checked_tick_on(
             staged.checked,
             &world.scratch.survivors,
             &mut staged.births,
             &mut staged.quota,
             released,
+            world.scratch.lanes.len(),
         )?;
         if !released_slots.is_empty()
             && let Some(backend) = world.controllers.backend.as_mut()
@@ -876,9 +877,19 @@ struct Scratch {
     pyramid: SensorPyramid,
     /// The committed rows, in identity order, that phases 3 and 4 read.
     rows: Vec<Organism>,
-    /// Phases 3 and 4 decisions in identity order, shared across dynamic
-    /// work-stealing tiles so `lanes` only hold per-worker scratch.
+    /// Phases 3 and 4 decisions, shared across dynamic work-stealing tiles so
+    /// `lanes` only hold per-worker scratch. Stored in identity order when
+    /// `row_to_spatial` is empty, or in spatial macro-tile order indexed by
+    /// `row_to_spatial[row_idx]` on large multi-worker flat-F32 ticks.
     decisions: Vec<Decision>,
+    /// Row indices partitioned into 8×8 spatial macro-tiles during large
+    /// multi-worker flat-F32 Pass 1/Pass 2 ticks (`capacity >= 8,192` and
+    /// `cells >= 32,768`; empty / 0 bytes otherwise).
+    spatial_rows: Vec<u32>,
+    /// Inverse map `row_idx -> spatial_pos` into `decisions` when spatial
+    /// Pass 1/Pass 2 ran on the current tick; empty when `decisions` is in
+    /// identity order.
+    row_to_spatial: Vec<u32>,
     /// One per CPU worker (`[execution] cpu_workers`).
     lanes: Vec<DecisionLane>,
     /// Pre-reserved dynamic work-stealing settle tiles for large multi-worker
@@ -908,6 +919,10 @@ struct Scratch {
     byproducts: Option<Deposits>,
     recycling: Deposits,
     survivors: Vec<Organism>,
+    /// Compact `f64` survivor energies filled by Phase 8 `BuildTile` so the
+    /// canonical compensated organism energy sum scans `8 B/org` in L2 instead
+    /// of `424 B/org` across `survivors`.
+    survivor_energies: Vec<f64>,
     deaths: Vec<Death>,
     /// The contact models' buffers; empty under every other model.
     contact: ContactWork,
@@ -2254,6 +2269,8 @@ impl World {
             [
                 capacity_bytes(&scratch.rows),
                 capacity_bytes(&scratch.decisions),
+                capacity_bytes(&scratch.spatial_rows),
+                capacity_bytes(&scratch.row_to_spatial),
                 capacity_bytes(&scratch.lanes),
                 capacity_bytes(&scratch.settle_tiles),
                 capacity_bytes(&scratch.sampled),
@@ -2274,6 +2291,7 @@ impl World {
                     .map_or(0, Deposits::allocated_bytes),
                 scratch.recycling.allocated_bytes(),
                 capacity_bytes(&scratch.survivors),
+                capacity_bytes(&scratch.survivor_energies),
                 capacity_bytes(&scratch.deaths),
                 scratch.contact.allocated_bytes(),
                 scratch.crowding.allocated_bytes(),
@@ -2922,6 +2940,8 @@ impl World {
             pyramid,
             rows,
             decisions,
+            spatial_rows,
+            row_to_spatial,
             lanes,
             settle_tiles,
             sampled,
@@ -2936,6 +2956,7 @@ impl World {
             byproducts,
             recycling,
             survivors,
+            survivor_energies,
             deaths,
             contact,
             crowding,
@@ -3109,6 +3130,8 @@ impl World {
             crowding_counts,
             [from, to],
             decisions,
+            spatial_rows,
+            row_to_spatial,
             lanes,
             controllers,
         )?;
@@ -3139,6 +3162,17 @@ impl World {
             });
         }
         let mut evaluated = 0_usize;
+        let spatial_decisions = !row_to_spatial.is_empty();
+        if spatial_decisions && row_to_spatial.len() != rows.len() {
+            return Err(CoreError::StateConflict {
+                operation: "gather decisions",
+                detail: format!(
+                    "{} spatial decision indices for {} organisms",
+                    row_to_spatial.len(),
+                    rows.len()
+                ),
+            });
+        }
         if rows.len() >= 512 && lanes.len() > 1 {
             let placeholder = Working {
                 committed: rows[0],
@@ -3168,24 +3202,38 @@ impl World {
                 .min(rows.len().div_ceil(512))
                 .max(1);
             let tile_len = rows.len().div_ceil(tile_count);
+            let all_decisions: &[Decision] = decisions.as_slice();
             struct GatherTile<'a> {
                 start: usize,
                 rows: &'a [Organism],
                 decisions: &'a [Decision],
+                spatial_map: &'a [u32],
                 out: &'a mut [Working],
                 evaluated: usize,
             }
             let mut tiles: Vec<GatherTile<'_>> = rows
                 .chunks(tile_len)
-                .zip(decisions.chunks(tile_len))
                 .zip(working.chunks_mut(tile_len))
                 .enumerate()
-                .map(|(idx, ((row_c, dec_c), out_c))| GatherTile {
-                    start: idx * tile_len,
-                    rows: row_c,
-                    decisions: dec_c,
-                    out: out_c,
-                    evaluated: 0,
+                .map(|(idx, (row_c, out_c))| {
+                    let start = idx * tile_len;
+                    let end = start + row_c.len();
+                    GatherTile {
+                        start,
+                        rows: row_c,
+                        decisions: if spatial_decisions {
+                            all_decisions
+                        } else {
+                            &all_decisions[start..end]
+                        },
+                        spatial_map: if spatial_decisions {
+                            &row_to_spatial[start..end]
+                        } else {
+                            &[]
+                        },
+                        out: out_c,
+                        evaluated: 0,
+                    }
                 })
                 .collect();
             flife_core::pool::try_parallel_tasks(
@@ -3194,13 +3242,16 @@ impl World {
                 &mut tiles,
                 |_, tile| {
                     let mut local_eval = 0_usize;
-                    for (i, ((&organism, decision), slot)) in tile
-                        .rows
-                        .iter()
-                        .zip(tile.decisions)
-                        .zip(tile.out.iter_mut())
-                        .enumerate()
+                    let mapped = !tile.spatial_map.is_empty();
+                    for (i, (&organism, slot)) in
+                        tile.rows.iter().zip(tile.out.iter_mut()).enumerate()
                     {
+                        let dec_idx = if mapped {
+                            tile.spatial_map[i] as usize
+                        } else {
+                            i
+                        };
+                        let decision = &tile.decisions[dec_idx];
                         local_eval += usize::from(decision.evaluated);
                         let basal_multiplier =
                             rules
@@ -3238,8 +3289,13 @@ impl World {
             }
         } else {
             working.clear();
-            for (row_index, (&organism, decision)) in rows.iter().zip(decisions.iter()).enumerate()
-            {
+            for (row_index, &organism) in rows.iter().enumerate() {
+                let dec_idx = if spatial_decisions {
+                    row_to_spatial[row_index] as usize
+                } else {
+                    row_index
+                };
+                let decision = &decisions[dec_idx];
                 evaluated += usize::from(decision.evaluated);
                 let basal_multiplier =
                     rules
@@ -3645,7 +3701,8 @@ impl World {
 
         // Every fate, in identity order; the deaths' residuals are settled.
         // The deaths are listed as they happened: phase 1's removals first.
-        survivors.clear();
+        // Preserve `survivors` length on the parallel path so `set_len_reuse`
+        // avoids serially zero-filling 42+ MB of `Organism` rows every tick.
         deaths.clear();
         deaths.append(&mut removals);
         let mut organisms = CompensatedSum::ZERO;
@@ -3747,23 +3804,31 @@ impl World {
                 total_survivors += tile.survivors;
                 die_list.extend(tile.dies);
             }
-            if total_survivors > 0 {
+            if total_survivors == 0 {
+                survivors.clear();
+            } else {
                 set_len_reuse(survivors, total_survivors, working[0].committed);
+                set_len_reuse(survivor_energies, total_survivors, 0.0);
                 struct BuildTile<'a> {
                     base: usize,
                     chunk: &'a [Working],
                     out: &'a mut [Organism],
+                    energies: &'a mut [f64],
                 }
                 let mut build_tiles: Vec<BuildTile<'_>> = Vec::with_capacity(tile_specs.len());
                 let mut rem_out = survivors.as_mut_slice();
+                let mut rem_e = survivor_energies.as_mut_slice();
                 for (base, len, surv_count) in tile_specs {
                     let (out_head, out_tail) = rem_out.split_at_mut(surv_count);
                     rem_out = out_tail;
+                    let (e_head, e_tail) = rem_e.split_at_mut(surv_count);
+                    rem_e = e_tail;
                     if surv_count > 0 {
                         build_tiles.push(BuildTile {
                             base,
                             chunk: &working[base..base + len],
                             out: out_head,
+                            energies: e_head,
                         });
                     }
                 }
@@ -3839,13 +3904,14 @@ impl World {
                                 last_neighbor_h0,
                                 ..organism.committed
                             };
+                            tile.energies[dst] = energy;
                             dst += 1;
                         }
                         Ok(())
                     },
                 )?;
-                for survivor in survivors.iter() {
-                    organisms.add(survivor.energy);
+                for &energy in &survivor_energies[..total_survivors] {
+                    organisms.add(energy);
                 }
                 if !trophallaxis_deltas.is_empty()
                     && let (Some(watched_id), Some(record)) =
@@ -3915,6 +3981,7 @@ impl World {
                 deaths.push(death);
             }
         } else {
+            survivors.clear();
             for (index, organism) in working.iter().enumerate() {
                 emitted += usize::from(organism.emitted);
                 match organism.vitality.fate()? {
@@ -4527,11 +4594,23 @@ impl Scratch {
                 quantity: "packet compositions",
             }
         })?;
+        let uses_spatial_pass1 =
+            rows >= SPATIAL_PASS1_MIN_ROWS && rules.grid.cell_count() >= SPATIAL_PASS1_MIN_CELLS;
+        let (spatial_rows, row_to_spatial) = if uses_spatial_pass1 {
+            (
+                reserved(rows, "spatial pass1 rows")?,
+                reserved(rows, "spatial pass1 map")?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Ok(Self {
             field,
             pyramid: SensorPyramid::from_config(config, &limits)?,
             rows: reserved(rows, "organism rows")?,
             decisions: reserved(rows, "decisions")?,
+            spatial_rows,
+            row_to_spatial,
             lanes: lanes(worker_count, rules, !use_tiles)?,
             settle_tiles,
             sampled: Vec::with_capacity(sources),
@@ -4574,6 +4653,7 @@ impl Scratch {
                 &limits,
             )?,
             survivors: reserved(rows, "survivors")?,
+            survivor_energies: reserved(rows, "survivor energies")?,
             deaths: reserved(rows, "deaths")?,
             contact: match &rules.contact {
                 Some(bodies) => ContactWork::with_capacity_v2_features(
@@ -6939,13 +7019,23 @@ enum Batched {
     Device(CoreError),
 }
 
+/// Minimum live organism count and grid cell count to partition flat-F32
+/// Pass 1 and Pass 2 into 8×8 spatial macro-tiles so each worker keeps its
+/// macro-tile slice in L2 and its 2-row fine strips in L1D instead of
+/// randomly thrashing the full multi-plane field.
+const SPATIAL_PASS1_MIN_ROWS: usize = 8_192;
+const SPATIAL_PASS1_MIN_CELLS: u64 = 32_768;
+const SPATIAL_NX: usize = 8;
+const SPATIAL_NY: usize = 8;
+const SPATIAL_TILES: usize = SPATIAL_NX * SPATIAL_NY;
+
 /// Phases 3 and 4 for every row, with the due evaluations batched on the
 /// world's backend if it has one. Any error on the batched path hands the
 /// tick to [`decide_all`], which reproduces the reference's own error (or
 /// finds none), so the result is always the reference's.
 #[expect(
     clippy::too_many_arguments,
-    reason = "phases 3 and 4's inputs, the backend's samples, post-Phase-1 crowding, and the controllers"
+    reason = "phases 3 and 4's inputs, the backend's samples, post-Phase-1 crowding, spatial staging, and the controllers"
 )]
 fn decide_with(
     rules: &Rules,
@@ -6956,6 +7046,8 @@ fn decide_with(
     crowding_counts: &[u32],
     ticks: [Tick; 2],
     decisions: &mut Vec<Decision>,
+    spatial_rows: &mut Vec<u32>,
+    row_to_spatial: &mut Vec<u32>,
     lanes: &mut [DecisionLane],
     controllers: &mut Controllers,
 ) -> Result<(), CoreError> {
@@ -6968,6 +7060,7 @@ fn decide_with(
         flat_outputs,
     } = controllers;
     let Some(device) = backend.as_deref_mut() else {
+        row_to_spatial.clear();
         return decide_all(
             rules,
             population,
@@ -6990,6 +7083,8 @@ fn decide_with(
             crowding_counts,
             ticks,
             decisions,
+            spatial_rows,
+            row_to_spatial,
             lanes,
             device,
             flat_inputs_f32,
@@ -6997,6 +7092,7 @@ fn decide_with(
             flat_outputs,
         )
     } else {
+        row_to_spatial.clear();
         decide_batched(
             rules,
             population,
@@ -7028,6 +7124,7 @@ fn decide_with(
             report.failure = Some(error.to_string());
             *backend = None;
             report.reference_ticks = report.reference_ticks.saturating_add(1);
+            row_to_spatial.clear();
             decide_all(
                 rules,
                 population,
@@ -7042,6 +7139,7 @@ fn decide_with(
         }
         Err(_) => {
             report.reference_ticks = report.reference_ticks.saturating_add(1);
+            row_to_spatial.clear();
             decide_all(
                 rules,
                 population,
@@ -7483,15 +7581,264 @@ fn pass1_flat_f32<'p>(
     Ok(())
 }
 
+/// Spatial-tile counterpart to [`pass1_flat_f32`]: processes organisms belonging
+/// to one 8×8 spatial macro-tile (via `row_indices`) with O(1) physical-slot
+/// lookup through `population.ordered_slots()`, keeping each 512-query pyramid
+/// chunk inside one coarse macro-tile so [`PyramidView::sample_batch_each`]
+/// activates fine 2-row strip sorting in L1D/L2.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "single-pass spatial macro-tile worker for L1D/L2-local sampling, F32 encoding, and job construction"
+)]
+fn pass1_flat_f32_spatial<'p>(
+    rules: &'p Rules,
+    population: &'p Population,
+    ordered_slots: &[u32],
+    view: &PyramidView<'_>,
+    rows: &[Organism],
+    crowding_counts: &[u32],
+    [from, to]: [Tick; 2],
+    row_indices: &[u32],
+    decisions_out: &mut [Decision],
+    in_f32: &mut [f32],
+    in_finite: &mut [u8],
+    jobs_out: &mut Vec<FlatControllerJob<'p>>,
+) -> Result<(), CoreError> {
+    const FLAT_SAMPLE_BATCH: usize = 512;
+    const NOT_DUE: u32 = u32::MAX;
+
+    let sensors = rules.v2.sensors();
+    let input_width = sensors.input_width();
+    let obs_width = sensors.observation_width();
+    let state_width = rules.recurrent_state_width;
+    let needs_expanded = input_width > SENSOR_WIDTH;
+    let dual_carrier = rules.v2.dual_carrier().is_some();
+
+    let mut local_due = 0_usize;
+
+    let finish_due_row = |dst: &mut [f32],
+                          finite_slot: &mut u8,
+                          row_idx: usize,
+                          organism: &Organism,
+                          trail_f32: Option<[f32; 4]>| {
+        if needs_expanded {
+            dst[SENSOR_WIDTH..].fill(0.0);
+            if let (Some(slot_idx), Some(trail)) = (sensors.dual_carrier_trails(), trail_f32) {
+                dst[slot_idx..slot_idx + trail.len()].copy_from_slice(&trail);
+            }
+            if let (Some(slot_idx), Some(n_loc)) = (
+                sensors.hippo_crowding(),
+                crowding_counts.get(row_idx).copied(),
+            ) {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "matches ReferenceController F32 input narrowing"
+                )]
+                {
+                    dst[slot_idx] = hippo_crowding_sensor(n_loc) as f32;
+                }
+            }
+            if let Some(slot_idx) = sensors.notch_delta() {
+                dst[slot_idx] = organism.last_neighbor_h0;
+            }
+            if state_width > 0 {
+                let prev = organism.held.recurrent_state_array();
+                dst[obs_width..input_width].copy_from_slice(&prev[..state_width]);
+            }
+        }
+        *finite_slot = u8::from(dst.iter().all(|v| v.is_finite()));
+    };
+
+    let build_job = |organism: &Organism,
+                     genome: &'p Genome,
+                     slot: Option<ArenaSlot>|
+     -> Result<FlatControllerJob<'p>, CoreError> {
+        let arena_slot = slot.ok_or_else(|| CoreError::StateConflict {
+            operation: "controller batch",
+            detail: format!("{} holds no arena slot", organism.id),
+        })?;
+        Ok(FlatControllerJob {
+            genome: organism.genome,
+            slot: arena_slot,
+            controller: genome.controller(&rules.catalog, &rules.limits)?,
+        })
+    };
+
+    let mut queries = [SensorQuery {
+        position: [0.0, 0.0],
+        scale: 1.0,
+    }; FLAT_SAMPLE_BATCH];
+    let mut batch_meta: [(Option<&'p Genome>, Option<ArenaSlot>, u32); FLAT_SAMPLE_BATCH] =
+        [(None, None, NOT_DUE); FLAT_SAMPLE_BATCH];
+    let mut chunk_jobs: [Option<FlatControllerJob<'p>>; FLAT_SAMPLE_BATCH] =
+        std::array::from_fn(|_| None);
+
+    for (chunk_idx, idx_chunk) in row_indices.chunks(FLAT_SAMPLE_BATCH).enumerate() {
+        let count = idx_chunk.len();
+        let local_base = chunk_idx * FLAT_SAMPLE_BATCH;
+        let mut chunk_due = 0_usize;
+        for i in 0..count {
+            let row_idx = idx_chunk[i] as usize;
+            let organism = &rows[row_idx];
+            let phys_slot = ordered_slots[row_idx] as usize;
+            if population.id_at_slot(phys_slot) != Some(organism.id) {
+                return Err(CoreError::StateConflict {
+                    operation: "read genome",
+                    detail: format!("{} slot mismatch", organism.id),
+                });
+            }
+            let (genome, slot) = population.genome_and_arena_at_slot(phys_slot);
+            let genome = genome.ok_or_else(|| CoreError::StateConflict {
+                operation: "read genome",
+                detail: format!("{} has no genome", organism.id),
+            })?;
+            let due_slot = if due(rules, organism, to) {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "chunk_due < FLAT_SAMPLE_BATCH (512) < u32::MAX"
+                )]
+                let d = chunk_due as u32;
+                chunk_due += 1;
+                d
+            } else {
+                NOT_DUE
+            };
+            batch_meta[i] = (Some(genome), slot, due_slot);
+            queries[i] = SensorQuery {
+                position: organism.position,
+                scale: genome.traits().sensing_scale(),
+            };
+        }
+        let chunk_in_f32 = in_f32
+            .get_mut(local_due * input_width..(local_due + chunk_due) * input_width)
+            .ok_or_else(|| CoreError::StateConflict {
+                operation: "controller batch",
+                detail: "flat input buffer shorter than due count".to_owned(),
+            })?;
+        let chunk_in_fin = in_finite
+            .get_mut(local_due..local_due + chunk_due)
+            .ok_or_else(|| CoreError::StateConflict {
+                operation: "controller batch",
+                detail: "flat finite flag buffer shorter than due count".to_owned(),
+            })?;
+        let chunk_dec = decisions_out
+            .get_mut(local_base..local_base + count)
+            .ok_or_else(|| CoreError::StateConflict {
+                operation: "controller batch",
+                detail: "decision buffer shorter than organism chunk".to_owned(),
+            })?;
+        if dual_carrier {
+            view.sample_dual_batch_each(&queries[..count], |i, raw| {
+                let (Some(genome), slot, due_slot) = batch_meta[i] else {
+                    return Ok(());
+                };
+                let row_idx = idx_chunk[i] as usize;
+                let organism = &rows[row_idx];
+                let dec = &mut chunk_dec[i];
+                if due_slot != NOT_DUE {
+                    let d = due_slot as usize;
+                    let dst = &mut chunk_in_f32[d * input_width..(d + 1) * input_width];
+                    let base_arr: &mut [f32; SENSOR_WIDTH] = (&mut dst[..SENSOR_WIDTH])
+                        .try_into()
+                        .map_err(|_| CoreError::StateConflict {
+                            operation: "controller batch",
+                            detail: "flat input slice narrower than SENSOR_WIDTH".to_owned(),
+                        })?;
+                    let mut trail_f32 = [0.0_f32; 4];
+                    encode_dual_for_controller_f32_into(
+                        rules,
+                        organism,
+                        raw,
+                        from,
+                        base_arr,
+                        &mut trail_f32,
+                        &mut dec.gradients,
+                    )?;
+                    finish_due_row(
+                        dst,
+                        &mut chunk_in_fin[d],
+                        row_idx,
+                        organism,
+                        Some(trail_f32),
+                    );
+                    chunk_jobs[d] = Some(build_job(organism, genome, slot)?);
+                    dec.held = organism.held;
+                    dec.evaluated = true;
+                } else {
+                    encode_dual_gradients_only_into(
+                        rules,
+                        organism,
+                        raw,
+                        from,
+                        &mut dec.gradients,
+                    )?;
+                    dec.held = organism.held;
+                    dec.evaluated = false;
+                    dec.actions = decode_held(rules, organism, &organism.held)?;
+                }
+                Ok(())
+            })?;
+        } else {
+            view.sample_batch_each(&queries[..count], |i, raw| {
+                let (Some(genome), slot, due_slot) = batch_meta[i] else {
+                    return Ok(());
+                };
+                let row_idx = idx_chunk[i] as usize;
+                let organism = &rows[row_idx];
+                let dec = &mut chunk_dec[i];
+                if due_slot != NOT_DUE {
+                    let d = due_slot as usize;
+                    let dst = &mut chunk_in_f32[d * input_width..(d + 1) * input_width];
+                    let base_arr: &mut [f32; SENSOR_WIDTH] = (&mut dst[..SENSOR_WIDTH])
+                        .try_into()
+                        .map_err(|_| CoreError::StateConflict {
+                            operation: "controller batch",
+                            detail: "flat input slice narrower than SENSOR_WIDTH".to_owned(),
+                        })?;
+                    encode_for_controller_f32_into(
+                        rules,
+                        organism,
+                        raw,
+                        from,
+                        base_arr,
+                        &mut dec.gradients,
+                    )?;
+                    finish_due_row(dst, &mut chunk_in_fin[d], row_idx, organism, None);
+                    chunk_jobs[d] = Some(build_job(organism, genome, slot)?);
+                    dec.held = organism.held;
+                    dec.evaluated = true;
+                } else {
+                    encode_gradients_only_into(rules, organism, raw, from, &mut dec.gradients)?;
+                    dec.held = organism.held;
+                    dec.evaluated = false;
+                    dec.actions = decode_held(rules, organism, &organism.held)?;
+                }
+                Ok(())
+            })?;
+        }
+        for job in chunk_jobs[..chunk_due].iter_mut() {
+            if let Some(job) = job.take() {
+                jobs_out.push(job);
+            }
+        }
+        local_due += chunk_due;
+    }
+    Ok(())
+}
+
 /// The zero-copy flat-F32 batched path for backends with
 /// [`ControllerBackend::supports_flat_f32`]: eliminates intermediate `[f64; 104]`
 /// / `[f64; 128]` staging, `Vec<ControllerJob>`, the second `population.ascending`
 /// walk, and the `by_row` unpack copy, using dynamic work-stealing tiles across
-/// `lanes` to eliminate P-core/E-core tail wait.
+/// `lanes` to eliminate P-core/E-core tail wait. On large multi-worker worlds
+/// (`rows >= 8,192` and `cells >= 32,768` with CPU pyramid sampling), partitions
+/// Pass 1 and Pass 2 into 8×8 spatial macro-tiles so each core streams one
+/// L2-resident macro-tile and 2-row L1D strips without duplicating `decisions`.
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "phases 3 and 4 flat-F32 fast path across Pass 1, evaluate_flat_f32, and Pass 2"
+    reason = "phases 3 and 4 flat-F32 fast path across spatial/linear Pass 1, evaluate_flat_f32, and Pass 2"
 )]
 fn decide_batched_flat_f32(
     rules: &Rules,
@@ -7502,12 +7849,15 @@ fn decide_batched_flat_f32(
     crowding_counts: &[u32],
     [from, to]: [Tick; 2],
     decisions: &mut Vec<Decision>,
+    spatial_rows: &mut Vec<u32>,
+    row_to_spatial: &mut Vec<u32>,
     lanes: &mut [DecisionLane],
     device: &mut dyn ControllerBackend,
     flat_inputs_f32: &mut Vec<f32>,
     flat_inputs_finite: &mut Vec<u8>,
     flat_outputs: &mut FlatOutputs,
 ) -> Result<Batched, CoreError> {
+    row_to_spatial.clear();
     for lane in lanes.iter_mut() {
         lane.due_offset = 0;
         lane.due_count = 0;
@@ -7535,6 +7885,365 @@ fn decide_batched_flat_f32(
     let raw_output_width = actions.raw_output_width();
 
     let worker_budget = lanes.len().max(1);
+    let ordered_slots = population.ordered_slots();
+    let try_spatial = sampled.is_none()
+        && worker_budget > 1
+        && rows.len() >= SPATIAL_PASS1_MIN_ROWS
+        && rules.grid.cell_count() >= SPATIAL_PASS1_MIN_CELLS
+        && ordered_slots.len() == rows.len()
+        && spatial_rows.capacity() >= rows.len()
+        && row_to_spatial.capacity() >= rows.len()
+        && u32::try_from(rows.len()).is_ok();
+
+    if try_spatial {
+        // Parallel Pass A: classify each row into an 8×8 spatial macro-tile
+        // in one read of `rows`, storing the tile ID temporarily in
+        // `row_to_spatial` so Pass B scatters purely inside 800 KiB of L2.
+        let width = rules.grid.world_width();
+        let height = rules.grid.world_height();
+        let inv_w = (SPATIAL_NX as f64) / width;
+        let inv_h = (SPATIAL_NY as f64) / height;
+        set_len_reuse(row_to_spatial, rows.len(), 0);
+        let bin_chunks = worker_budget.min(rows.len().div_ceil(1_024)).max(1);
+        let bin_len = rows.len().div_ceil(bin_chunks);
+        struct BinTask<'a> {
+            rows: &'a [Organism],
+            tile_ids: &'a mut [u32],
+            counts: [usize; SPATIAL_TILES],
+            due: [usize; SPATIAL_TILES],
+            ok: bool,
+        }
+        let mut bin_tasks: Vec<BinTask<'_>> = rows
+            .chunks(bin_len)
+            .zip(row_to_spatial.chunks_mut(bin_len))
+            .map(|(r, t)| BinTask {
+                rows: r,
+                tile_ids: t,
+                counts: [0; SPATIAL_TILES],
+                due: [0; SPATIAL_TILES],
+                ok: true,
+            })
+            .collect();
+        flife_core::pool::parallel_tasks(
+            worker_budget,
+            "spatial pass1 bin",
+            &mut bin_tasks,
+            |_, task| {
+                for (organism, tile_out) in task.rows.iter().zip(task.tile_ids.iter_mut()) {
+                    let [x, y] = organism.position;
+                    if !x.is_finite()
+                        || !y.is_finite()
+                        || x < 0.0
+                        || x >= width
+                        || y < 0.0
+                        || y >= height
+                    {
+                        task.ok = false;
+                        return;
+                    }
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "0 <= x < width and 0 <= y < height checked above, clamped to 0..8"
+                    )]
+                    let tx = ((x * inv_w) as usize).min(SPATIAL_NX - 1);
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "0 <= x < width and 0 <= y < height checked above, clamped to 0..8"
+                    )]
+                    let ty = ((y * inv_h) as usize).min(SPATIAL_NY - 1);
+                    let tile = ty * SPATIAL_NX + tx;
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "tile < SPATIAL_TILES (64) <= u32::MAX"
+                    )]
+                    {
+                        *tile_out = tile as u32;
+                    }
+                    task.counts[tile] += 1;
+                    task.due[tile] += usize::from(due(rules, organism, to));
+                }
+            },
+        )?;
+        let spatial_ok = bin_tasks.iter().all(|task| task.ok);
+        if spatial_ok {
+            let mut tile_counts = [0_usize; SPATIAL_TILES];
+            let mut tile_due = [0_usize; SPATIAL_TILES];
+            for task in &bin_tasks {
+                for t in 0..SPATIAL_TILES {
+                    tile_counts[t] += task.counts[t];
+                    tile_due[t] += task.due[t];
+                }
+            }
+            let mut tile_offsets = [0_usize; SPATIAL_TILES + 1];
+            let mut total_due = 0_usize;
+            for t in 0..SPATIAL_TILES {
+                tile_offsets[t + 1] = tile_offsets[t] + tile_counts[t];
+                total_due = total_due
+                    .checked_add(tile_due[t])
+                    .ok_or(CoreError::Overflow {
+                        quantity: "due controller jobs",
+                    })?;
+            }
+            set_len_reuse(spatial_rows, rows.len(), 0);
+            let mut cursor = [0_usize; SPATIAL_TILES];
+            cursor.copy_from_slice(&tile_offsets[..SPATIAL_TILES]);
+            for (row_idx, slot) in row_to_spatial.iter_mut().enumerate() {
+                let tile = *slot as usize;
+                let pos = cursor[tile];
+                cursor[tile] = pos + 1;
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "rows.len() <= u32::MAX checked in try_spatial"
+                )]
+                {
+                    spatial_rows[pos] = row_idx as u32;
+                    *slot = pos as u32;
+                }
+            }
+
+            let total_input_elems =
+                total_due
+                    .checked_mul(input_width)
+                    .ok_or(CoreError::Overflow {
+                        quantity: "flat controller inputs",
+                    })?;
+            reserve_for(
+                flat_inputs_f32,
+                total_input_elems.saturating_sub(flat_inputs_f32.len()),
+                "flat controller inputs",
+            )?;
+            set_len_reuse(flat_inputs_f32, total_input_elems, 0.0_f32);
+            reserve_for(
+                flat_inputs_finite,
+                total_due.saturating_sub(flat_inputs_finite.len()),
+                "flat controller input flags",
+            )?;
+            set_len_reuse(flat_inputs_finite, total_due, 0_u8);
+
+            // Subdivide heavily clustered spatial tiles so all workers stay
+            // load-balanced even if every organism congregates in one corner.
+            let max_sub_tile = rows
+                .len()
+                .div_ceil(worker_budget.saturating_mul(4))
+                .max(MINIMUM_ROWS_PER_LANE);
+            struct SpatialSubSpec {
+                start: usize,
+                len: usize,
+                due_offset: usize,
+                due_count: usize,
+            }
+            let mut sub_specs: Vec<SpatialSubSpec> = Vec::with_capacity(SPATIAL_TILES);
+            let mut due_cursor = 0_usize;
+            for t in 0..SPATIAL_TILES {
+                let count = tile_counts[t];
+                if count == 0 {
+                    continue;
+                }
+                let base = tile_offsets[t];
+                if count <= max_sub_tile {
+                    sub_specs.push(SpatialSubSpec {
+                        start: base,
+                        len: count,
+                        due_offset: due_cursor,
+                        due_count: tile_due[t],
+                    });
+                    due_cursor += tile_due[t];
+                } else {
+                    let mut off = 0_usize;
+                    while off < count {
+                        let sub_len = (count - off).min(max_sub_tile);
+                        let sub_due = spatial_rows[base + off..base + off + sub_len]
+                            .iter()
+                            .filter(|&&r| due(rules, &rows[r as usize], to))
+                            .count();
+                        sub_specs.push(SpatialSubSpec {
+                            start: base + off,
+                            len: sub_len,
+                            due_offset: due_cursor,
+                            due_count: sub_due,
+                        });
+                        due_cursor += sub_due;
+                        off += sub_len;
+                    }
+                }
+            }
+
+            struct Pass1SpatialTile<'a, 'p> {
+                row_indices: &'a [u32],
+                decisions: &'a mut [Decision],
+                in_f32: &'a mut [f32],
+                in_fin: &'a mut [u8],
+                jobs: Vec<FlatControllerJob<'p>>,
+            }
+            let mut tiles: Vec<Pass1SpatialTile<'_, '_>> = Vec::with_capacity(sub_specs.len());
+            let mut rem_dec = decisions.as_mut_slice();
+            let mut rem_f32 = flat_inputs_f32.as_mut_slice();
+            let mut rem_fin = flat_inputs_finite.as_mut_slice();
+            for spec in &sub_specs {
+                let (my_dec, next_dec) = rem_dec.split_at_mut(spec.len);
+                rem_dec = next_dec;
+                let (my_f32, next_f32) = rem_f32.split_at_mut(spec.due_count * input_width);
+                rem_f32 = next_f32;
+                let (my_fin, next_fin) = rem_fin.split_at_mut(spec.due_count);
+                rem_fin = next_fin;
+                let mut jobs = Vec::new();
+                reserve_for(&mut jobs, spec.due_count, "controller jobs")?;
+                tiles.push(Pass1SpatialTile {
+                    row_indices: &spatial_rows[spec.start..spec.start + spec.len],
+                    decisions: my_dec,
+                    in_f32: my_f32,
+                    in_fin: my_fin,
+                    jobs,
+                });
+            }
+            flife_core::pool::try_parallel_tasks(
+                worker_budget,
+                "decide spatial",
+                &mut tiles,
+                |_, tile| {
+                    pass1_flat_f32_spatial(
+                        rules,
+                        population,
+                        ordered_slots,
+                        view,
+                        rows,
+                        crowding_counts,
+                        [from, to],
+                        tile.row_indices,
+                        tile.decisions,
+                        tile.in_f32,
+                        tile.in_fin,
+                        &mut tile.jobs,
+                    )
+                },
+            )?;
+            let mut flat_jobs = Vec::new();
+            reserve_for(&mut flat_jobs, total_due, "controller jobs")?;
+            for mut tile in tiles {
+                flat_jobs.append(&mut tile.jobs);
+            }
+
+            let mut device_nanoseconds = 0_u64;
+            if flat_jobs.is_empty() {
+                flat_outputs.clear();
+            } else {
+                if let Err(error) = device.evaluate_flat_f32(
+                    &flat_jobs,
+                    input_width,
+                    flat_inputs_f32,
+                    flat_inputs_finite,
+                    flat_outputs,
+                ) {
+                    flat_outputs.clear();
+                    return Ok(Batched::Device(error));
+                }
+                device_nanoseconds = device.last_device_nanoseconds();
+                if flat_outputs.valid.len() != flat_jobs.len()
+                    || flat_outputs.output_width != raw_output_width
+                    || flat_outputs.values.len() != flat_jobs.len().saturating_mul(raw_output_width)
+                {
+                    return Ok(Batched::Device(CoreError::StateConflict {
+                        operation: "batch controllers",
+                        detail: format!(
+                            "backend returned {} valid flags and {} values (width {}), expected {} x {raw_output_width}",
+                            flat_outputs.valid.len(),
+                            flat_outputs.values.len(),
+                            flat_outputs.output_width,
+                            flat_jobs.len(),
+                        ),
+                    }));
+                }
+
+                let flat_jobs_slice: &[FlatControllerJob<'_>] = &flat_jobs;
+                let flat_in_slice: &[f32] = flat_inputs_f32;
+                let flat_out_ref: &FlatOutputs = flat_outputs;
+                struct Pass2SpatialTile<'a> {
+                    row_indices: &'a [u32],
+                    decisions: &'a mut [Decision],
+                    due_offset: usize,
+                    due_count: usize,
+                }
+                let mut pass2_tiles: Vec<Pass2SpatialTile<'_>> =
+                    Vec::with_capacity(sub_specs.len());
+                let mut rem_dec = decisions.as_mut_slice();
+                for spec in &sub_specs {
+                    let (my_dec, next_dec) = rem_dec.split_at_mut(spec.len);
+                    rem_dec = next_dec;
+                    pass2_tiles.push(Pass2SpatialTile {
+                        row_indices: &spatial_rows[spec.start..spec.start + spec.len],
+                        decisions: my_dec,
+                        due_offset: spec.due_offset,
+                        due_count: spec.due_count,
+                    });
+                }
+                flife_core::pool::try_parallel_tasks_with_lanes(
+                    worker_budget,
+                    "decode controllers spatial",
+                    lanes,
+                    &mut pass2_tiles,
+                    |_, tile, lane| {
+                        if tile.due_count == 0 {
+                            return Ok(());
+                        }
+                        let mut job_idx = tile.due_offset;
+                        for (&row_u32, decision) in
+                            tile.row_indices.iter().zip(tile.decisions.iter_mut())
+                        {
+                            if !decision.evaluated {
+                                continue;
+                            }
+                            let organism = &rows[row_u32 as usize];
+                            let held = match flat_out_ref.row(job_idx) {
+                                Some(raw_slice) => {
+                                    held_from_raw_slice(rules, organism, to, raw_slice)?
+                                }
+                                None => {
+                                    let job = flat_jobs_slice.get(job_idx).ok_or_else(|| {
+                                        CoreError::StateConflict {
+                                            operation: "batch controllers",
+                                            detail: format!("missing deferred job {job_idx}"),
+                                        }
+                                    })?;
+                                    let start_in = job_idx * input_width;
+                                    let in_row = flat_in_slice
+                                        .get(start_in..start_in + input_width)
+                                        .ok_or_else(|| CoreError::StateConflict {
+                                            operation: "batch controllers",
+                                            detail: format!(
+                                                "missing flat inputs for deferred job {job_idx}"
+                                            ),
+                                        })?;
+                                    evaluate_reference_held_from_f32(
+                                        rules,
+                                        job.controller,
+                                        organism,
+                                        in_row,
+                                        to,
+                                        &mut lane.controller,
+                                    )?
+                                }
+                            };
+                            decision.actions = decode_held(rules, organism, &held)?;
+                            decision.held = held;
+                            job_idx += 1;
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
+            let deferred = flat_outputs.valid.iter().filter(|&&v| v == 0).count();
+            let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+            return Ok(Batched::Done {
+                batched: count(flat_jobs.len().saturating_sub(deferred)),
+                deferred: count(deferred),
+                device_nanoseconds,
+            });
+        }
+        row_to_spatial.clear();
+    }
+
     let max_tiles = rows.len().div_ceil(MINIMUM_ROWS_PER_LANE).max(1);
     let tile_count = if worker_budget <= 1 || max_tiles <= 1 {
         1

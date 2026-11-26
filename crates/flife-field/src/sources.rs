@@ -333,6 +333,7 @@ impl SourceKernel {
                 ),
             });
         }
+        rebuild_runs(cell_indices, &mut support.runs);
         Ok(())
     }
 
@@ -373,6 +374,7 @@ impl SourceKernel {
     ) -> Result<(), CoreError> {
         support.cell_indices.clear();
         support.cell_weights.clear();
+        support.runs.clear();
         support.max_cell = 0;
         support.weight_sum = 0.0;
         let columns = axis_candidates(
@@ -419,6 +421,7 @@ impl SourceKernel {
         let SourceSupport {
             cell_indices,
             cell_weights,
+            runs,
             max_cell,
             weight_sum,
             columns,
@@ -427,6 +430,7 @@ impl SourceKernel {
         } = support;
         cell_indices.clear();
         cell_weights.clear();
+        runs.clear();
         *max_cell = 0;
         *weight_sum = 0.0;
         for &row in rows.iter() {
@@ -452,6 +456,7 @@ impl SourceKernel {
                 ),
             });
         }
+        rebuild_runs(cell_indices, runs);
         Ok(())
     }
 
@@ -534,14 +539,46 @@ fn axis_candidates(
     true
 }
 
+/// Contiguous cell-index span inside a [`SourceSupport`], letting energy and
+/// moment deposition stream linear plane slices without reading `cell_indices`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CellRun {
+    cell_start: usize,
+    offset: usize,
+    len: usize,
+}
+
+fn rebuild_runs(cell_indices: &[usize], runs: &mut Vec<CellRun>) {
+    runs.clear();
+    let n = cell_indices.len();
+    let mut i = 0;
+    while i < n {
+        let cell_start = cell_indices[i];
+        let offset = i;
+        let mut prev = cell_start;
+        i += 1;
+        while i < n && cell_indices[i] == prev + 1 {
+            prev = cell_indices[i];
+            i += 1;
+        }
+        runs.push(CellRun {
+            cell_start,
+            offset,
+            len: i - offset,
+        });
+    }
+}
+
 /// A source's support: cell indices and raw weights, in cell-index order.
-/// Stored as parallel SoA arrays so 32-plane moment deposition streams dense
-/// `cell_indices` without dragging unused raw weights through cache.
+/// Stored as parallel SoA arrays plus compact contiguous [`CellRun`] spans so
+/// 32-plane moment deposition streams linear plane slices without dragging
+/// `cell_indices` or raw weights through cache.
 /// It is reused across ticks, so steady state does not allocate.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SourceSupport {
     cell_indices: Vec<usize>,
     cell_weights: Vec<f64>,
+    runs: Vec<CellRun>,
     max_cell: usize,
     weight_sum: f64,
     columns: Vec<u32>,
@@ -566,6 +603,7 @@ impl SourceSupport {
     pub fn for_kernel(kernel: &SourceKernel, grid: &FieldGrid) -> Result<Self, CoreError> {
         let [columns, rows] = kernel.candidate_bound(grid);
         let cells = columns.saturating_mul(rows);
+        let max_runs = rows.saturating_mul(2);
         let mut support = Self::new();
         let refused = |bytes: u64| CoreError::AllocationFailed {
             buffer: "source support",
@@ -588,6 +626,10 @@ impl SourceSupport {
             .try_reserve_exact(cells)
             .map_err(|_| refused(bytes_for::<f64>(cells)))?;
         support
+            .runs
+            .try_reserve_exact(max_runs)
+            .map_err(|_| refused(bytes_for::<CellRun>(max_runs)))?;
+        support
             .amounts
             .try_reserve_exact(cells)
             .map_err(|_| refused(bytes_for::<f64>(cells)))?;
@@ -600,6 +642,7 @@ impl SourceSupport {
         total([
             capacity_bytes(&self.cell_indices),
             capacity_bytes(&self.cell_weights),
+            capacity_bytes(&self.runs),
             capacity_bytes(&self.columns),
             capacity_bytes(&self.rows),
             capacity_bytes(&self.amounts),
@@ -651,9 +694,16 @@ impl SourceSupport {
     pub(crate) fn clear_for_zero_power(&mut self) {
         self.cell_indices.clear();
         self.cell_weights.clear();
+        self.runs.clear();
         self.max_cell = 0;
         self.weight_sum = 0.0;
         self.amounts.clear();
+    }
+
+    /// Whether any support cell lies at or beyond `cells`.
+    #[inline]
+    pub(crate) fn has_cell_out_of_bounds(&self, cells: usize) -> bool {
+        !self.cell_indices.is_empty() && self.max_cell >= cells
     }
 
     /// `(cell index, k_c / Σ k)` in cell-index order.
@@ -1119,15 +1169,35 @@ pub fn deposit_energy(
     let mut applied = 0.0;
     support.amounts.clear();
     let energy = state.energy_mut();
-    for (&index, &weight) in support.cell_indices.iter().zip(&support.cell_weights) {
-        let amount = declared * (weight / support.weight_sum);
-        normalized_total += amount;
-        let energy = energy.get_mut(index).ok_or_else(outside)?;
-        let before = f64::from(*energy);
-        let after = (before + amount) as f32;
-        applied += f64::from(after) - before;
-        *energy = after;
-        support.amounts.push(amount);
+    let weight_sum = support.weight_sum;
+    if !support.runs.is_empty()
+        && support.max_cell < energy.len()
+        && support.cell_weights.len() >= support.cell_indices.len()
+    {
+        for &run in &support.runs {
+            let e_slice = &mut energy[run.cell_start..run.cell_start + run.len];
+            let w_slice = &support.cell_weights[run.offset..run.offset + run.len];
+            for (slot, &weight) in e_slice.iter_mut().zip(w_slice) {
+                let amount = declared * (weight / weight_sum);
+                normalized_total += amount;
+                let before = f64::from(*slot);
+                let after = (before + amount) as f32;
+                applied += f64::from(after) - before;
+                *slot = after;
+                support.amounts.push(amount);
+            }
+        }
+    } else {
+        for (&index, &weight) in support.cell_indices.iter().zip(&support.cell_weights) {
+            let amount = declared * (weight / weight_sum);
+            normalized_total += amount;
+            let energy = energy.get_mut(index).ok_or_else(outside)?;
+            let before = f64::from(*energy);
+            let after = (before + amount) as f32;
+            applied += f64::from(after) - before;
+            *energy = after;
+            support.amounts.push(amount);
+        }
     }
     Ok(DepositReport {
         source: source.id,
@@ -1298,6 +1368,17 @@ pub(crate) fn deposit_moment(
         return Ok(());
     }
     if support.max_cell < plane.len() {
+        if !support.runs.is_empty() && support.amounts.len() >= support.cell_indices.len() {
+            let amounts = &support.amounts;
+            for &run in &support.runs {
+                let p_run = &mut plane[run.cell_start..run.cell_start + run.len];
+                let a_run = &amounts[run.offset..run.offset + run.len];
+                for (slot, &amount) in p_run.iter_mut().zip(a_run) {
+                    *slot = (f64::from(*slot) + amount * component) as f32;
+                }
+            }
+            return Ok(());
+        }
         let indices = &support.cell_indices[..len];
         let amounts = &support.amounts[..len];
         let (idx_chunks, idx_rem) = indices.as_chunks::<4>();
@@ -1320,6 +1401,99 @@ pub(crate) fn deposit_moment(
     for (&index, &amount) in support.cell_indices.iter().zip(&support.amounts) {
         let moment = plane.get_mut(index).ok_or_else(outside)?;
         *moment = (f64::from(*moment) + amount * component) as f32;
+    }
+    Ok(())
+}
+
+/// Deposit every source in exact source order into one cell band
+/// `[band_start, band_end)` across up to four moment planes simultaneously.
+///
+/// Shares each `support.amounts` read across all planes in the group, skips
+/// `cell_indices` entirely via contiguous [`CellRun`] slices, and keeps the
+/// plane band hot in L2 cache across overlapping sources while preserving
+/// exact per-source F32 rounding (0-ulp bit-identical to [`deposit_moment`]).
+pub(crate) fn deposit_moment_band_group(
+    band_start: usize,
+    band_end: usize,
+    channel_base: usize,
+    planes: &mut [&mut [f32]],
+    sources: &[Source],
+    supports: &[SourceSupport],
+) -> Result<(), CoreError> {
+    if band_start >= band_end || planes.is_empty() {
+        return Ok(());
+    }
+    for (source, support) in sources.iter().zip(supports) {
+        let runs = &support.runs;
+        if runs.is_empty()
+            || support.amounts.len() < support.cell_indices.len()
+            || support.max_cell < band_start
+            || runs[0].cell_start >= band_end
+        {
+            continue;
+        }
+        let first_run = runs.partition_point(|r| r.cell_start + r.len <= band_start);
+        if first_run >= runs.len() || runs[first_run].cell_start >= band_end {
+            continue;
+        }
+        if let [p0, p1, p2, p3] = planes {
+            let c0 = component(source, channel_base);
+            let c1 = component(source, channel_base + 1);
+            let c2 = component(source, channel_base + 2);
+            let c3 = component(source, channel_base + 3);
+            if c0 != 0.0 && c1 != 0.0 && c2 != 0.0 && c3 != 0.0 {
+                for &run in &runs[first_run..] {
+                    if run.cell_start >= band_end {
+                        break;
+                    }
+                    let s = run.cell_start.max(band_start);
+                    let e = (run.cell_start + run.len).min(band_end);
+                    if s >= e {
+                        continue;
+                    }
+                    let ls = s - band_start;
+                    let le = e - band_start;
+                    let a_s = run.offset + (s - run.cell_start);
+                    let a_e = a_s + (e - s);
+                    let amts = &support.amounts[a_s..a_e];
+                    for (((v0, v1), (v2, v3)), &amount) in p0[ls..le]
+                        .iter_mut()
+                        .zip(p1[ls..le].iter_mut())
+                        .zip(p2[ls..le].iter_mut().zip(p3[ls..le].iter_mut()))
+                        .zip(amts)
+                    {
+                        *v0 = (f64::from(*v0) + amount * c0) as f32;
+                        *v1 = (f64::from(*v1) + amount * c1) as f32;
+                        *v2 = (f64::from(*v2) + amount * c2) as f32;
+                        *v3 = (f64::from(*v3) + amount * c3) as f32;
+                    }
+                }
+                continue;
+            }
+        }
+        for (offset, plane) in planes.iter_mut().enumerate() {
+            let c = component(source, channel_base + offset);
+            if c == 0.0 {
+                continue;
+            }
+            for &run in &runs[first_run..] {
+                if run.cell_start >= band_end {
+                    break;
+                }
+                let s = run.cell_start.max(band_start);
+                let e = (run.cell_start + run.len).min(band_end);
+                if s >= e {
+                    continue;
+                }
+                let ls = s - band_start;
+                let le = e - band_start;
+                let a_s = run.offset + (s - run.cell_start);
+                let a_e = a_s + (e - s);
+                for (slot, &amount) in plane[ls..le].iter_mut().zip(&support.amounts[a_s..a_e]) {
+                    *slot = (f64::from(*slot) + amount * c) as f32;
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -435,3 +435,138 @@ fn failing_settle_backend_drop_followed_by_controller_backend_keeps_fixed_scratc
         );
     }
 }
+
+/// Large-world spatial Pass 1/Pass 2 (`rows >= 8,192`, `cells >= 32,768`),
+/// band-grouped 4-plane moment deposition, `Population::ordered_slots` +
+/// parallel `check_whole_tick_on` + parallel `apply_checked_tick_on`, and
+/// Phase-8 `survivor_energies` must match 1-worker serial bit-for-bit across
+/// both `FreeList` and `Compact`, with zero scratch footprint drift and clean
+/// fallback on a Phase-1 `RemoveOrganisms` intervention.
+#[test]
+fn spatial_pass1_and_parallel_population_publish_match_serial_bit_for_bit() {
+    use flife_engine::{Disposition, Intervention};
+
+    let toml = PRESET
+        .replace("grid_width = 128", "grid_width = 256")
+        .replace("grid_height = 128", "grid_height = 256")
+        .replace("width = 128.0", "width = 256.0")
+        .replace("height = 128.0", "height = 256.0")
+        .replace("initial_count = 4096", "initial_count = 8192")
+        .replace("maximum_count = 16384", "maximum_count = 9216")
+        .replace(
+            "evaluation_interval_ticks = 1",
+            "evaluation_interval_ticks = 2",
+        )
+        .replace("hidden_widths = [64, 32]", "hidden_widths = [8]");
+    let cfg = ValidatedConfig::from_toml(&toml).expect("valid 8k 256x256 config");
+
+    for arrangement in [Arrangement::FreeList, Arrangement::Compact] {
+        let mut serial = World::found(
+            &cfg,
+            arrangement,
+            NumericalProfile::reference_f32().expect("profile"),
+        )
+        .expect("serial");
+        let mut parallel = World::found(
+            &cfg,
+            arrangement,
+            NumericalProfile::reference_f32().expect("profile"),
+        )
+        .expect("parallel");
+        parallel
+            .set_cpu_workers(NonZeroUsize::new(4).expect("4"))
+            .expect("4 workers");
+        parallel.set_controller_backend(Some(Box::new(ExactFlatF32Backend)));
+
+        let founded = parallel.allocated();
+        let bound = parallel.footprint();
+        assert_eq!(founded.field, bound.field, "{arrangement:?} field bound");
+        assert_eq!(
+            founded.scratch, bound.scratch,
+            "{arrangement:?} scratch bound"
+        );
+
+        let mut removed_on_tick3 = 0_usize;
+        for tick in 1..=5 {
+            if tick == 3 {
+                // Remove organisms inside a disk in Phase 1 to verify:
+                // 1) spatial Pass 1 cleanly falls back when `rows.len() != population.len()`,
+                // 2) FreeList holes + `ordered_slots` retain + column-parallel publish work
+                //    bit-identically on tick 3 and subsequent fragmented ticks 4..=5!
+                let removal = Intervention::RemoveOrganisms {
+                    center: [64.0, 64.0],
+                    radius: 16.0,
+                    disposition: Disposition::Recycle,
+                };
+                assert!(matches!(
+                    serial
+                        .step_with(&[removal])
+                        .expect("serial step with removal"),
+                    Stepped::Published(_)
+                ));
+                let Stepped::Published(report) = parallel
+                    .step_with(&[removal])
+                    .expect("parallel step with removal")
+                else {
+                    panic!("expected published tick 3");
+                };
+                removed_on_tick3 = report.deaths.len();
+            } else if tick == 4 {
+                // Re-introduce organisms so FreeList reuses freed slots while
+                // `slots_dense_ascending` is `false` and `ordered_slots` stays
+                // strictly ascending in OrganismId order.
+                let intro = Intervention::IntroduceOrganisms {
+                    cell: [64, 64],
+                    count: 32,
+                    energy: 1.0,
+                };
+                assert!(matches!(
+                    serial.step_with(&[intro]).expect("serial step with intro"),
+                    Stepped::Published(_)
+                ));
+                assert!(matches!(
+                    parallel
+                        .step_with(&[intro])
+                        .expect("parallel step with intro"),
+                    Stepped::Published(_)
+                ));
+            } else {
+                assert!(matches!(
+                    serial.step().expect("serial step"),
+                    Stepped::Published(_)
+                ));
+                assert!(matches!(
+                    parallel.step().expect("parallel step"),
+                    Stepped::Published(_)
+                ));
+            }
+            let now = parallel.allocated();
+            assert_eq!(
+                now.field, founded.field,
+                "{arrangement:?} field grew at tick {tick}"
+            );
+            assert_eq!(
+                now.scratch, founded.scratch,
+                "{arrangement:?} scratch grew at tick {tick}"
+            );
+            assert!(
+                now.state <= bound.state,
+                "{arrangement:?} state exceeded bound at tick {tick}"
+            );
+            assert_eq!(
+                parallel.digest(),
+                serial.digest(),
+                "{arrangement:?} spatial Pass1 / parallel publish diverged at tick {tick}"
+            );
+        }
+        assert!(
+            removed_on_tick3 > 0,
+            "{arrangement:?} expected Phase-1 removal to exercise holes"
+        );
+        assert!(
+            parallel.controller_report().batched > 0 && parallel.controller_report().deferred == 0,
+            "{arrangement:?} flat-F32 spatial path did not batch: {:?}",
+            parallel.controller_report()
+        );
+    }
+}

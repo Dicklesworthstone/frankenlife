@@ -856,23 +856,40 @@ impl PyramidView<'_> {
             lo_level: u8,
             hi_level: u8,
             tile: u8,
+            fine_tile: u8,
         }
 
-        let sort_by_tile = |indices: &[u16], prepared: &[PreparedQuery], sorted: &mut [u16]| {
-            let mut counts = [0_u16; TILES + 1];
-            for &qi in indices {
-                counts[prepared[qi as usize].tile as usize + 1] += 1;
-            }
-            for tile in 1..=TILES {
-                counts[tile] += counts[tile - 1];
-            }
-            for &qi in indices {
-                let bucket = prepared[qi as usize].tile as usize;
-                let dst = counts[bucket] as usize;
-                counts[bucket] += 1;
-                sorted[dst] = qi;
-            }
-        };
+        let sort_by_tile =
+            |indices: &[u16], prepared: &[PreparedQuery], use_fine: bool, sorted: &mut [u16]| {
+                let mut counts = [0_u16; TILES + 1];
+                if use_fine {
+                    for &qi in indices {
+                        counts[prepared[qi as usize].fine_tile as usize + 1] += 1;
+                    }
+                    for tile in 1..=TILES {
+                        counts[tile] += counts[tile - 1];
+                    }
+                    for &qi in indices {
+                        let bucket = prepared[qi as usize].fine_tile as usize;
+                        let dst = counts[bucket] as usize;
+                        counts[bucket] += 1;
+                        sorted[dst] = qi;
+                    }
+                } else {
+                    for &qi in indices {
+                        counts[prepared[qi as usize].tile as usize + 1] += 1;
+                    }
+                    for tile in 1..=TILES {
+                        counts[tile] += counts[tile - 1];
+                    }
+                    for &qi in indices {
+                        let bucket = prepared[qi as usize].tile as usize;
+                        let dst = counts[bucket] as usize;
+                        counts[bucket] += 1;
+                        sorted[dst] = qi;
+                    }
+                }
+            };
 
         const MAX_LEVELS: usize = 32;
         let empty_meta = LevelMeta {
@@ -923,7 +940,7 @@ impl PyramidView<'_> {
             }
         }
 
-        let prepare_level = |level: u32, wrapped: [f64; 2]| -> Option<(PackedCorners, u8)> {
+        let prepare_level = |level: u32, wrapped: [f64; 2]| -> Option<(PackedCorners, u8, u8)> {
             if level > self.pyramid.levels {
                 return None;
             }
@@ -943,10 +960,12 @@ impl PyramidView<'_> {
             if x0 >= meta.cx || x1 >= meta.cx || y0 >= meta.cy || y1 >= meta.cy {
                 return None;
             }
-            // 8x4 coarse spatial tile index in `0..32` for L1-friendly batch
-            // counting sort (reordering independent queries is bit-exact).
+            // 8x4 coarse spatial tile index in `0..32` for unpartitioned callers,
+            // plus fine 2-row strip bucket `(y0 >> 1) & 31` when all queries in
+            // a batch already share one coarse macro-tile (e.g. spatial Pass 1).
             let tx = ((x0 as u64) * 8) / (meta.cx as u64);
             let ty = ((y0 as u64) * 4) / (meta.cy as u64);
+            let fine_tile = ((y0 >> 1) & (TILES - 1)) as u8;
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "tx in 0..8, ty in 0..4, and cells <= u32::MAX is checked in level_meta"
@@ -961,6 +980,7 @@ impl PyramidView<'_> {
                     fy,
                 },
                 ((ty << 3) | tx) as u8,
+                fine_tile,
             ))
         };
 
@@ -1022,6 +1042,7 @@ impl PyramidView<'_> {
             lo_level: 0,
             hi_level: NO_LEVEL,
             tile: 0,
+            fine_tile: 0,
         }; BATCH];
         let mut l0_idx = [0_u16; BATCH];
         let mut l0_sorted = [0_u16; BATCH];
@@ -1029,9 +1050,11 @@ impl PyramidView<'_> {
         let mut l01_sorted = [0_u16; BATCH];
         let mut other_idx = [0_u16; BATCH];
         let mut other_sorted = [0_u16; BATCH];
-        // Compact L1D-resident SoA staging (`3 * P * 16 * 8 = ~13 KiB`) hoisted
-        // outside the chunk loop so each `plane in 0..P` writes 3 contiguous
-        // 128-byte cache lines instead of scattered 792-byte AoS records.
+        // Compact L1D-resident staging (`P * 16 * 3 * 8 = ~12.7 KiB`) hoisted
+        // outside the chunk loop. Interleaving `[value, dx, dy]` per lane keeps
+        // plane stride at 384 bytes (avoiding the 4 KiB L1D set aliasing of 3
+        // separate 4,224-byte arrays) and turns `load_from_soa_lane` into one
+        // contiguous 24-byte read per plane.
         let mut sub_lo = [dummy_corners; SUB_BATCH];
         let mut sub_blend = [dummy_blend; SUB_BATCH];
         let mut sub_coarse = [PackedCoarse {
@@ -1039,9 +1062,7 @@ impl PyramidView<'_> {
             hi: None,
             t: 0.0,
         }; SUB_BATCH];
-        let mut soa_v = [[0.0_f64; SUB_BATCH]; P];
-        let mut soa_dx = [[0.0_f64; SUB_BATCH]; P];
-        let mut soa_dy = [[0.0_f64; SUB_BATCH]; P];
+        let mut soa = [[[0.0_f64; 3]; SUB_BATCH]; P];
         // One reusable sample slot hoisted outside all chunk/sub-batch loops so
         // `load_from_soa_lane` writes directly into it without per-organism
         // zero-initialization or 792-byte by-value `sret` copies.
@@ -1052,6 +1073,10 @@ impl PyramidView<'_> {
             let mut n_l0 = 0_usize;
             let mut n_l01 = 0_usize;
             let mut n_other = 0_usize;
+            let mut l0_tile_or = 0_u8;
+            let mut l0_tile_and = u8::MAX;
+            let mut l01_tile_or = 0_u8;
+            let mut l01_tile_and = u8::MAX;
             let mut need_fallback = false;
             for (qi, (slot, query)) in prepared.iter_mut().zip(q_chunk).enumerate() {
                 let Ok((level, t)) = self.blend(query.scale) else {
@@ -1062,14 +1087,14 @@ impl PyramidView<'_> {
                     need_fallback = true;
                     break;
                 };
-                let Some((lo, tile)) = prepare_level(level, wrapped) else {
+                let Some((lo, tile, fine_tile)) = prepare_level(level, wrapped) else {
                     need_fallback = true;
                     break;
                 };
                 let (hi, hi_level) = if t == 0.0 {
                     (dummy_corners, NO_LEVEL)
                 } else {
-                    let Some((hi_corners, _)) = prepare_level(level + 1, wrapped) else {
+                    let Some((hi_corners, _, _)) = prepare_level(level + 1, wrapped) else {
                         need_fallback = true;
                         break;
                     };
@@ -1088,9 +1113,13 @@ impl PyramidView<'_> {
                     if hi_level == NO_LEVEL {
                         l0_idx[n_l0] = qi_u16;
                         n_l0 += 1;
+                        l0_tile_or |= tile;
+                        l0_tile_and &= tile;
                     } else {
                         l01_idx[n_l01] = qi_u16;
                         n_l01 += 1;
+                        l01_tile_or |= tile;
+                        l01_tile_and &= tile;
                     }
                 } else {
                     other_idx[n_other] = qi_u16;
@@ -1103,11 +1132,13 @@ impl PyramidView<'_> {
                     lo_level,
                     hi_level,
                     tile,
+                    fine_tile,
                 };
             }
 
             // Fast bucket 1: level-0-only queries grouped by 8x4 coarse tile
-            // into 16-query L1D SoA sub-batches. Power-of-two grids mask cell
+            // (or 2-row fine strip when already inside one macro-tile) into
+            // 16-query L1D staging sub-batches. Power-of-two grids mask cell
             // indices against `cells0 - 1` (algebraically `< p0.len()`, eliding
             // 132 bounds checks/organism in safe Rust while identical for every
             // validated index `< cells0`).
@@ -1116,7 +1147,12 @@ impl PyramidView<'_> {
                 let pow2_l0 = cells0.is_power_of_two();
                 let mask0 = cells0.saturating_sub(1);
                 let ordered = if n_l0 > SUB_BATCH {
-                    sort_by_tile(&l0_idx[..n_l0], &prepared, &mut l0_sorted[..n_l0]);
+                    sort_by_tile(
+                        &l0_idx[..n_l0],
+                        &prepared,
+                        l0_tile_or == l0_tile_and,
+                        &mut l0_sorted[..n_l0],
+                    );
                     &l0_sorted[..n_l0]
                 } else {
                     &l0_idx[..n_l0]
@@ -1130,9 +1166,7 @@ impl PyramidView<'_> {
                     if unit_l0 {
                         for plane in 0..P {
                             let plane_slice = &field_data[plane * cells0..(plane + 1) * cells0];
-                            let sv = &mut soa_v[plane][..n];
-                            let sdx = &mut soa_dx[plane][..n];
-                            let sdy = &mut soa_dy[plane][..n];
+                            let sp = &mut soa[plane][..n];
                             if pow2_l0 && plane_slice.len() > mask0 {
                                 for j in 0..n {
                                     let p = &sub_lo[j];
@@ -1145,9 +1179,7 @@ impl PyramidView<'_> {
                                         p.fy,
                                     );
                                     finite_acc += (value + dx) + dy;
-                                    sv[j] = value;
-                                    sdx[j] = dx;
-                                    sdy[j] = dy;
+                                    sp[j] = [value, dx, dy];
                                 }
                             } else {
                                 for j in 0..n {
@@ -1161,9 +1193,7 @@ impl PyramidView<'_> {
                                         p.fy,
                                     );
                                     finite_acc += (value + dx) + dy;
-                                    sv[j] = value;
-                                    sdx[j] = dx;
-                                    sdy[j] = dy;
+                                    sp[j] = [value, dx, dy];
                                 }
                             }
                         }
@@ -1172,9 +1202,7 @@ impl PyramidView<'_> {
                     {
                         for plane in 0..P {
                             let plane_slice = &field_data[plane * cells0..(plane + 1) * cells0];
-                            let sv = &mut soa_v[plane][..n];
-                            let sdx = &mut soa_dx[plane][..n];
-                            let sdy = &mut soa_dy[plane][..n];
+                            let sp = &mut soa[plane][..n];
                             if pow2_l0 && plane_slice.len() > mask0 {
                                 for j in 0..n {
                                     let p = &sub_lo[j];
@@ -1189,9 +1217,7 @@ impl PyramidView<'_> {
                                     let dx = dx_num * rx;
                                     let dy = dy_num * ry;
                                     finite_acc += (value + dx) + dy;
-                                    sv[j] = value;
-                                    sdx[j] = dx;
-                                    sdy[j] = dy;
+                                    sp[j] = [value, dx, dy];
                                 }
                             } else {
                                 for j in 0..n {
@@ -1207,9 +1233,7 @@ impl PyramidView<'_> {
                                     let dx = dx_num * rx;
                                     let dy = dy_num * ry;
                                     finite_acc += (value + dx) + dy;
-                                    sv[j] = value;
-                                    sdx[j] = dx;
-                                    sdy[j] = dy;
+                                    sp[j] = [value, dx, dy];
                                 }
                             }
                         }
@@ -1218,9 +1242,7 @@ impl PyramidView<'_> {
                         let sy = meta0.spacing_y;
                         for plane in 0..P {
                             let plane_slice = &field_data[plane * cells0..(plane + 1) * cells0];
-                            let sv = &mut soa_v[plane][..n];
-                            let sdx = &mut soa_dx[plane][..n];
-                            let sdy = &mut soa_dy[plane][..n];
+                            let sp = &mut soa[plane][..n];
                             for j in 0..n {
                                 let p = &sub_lo[j];
                                 let (value, dx_num, dy_num) = bilinear_raw(
@@ -1234,9 +1256,7 @@ impl PyramidView<'_> {
                                 let dx = dx_num / sx;
                                 let dy = dy_num / sy;
                                 finite_acc += (value + dx) + dy;
-                                sv[j] = value;
-                                sdx[j] = dx;
-                                sdy[j] = dy;
+                                sp[j] = [value, dx, dy];
                             }
                         }
                     }
@@ -1245,7 +1265,7 @@ impl PyramidView<'_> {
                         break;
                     }
                     for (j, &qi) in sub.iter().enumerate() {
-                        sample.load_from_soa_lane(&soa_v, &soa_dx, &soa_dy, j);
+                        sample.load_from_soa_lane(&soa, j);
                         if on_sample(chunk_base + qi as usize, &sample).is_err() {
                             need_fallback = true;
                             break;
@@ -1258,8 +1278,8 @@ impl PyramidView<'_> {
             }
 
             // Fast bucket 2: level-0 / level-1 blended queries (the dominant
-            // mutated-scale case) with tile-sorted 16-query L1D SoA sub-batches
-            // and power-of-two masked indexing on both fine and coarse planes.
+            // mutated-scale case) with tile-sorted (or 2-row fine-strip) 16-query
+            // L1D sub-batches and power-of-two masked indexing on both planes.
             if !need_fallback
                 && n_l01 > 0
                 && let Some(coarse1) = self.pyramid.coarse.first()
@@ -1271,7 +1291,12 @@ impl PyramidView<'_> {
                 let mask0 = cells0.saturating_sub(1);
                 let mask1 = cells1.saturating_sub(1);
                 let ordered = if n_l01 > SUB_BATCH {
-                    sort_by_tile(&l01_idx[..n_l01], &prepared, &mut l01_sorted[..n_l01]);
+                    sort_by_tile(
+                        &l01_idx[..n_l01],
+                        &prepared,
+                        l01_tile_or == l01_tile_and,
+                        &mut l01_sorted[..n_l01],
+                    );
                     &l01_sorted[..n_l01]
                 } else {
                     &l01_idx[..n_l01]
@@ -1291,9 +1316,7 @@ impl PyramidView<'_> {
                         for plane in 0..P {
                             let p0 = &field_data[plane * cells0..(plane + 1) * cells0];
                             let p1 = &coarse1[plane * cells1..(plane + 1) * cells1];
-                            let sv = &mut soa_v[plane][..n];
-                            let sdx = &mut soa_dx[plane][..n];
-                            let sdy = &mut soa_dy[plane][..n];
+                            let sp = &mut soa[plane][..n];
                             if pow2_both && p0.len() > mask0 && p1.len() > mask1 {
                                 for j in 0..n {
                                     let pb = &sub_blend[j];
@@ -1322,9 +1345,7 @@ impl PyramidView<'_> {
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
                                     finite_acc += (v + dx) + dy;
-                                    sv[j] = v;
-                                    sdx[j] = dx;
-                                    sdy[j] = dy;
+                                    sp[j] = [v, dx, dy];
                                 }
                             } else {
                                 for j in 0..n {
@@ -1354,9 +1375,7 @@ impl PyramidView<'_> {
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
                                     finite_acc += (v + dx) + dy;
-                                    sv[j] = v;
-                                    sdx[j] = dx;
-                                    sdy[j] = dy;
+                                    sp[j] = [v, dx, dy];
                                 }
                             }
                         }
@@ -1370,9 +1389,7 @@ impl PyramidView<'_> {
                         for plane in 0..P {
                             let p0 = &field_data[plane * cells0..(plane + 1) * cells0];
                             let p1 = &coarse1[plane * cells1..(plane + 1) * cells1];
-                            let sv = &mut soa_v[plane][..n];
-                            let sdx = &mut soa_dx[plane][..n];
-                            let sdy = &mut soa_dy[plane][..n];
+                            let sp = &mut soa[plane][..n];
                             if pow2_both && p0.len() > mask0 && p1.len() > mask1 {
                                 for j in 0..n {
                                     let pb = &sub_blend[j];
@@ -1403,9 +1420,7 @@ impl PyramidView<'_> {
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
                                     finite_acc += (v + dx) + dy;
-                                    sv[j] = v;
-                                    sdx[j] = dx;
-                                    sdy[j] = dy;
+                                    sp[j] = [v, dx, dy];
                                 }
                             } else {
                                 for j in 0..n {
@@ -1437,9 +1452,7 @@ impl PyramidView<'_> {
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
                                     finite_acc += (v + dx) + dy;
-                                    sv[j] = v;
-                                    sdx[j] = dx;
-                                    sdy[j] = dy;
+                                    sp[j] = [v, dx, dy];
                                 }
                             }
                         }
@@ -1449,9 +1462,7 @@ impl PyramidView<'_> {
                         for plane in 0..P {
                             let p0 = &field_data[plane * cells0..(plane + 1) * cells0];
                             let p1 = &coarse1[plane * cells1..(plane + 1) * cells1];
-                            let sv = &mut soa_v[plane][..n];
-                            let sdx = &mut soa_dx[plane][..n];
-                            let sdy = &mut soa_dy[plane][..n];
+                            let sp = &mut soa[plane][..n];
                             for j in 0..n {
                                 let pb = &sub_blend[j];
                                 let lo = &pb.lo;
@@ -1481,9 +1492,7 @@ impl PyramidView<'_> {
                                 let dx = ldx + t * (hdx - ldx);
                                 let dy = ldy + t * (hdy - ldy);
                                 finite_acc += (v + dx) + dy;
-                                sv[j] = v;
-                                sdx[j] = dx;
-                                sdy[j] = dy;
+                                sp[j] = [v, dx, dy];
                             }
                         }
                     }
@@ -1492,7 +1501,7 @@ impl PyramidView<'_> {
                         break;
                     }
                     for (j, &qi) in sub.iter().enumerate() {
-                        sample.load_from_soa_lane(&soa_v, &soa_dx, &soa_dy, j);
+                        sample.load_from_soa_lane(&soa, j);
                         if on_sample(chunk_base + qi as usize, &sample).is_err() {
                             need_fallback = true;
                             break;
@@ -1505,7 +1514,7 @@ impl PyramidView<'_> {
             }
 
             // Bucket 3: coarse-level queries (`lo_level >= 1`), tile-sorted and
-            // evaluated plane-outer across 16-query L1D SoA sub-batches.
+            // evaluated plane-outer across 16-query L1D staging sub-batches.
             if !need_fallback && n_other > 0 {
                 let pack_coarse = |level: u8, corners: PackedCorners| -> PackedCoarseLevel<'_> {
                     let meta = level_meta[level as usize];
@@ -1523,6 +1532,7 @@ impl PyramidView<'_> {
                     sort_by_tile(
                         &other_idx[..n_other],
                         &prepared,
+                        false,
                         &mut other_sorted[..n_other],
                     );
                     &other_sorted[..n_other]
@@ -1541,10 +1551,8 @@ impl PyramidView<'_> {
                     }
                     let mut finite_acc = 0.0_f64;
                     if all_exact_recip {
-                        for plane in 0..P {
-                            let sv = &mut soa_v[plane][..n];
-                            let sdx = &mut soa_dx[plane][..n];
-                            let sdy = &mut soa_dy[plane][..n];
+                        for (plane, soa_plane) in soa.iter_mut().enumerate() {
+                            let sp = &mut soa_plane[..n];
                             for j in 0..n {
                                 let pc = &sub_coarse[j];
                                 let lo = &pc.lo;
@@ -1578,22 +1586,16 @@ impl PyramidView<'_> {
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
                                     finite_acc += (v + dx) + dy;
-                                    sv[j] = v;
-                                    sdx[j] = dx;
-                                    sdy[j] = dy;
+                                    sp[j] = [v, dx, dy];
                                 } else {
                                     finite_acc += (lv + ldx) + ldy;
-                                    sv[j] = lv;
-                                    sdx[j] = ldx;
-                                    sdy[j] = ldy;
+                                    sp[j] = [lv, ldx, ldy];
                                 }
                             }
                         }
                     } else {
-                        for plane in 0..P {
-                            let sv = &mut soa_v[plane][..n];
-                            let sdx = &mut soa_dx[plane][..n];
-                            let sdy = &mut soa_dy[plane][..n];
+                        for (plane, soa_plane) in soa.iter_mut().enumerate() {
+                            let sp = &mut soa_plane[..n];
                             for j in 0..n {
                                 let pc = &sub_coarse[j];
                                 let lo = &pc.lo;
@@ -1627,14 +1629,10 @@ impl PyramidView<'_> {
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
                                     finite_acc += (v + dx) + dy;
-                                    sv[j] = v;
-                                    sdx[j] = dx;
-                                    sdy[j] = dy;
+                                    sp[j] = [v, dx, dy];
                                 } else {
                                     finite_acc += (lv + ldx) + ldy;
-                                    sv[j] = lv;
-                                    sdx[j] = ldx;
-                                    sdy[j] = ldy;
+                                    sp[j] = [lv, ldx, ldy];
                                 }
                             }
                         }
@@ -1644,7 +1642,7 @@ impl PyramidView<'_> {
                         break;
                     }
                     for (j, &qi) in sub.iter().enumerate() {
-                        sample.load_from_soa_lane(&soa_v, &soa_dx, &soa_dy, j);
+                        sample.load_from_soa_lane(&soa, j);
                         if on_sample(chunk_base + qi as usize, &sample).is_err() {
                             need_fallback = true;
                             break;
@@ -1880,13 +1878,7 @@ impl PyramidView<'_> {
 trait SampleSlot<const P: usize>: Copy {
     const ZERO: Self;
 
-    fn load_from_soa_lane<const N: usize>(
-        &mut self,
-        values: &[[f64; N]; P],
-        dx: &[[f64; N]; P],
-        dy: &[[f64; N]; P],
-        lane: usize,
-    );
+    fn load_from_soa_lane<const N: usize>(&mut self, soa: &[[[f64; 3]; N]; P], lane: usize);
 }
 
 impl SampleSlot<PLANES> for RawSample {
@@ -1897,18 +1889,13 @@ impl SampleSlot<PLANES> for RawSample {
     };
 
     #[inline]
-    fn load_from_soa_lane<const N: usize>(
-        &mut self,
-        values: &[[f64; N]; PLANES],
-        dx: &[[f64; N]; PLANES],
-        dy: &[[f64; N]; PLANES],
-        lane: usize,
-    ) {
+    fn load_from_soa_lane<const N: usize>(&mut self, soa: &[[[f64; 3]; N]; PLANES], lane: usize) {
         if lane < N {
             for plane in 0..PLANES {
-                self.values[plane] = values[plane][lane];
-                self.dx[plane] = dx[plane][lane];
-                self.dy[plane] = dy[plane][lane];
+                let [v, dx, dy] = soa[plane][lane];
+                self.values[plane] = v;
+                self.dx[plane] = dx;
+                self.dy[plane] = dy;
             }
         }
     }
@@ -1924,16 +1911,15 @@ impl SampleSlot<MAX_PLANES> for DualRawSample {
     #[inline]
     fn load_from_soa_lane<const N: usize>(
         &mut self,
-        values: &[[f64; N]; MAX_PLANES],
-        dx: &[[f64; N]; MAX_PLANES],
-        dy: &[[f64; N]; MAX_PLANES],
+        soa: &[[[f64; 3]; N]; MAX_PLANES],
         lane: usize,
     ) {
         if lane < N {
             for plane in 0..MAX_PLANES {
-                self.values[plane] = values[plane][lane];
-                self.dx[plane] = dx[plane][lane];
-                self.dy[plane] = dy[plane][lane];
+                let [v, dx, dy] = soa[plane][lane];
+                self.values[plane] = v;
+                self.dx[plane] = dx;
+                self.dy[plane] = dy;
             }
         }
     }

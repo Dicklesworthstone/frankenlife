@@ -834,9 +834,16 @@ export default function Home() {
                     <p className="mt-3 font-mono text-[11px] text-slate-500">{preset.model}</p>
                     <PopulationBar founders={preset.founders} ceiling={preset.ceiling} />
                     <p className="mt-2 font-mono text-[11px] text-slate-400 tabular-nums">
-                      {preset.grid}² field · {preset.torus}-unit torus · Δt {preset.dt} s
+                      {preset.grid}² field · {preset.torus}-unit torus ·{" "}
+                      <span className="whitespace-nowrap">Δt {preset.dt} s</span>
                     </p>
                     <p className="mt-3 text-sm leading-relaxed text-slate-400">{preset.body}</p>
+                    {preset.variant ? (
+                      <p className="mt-3 border-t border-white/[0.06] pt-3 text-sm leading-relaxed text-slate-400">
+                        <code className="font-mono text-[12.5px] whitespace-nowrap text-slate-200">{preset.variant.file}</code>{" "}
+                        is {preset.variant.body}
+                      </p>
+                    ) : null}
                   </Reveal>
                 </li>
               ))}

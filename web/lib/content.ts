@@ -913,6 +913,8 @@ export const presets: {
   kind: "profile" | "search" | "v2";
   chosen: string;
   body: string;
+  /** A separately named preset that is this one with one change (lib/presets.test.ts checks which). */
+  variant?: { file: string; body: string };
 }[] = [
   {
     file: "reference-small-world",
@@ -949,6 +951,10 @@ export const presets: {
     kind: "profile",
     chosen: "Desktop profile · FL-034 E2",
     body: "F16 weights; settles at 91,664 to 99,361 alive. 23 to 24 ticks a second on an M5 Ultra with Metal controllers.",
+    variant: {
+      file: "desktop-multirate-4t",
+      body: "this world with each controller run every fourth tick: a separate profile, never counted toward G7.",
+    },
   },
   {
     file: "showcase-world",

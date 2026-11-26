@@ -307,7 +307,8 @@ export function BranchDiagram() {
           </p>
         </div>
 
-        <pre className="overflow-x-auto rounded-xl border border-white/10 bg-black/40 p-3 text-[12px] leading-relaxed text-green-200 [scrollbar-width:thin]">
+        {/* Focusable, so a keyboard can scroll the long lines sideways (axe: scrollable-region-focusable). */}
+        <pre tabIndex={0} className="overflow-x-auto rounded-xl border border-white/10 bg-black/40 p-3 text-[12px] leading-relaxed text-green-200 [scrollbar-width:thin]">
           <code>{commands.join("\n")}</code>
         </pre>
       </div>

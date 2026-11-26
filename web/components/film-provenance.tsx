@@ -111,7 +111,8 @@ export function FilmProvenance({ film }: { film: FilmManifest }) {
             −
           </span>
         </summary>
-        <pre className="overflow-x-auto px-4 pb-4 text-[12.5px] leading-relaxed text-green-200">
+        {/* Focusable, so a keyboard can scroll the long lines sideways (axe: scrollable-region-focusable). */}
+        <pre tabIndex={0} className="overflow-x-auto px-4 pb-4 text-[12.5px] leading-relaxed text-green-200">
           <code>{reproduce.join("\n")}</code>
         </pre>
         <p className="px-4 pb-4 text-xs leading-relaxed text-slate-400">

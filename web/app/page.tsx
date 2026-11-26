@@ -414,7 +414,8 @@ export default function Home() {
               <div className="panel panel-strong relative rounded-[1.75rem] p-6 sm:p-8">
                 <Reticle inset={9} size={12} />
                 <MicroLabel>The ledger</MicroLabel>
-                <p className="mt-5 overflow-x-auto font-mono text-[15px] whitespace-nowrap text-green-100 sm:text-lg">
+                {/* Focusable, so a keyboard can scroll it sideways on a phone (axe: scrollable-region-focusable). */}
+                <p tabIndex={0} className="mt-5 overflow-x-auto font-mono text-[15px] whitespace-nowrap text-green-100 sm:text-lg">
                   𝓔ₙ₊₁ − 𝓔ₙ = injection − removal − dissipation + numerical residual
                 </p>
                 <p className="mt-4 text-sm leading-relaxed text-slate-400">

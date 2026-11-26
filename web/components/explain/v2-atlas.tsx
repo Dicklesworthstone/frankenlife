@@ -622,6 +622,10 @@ function RulePanel({ entry, toggle }: { entry: AtlasEntry; toggle: boolean }) {
 }
 
 /** One step's picture: the still drawn with the view that shows its state, or else its rule. */
+/** A still's provenance, as its badge shows it and its link's name says it. */
+const stillBadge = (still: V2Still) =>
+  `flife render · tick ${grouped(still.tick)} · seed ${still.seed}${still.view.zoom > 1.01 ? ` · ×${still.view.zoom}` : ""}`;
+
 function Stage({ entry, view, setView }: { entry: AtlasEntry; view: "world" | "rule"; setView: (view: "world" | "rule") => void }) {
   const still = entry.still ? stillById(entry.still) : null;
   const showStill = still !== null && view === "world";
@@ -647,7 +651,12 @@ function Stage({ entry, view, setView }: { entry: AtlasEntry; view: "world" | "r
       ) : null}
       {showStill ? (
         <>
-          <a href={still.src} className="relative block aspect-square bg-black" aria-label={`${still.label}: open the ${still.width} × ${still.height} still`}>
+          {/* The name holds the badge's visible words, so a voice command that reads them finds the link. */}
+          <a
+            href={still.src}
+            className="relative block aspect-square bg-black"
+            aria-label={`${still.label}, ${stillBadge(still)}: open the ${still.width} × ${still.height} still`}
+          >
             {/* eslint-disable-next-line @next/next/no-img-element -- a static export; the manifest names the file */}
             <img
               src={still.src}
@@ -661,8 +670,7 @@ function Stage({ entry, view, setView }: { entry: AtlasEntry; view: "world" | "r
             />
             <Reticle inset={10} size={14} />
             <span className="absolute bottom-3 left-3 rounded-full border border-white/10 bg-black/60 px-2.5 py-1 font-mono text-[10px] tracking-[0.12em] text-green-200 uppercase backdrop-blur-md">
-              flife render · tick {grouped(still.tick)} · seed {still.seed}
-              {still.view.zoom > 1.01 ? ` · ×${still.view.zoom}` : ""}
+              {stillBadge(still)}
             </span>
           </a>
           <figcaption className="px-5 py-4 text-[13px] leading-relaxed text-slate-400 sm:px-6">
@@ -803,21 +811,23 @@ export function MechanismStory({ story }: { story: "tissue" | "supercolony" }) {
             </div>
           ) : null}
           <div className="mt-6 flex items-center justify-between gap-3 border-t border-white/[0.06] pt-5">
+            {/* Named "Previous step: Polarity" (hidden words, then the visible ones), not by the step's full
+                title: a voice command says what it sees. */}
             <button
               type="button"
               onClick={() => go(at - 1)}
-              aria-label={`Previous step: ${steps[(at - 1 + steps.length) % steps.length]?.name}`}
               className="inline-flex min-h-11 items-center gap-2 text-[13px] font-semibold text-slate-400 transition-colors hover:text-white focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none"
             >
               <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
+              <span className="sr-only">Previous step: </span>
               {steps[(at - 1 + steps.length) % steps.length]?.short}
             </button>
             <button
               type="button"
               onClick={() => go(at + 1)}
-              aria-label={`Next step: ${steps[(at + 1) % steps.length]?.name}`}
               className="inline-flex min-h-11 items-center gap-2 text-[13px] font-semibold text-slate-200 transition-colors hover:text-white focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none"
             >
+              <span className="sr-only">Next step: </span>
               {steps[(at + 1) % steps.length]?.short}
               <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
             </button>

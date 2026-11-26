@@ -28,7 +28,10 @@ hero's picture, not a decoration. Each chapter wears one colour of the film's li
 (`Reticle` in `components/franken.tsx`) frame anything that is a specimen or a figure. Surfaces are
 `panel`s; blurred glass is kept for the floating header and dock. Lists are ruled rather than boxed.
 `app/globals.css` holds the tokens, the display sizes and the muted text tone, which is raised from
-Tailwind's slate-500 to meet WCAG AA contrast on the ink.
+Tailwind's slate-500 to meet WCAG AA contrast on the ink. A box that scrolls sideways with nothing focusable
+in it takes `tabIndex={0}`, so a keyboard can scroll it, and a control's accessible name contains the words
+it shows, so a voice command finds it. axe-core 4.14 found no violations on 2026-11-25 at 320, 390 and
+1,440 px, in every tab, view and opened `<details>`.
 
 ## The explainers
 

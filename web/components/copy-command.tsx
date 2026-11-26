@@ -34,7 +34,8 @@ export function CopyCommand({ comment, command }: { comment: string; command: st
           {copied ? "Copied to the clipboard" : ""}
         </span>
       </div>
-      <pre className="overflow-x-auto text-[13px] leading-relaxed text-green-200 [scrollbar-width:thin]">
+      {/* Focusable, so a keyboard can scroll a long command sideways (axe: scrollable-region-focusable). */}
+      <pre tabIndex={0} className="overflow-x-auto text-[13px] leading-relaxed text-green-200 [scrollbar-width:thin]">
         <code>{command}</code>
       </pre>
     </div>

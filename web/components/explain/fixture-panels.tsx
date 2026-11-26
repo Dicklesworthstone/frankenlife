@@ -112,7 +112,8 @@ function FixtureCheck({
           )}
         </span>
       </p>
-      <DemoButton onClick={onReset} disabled={atFixture} label={`Reset to fixture ${fixture}`}>
+      {/* The name starts with the visible words, so a voice command ("click Reset to C.1") finds it. */}
+      <DemoButton onClick={onReset} disabled={atFixture} label={`Reset to ${fixture}, the fixture's numbers`}>
         <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" /> Reset to {fixture}
       </DemoButton>
     </div>

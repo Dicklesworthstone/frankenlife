@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useId, useState } from "react";
 
 import { CATALOG, parameterCount, widths } from "@/components/explain/brain-math";
 import { BasisBadge, DemoFrame, Readout, Segmented, Slider } from "@/components/explain/demo";
@@ -52,6 +52,7 @@ const MEASURED_PLAIN_READ = [956e9, 1_082e9] as const;
 
 /** Why the scale is hard: the weight bank, its bandwidth and its food, as arithmetic you can move. */
 export function ScaleCalculator() {
+  const tableId = useId();
   const [population, setPopulation] = useState(400_000);
   const [parameters, setParameters] = useState(9_988);
   const [sweeps, setSweeps] = useState(30);
@@ -230,10 +231,12 @@ export function ScaleCalculator() {
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1.2fr_1fr]">
           {/* README's table, recomputed for this population and network size. */}
           <div className="min-w-0 rounded-2xl border border-white/10 bg-black/30 p-4">
-            <p className="text-[10px] font-black tracking-[0.2em] text-slate-500 uppercase">
+            <p id={tableId} className="text-[10px] font-black tracking-[0.2em] text-slate-500 uppercase">
               {grouped(population)} × {grouped(parameters)} parameters
             </p>
-            <div className="mt-3 overflow-x-auto">
+            {/* A named region a keyboard can focus, so it can scroll the table sideways on a phone (axe:
+                scrollable-region-focusable). */}
+            <div tabIndex={0} role="region" aria-labelledby={tableId} className="mt-3 overflow-x-auto">
               <table className="w-full min-w-[22rem] text-right font-mono text-xs tabular-nums">
                 <thead>
                   <tr className="text-[10px] tracking-wider text-slate-500 uppercase">

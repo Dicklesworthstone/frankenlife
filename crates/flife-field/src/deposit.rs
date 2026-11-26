@@ -880,15 +880,25 @@ fn add_up(a: f64, b: f64) -> f64 {
 }
 
 /// The largest F32 value at or below `value`, for `value ≥ 0`.
+#[inline]
 fn round_down_f32(value: f64) -> f32 {
     if value >= f64::from(f32::MAX) {
         return f32::MAX;
     }
     let nearest = value as f32;
-    if f64::from(nearest) > value {
-        nearest.next_down()
+    if value < 0.0 {
+        if f64::from(nearest) > value {
+            nearest.next_down()
+        } else {
+            nearest
+        }
     } else {
-        nearest
+        // Branchless `if f64::from(nearest) > value { nearest.next_down() } else { nearest }`
+        // for `0 <= value < f32::MAX`: `nearest > 0` whenever `nearest > value >= 0`,
+        // so subtracting 1 from its IEEE-754 bit pattern is exact across normals
+        // and subnormals down to `+0.0`.
+        let dec = u32::from(f64::from(nearest) > value);
+        f32::from_bits(nearest.to_bits().wrapping_sub(dec))
     }
 }
 
@@ -1882,38 +1892,57 @@ fn reduce_run_const<const M: usize>(
         }
         let slice = &order[first..end];
         let before = run.energy[at];
-        let mut total = 0.0_f64;
         // Accumulate directly into `accum[batch_len]` to avoid copying 256 B
-        // per cell before batch flush.
+        // per cell before batch flush; fast-path single-packet cells (skipping
+        // `moment.fill(0.0)` and `add_down(0.0, amount)`).
         let moment = &mut accum[batch_len];
-        moment.fill(0.0);
-        match sequence {
-            None => {
-                for &ord in slice {
-                    let packet = &packets[ord as usize];
-                    total = add_down(total, packet.amount);
-                    if let Some(dir) = entries[packet.entry].direction.first_chunk::<M>() {
-                        let amount = packet.amount;
-                        for (slot, &component) in moment.iter_mut().zip(dir) {
-                            *slot += amount * component;
+        let total = if slice.len() == 1 {
+            let pkt_idx = match sequence {
+                None => slice[0] as usize,
+                Some(seq_slice) => seq_slice[slice[0] as usize] as usize,
+            };
+            let packet = &packets[pkt_idx];
+            if let Some(dir) = entries[packet.entry].direction.first_chunk::<M>() {
+                let amount = packet.amount;
+                for (slot, &component) in moment.iter_mut().zip(dir) {
+                    *slot = amount * component;
+                }
+            } else {
+                moment.fill(0.0);
+            }
+            packet.amount
+        } else {
+            let mut total = 0.0_f64;
+            moment.fill(0.0);
+            match sequence {
+                None => {
+                    for &ord in slice {
+                        let packet = &packets[ord as usize];
+                        total = add_down(total, packet.amount);
+                        if let Some(dir) = entries[packet.entry].direction.first_chunk::<M>() {
+                            let amount = packet.amount;
+                            for (slot, &component) in moment.iter_mut().zip(dir) {
+                                *slot += amount * component;
+                            }
+                        }
+                    }
+                }
+                Some(sequence) => {
+                    for &ord in slice {
+                        let seq = sequence[ord as usize];
+                        let packet = &packets[seq as usize];
+                        total = add_down(total, packet.amount);
+                        if let Some(dir) = entries[packet.entry].direction.first_chunk::<M>() {
+                            let amount = packet.amount;
+                            for (slot, &component) in moment.iter_mut().zip(dir) {
+                                *slot += amount * component;
+                            }
                         }
                     }
                 }
             }
-            Some(sequence) => {
-                for &ord in slice {
-                    let seq = sequence[ord as usize];
-                    let packet = &packets[seq as usize];
-                    total = add_down(total, packet.amount);
-                    if let Some(dir) = entries[packet.entry].direction.first_chunk::<M>() {
-                        let amount = packet.amount;
-                        for (slot, &component) in moment.iter_mut().zip(dir) {
-                            *slot += amount * component;
-                        }
-                    }
-                }
-            }
-        }
+            total
+        };
         let after = round_down_f32(add_down(f64::from(before), total));
         let received = f64::from(after) - f64::from(before);
         let factor = if total > 0.0 && total.is_finite() {

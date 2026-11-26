@@ -582,14 +582,41 @@ pub fn tanh(x: f64) -> Option<f64> {
     Some(if x.is_sign_negative() { -value } else { value })
 }
 
+/// Four-lane `exp(-x)` for `x ∈ (REDUCED, 40.0)` (`0 ≤ n ≤ 58`), bit-identical
+/// to `[exp_neg(xs[0]), ...]` using single-step branchless `2^(-n)` scaling
+/// (since `n ≤ 58 < 1000`, `first = n` and `power_of_two(first - n) = 1.0`,
+/// and `scaled * 2^(-n)` stays strictly normal).
+#[inline]
+fn exp_neg_small_4(xs: [f64; 4]) -> [f64; 4] {
+    let n = [
+        (xs[0] / core::f64::consts::LN_2).round(),
+        (xs[1] / core::f64::consts::LN_2).round(),
+        (xs[2] / core::f64::consts::LN_2).round(),
+        (xs[3] / core::f64::consts::LN_2).round(),
+    ];
+    let r = [
+        (xs[0] - n[0] * LN2_HI) - n[0] * LN2_LO,
+        (xs[1] - n[1] * LN2_HI) - n[1] * LN2_LO,
+        (xs[2] - n[2] * LN2_HI) - n[2] * LN2_LO,
+        (xs[3] - n[3] * LN2_HI) - n[3] * LN2_LO,
+    ];
+    let scaled = exp_series_15_4(r);
+    [
+        scaled[0] * power_of_two_neg_small(n[0]),
+        scaled[1] * power_of_two_neg_small(n[1]),
+        scaled[2] * power_of_two_neg_small(n[2]),
+        scaled[3] * power_of_two_neg_small(n[3]),
+    ]
+}
+
 /// Four-lane batch [`tanh`], bit-identical to
 /// `[tanh(xs[0])?, tanh(xs[1])?, tanh(xs[2])?, tanh(xs[3])?]`.
 ///
-/// Fast-paths the dominant `|x| < 1` regime through [`expm1_neg_4`] and
-/// delegates any lane with `|x| ≥ 1` to [`tanh_4_large`] (which vectorizes the
-/// unified `|x| ∈ {0} ∪ [ln(2)/2, ∞)` regime in one [`exp_neg_4`] call even
-/// when lanes straddle `1.0` or `20.0`). Returns `None` if any lane is
-/// nonfinite.
+/// Fast-paths the two dominant smooth-field Chemistry regimes (`1 ≤ |x| < 20`
+/// and `ln(2)/2 ≤ |x| < 1`) through branchless 2-wide NEON [`exp_neg_small_4`]
+/// and `copysign`, handles general `|x| < 1` via [`expm1_neg_4`], and
+/// delegates mixed/saturated lanes to [`tanh_4_large`]. Returns `None` if any
+/// lane is nonfinite.
 #[inline]
 #[must_use]
 pub fn tanh_4(xs: [f64; 4]) -> Option<[f64; 4]> {
@@ -598,15 +625,42 @@ pub fn tanh_4(xs: [f64; 4]) -> Option<[f64; 4]> {
     }
     let mags = [xs[0].abs(), xs[1].abs(), xs[2].abs(), xs[3].abs()];
     let two_mags = [2.0 * mags[0], 2.0 * mags[1], 2.0 * mags[2], 2.0 * mags[3]];
+    if mags[0] >= 1.0
+        && mags[0] < TANH_SATURATES
+        && mags[1] >= 1.0
+        && mags[1] < TANH_SATURATES
+        && mags[2] >= 1.0
+        && mags[2] < TANH_SATURATES
+        && mags[3] >= 1.0
+        && mags[3] < TANH_SATURATES
+    {
+        let d = exp_neg_small_4(two_mags);
+        return Some([
+            (1.0 - 2.0 * d[0] / (1.0 + d[0])).copysign(xs[0]),
+            (1.0 - 2.0 * d[1] / (1.0 + d[1])).copysign(xs[1]),
+            (1.0 - 2.0 * d[2] / (1.0 + d[2])).copysign(xs[2]),
+            (1.0 - 2.0 * d[3] / (1.0 + d[3])).copysign(xs[3]),
+        ]);
+    }
     if mags[0] < 1.0 && mags[1] < 1.0 && mags[2] < 1.0 && mags[3] < 1.0 {
+        let ln2 = core::f64::consts::LN_2;
+        if two_mags[0] >= ln2 && two_mags[1] >= ln2 && two_mags[2] >= ln2 && two_mags[3] >= ln2 {
+            let d = exp_neg_small_4(two_mags);
+            let m = [1.0 - d[0], 1.0 - d[1], 1.0 - d[2], 1.0 - d[3]];
+            return Some([
+                (m[0] / (2.0 - m[0])).copysign(xs[0]),
+                (m[1] / (2.0 - m[1])).copysign(xs[1]),
+                (m[2] / (2.0 - m[2])).copysign(xs[2]),
+                (m[3] / (2.0 - m[3])).copysign(xs[3]),
+            ]);
+        }
         let m = expm1_neg_4(two_mags)?;
         let mut out = [0.0_f64; 4];
         for ((dst, &x), &mi) in out.iter_mut().zip(&xs).zip(&m) {
             *dst = if x == 0.0 {
                 x
             } else {
-                let v = mi / (2.0 - mi);
-                if x.is_sign_negative() { -v } else { v }
+                (mi / (2.0 - mi)).copysign(x)
             };
         }
         return Some(out);
@@ -619,8 +673,8 @@ fn tanh_4_large(xs: [f64; 4], mags: [f64; 4], two_mags: [f64; 4]) -> Option<[f64
     let ln2 = core::f64::consts::LN_2;
     // Both `ln(2)/2 ≤ |x| < 1` (`m = 1 - exp_neg(2|x|); m/(2 - m)`) and
     // `1 ≤ |x| < 20` (`d = exp_neg(2|x|); 1 - 2d/(1 + d)`) evaluate the exact
-    // same `exp_neg(2|x|)`; handle them together with `0.0` and `>= 20` in one
-    // vectorized `exp_neg_4` pass so straddling `1.0` never drops to scalar.
+    // same `exp_neg(2|x|)` with `2|x| ∈ [ln 2, 40)`; handle them together with
+    // `0.0` and `>= 20` in one vectorized `exp_neg_small_4` pass.
     let exp_ok = (two_mags[0] >= ln2 || mags[0] == 0.0)
         && (two_mags[1] >= ln2 || mags[1] == 0.0)
         && (two_mags[2] >= ln2 || mags[2] == 0.0)
@@ -636,40 +690,32 @@ fn tanh_4_large(xs: [f64; 4], mags: [f64; 4], two_mags: [f64; 4]) -> Option<[f64
             return Some([
                 if mags[0] == 0.0 {
                     xs[0]
-                } else if xs[0].is_sign_negative() {
-                    -1.0
                 } else {
-                    1.0
+                    1.0_f64.copysign(xs[0])
                 },
                 if mags[1] == 0.0 {
                     xs[1]
-                } else if xs[1].is_sign_negative() {
-                    -1.0
                 } else {
-                    1.0
+                    1.0_f64.copysign(xs[1])
                 },
                 if mags[2] == 0.0 {
                     xs[2]
-                } else if xs[2].is_sign_negative() {
-                    -1.0
                 } else {
-                    1.0
+                    1.0_f64.copysign(xs[2])
                 },
                 if mags[3] == 0.0 {
                     xs[3]
-                } else if xs[3].is_sign_negative() {
-                    -1.0
                 } else {
-                    1.0
+                    1.0_f64.copysign(xs[3])
                 },
             ]);
         }
-        let d = exp_neg_4([
+        let d = exp_neg_small_4([
             if active[0] { two_mags[0] } else { 1.0 },
             if active[1] { two_mags[1] } else { 1.0 },
             if active[2] { two_mags[2] } else { 1.0 },
             if active[3] { two_mags[3] } else { 1.0 },
-        ])?;
+        ]);
         let mut out = [0.0_f64; 4];
         for ((dst, (&x, &mag)), &di) in out.iter_mut().zip(xs.iter().zip(&mags)).zip(&d) {
             *dst = if mag == 0.0 {
@@ -683,7 +729,7 @@ fn tanh_4_large(xs: [f64; 4], mags: [f64; 4], two_mags: [f64; 4]) -> Option<[f64
                     let m = 1.0 - di;
                     m / (2.0 - m)
                 };
-                if x.is_sign_negative() { -v } else { v }
+                v.copysign(x)
             };
         }
         return Some(out);

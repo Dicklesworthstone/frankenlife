@@ -744,45 +744,57 @@ fn saturate_4(xs: [f64; 4]) -> Result<[f32; 4], CoreError> {
 type NormalizedSingle = ([f64; PLANES], [[f64; 2]; PLANES], f64, f64);
 type SaturatedSingle = ([f32; PLANES], [f32; PLANES], f32, f32, f32);
 
-#[inline]
+#[cold]
+#[inline(never)]
+fn validate_single_denoms_err(
+    density: f64,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+) -> CoreError {
+    if !density.is_finite() || density < 0.0 {
+        return err_sensor_invalid(
+            "sensed energy density",
+            format!("{density} is not a density"),
+        );
+    }
+    if !intrinsic.energy.is_finite() || intrinsic.energy < 0.0 {
+        return err_sensor_invalid(
+            "internal energy",
+            format!("{} is not an energy", intrinsic.energy),
+        );
+    }
+    if !intrinsic.age_seconds.is_finite() || intrinsic.age_seconds < 0.0 {
+        return err_sensor_invalid("age", format!("{} is not an age", intrinsic.age_seconds));
+    }
+    let _ = scales;
+    err_sensor_invalid(
+        "sensor normalization denominator",
+        "density, energy, or age scale sum overflowed".to_owned(),
+    )
+}
+
+#[inline(always)]
 fn validate_single_denoms(
     density: f64,
     intrinsic: &Intrinsic,
     scales: &SensorScales,
 ) -> Result<(f64, f64, f64, f64), CoreError> {
-    if !density.is_finite() || density < 0.0 {
-        return Err(err_sensor_invalid(
-            "sensed energy density",
-            format!("{density} is not a density"),
-        ));
-    }
-    if !intrinsic.energy.is_finite() || intrinsic.energy < 0.0 {
-        return Err(err_sensor_invalid(
-            "internal energy",
-            format!("{} is not an energy", intrinsic.energy),
-        ));
-    }
-    if !intrinsic.age_seconds.is_finite() || intrinsic.age_seconds < 0.0 {
-        return Err(err_sensor_invalid(
-            "age",
-            format!("{} is not an age", intrinsic.age_seconds),
-        ));
-    }
     let shifted = density + scales.energy_density;
     let regularized = density + scales.composition_floor;
     let energy_denom = intrinsic.energy + scales.internal_energy;
     let age_denom = intrinsic.age_seconds + scales.age_seconds;
-    if !shifted.is_finite()
-        || !regularized.is_finite()
-        || !energy_denom.is_finite()
-        || !age_denom.is_finite()
-    {
-        return Err(err_sensor_invalid(
-            "sensor normalization denominator",
-            "density, energy, or age scale sum overflowed".to_owned(),
-        ));
+    let ok = (density >= 0.0)
+        & (intrinsic.energy >= 0.0)
+        & (intrinsic.age_seconds >= 0.0)
+        & shifted.is_finite()
+        & regularized.is_finite()
+        & energy_denom.is_finite()
+        & age_denom.is_finite();
+    if ok {
+        Ok((shifted, regularized, energy_denom, age_denom))
+    } else {
+        Err(validate_single_denoms_err(density, intrinsic, scales))
     }
-    Ok((shifted, regularized, energy_denom, age_denom))
 }
 
 #[inline]

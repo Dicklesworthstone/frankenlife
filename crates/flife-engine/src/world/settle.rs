@@ -166,6 +166,7 @@ pub(super) fn settle_with(
     observed: &FieldState,
     grants: (&Bins, &[GrantPacket], &Bins),
     compositions: (&mut Vec<[f64; CHANNELS]>, &mut Vec<u32>),
+    spatial: super::SpatialSettle<'_>,
     from: Tick,
     watched: Option<OrganismId>,
     working: &mut [Working],
@@ -175,6 +176,13 @@ pub(super) fn settle_with(
 ) -> Result<usize, CoreError> {
     let (by_demand, granted, grants_bins) = grants;
     let (cell_compositions, packet_compositions) = compositions;
+    let super::SpatialSettle {
+        rows: spatial_rows,
+        row_to_spatial,
+        tile_offsets: spatial_tile_offsets,
+        uptake: spatial_uptake,
+    } = spatial;
+    spatial_uptake.clear();
     let Settle {
         backend,
         report,
@@ -212,10 +220,22 @@ pub(super) fn settle_with(
         cell_compositions,
         packet_compositions,
     )?;
+    super::spatial_chemistry_prepass(
+        rules,
+        population,
+        (by_demand, granted, cell_compositions, packet_compositions),
+        working,
+        lanes.len(),
+        spatial_rows,
+        row_to_spatial,
+        spatial_tile_offsets,
+        spatial_uptake,
+    );
     let active_tiles = settle_all(
         rules,
         population,
         (by_demand, granted, cell_compositions, packet_compositions),
+        (row_to_spatial, spatial_uptake.as_slice()),
         from,
         watched,
         working,

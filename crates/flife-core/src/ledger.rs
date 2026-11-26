@@ -323,7 +323,21 @@ pub fn add_down(a: f64, b: f64) -> f64 {
     let b_part = sum - a;
     let a_part = sum - b_part;
     let error = (a - a_part) + (b - b_part);
-    if error < 0.0 { sum.next_down() } else { sum }
+    // Branchless `if error < 0.0 { sum.next_down() } else { sum }` across every
+    // IEEE-754 f64 (eliminating ~50% branch mispredictions in deposit/budget
+    // loops). For finite `a, b` with `sum == ±0.0`, `a == -b` is exact so
+    // `error == 0.0`; for nonfinite `sum`, `error` is NaN so `error < 0.0` is
+    // false. For finite nonzero `sum`: positive decrements bits, negative
+    // increments bits.
+    let bits = sum.to_bits();
+    let abs_bits = bits & 0x7fff_ffff_ffff_ffff;
+    let adjust = u64::from((error < 0.0) & (abs_bits != 0) & (abs_bits < 0x7ff0_0000_0000_0000));
+    let delta = if (bits >> 63) != 0 {
+        adjust
+    } else {
+        adjust.wrapping_neg()
+    };
+    f64::from_bits(bits.wrapping_add(delta))
 }
 
 /// `a − b`, rounded so that it never exceeds the exact difference.

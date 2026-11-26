@@ -323,11 +323,8 @@ impl Grants {
         Ok(GrantDebit { grants: self })
     }
 
-    /// [`apply_grants_on`]'s checks of these grants against `field`, which
-    /// they would debit: not applied, resolved for its grid, every debited
-    /// cell still holding the energy they were resolved against, and every
-    /// plane whole. Returns the grid's cell count.
-    fn check_debit(&self, field: &FieldState) -> Result<usize, CoreError> {
+    /// [`apply_grants_on`]'s header checks before checking individual debits.
+    fn check_debit_prefix(&self, field: &FieldState) -> Result<(), CoreError> {
         let conflict = |detail: String| CoreError::StateConflict {
             operation: "uptake grants",
             detail,
@@ -340,16 +337,15 @@ impl Grants {
                 "these grants were resolved for another grid".into(),
             ));
         }
-        let energy = field.energy();
-        for debit in &self.debits {
-            let current = energy.get(debit.cell).copied();
-            if current.map(f32::to_bits) != Some(debit.energy_before.to_bits()) {
-                return Err(conflict(format!(
-                    "cell {} holds {current:?}, but the grants were resolved against {}",
-                    debit.cell, debit.energy_before
-                )));
-            }
-        }
+        Ok(())
+    }
+
+    /// [`apply_grants_on`]'s plane-integrity checks after debits match.
+    fn check_debit_planes(&self, field: &FieldState) -> Result<usize, CoreError> {
+        let conflict = |detail: String| CoreError::StateConflict {
+            operation: "uptake grants",
+            detail,
+        };
         let carrier0_moments = field.carrier0().moment_count;
         if (0..carrier0_moments).any(|channel| field.moment(channel).is_none()) {
             return Err(conflict("a moment plane is missing".into()));
@@ -365,6 +361,28 @@ impl Grants {
             return Err(conflict("the moment planes are not whole".into()));
         }
         Ok(cells)
+    }
+
+    /// [`apply_grants_on`]'s checks of these grants against `field`, which
+    /// they would debit: not applied, resolved for its grid, every debited
+    /// cell still holding the energy they were resolved against, and every
+    /// plane whole. Returns the grid's cell count.
+    fn check_debit(&self, field: &FieldState) -> Result<usize, CoreError> {
+        self.check_debit_prefix(field)?;
+        let energy = field.energy();
+        for debit in &self.debits {
+            let current = energy.get(debit.cell).copied();
+            if current.map(f32::to_bits) != Some(debit.energy_before.to_bits()) {
+                return Err(CoreError::StateConflict {
+                    operation: "uptake grants",
+                    detail: format!(
+                        "cell {} holds {current:?}, but the grants were resolved against {}",
+                        debit.cell, debit.energy_before
+                    ),
+                });
+            }
+        }
+        self.check_debit_planes(field)
     }
 
     /// `U_i = Σ_c u_ic` for each demand, in the order the demands were
@@ -1269,6 +1287,206 @@ pub fn apply_grants_on(
     grants: &mut Grants,
     workers: usize,
 ) -> Result<f64, CoreError> {
+    let active_moments = field.carrier0_moments_count();
+    let grid_cells = usize::try_from(field.grid().cell_count()).unwrap_or(0);
+    if workers > 1
+        && grants.debits.len() >= 4_096
+        && grants.shares.capacity() >= grants.debits.len()
+        && grid_cells >= 16_384
+        && active_moments >= 4
+    {
+        grants.check_debit_prefix(field)?;
+        let debit_count = grants.debits.len();
+        if grants.shares.len() >= debit_count {
+            grants.shares.truncate(debit_count);
+        } else {
+            grants.shares.resize(
+                debit_count,
+                Share {
+                    quanta: 0,
+                    remainder: -1.0,
+                },
+            );
+        }
+        // Pass 1 (parallel, read-only): verify every debited cell matches its
+        // snapshot energy in ascending order and precompute F64 moment-scale
+        // ratios into pre-reserved `grants.shares` (`-1.0` sentinel skips
+        // zero-grant debits without compacting or allocating).
+        {
+            let energy_ro = field.energy();
+            let check_tiles = workers
+                .saturating_mul(4)
+                .min(64)
+                .min(debit_count.div_ceil(1_024))
+                .max(1);
+            let chunk_len = debit_count.div_ceil(check_tiles);
+            let mut verify_tasks: Vec<(&[CellDebit], &mut [Share])> = grants
+                .debits
+                .chunks(chunk_len)
+                .zip(grants.shares.chunks_mut(chunk_len))
+                .collect();
+            flife_core::pool::try_parallel_tasks(
+                workers,
+                "verify uptake grants",
+                &mut verify_tasks,
+                |_, (debits_chunk, shares_chunk)| {
+                    for (debit, out) in debits_chunk.iter().zip(shares_chunk.iter_mut()) {
+                        let current = energy_ro.get(debit.cell).copied();
+                        if current.map(f32::to_bits) != Some(debit.energy_before.to_bits()) {
+                            return Err(CoreError::StateConflict {
+                                operation: "uptake grants",
+                                detail: format!(
+                                    "cell {} holds {current:?}, but the grants were resolved against {}",
+                                    debit.cell, debit.energy_before
+                                ),
+                            });
+                        }
+                        let ratio = if debit.granted > 0.0 {
+                            if debit.energy_after == 0.0 {
+                                0.0
+                            } else {
+                                f64::from(debit.energy_after) / f64::from(debit.energy_before)
+                            }
+                        } else {
+                            -1.0
+                        };
+                        *out = Share {
+                            quanta: debit.cell as u64,
+                            remainder: ratio,
+                        };
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        let cells = grants.check_debit_planes(field)?;
+
+        // Pass 2 (parallel, single dispatch): partition into L2-resident
+        // cell bands × 4-plane moment groups (with group 0 of each band also
+        // writing its energy debits), reading `grants.shares` once per 4
+        // moment planes (4× less memory bandwidth than per-plane tasks).
+        const GROUP_PLANES: usize = 4;
+        const MAX_BANDS: usize = 16;
+        let bands = (cells / 32_768).clamp(4, MAX_BANDS);
+        let band_len = cells.div_ceil(bands);
+        let debits_ref: &[CellDebit] = &grants.debits;
+        let ratios_ref: &[Share] = &grants.shares;
+
+        let mut band_debit_bounds = [0_usize; MAX_BANDS + 1];
+        for (b, slot) in band_debit_bounds.iter_mut().take(bands).enumerate() {
+            let cell_start = (b * band_len).min(cells);
+            *slot = debits_ref.partition_point(|d| d.cell < cell_start);
+        }
+        band_debit_bounds[bands] = debit_count;
+
+        let values = field.as_mut_slice();
+        let (energy_all, rest) = values.split_at_mut(cells);
+        let (moments_all, _) = rest.split_at_mut(active_moments * cells);
+
+        let mut energy_bands: Vec<Option<&mut [f32]>> =
+            energy_all.chunks_mut(band_len).map(Some).collect();
+        let actual_bands = energy_bands.len();
+        let plane_groups = active_moments.div_ceil(GROUP_PLANES);
+        let mut moment_planes: Vec<Vec<&mut [f32]>> = moments_all
+            .chunks_exact_mut(cells)
+            .map(|plane| plane.chunks_mut(band_len).collect())
+            .collect();
+
+        struct GrantBandTask<'a> {
+            cell_base: usize,
+            d_start: usize,
+            d_end: usize,
+            energy: Option<&'a mut [f32]>,
+            planes: [&'a mut [f32]; GROUP_PLANES],
+            plane_count: usize,
+        }
+        let mut tasks: Vec<GrantBandTask<'_>> = Vec::with_capacity(actual_bands * plane_groups);
+        for g in 0..plane_groups {
+            let p_start = g * GROUP_PLANES;
+            let p_end = (p_start + GROUP_PLANES).min(active_moments);
+            let p_count = p_end - p_start;
+            let mut group_slices: [Vec<&mut [f32]>; GROUP_PLANES] =
+                std::array::from_fn(|_| Vec::new());
+            for (slot, plane_vec) in group_slices
+                .iter_mut()
+                .zip(moment_planes[p_start..p_end].iter_mut())
+            {
+                *slot = std::mem::take(plane_vec);
+            }
+            for (b, e_opt) in energy_bands.iter_mut().enumerate() {
+                let d_start = band_debit_bounds[b];
+                let d_end = band_debit_bounds[b + 1];
+                let mut planes: [&mut [f32]; GROUP_PLANES] =
+                    std::array::from_fn(|_| <&mut [f32]>::default());
+                for (dst, src) in planes.iter_mut().zip(group_slices.iter_mut()).take(p_count) {
+                    if let Some(band_slice) = src.get_mut(b) {
+                        *dst = std::mem::take(band_slice);
+                    }
+                }
+                let energy = if g == 0 { e_opt.take() } else { None };
+                if d_start < d_end {
+                    tasks.push(GrantBandTask {
+                        cell_base: b * band_len,
+                        d_start,
+                        d_end,
+                        energy,
+                        planes,
+                        plane_count: p_count,
+                    });
+                }
+            }
+        }
+        flife_core::pool::parallel_tasks(workers, "apply grants", &mut tasks, |_, task| {
+            let base = task.cell_base;
+            if let Some(energy_band) = task.energy.as_deref_mut() {
+                for debit in &debits_ref[task.d_start..task.d_end] {
+                    if debit.granted > 0.0 {
+                        energy_band[debit.cell - base] = debit.energy_after;
+                    }
+                }
+            }
+            let band_ratios = &ratios_ref[task.d_start..task.d_end];
+            if task.plane_count == GROUP_PLANES {
+                let [p0, p1, p2, p3] = &mut task.planes;
+                for item in band_ratios {
+                    let ratio = item.remainder;
+                    if ratio < 0.0 {
+                        continue;
+                    }
+                    let idx = (item.quanta as usize) - base;
+                    if ratio == 0.0 {
+                        p0[idx] = 0.0;
+                        p1[idx] = 0.0;
+                        p2[idx] = 0.0;
+                        p3[idx] = 0.0;
+                    } else {
+                        p0[idx] = (f64::from(p0[idx]) * ratio) as f32;
+                        p1[idx] = (f64::from(p1[idx]) * ratio) as f32;
+                        p2[idx] = (f64::from(p2[idx]) * ratio) as f32;
+                        p3[idx] = (f64::from(p3[idx]) * ratio) as f32;
+                    }
+                }
+            } else {
+                for plane in &mut task.planes[..task.plane_count] {
+                    for item in band_ratios {
+                        let ratio = item.remainder;
+                        if ratio < 0.0 {
+                            continue;
+                        }
+                        let idx = (item.quanta as usize) - base;
+                        plane[idx] = if ratio == 0.0 {
+                            0.0
+                        } else {
+                            (f64::from(plane[idx]) * ratio) as f32
+                        };
+                    }
+                }
+            }
+        })?;
+        grants.applied = true;
+        return Ok(grants.summary.granted);
+    }
+
     let cells = grants.check_debit(field)?;
     // Apply energy debits and precompute each positive debit's F64 moment-scale
     // ratio ONCE into `grants.shares` (idle scratch after `resolve_uptake`,
@@ -1292,7 +1510,6 @@ pub fn apply_grants_on(
         }
     }
     let ratios: &[Share] = &grants.shares;
-    let active_moments = field.carrier0_moments_count();
     if !ratios.is_empty() && active_moments > 0 {
         let used = workers.clamp(1, active_moments);
         let plane_len = cells.max(1);

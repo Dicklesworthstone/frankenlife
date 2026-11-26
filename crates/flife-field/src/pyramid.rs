@@ -1050,11 +1050,10 @@ impl PyramidView<'_> {
         let mut l01_sorted = [0_u16; BATCH];
         let mut other_idx = [0_u16; BATCH];
         let mut other_sorted = [0_u16; BATCH];
-        // Compact L1D-resident staging (`P * 16 * 3 * 8 = ~12.7 KiB`) hoisted
-        // outside the chunk loop. Interleaving `[value, dx, dy]` per lane keeps
-        // plane stride at 384 bytes (avoiding the 4 KiB L1D set aliasing of 3
-        // separate 4,224-byte arrays) and turns `load_from_soa_lane` into one
-        // contiguous 24-byte read per plane.
+        // Compact L1D-resident output staging (`SUB_BATCH * sizeof(S) ≈ 12.7 KiB`)
+        // hoisted outside the chunk loop. Writing each plane straight into the
+        // `SUB_BATCH` final `S` slots keeps plane-major field reads without a
+        // 792 B/organism SoA-to-AoS transpose copy (`~79 MB/tick` saved at 100k).
         let mut sub_lo = [dummy_corners; SUB_BATCH];
         let mut sub_blend = [dummy_blend; SUB_BATCH];
         let mut sub_coarse = [PackedCoarse {
@@ -1062,11 +1061,7 @@ impl PyramidView<'_> {
             hi: None,
             t: 0.0,
         }; SUB_BATCH];
-        let mut soa = [[[0.0_f64; 3]; SUB_BATCH]; P];
-        // One reusable sample slot hoisted outside all chunk/sub-batch loops so
-        // `load_from_soa_lane` writes directly into it without per-organism
-        // zero-initialization or 792-byte by-value `sret` copies.
-        let mut sample = S::ZERO;
+        let mut samples = [S::ZERO; SUB_BATCH];
 
         for (chunk_idx, q_chunk) in queries.chunks(BATCH).enumerate() {
             let chunk_base = chunk_idx * BATCH;
@@ -1166,10 +1161,8 @@ impl PyramidView<'_> {
                     if unit_l0 {
                         for plane in 0..P {
                             let plane_slice = &field_data[plane * cells0..(plane + 1) * cells0];
-                            let sp = &mut soa[plane][..n];
                             if pow2_l0 && plane_slice.len() > mask0 {
-                                for j in 0..n {
-                                    let p = &sub_lo[j];
+                                for (p, slot) in sub_lo[..n].iter().zip(&mut samples[..n]) {
                                     let (value, dx, dy) = bilinear_raw(
                                         f64::from(plane_slice[(p.i00 as usize) & mask0]),
                                         f64::from(plane_slice[(p.i10 as usize) & mask0]),
@@ -1179,11 +1172,10 @@ impl PyramidView<'_> {
                                         p.fy,
                                     );
                                     finite_acc += (value + dx) + dy;
-                                    sp[j] = [value, dx, dy];
+                                    slot.write_plane(plane, value, dx, dy);
                                 }
                             } else {
-                                for j in 0..n {
-                                    let p = &sub_lo[j];
+                                for (p, slot) in sub_lo[..n].iter().zip(&mut samples[..n]) {
                                     let (value, dx, dy) = bilinear_raw(
                                         f64::from(plane_slice[p.i00 as usize]),
                                         f64::from(plane_slice[p.i10 as usize]),
@@ -1193,7 +1185,7 @@ impl PyramidView<'_> {
                                         p.fy,
                                     );
                                     finite_acc += (value + dx) + dy;
-                                    sp[j] = [value, dx, dy];
+                                    slot.write_plane(plane, value, dx, dy);
                                 }
                             }
                         }
@@ -1202,10 +1194,8 @@ impl PyramidView<'_> {
                     {
                         for plane in 0..P {
                             let plane_slice = &field_data[plane * cells0..(plane + 1) * cells0];
-                            let sp = &mut soa[plane][..n];
                             if pow2_l0 && plane_slice.len() > mask0 {
-                                for j in 0..n {
-                                    let p = &sub_lo[j];
+                                for (p, slot) in sub_lo[..n].iter().zip(&mut samples[..n]) {
                                     let (value, dx_num, dy_num) = bilinear_raw(
                                         f64::from(plane_slice[(p.i00 as usize) & mask0]) * ra,
                                         f64::from(plane_slice[(p.i10 as usize) & mask0]) * ra,
@@ -1217,11 +1207,10 @@ impl PyramidView<'_> {
                                     let dx = dx_num * rx;
                                     let dy = dy_num * ry;
                                     finite_acc += (value + dx) + dy;
-                                    sp[j] = [value, dx, dy];
+                                    slot.write_plane(plane, value, dx, dy);
                                 }
                             } else {
-                                for j in 0..n {
-                                    let p = &sub_lo[j];
+                                for (p, slot) in sub_lo[..n].iter().zip(&mut samples[..n]) {
                                     let (value, dx_num, dy_num) = bilinear_raw(
                                         f64::from(plane_slice[p.i00 as usize]) * ra,
                                         f64::from(plane_slice[p.i10 as usize]) * ra,
@@ -1233,7 +1222,7 @@ impl PyramidView<'_> {
                                     let dx = dx_num * rx;
                                     let dy = dy_num * ry;
                                     finite_acc += (value + dx) + dy;
-                                    sp[j] = [value, dx, dy];
+                                    slot.write_plane(plane, value, dx, dy);
                                 }
                             }
                         }
@@ -1242,9 +1231,7 @@ impl PyramidView<'_> {
                         let sy = meta0.spacing_y;
                         for plane in 0..P {
                             let plane_slice = &field_data[plane * cells0..(plane + 1) * cells0];
-                            let sp = &mut soa[plane][..n];
-                            for j in 0..n {
-                                let p = &sub_lo[j];
+                            for (p, slot) in sub_lo[..n].iter().zip(&mut samples[..n]) {
                                 let (value, dx_num, dy_num) = bilinear_raw(
                                     f64::from(plane_slice[p.i00 as usize]) / area,
                                     f64::from(plane_slice[p.i10 as usize]) / area,
@@ -1256,7 +1243,7 @@ impl PyramidView<'_> {
                                 let dx = dx_num / sx;
                                 let dy = dy_num / sy;
                                 finite_acc += (value + dx) + dy;
-                                sp[j] = [value, dx, dy];
+                                slot.write_plane(plane, value, dx, dy);
                             }
                         }
                     }
@@ -1264,9 +1251,8 @@ impl PyramidView<'_> {
                         need_fallback = true;
                         break;
                     }
-                    for (j, &qi) in sub.iter().enumerate() {
-                        sample.load_from_soa_lane(&soa, j);
-                        if on_sample(chunk_base + qi as usize, &sample).is_err() {
+                    for (slot, &qi) in samples[..n].iter().zip(sub) {
+                        if on_sample(chunk_base + qi as usize, slot).is_err() {
                             need_fallback = true;
                             break;
                         }
@@ -1316,10 +1302,8 @@ impl PyramidView<'_> {
                         for plane in 0..P {
                             let p0 = &field_data[plane * cells0..(plane + 1) * cells0];
                             let p1 = &coarse1[plane * cells1..(plane + 1) * cells1];
-                            let sp = &mut soa[plane][..n];
                             if pow2_both && p0.len() > mask0 && p1.len() > mask1 {
-                                for j in 0..n {
-                                    let pb = &sub_blend[j];
+                                for (pb, slot) in sub_blend[..n].iter().zip(&mut samples[..n]) {
                                     let lo = &pb.lo;
                                     let hi = &pb.hi;
                                     let (lv, ldx, ldy) = bilinear_raw(
@@ -1345,11 +1329,10 @@ impl PyramidView<'_> {
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
                                     finite_acc += (v + dx) + dy;
-                                    sp[j] = [v, dx, dy];
+                                    slot.write_plane(plane, v, dx, dy);
                                 }
                             } else {
-                                for j in 0..n {
-                                    let pb = &sub_blend[j];
+                                for (pb, slot) in sub_blend[..n].iter().zip(&mut samples[..n]) {
                                     let lo = &pb.lo;
                                     let hi = &pb.hi;
                                     let (lv, ldx, ldy) = bilinear_raw(
@@ -1375,7 +1358,7 @@ impl PyramidView<'_> {
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
                                     finite_acc += (v + dx) + dy;
-                                    sp[j] = [v, dx, dy];
+                                    slot.write_plane(plane, v, dx, dy);
                                 }
                             }
                         }
@@ -1389,10 +1372,8 @@ impl PyramidView<'_> {
                         for plane in 0..P {
                             let p0 = &field_data[plane * cells0..(plane + 1) * cells0];
                             let p1 = &coarse1[plane * cells1..(plane + 1) * cells1];
-                            let sp = &mut soa[plane][..n];
                             if pow2_both && p0.len() > mask0 && p1.len() > mask1 {
-                                for j in 0..n {
-                                    let pb = &sub_blend[j];
+                                for (pb, slot) in sub_blend[..n].iter().zip(&mut samples[..n]) {
                                     let lo = &pb.lo;
                                     let hi = &pb.hi;
                                     let (lv, ldx_num, ldy_num) = bilinear_raw(
@@ -1420,11 +1401,10 @@ impl PyramidView<'_> {
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
                                     finite_acc += (v + dx) + dy;
-                                    sp[j] = [v, dx, dy];
+                                    slot.write_plane(plane, v, dx, dy);
                                 }
                             } else {
-                                for j in 0..n {
-                                    let pb = &sub_blend[j];
+                                for (pb, slot) in sub_blend[..n].iter().zip(&mut samples[..n]) {
                                     let lo = &pb.lo;
                                     let hi = &pb.hi;
                                     let (lv, ldx_num, ldy_num) = bilinear_raw(
@@ -1452,7 +1432,7 @@ impl PyramidView<'_> {
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
                                     finite_acc += (v + dx) + dy;
-                                    sp[j] = [v, dx, dy];
+                                    slot.write_plane(plane, v, dx, dy);
                                 }
                             }
                         }
@@ -1462,9 +1442,7 @@ impl PyramidView<'_> {
                         for plane in 0..P {
                             let p0 = &field_data[plane * cells0..(plane + 1) * cells0];
                             let p1 = &coarse1[plane * cells1..(plane + 1) * cells1];
-                            let sp = &mut soa[plane][..n];
-                            for j in 0..n {
-                                let pb = &sub_blend[j];
+                            for (pb, slot) in sub_blend[..n].iter().zip(&mut samples[..n]) {
                                 let lo = &pb.lo;
                                 let hi = &pb.hi;
                                 let (lv, ldx_num, ldy_num) = bilinear_raw(
@@ -1492,7 +1470,7 @@ impl PyramidView<'_> {
                                 let dx = ldx + t * (hdx - ldx);
                                 let dy = ldy + t * (hdy - ldy);
                                 finite_acc += (v + dx) + dy;
-                                sp[j] = [v, dx, dy];
+                                slot.write_plane(plane, v, dx, dy);
                             }
                         }
                     }
@@ -1500,9 +1478,8 @@ impl PyramidView<'_> {
                         need_fallback = true;
                         break;
                     }
-                    for (j, &qi) in sub.iter().enumerate() {
-                        sample.load_from_soa_lane(&soa, j);
-                        if on_sample(chunk_base + qi as usize, &sample).is_err() {
+                    for (slot, &qi) in samples[..n].iter().zip(sub) {
+                        if on_sample(chunk_base + qi as usize, slot).is_err() {
                             need_fallback = true;
                             break;
                         }
@@ -1551,10 +1528,8 @@ impl PyramidView<'_> {
                     }
                     let mut finite_acc = 0.0_f64;
                     if all_exact_recip {
-                        for (plane, soa_plane) in soa.iter_mut().enumerate() {
-                            let sp = &mut soa_plane[..n];
-                            for j in 0..n {
-                                let pc = &sub_coarse[j];
+                        for plane in 0..P {
+                            for (pc, slot) in sub_coarse[..n].iter().zip(&mut samples[..n]) {
                                 let lo = &pc.lo;
                                 let c = &lo.corners;
                                 let lb = plane * lo.cells;
@@ -1586,18 +1561,16 @@ impl PyramidView<'_> {
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
                                     finite_acc += (v + dx) + dy;
-                                    sp[j] = [v, dx, dy];
+                                    slot.write_plane(plane, v, dx, dy);
                                 } else {
                                     finite_acc += (lv + ldx) + ldy;
-                                    sp[j] = [lv, ldx, ldy];
+                                    slot.write_plane(plane, lv, ldx, ldy);
                                 }
                             }
                         }
                     } else {
-                        for (plane, soa_plane) in soa.iter_mut().enumerate() {
-                            let sp = &mut soa_plane[..n];
-                            for j in 0..n {
-                                let pc = &sub_coarse[j];
+                        for plane in 0..P {
+                            for (pc, slot) in sub_coarse[..n].iter().zip(&mut samples[..n]) {
                                 let lo = &pc.lo;
                                 let c = &lo.corners;
                                 let lb = plane * lo.cells;
@@ -1629,10 +1602,10 @@ impl PyramidView<'_> {
                                     let dx = ldx + t * (hdx - ldx);
                                     let dy = ldy + t * (hdy - ldy);
                                     finite_acc += (v + dx) + dy;
-                                    sp[j] = [v, dx, dy];
+                                    slot.write_plane(plane, v, dx, dy);
                                 } else {
                                     finite_acc += (lv + ldx) + ldy;
-                                    sp[j] = [lv, ldx, ldy];
+                                    slot.write_plane(plane, lv, ldx, ldy);
                                 }
                             }
                         }
@@ -1641,9 +1614,8 @@ impl PyramidView<'_> {
                         need_fallback = true;
                         break;
                     }
-                    for (j, &qi) in sub.iter().enumerate() {
-                        sample.load_from_soa_lane(&soa, j);
-                        if on_sample(chunk_base + qi as usize, &sample).is_err() {
+                    for (slot, &qi) in samples[..n].iter().zip(sub) {
+                        if on_sample(chunk_base + qi as usize, slot).is_err() {
                             need_fallback = true;
                             break;
                         }
@@ -1878,7 +1850,7 @@ impl PyramidView<'_> {
 trait SampleSlot<const P: usize>: Copy {
     const ZERO: Self;
 
-    fn load_from_soa_lane<const N: usize>(&mut self, soa: &[[[f64; 3]; N]; P], lane: usize);
+    fn write_plane(&mut self, plane: usize, value: f64, dx: f64, dy: f64);
 }
 
 impl SampleSlot<PLANES> for RawSample {
@@ -1888,16 +1860,11 @@ impl SampleSlot<PLANES> for RawSample {
         dy: [0.0; PLANES],
     };
 
-    #[inline]
-    fn load_from_soa_lane<const N: usize>(&mut self, soa: &[[[f64; 3]; N]; PLANES], lane: usize) {
-        if lane < N {
-            for plane in 0..PLANES {
-                let [v, dx, dy] = soa[plane][lane];
-                self.values[plane] = v;
-                self.dx[plane] = dx;
-                self.dy[plane] = dy;
-            }
-        }
+    #[inline(always)]
+    fn write_plane(&mut self, plane: usize, value: f64, dx: f64, dy: f64) {
+        self.values[plane] = value;
+        self.dx[plane] = dx;
+        self.dy[plane] = dy;
     }
 }
 
@@ -1908,20 +1875,11 @@ impl SampleSlot<MAX_PLANES> for DualRawSample {
         dy: [0.0; MAX_PLANES],
     };
 
-    #[inline]
-    fn load_from_soa_lane<const N: usize>(
-        &mut self,
-        soa: &[[[f64; 3]; N]; MAX_PLANES],
-        lane: usize,
-    ) {
-        if lane < N {
-            for plane in 0..MAX_PLANES {
-                let [v, dx, dy] = soa[plane][lane];
-                self.values[plane] = v;
-                self.dx[plane] = dx;
-                self.dy[plane] = dy;
-            }
-        }
+    #[inline(always)]
+    fn write_plane(&mut self, plane: usize, value: f64, dx: f64, dy: f64) {
+        self.values[plane] = value;
+        self.dx[plane] = dx;
+        self.dy[plane] = dy;
     }
 }
 

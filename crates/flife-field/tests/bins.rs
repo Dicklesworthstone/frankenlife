@@ -1571,3 +1571,104 @@ fn sample_batch_single_macro_tile_fine_strip_sort_matches_scalar_bit_for_bit() {
         );
     }
 }
+
+/// Large-grid parallel `apply_grants_on` (parallel debit verification +
+/// F64 ratio precompute + 4-plane × cell-band moment scaling) must match
+/// single-threaded `apply_grants` bit-for-bit across worker counts, keep
+/// `Grants::allocated()` unchanged, and refuse stale cells cleanly without
+/// mutating any plane.
+#[test]
+fn apply_grants_parallel_band_groups_match_serial_bit_for_bit() {
+    let g = grid(128, 128);
+    let mut base = field(g, 31415);
+    // Mix drained, scaled, and zero-grant (tiny demand < half quantum) cells.
+    let mut rng = lcg(27182);
+    let mut demands = Vec::with_capacity(12_000);
+    for i in 0..12_000_u64 {
+        let pos = [
+            rng() * f64::from(g.cells_x()),
+            rng() * f64::from(g.cells_y()),
+        ];
+        let amount = match i % 5 {
+            0 => 1.0e-12, // below half quantum -> granted == 0.0 debit
+            1 => 25.0,    // contends and drains cells -> ratio == 0.0
+            _ => 0.05 + rng() * 0.4,
+        };
+        demands.push(Demand {
+            organism: OrganismId::new(i + 1),
+            position: pos,
+            amount,
+        });
+    }
+    // Also force a few exact zero-energy cells so zero-grant debits are covered.
+    for c in (0..16_384).step_by(97) {
+        base.energy_mut()[c] = 0.0;
+    }
+
+    let limits = BufferLimits::host();
+    let mut serial_grants = Grants::with_capacity(&g, demands.len() as u64, &limits).expect("cap");
+    let expected_summary = resolve_uptake(&base, &demands, &mut serial_grants).expect("resolve");
+    assert!(
+        serial_grants.debits().len() >= 4_096,
+        "test must exercise parallel apply_grants_on threshold (got {})",
+        serial_grants.debits().len()
+    );
+    let mut serial_field = base.clone();
+    let serial_applied = apply_grants(&mut serial_field, &mut serial_grants).expect("apply 1");
+    assert_eq!(serial_applied.to_bits(), expected_summary.granted.to_bits());
+
+    for workers in [2, 4, 8] {
+        let mut grants = Grants::with_capacity(&g, demands.len() as u64, &limits).expect("cap");
+        let alloc_before = grants.allocated();
+        let summary = resolve_uptake_on_workers(&base, &demands, &mut grants, workers)
+            .expect("resolve parallel");
+        assert_eq!(
+            summary.granted.to_bits(),
+            expected_summary.granted.to_bits()
+        );
+        let mut state = base.clone();
+        let applied = apply_grants_on(&mut state, &mut grants, workers).expect("apply parallel");
+        assert_eq!(
+            applied.to_bits(),
+            serial_applied.to_bits(),
+            "workers={workers}"
+        );
+        assert_eq!(
+            grants.allocated(),
+            alloc_before,
+            "workers={workers}: allocated"
+        );
+        assert_eq!(
+            planes(&state),
+            planes(&serial_field),
+            "workers={workers}: field differs from serial"
+        );
+    }
+
+    // Stale cell mismatch must be detected in canonical ascending cell order
+    // before mutating a single element of `field`.
+    let mut stale_grants = Grants::with_capacity(&g, demands.len() as u64, &limits).expect("cap");
+    resolve_uptake_on_workers(&base, &demands, &mut stale_grants, 4).expect("resolve stale");
+    let first_bad_cell = stale_grants.debits()[123].cell;
+    let later_bad_cell = stale_grants.debits()[3_500].cell;
+    let mut stale_field = base.clone();
+    stale_field.energy_mut()[first_bad_cell] += 0.5;
+    stale_field.energy_mut()[later_bad_cell] += 0.5;
+    let snapshot_before = planes(&stale_field);
+    let err = apply_grants_on(&mut stale_field, &mut stale_grants, 8)
+        .expect_err("stale cell must be refused");
+    match err {
+        CoreError::StateConflict { detail, .. } => {
+            assert!(
+                detail.contains(&format!("cell {first_bad_cell} holds")),
+                "must report lowest-index mismatched cell {first_bad_cell}, got: {detail}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(
+        planes(&stale_field),
+        snapshot_before,
+        "failed apply_grants_on must not mutate field"
+    );
+}

@@ -1182,3 +1182,185 @@ fn simd_4_lane_exp_expm1_tanh_sigmoid_and_tanh_f32_4_match_scalar_bit_for_bit() 
         check_tanh_f32_4(f32s);
     }
 }
+
+#[test]
+fn branchless_add_down_and_sub_down_match_reference_twosum_bit_for_bit() {
+    use flife_core::ledger::{add_down, sub_down};
+
+    let ref_add_down = |a: f64, b: f64| -> f64 {
+        let sum = a + b;
+        let b_part = sum - a;
+        let a_part = sum - b_part;
+        let error = (a - a_part) + (b - b_part);
+        if error < 0.0 { sum.next_down() } else { sum }
+    };
+    let assert_same = |label: &str, got: f64, want: f64| {
+        if want.is_nan() {
+            assert!(got.is_nan(), "{label}: expected NaN, got {got:?}");
+        } else {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{label}: got {got:e} ({:#018x}) != want {want:e} ({:#018x})",
+                got.to_bits(),
+                want.to_bits()
+            );
+        }
+    };
+
+    let edges = [
+        0.0_f64,
+        -0.0,
+        f64::from_bits(1),
+        -f64::from_bits(1),
+        f64::MIN_POSITIVE,
+        -f64::MIN_POSITIVE,
+        1.0e-300,
+        -1.0e-300,
+        1.0e-16,
+        -1.0e-16,
+        1.0,
+        -1.0,
+        1.0_f64.next_up(),
+        -1.0_f64.next_up(),
+        1.0e16,
+        -1.0e16,
+        f64::MAX,
+        -f64::MAX,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    for &a in &edges {
+        for &b in &edges {
+            assert_same("add_down edge", add_down(a, b), ref_add_down(a, b));
+            assert_same("sub_down edge", sub_down(a, b), ref_add_down(a, -b));
+            assert_same("add_up edge", -add_down(-a, -b), -ref_add_down(-a, -b));
+        }
+    }
+
+    let mut state = 0x5EED_ADD0_D00D_1234_u64;
+    let mut next_u64 = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        state
+    };
+    let mut draw = || {
+        let r = next_u64();
+        let sign = if r & 1 == 0 { 1.0 } else { -1.0 };
+        match (r >> 1) & 15 {
+            0 => sign * f64::from_bits(1 + ((r >> 5) & 0xfff)), // subnormal
+            1 => sign * 0.0,
+            _ => {
+                let exp = ((r >> 5) % 2000) as i32 - 1000;
+                let frac = ((r >> 16) as f64) / ((1_u64 << 48) as f64);
+                sign * (1.0 + frac) * 2.0_f64.powi(exp)
+            }
+        }
+    };
+    for _ in 0..20_000 {
+        let a = draw();
+        let b = draw();
+        assert_same("add_down rand", add_down(a, b), ref_add_down(a, b));
+        assert_same("sub_down rand", sub_down(a, b), ref_add_down(a, -b));
+        assert_same("add_up rand", -add_down(-a, -b), -ref_add_down(-a, -b));
+    }
+}
+
+#[test]
+fn tanh_4_homogeneous_and_mixed_regimes_match_scalar_bit_for_bit() {
+    let check = |xs: [f64; 4]| {
+        let want = [tanh(xs[0]), tanh(xs[1]), tanh(xs[2]), tanh(xs[3])];
+        let want_opt = if want.iter().all(Option::is_some) {
+            Some([
+                want[0].expect("some").to_bits(),
+                want[1].expect("some").to_bits(),
+                want[2].expect("some").to_bits(),
+                want[3].expect("some").to_bits(),
+            ])
+        } else {
+            None
+        };
+        assert_eq!(
+            tanh_4(xs).map(|v| v.map(f64::to_bits)),
+            want_opt,
+            "tanh_4({xs:?})"
+        );
+    };
+
+    let ln2_half = 0.5 * core::f64::consts::LN_2;
+    for xs in [
+        // Homogeneous `[1, 20)` fast path (both signs + exact boundary neighbors)
+        [1.0, -1.0, 19.999_999_999, -19.999_999_999],
+        [1.0_f64.next_up(), -2.5, 10.0, 20.0_f64.next_down()],
+        // Homogeneous `[ln(2)/2, 1)` fast path
+        [
+            ln2_half,
+            -ln2_half,
+            1.0_f64.next_down(),
+            -(1.0_f64.next_down()),
+        ],
+        [0.4, -0.5, 0.75, -0.999_999],
+        // Homogeneous `|x| < ln(2)/2` including `±0.0` and smallest subnormal
+        [0.0, -0.0, f64::from_bits(1), -f64::from_bits(1)],
+        [
+            ln2_half.next_down(),
+            -ln2_half.next_down(),
+            0.03125,
+            -0.03125,
+        ],
+        // Mixed `tanh_4_large` exp_ok fast path: `{±0.0} ∪ [ln(2)/2, ∞)`
+        [0.0, -0.0, 20.0, -25.0],
+        [0.0, -ln2_half, 1.0, -20.0],
+        [-0.0, 0.8, -1.5, 19.5],
+        [20.0, -20.0, 100.0, -100.0],
+        // Mixed `tanh_4_large` scalar fallback (small nonzero + large)
+        [f64::from_bits(1), 1.5, -0.1, 25.0],
+        [-0.01, -0.0, 5.0, -20.0],
+    ] {
+        check(xs);
+    }
+
+    let mut state = 0x7A44_4444_BEEF_9999_u64;
+    let next_u64 = |s: &mut u64| {
+        *s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *s
+    };
+    let unit = |s: &mut u64| ((next_u64(s) >> 11) as f64) / ((1_u64 << 53) as f64);
+    let sign = |s: &mut u64| if next_u64(s) & 1 == 0 { 1.0 } else { -1.0 };
+
+    for _ in 0..5_000 {
+        // Regime A: all in `[1.0, 20.0)`
+        let a = [
+            sign(&mut state) * (1.0 + unit(&mut state) * 19.0),
+            sign(&mut state) * (1.0 + unit(&mut state) * 19.0),
+            sign(&mut state) * (1.0 + unit(&mut state) * 19.0),
+            sign(&mut state) * (1.0 + unit(&mut state) * 19.0),
+        ];
+        check(a);
+        // Regime B: all in `[ln(2)/2, 1.0)`
+        let span = 1.0 - ln2_half;
+        let b = [
+            sign(&mut state) * (ln2_half + unit(&mut state) * span),
+            sign(&mut state) * (ln2_half + unit(&mut state) * span),
+            sign(&mut state) * (ln2_half + unit(&mut state) * span),
+            sign(&mut state) * (ln2_half + unit(&mut state) * span),
+        ];
+        check(b);
+        // Regime C: mixed across `{±0.0}`, `[ln(2)/2, 1.0)`, `[1.0, 20.0)`, `[20.0, 40.0)`
+        let mut c = [0.0; 4];
+        for slot in &mut c {
+            let s = sign(&mut state);
+            *slot = match next_u64(&mut state) & 3 {
+                0 => s * 0.0,
+                1 => s * (ln2_half + unit(&mut state) * span),
+                2 => s * (1.0 + unit(&mut state) * 19.0),
+                _ => s * (20.0 + unit(&mut state) * 20.0),
+            };
+        }
+        check(c);
+    }
+}

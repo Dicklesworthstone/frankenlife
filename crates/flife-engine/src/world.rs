@@ -867,6 +867,18 @@ impl Rules {
     }
 }
 
+/// Precomputed Phase-6 chemistry settlement and post-chemistry budget for one organism.
+type PrecomputedUptake = (UptakeSettlement, EnergyBudget);
+
+/// Spatial macro-tile order and precomputed Phase-6 chemistry scratch handed to
+/// [`settle::settle_with`].
+struct SpatialSettle<'a> {
+    rows: &'a [u32],
+    row_to_spatial: &'a [u32],
+    tile_offsets: &'a [usize; SPATIAL_TILES + 1],
+    uptake: &'a mut Vec<PrecomputedUptake>,
+}
+
 /// Reusable per-tick buffers (§9.4). Their contents never outlive the
 /// candidate that wrote them, except the survivors and deaths, which a
 /// candidate's publication reads.
@@ -890,6 +902,14 @@ struct Scratch {
     /// Pass 1/Pass 2 ran on the current tick; empty when `decisions` is in
     /// identity order.
     row_to_spatial: Vec<u32>,
+    /// Macro-tile prefix offsets into `spatial_rows` from the last spatial
+    /// Pass 1 (`[0; SPATIAL_TILES + 1]` when spatial Pass 1 did not run).
+    spatial_tile_offsets: [usize; SPATIAL_TILES + 1],
+    /// Precomputed Phase-6 chemistry settlements in spatial macro-tile order
+    /// (`spatial_pos -> (UptakeSettlement, EnergyBudget)`), reserved alongside
+    /// `spatial_rows` on large worlds (`0` bytes otherwise) so Phase-6
+    /// chemistry streams `compositions` inside L2-resident 1 MiB tiles.
+    spatial_uptake: Vec<(UptakeSettlement, EnergyBudget)>,
     /// One per CPU worker (`[execution] cpu_workers`).
     lanes: Vec<DecisionLane>,
     /// Pre-reserved dynamic work-stealing settle tiles for large multi-worker
@@ -2271,6 +2291,7 @@ impl World {
                 capacity_bytes(&scratch.decisions),
                 capacity_bytes(&scratch.spatial_rows),
                 capacity_bytes(&scratch.row_to_spatial),
+                capacity_bytes(&scratch.spatial_uptake),
                 capacity_bytes(&scratch.lanes),
                 capacity_bytes(&scratch.settle_tiles),
                 capacity_bytes(&scratch.sampled),
@@ -2942,6 +2963,8 @@ impl World {
             decisions,
             spatial_rows,
             row_to_spatial,
+            spatial_tile_offsets,
+            spatial_uptake,
             lanes,
             settle_tiles,
             sampled,
@@ -3132,6 +3155,7 @@ impl World {
             decisions,
             spatial_rows,
             row_to_spatial,
+            spatial_tile_offsets,
             lanes,
             controllers,
         )?;
@@ -3369,6 +3393,12 @@ impl World {
             observed,
             (by_demand, granted, grants.bins()),
             (compositions, packet_compositions),
+            SpatialSettle {
+                rows: spatial_rows,
+                row_to_spatial,
+                tile_offsets: spatial_tile_offsets,
+                uptake: spatial_uptake,
+            },
             from,
             watch.organism,
             working,
@@ -4596,13 +4626,14 @@ impl Scratch {
         })?;
         let uses_spatial_pass1 =
             rows >= SPATIAL_PASS1_MIN_ROWS && rules.grid.cell_count() >= SPATIAL_PASS1_MIN_CELLS;
-        let (spatial_rows, row_to_spatial) = if uses_spatial_pass1 {
+        let (spatial_rows, row_to_spatial, spatial_uptake) = if uses_spatial_pass1 {
             (
                 reserved(rows, "spatial pass1 rows")?,
                 reserved(rows, "spatial pass1 map")?,
+                reserved(rows, "spatial phase6 uptake")?,
             )
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
         Ok(Self {
             field,
@@ -4611,6 +4642,8 @@ impl Scratch {
             decisions: reserved(rows, "decisions")?,
             spatial_rows,
             row_to_spatial,
+            spatial_tile_offsets: [0; SPATIAL_TILES + 1],
+            spatial_uptake,
             lanes: lanes(worker_count, rules, !use_tiles)?,
             settle_tiles,
             sampled: Vec::with_capacity(sources),
@@ -6355,6 +6388,145 @@ fn fit_settle_tiles(
     Ok(())
 }
 
+/// Precompute Phase-6 chemistry settlements in 8×8 spatial macro-tile order
+/// reusing Pass 1's `spatial_rows` and `spatial_tile_offsets`. Each tile's
+/// deduplicated `compositions` working set is ~1 MiB (L2-resident) instead of
+/// randomly striding across the full 67 MiB table in identity order.
+///
+/// Any error clears `spatial_uptake` so [`settle_all`] executes chemistry in
+/// canonical ascending identity order and reports the exact first error.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "private Phase-6 spatial chemistry pre-pass taking the tick's grants, compositions, and spatial buffers"
+)]
+fn spatial_chemistry_prepass(
+    rules: &Rules,
+    population: &Population,
+    grants: (&Bins, &[GrantPacket], &[[f64; CHANNELS]], &[u32]),
+    working: &[Working],
+    workers: usize,
+    spatial_rows: &[u32],
+    row_to_spatial: &[u32],
+    spatial_tile_offsets: &[usize; SPATIAL_TILES + 1],
+    spatial_uptake: &mut Vec<(UptakeSettlement, EnergyBudget)>,
+) {
+    spatial_uptake.clear();
+    let ordered_slots = population.ordered_slots();
+    if workers <= 1
+        || working.is_empty()
+        || row_to_spatial.len() != working.len()
+        || spatial_rows.len() != working.len()
+        || spatial_tile_offsets[SPATIAL_TILES] != working.len()
+        || ordered_slots.len() != working.len()
+        || spatial_uptake.capacity() < working.len()
+        || rules.v2.affinity_rotation_enabled()
+        || rules.limits.affinity_norm() > rules.chemistry.affinity_norm_limit()
+        || !rules.exchange.is_grid_cic()
+    {
+        return;
+    }
+    let Ok(zero_budget) = EnergyBudget::new(0.0) else {
+        return;
+    };
+    let placeholder = (
+        UptakeSettlement {
+            absorbed: 0.0,
+            gain: 0.0,
+            toxicity: flife_core::ledger::Payment {
+                requested: 0.0,
+                paid: 0.0,
+            },
+        },
+        zero_budget,
+    );
+    set_len_reuse(spatial_uptake, working.len(), placeholder);
+
+    let (by_demand, granted, compositions, packet_compositions) = grants;
+    let max_sub_tile = working
+        .len()
+        .div_ceil(workers.saturating_mul(4))
+        .max(MINIMUM_ROWS_PER_LANE);
+    struct ChemTile<'a> {
+        row_indices: &'a [u32],
+        out: &'a mut [(UptakeSettlement, EnergyBudget)],
+    }
+    let mut tiles: Vec<ChemTile<'_>> = Vec::with_capacity(SPATIAL_TILES);
+    let mut rem_out = spatial_uptake.as_mut_slice();
+    for t in 0..SPATIAL_TILES {
+        let base = spatial_tile_offsets[t];
+        let end = spatial_tile_offsets[t + 1];
+        let count = end.saturating_sub(base);
+        if count == 0 {
+            continue;
+        }
+        let mut off = 0_usize;
+        while off < count {
+            let sub_len = (count - off).min(max_sub_tile);
+            let (out_head, out_tail) = rem_out.split_at_mut(sub_len);
+            rem_out = out_tail;
+            tiles.push(ChemTile {
+                row_indices: &spatial_rows[base + off..base + off + sub_len],
+                out: out_head,
+            });
+            off += sub_len;
+        }
+    }
+    let ok = flife_core::pool::try_parallel_tasks(
+        workers,
+        "phase 6 spatial chemistry",
+        &mut tiles,
+        |_, tile| {
+            let mut stack_packets = [(0.0_f64, 0_u32); PACKETS_PER_ORGANISM];
+            for (&row_u32, out_slot) in tile.row_indices.iter().zip(tile.out.iter_mut()) {
+                let row_idx = row_u32 as usize;
+                let organism = &working[row_idx];
+                let phys_slot = ordered_slots[row_idx] as usize;
+                if population.id_at_slot(phys_slot) != Some(organism.committed.id) {
+                    return Err(CoreError::StateConflict {
+                        operation: "read genome",
+                        detail: format!("{} slot mismatch", organism.committed.id),
+                    });
+                }
+                let (genome, _) = population.genome_and_arena_at_slot(phys_slot);
+                let genome = genome.ok_or_else(|| CoreError::StateConflict {
+                    operation: "read genome",
+                    detail: format!("{} has no genome", organism.committed.id),
+                })?;
+                let bucket = by_demand.bucket(row_idx);
+                if bucket.len() > PACKETS_PER_ORGANISM {
+                    return Err(CoreError::StateConflict {
+                        operation: "spatial chemistry prepass",
+                        detail: "bucket exceeded grid-cic packet count".to_owned(),
+                    });
+                }
+                let mut n = 0_usize;
+                for &at in bucket {
+                    let at = at as usize;
+                    if let (Some(packet), Some(&comp_idx)) =
+                        (granted.get(at), packet_compositions.get(at))
+                    {
+                        stack_packets[n] = (packet.granted, comp_idx);
+                        n += 1;
+                    }
+                }
+                let mut budget = organism.budget;
+                let settlement = rules.chemistry.settle_indexed_slice(
+                    genome.traits().affinity(),
+                    &stack_packets[..n],
+                    compositions,
+                    &mut budget,
+                )?;
+                *out_slot = (settlement, budget);
+            }
+            Ok(())
+        },
+    )
+    .is_ok();
+    if !ok {
+        spatial_uptake.clear();
+    }
+}
+
 /// Phases 6 and 7 for every working organism, on the lanes (or pre-reserved
 /// `settle_tiles` for large multi-worker `grid-cic-v1` worlds): each unit
 /// settles a contiguous identity-ordered run and keeps, in identity order, its
@@ -6370,6 +6542,7 @@ fn settle_all(
     rules: &Rules,
     population: &Population,
     grants: (&Bins, &[GrantPacket], &[[f64; CHANNELS]], &[u32]),
+    spatial_precomputed: (&[u32], &[(UptakeSettlement, EnergyBudget)]),
     from: Tick,
     watched: Option<OrganismId>,
     working: &mut [Working],
@@ -6377,6 +6550,10 @@ fn settle_all(
     settle_tiles: &mut Vec<SettleTileBuf>,
 ) -> Result<usize, CoreError> {
     let (by_demand, granted, compositions, packet_compositions) = grants;
+    let (row_to_spatial, spatial_uptake) = spatial_precomputed;
+    let use_precomputed = !spatial_uptake.is_empty()
+        && spatial_uptake.len() == working.len()
+        && row_to_spatial.len() == working.len();
     for lane in lanes.iter_mut() {
         lane.flows.clear();
         lane.emissions.clear();
@@ -6443,30 +6620,37 @@ fn settle_all(
                     .map(|first| population.ascending_from(first.committed.id));
                 let mut stack_packets = [(0.0_f64, 0_u32); PACKETS_PER_ORGANISM];
                 for (offset, organism) in sub_run.iter_mut().enumerate() {
-                    let bucket = by_demand.bucket(*start + offset);
-                    let packet_slice: &[(f64, u32)] = if bucket.len() <= PACKETS_PER_ORGANISM {
-                        let mut n = 0_usize;
-                        for &at in bucket {
-                            let at = at as usize;
-                            if let (Some(packet), Some(&comp_idx)) =
-                                (granted.get(at), packet_compositions.get(at))
-                            {
-                                stack_packets[n] = (packet.granted, comp_idx);
-                                n += 1;
-                            }
-                        }
-                        &stack_packets[..n]
+                    let row_idx = *start + offset;
+                    let precomputed_uptake: Option<PrecomputedUptake> =
+                        use_precomputed.then(|| spatial_uptake[row_to_spatial[row_idx] as usize]);
+                    let packet_slice: &[(f64, u32)] = if precomputed_uptake.is_some() {
+                        &[]
                     } else {
-                        packets.clear();
-                        for &at in bucket {
-                            let at = at as usize;
-                            if let (Some(packet), Some(&comp_idx)) =
-                                (granted.get(at), packet_compositions.get(at))
-                            {
-                                packets.push((packet.granted, comp_idx));
+                        let bucket = by_demand.bucket(row_idx);
+                        if bucket.len() <= PACKETS_PER_ORGANISM {
+                            let mut n = 0_usize;
+                            for &at in bucket {
+                                let at = at as usize;
+                                if let (Some(packet), Some(&comp_idx)) =
+                                    (granted.get(at), packet_compositions.get(at))
+                                {
+                                    stack_packets[n] = (packet.granted, comp_idx);
+                                    n += 1;
+                                }
                             }
+                            &stack_packets[..n]
+                        } else {
+                            packets.clear();
+                            for &at in bucket {
+                                let at = at as usize;
+                                if let (Some(packet), Some(&comp_idx)) =
+                                    (granted.get(at), packet_compositions.get(at))
+                                {
+                                    packets.push((packet.granted, comp_idx));
+                                }
+                            }
+                            packets.as_slice()
                         }
-                        packets.as_slice()
                     };
                     let genome = live
                         .as_mut()
@@ -6481,6 +6665,7 @@ fn settle_all(
                         parameters: parameter_count(&rules.catalog, genome)?,
                         packets: packet_slice,
                         compositions,
+                        precomputed_uptake,
                     };
                     let record =
                         (watched == Some(organism.committed.id)).then_some(&mut buf.transactions);
@@ -6520,30 +6705,37 @@ fn settle_all(
             .map(|first| population.ascending_from(first.committed.id));
         let mut stack_packets = [(0.0_f64, 0_u32); PACKETS_PER_ORGANISM];
         for (offset, organism) in run.iter_mut().enumerate() {
-            let bucket = by_demand.bucket(start + offset);
-            let packet_slice: &[(f64, u32)] = if bucket.len() <= PACKETS_PER_ORGANISM {
-                let mut n = 0_usize;
-                for &at in bucket {
-                    let at = at as usize;
-                    if let (Some(packet), Some(&comp_idx)) =
-                        (granted.get(at), packet_compositions.get(at))
-                    {
-                        stack_packets[n] = (packet.granted, comp_idx);
-                        n += 1;
-                    }
-                }
-                &stack_packets[..n]
+            let row_idx = start + offset;
+            let precomputed_uptake: Option<PrecomputedUptake> =
+                use_precomputed.then(|| spatial_uptake[row_to_spatial[row_idx] as usize]);
+            let packet_slice: &[(f64, u32)] = if precomputed_uptake.is_some() {
+                &[]
             } else {
-                packets.clear();
-                for &at in bucket {
-                    let at = at as usize;
-                    if let (Some(packet), Some(&comp_idx)) =
-                        (granted.get(at), packet_compositions.get(at))
-                    {
-                        packets.push((packet.granted, comp_idx));
+                let bucket = by_demand.bucket(row_idx);
+                if bucket.len() <= PACKETS_PER_ORGANISM {
+                    let mut n = 0_usize;
+                    for &at in bucket {
+                        let at = at as usize;
+                        if let (Some(packet), Some(&comp_idx)) =
+                            (granted.get(at), packet_compositions.get(at))
+                        {
+                            stack_packets[n] = (packet.granted, comp_idx);
+                            n += 1;
+                        }
                     }
+                    &stack_packets[..n]
+                } else {
+                    packets.clear();
+                    for &at in bucket {
+                        let at = at as usize;
+                        if let (Some(packet), Some(&comp_idx)) =
+                            (granted.get(at), packet_compositions.get(at))
+                        {
+                            packets.push((packet.granted, comp_idx));
+                        }
+                    }
+                    packets.as_slice()
                 }
-                packets.as_slice()
             };
             let genome = live
                 .as_mut()
@@ -6558,6 +6750,7 @@ fn settle_all(
                 parameters: parameter_count(&rules.catalog, genome)?,
                 packets: packet_slice,
                 compositions,
+                precomputed_uptake,
             };
             let record = (watched == Some(organism.committed.id)).then_some(&mut *transactions);
             settle_stages(
@@ -7048,6 +7241,7 @@ fn decide_with(
     decisions: &mut Vec<Decision>,
     spatial_rows: &mut Vec<u32>,
     row_to_spatial: &mut Vec<u32>,
+    spatial_tile_offsets: &mut [usize; SPATIAL_TILES + 1],
     lanes: &mut [DecisionLane],
     controllers: &mut Controllers,
 ) -> Result<(), CoreError> {
@@ -7061,6 +7255,7 @@ fn decide_with(
     } = controllers;
     let Some(device) = backend.as_deref_mut() else {
         row_to_spatial.clear();
+        *spatial_tile_offsets = [0; SPATIAL_TILES + 1];
         return decide_all(
             rules,
             population,
@@ -7085,6 +7280,7 @@ fn decide_with(
             decisions,
             spatial_rows,
             row_to_spatial,
+            spatial_tile_offsets,
             lanes,
             device,
             flat_inputs_f32,
@@ -7093,6 +7289,7 @@ fn decide_with(
         )
     } else {
         row_to_spatial.clear();
+        *spatial_tile_offsets = [0; SPATIAL_TILES + 1];
         decide_batched(
             rules,
             population,
@@ -7125,6 +7322,7 @@ fn decide_with(
             *backend = None;
             report.reference_ticks = report.reference_ticks.saturating_add(1);
             row_to_spatial.clear();
+            *spatial_tile_offsets = [0; SPATIAL_TILES + 1];
             decide_all(
                 rules,
                 population,
@@ -7140,6 +7338,7 @@ fn decide_with(
         Err(_) => {
             report.reference_ticks = report.reference_ticks.saturating_add(1);
             row_to_spatial.clear();
+            *spatial_tile_offsets = [0; SPATIAL_TILES + 1];
             decide_all(
                 rules,
                 population,
@@ -7851,6 +8050,7 @@ fn decide_batched_flat_f32(
     decisions: &mut Vec<Decision>,
     spatial_rows: &mut Vec<u32>,
     row_to_spatial: &mut Vec<u32>,
+    spatial_tile_offsets: &mut [usize; SPATIAL_TILES + 1],
     lanes: &mut [DecisionLane],
     device: &mut dyn ControllerBackend,
     flat_inputs_f32: &mut Vec<f32>,
@@ -7858,6 +8058,7 @@ fn decide_batched_flat_f32(
     flat_outputs: &mut FlatOutputs,
 ) -> Result<Batched, CoreError> {
     row_to_spatial.clear();
+    *spatial_tile_offsets = [0; SPATIAL_TILES + 1];
     for lane in lanes.iter_mut() {
         lane.due_offset = 0;
         lane.due_count = 0;
@@ -7986,6 +8187,7 @@ fn decide_batched_flat_f32(
                         quantity: "due controller jobs",
                     })?;
             }
+            *spatial_tile_offsets = tile_offsets;
             set_len_reuse(spatial_rows, rows.len(), 0);
             let mut cursor = [0_usize; SPATIAL_TILES];
             cursor.copy_from_slice(&tile_offsets[..SPATIAL_TILES]);
@@ -9191,6 +9393,7 @@ struct Reference<'a> {
     parameters: u32,
     packets: &'a [(f64, u32)],
     compositions: &'a [[f64; CHANNELS]],
+    precomputed_uptake: Option<(UptakeSettlement, EnergyBudget)>,
 }
 
 impl Stages for Reference<'_> {
@@ -9201,6 +9404,10 @@ impl Stages for Reference<'_> {
         organism: &Working,
         budget: &mut EnergyBudget,
     ) -> Result<UptakeSettlement, CoreError> {
+        if let Some((settlement, next_budget)) = self.precomputed_uptake {
+            *budget = next_budget;
+            return Ok(settlement);
+        }
         let h0 = organism.held.recurrent_state_array()[0];
         if (!rules.v2.affinity_rotation_enabled() || h0 == 0.0)
             && rules.limits.affinity_norm() <= rules.chemistry.affinity_norm_limit()

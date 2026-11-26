@@ -293,16 +293,12 @@ impl SourceKernel {
                             }
                             fallback
                         };
-                        for lane in 0..4 {
-                            let idx = batch_idx[lane];
-                            let weight = weights[lane];
-                            cell_indices.push(idx);
-                            cell_weights.push(weight);
-                            if idx > *max_cell {
-                                *max_cell = idx;
-                            }
-                            *weight_sum += weight;
-                        }
+                        cell_indices.extend_from_slice(&batch_idx);
+                        cell_weights.extend_from_slice(&weights);
+                        *weight_sum += weights[0];
+                        *weight_sum += weights[1];
+                        *weight_sum += weights[2];
+                        *weight_sum += weights[3];
                         batch_len = 0;
                     }
                 }
@@ -315,14 +311,13 @@ impl SourceKernel {
                         detail: format!("|d|² = {distance_squared:?} has no weight"),
                     }
                 })?;
-                let idx = batch_idx[lane];
-                cell_indices.push(idx);
+                cell_indices.push(batch_idx[lane]);
                 cell_weights.push(weight);
-                if idx > *max_cell {
-                    *max_cell = idx;
-                }
                 *weight_sum += weight;
             }
+            // `rows` and `columns` are strictly ascending, so `cell_indices`
+            // is strictly ascending and its last element is the maximum cell.
+            *max_cell = cell_indices.last().copied().unwrap_or(0);
         }
         if cell_indices.is_empty() || *weight_sum <= 0.0 || !weight_sum.is_finite() {
             return Err(CoreError::NumericalInvalid {
@@ -536,9 +531,28 @@ fn axis_candidates(
     // |low|, |high| < 2^52 < i64::MAX, so both casts are exact and never saturate.
     let (low, high) = (low as i64, high as i64);
     let modulus = i64::from(cells);
-    out.extend((low..=high).filter_map(|index| u32::try_from(index.rem_euclid(modulus)).ok()));
-    out.sort_unstable();
-    out.dedup();
+    if low > high {
+        return true;
+    }
+    if high - low + 1 >= modulus {
+        out.extend(0..cells);
+        return true;
+    }
+    // Since `0 <= high - low < cells`, `low..=high` maps bijectively onto
+    // either one contiguous range `[lo..=hi]` or two sorted wrapped ranges
+    // `[0..=hi]` followed by `[lo..cells]` — already strictly ascending and
+    // duplicate-free without per-cell modulo or sorting.
+    if let (Ok(lo), Ok(hi)) = (
+        u32::try_from(low.rem_euclid(modulus)),
+        u32::try_from(high.rem_euclid(modulus)),
+    ) {
+        if lo <= hi {
+            out.extend(lo..=hi);
+        } else {
+            out.extend(0..=hi);
+            out.extend(lo..cells);
+        }
+    }
     true
 }
 

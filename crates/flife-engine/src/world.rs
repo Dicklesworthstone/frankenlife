@@ -8498,7 +8498,7 @@ fn pass1_flat_f32<'p>(
                 dst[obs_width..input_width].copy_from_slice(&prev[..state_width]);
             }
         }
-        *finite_slot = u8::from(dst.iter().all(|v| v.is_finite()));
+        *finite_slot = u8::from(all_f32_finite(dst));
     };
 
     let build_job = |organism: &Organism,
@@ -8858,6 +8858,28 @@ fn pass1_flat_f32<'p>(
     Ok(())
 }
 
+/// Branchless IEEE-754 finiteness check over an F32 slice (`v.is_finite()`
+/// iff exponent bits `0x7F80_0000` are not all 1), structured in 4-lane chunks
+/// so LLVM emits NEON `and.4s` / `cmeq.4s` / `orr.16b` instead of 104 scalar
+/// short-circuiting branches per organism.
+#[inline(always)]
+fn all_f32_finite(values: &[f32]) -> bool {
+    const EXP_MASK: u32 = 0x7F80_0000;
+    let mut bad = [0_u32; 4];
+    let (chunks, rem) = values.as_chunks::<4>();
+    for c in chunks {
+        bad[0] |= u32::from((c[0].to_bits() & EXP_MASK) == EXP_MASK);
+        bad[1] |= u32::from((c[1].to_bits() & EXP_MASK) == EXP_MASK);
+        bad[2] |= u32::from((c[2].to_bits() & EXP_MASK) == EXP_MASK);
+        bad[3] |= u32::from((c[3].to_bits() & EXP_MASK) == EXP_MASK);
+    }
+    let mut any_bad = (bad[0] | bad[1]) | (bad[2] | bad[3]);
+    for &v in rem {
+        any_bad |= u32::from((v.to_bits() & EXP_MASK) == EXP_MASK);
+    }
+    any_bad == 0
+}
+
 /// Spatial-tile counterpart to [`pass1_flat_f32`]: processes organisms belonging
 /// to one 8×8 spatial macro-tile (via `row_indices`) with O(1) physical-slot
 /// lookup through `population.ordered_slots()`, keeping each 512-query pyramid
@@ -8924,7 +8946,7 @@ fn pass1_flat_f32_spatial<'p>(
                 dst[obs_width..input_width].copy_from_slice(&prev[..state_width]);
             }
         }
-        *finite_slot = u8::from(dst.iter().all(|v| v.is_finite()));
+        *finite_slot = u8::from(all_f32_finite(dst));
     };
 
     let build_job = |organism: &Organism,
@@ -9081,7 +9103,11 @@ fn pass1_flat_f32_spatial<'p>(
                         base_arr,
                         &mut dec.gradients,
                     )?;
-                    finish_due_row(dst, &mut chunk_in_fin[d], row_idx, organism, None);
+                    if needs_expanded {
+                        finish_due_row(dst, &mut chunk_in_fin[d], row_idx, organism, None);
+                    } else {
+                        chunk_in_fin[d] = u8::from(all_f32_finite(dst));
+                    }
                     chunk_jobs[d] = Some(build_job(organism, genome, slot)?);
                     // Pass 2 overwrites `dec.held` for every evaluated organism.
                     dec.evaluated = true;
@@ -11454,9 +11480,50 @@ fn settle_stages(
 
 #[cfg(test)]
 mod tests {
-    use super::compute_tile_compositions;
+    use super::{all_f32_finite, compute_tile_compositions};
     use flife_field::state::CHANNELS;
     use flife_field::{BufferLimits, FieldGrid, FieldState};
+
+    #[test]
+    fn all_f32_finite_matches_std_across_special_values_and_lengths() {
+        let valid = [
+            0.0_f32,
+            -0.0_f32,
+            1.0,
+            -1.0,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),           // smallest positive subnormal
+            f32::from_bits(0x8000_0001), // smallest negative subnormal
+            f32::MAX,
+            f32::MIN,
+        ];
+        let invalid = [
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::from_bits(0x7F80_0001), // signaling NaN +
+            f32::from_bits(0xFF80_0001), // signaling NaN -
+            f32::from_bits(0xFFFF_FFFF), // all-ones NaN
+        ];
+        for len in [0_usize, 1, 2, 3, 4, 5, 7, 8, 104, 107, 128] {
+            let mut buf: Vec<f32> = (0..len).map(|i| valid[i % valid.len()]).collect();
+            assert!(all_f32_finite(&buf), "len={len} all finite");
+            for &bad in &invalid {
+                for pos in [0, len / 2, len.saturating_sub(1)] {
+                    if pos < len {
+                        let prev = buf[pos];
+                        buf[pos] = bad;
+                        assert!(
+                            !all_f32_finite(&buf),
+                            "len={len} pos={pos} bad={:#x}",
+                            bad.to_bits()
+                        );
+                        buf[pos] = prev;
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn compute_tile_compositions_matches_scalar_across_contig_row_jumps_sparse_and_zero_energy() {

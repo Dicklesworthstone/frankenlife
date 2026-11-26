@@ -3483,17 +3483,23 @@ pub enum ControllerChoice {
 }
 
 /// The most CPU workers at which [`ControllerChoice::Auto`] takes Metal.
-/// Measured on an Apple M5 Ultra: Metal beats CPU/Torch at 1–4 workers
-/// (2.2x on 1 worker, 1.7x on 2, 1.3x on 4 on the preset), whereas with the
-/// flat-F32 `ControllerBackend::evaluate_flat_f32` path (`phase_profile`,
-/// bit-exact digests, 2026-11-23), [`ControllerChoice::Torch`] beats Metal at
-/// 8, 12 and 16 workers across every measured workload — Bundle A (~11k, 32
-/// ticks): `torch 28.87 / 25.17 / 23.76 ms/t` vs `metal 30.36 / 27.14 /
-/// 28.26 ms/t`; Bundle B (~18k, 32 ticks): `torch 31.73 / 27.74 / 27.49 ms/t`
-/// vs `metal 34.15 / 32.12 / 31.63 ms/t`; Confluent 65k (65,536 -> 69,463,
-/// F16, 8 ticks): `torch 152.42 / 132.64 / 120.51 ms/t` vs `metal 176.95 /
-/// 154.39 / 160.56 ms/t`.
-pub const AUTO_METAL_MAX_WORKERS: usize = 4;
+/// Measured on an Apple M5 Ultra with AoSoA F16 + minimax `[7/8]` `tanh`
+/// (`6980c2f`, `7c69013`) and Phase 5–6 CPU↔GPU overlap (`99962d9`,
+/// `tick_throughput`, bit-exact digests across all 11 workloads, 2026-11-26):
+/// Metal beats both scalar CPU and [`ControllerChoice::Torch`] across 1–16
+/// workers on every measured preset — at 16 workers:
+/// `reference-small-world` (4k): `214.94 vs 187.72 t/s` (`1.15×`),
+/// `morphogenesis-tissue-v2` (3.9k): `67.82 vs 51.65` (`1.31×`),
+/// `supercolony-v2` (12k): `50.97 vs 39.16` (`1.30×`),
+/// `interactive-world` (25k): `77.69 vs 43.97` (`1.77×`),
+/// `confluent-world` (11.9k): `45.73 vs 39.32` (`1.16×`),
+/// `desktop-world` (100k): `21.81 vs 15.58` (`1.40×`),
+/// `desktop-multirate-4t` (100k, K=4): `17.78 vs 17.02` (`1.04×`);
+/// and at 8 workers: `interactive` `73.48 vs 44.61` (`1.65×`),
+/// `desktop` `12.90 vs 10.16` (`1.27×`). Note: measured on a shared host
+/// (indicative under load rather than a quiet-host <=5% CV gate), with
+/// `AUTO_METAL_MAX_WORKERS = 16` matching the default `AUTO_WORKER_CEILING`.
+pub const AUTO_METAL_MAX_WORKERS: usize = 16;
 
 /// The most CPU workers at which [`ControllerChoice::Auto`] takes
 /// FrankenTorch's CPU route where it does not take Metal (FL-025). With

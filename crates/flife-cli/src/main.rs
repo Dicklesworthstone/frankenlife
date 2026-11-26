@@ -149,7 +149,7 @@ enum Command {
         /// Where due controllers are evaluated: `metal`, `cpu` (the
         /// reference), `torch` (FrankenTorch's CPU kernel on the world's
         /// workers), or `auto` for Metal where this host has it and the
-        /// world uses at most 4 CPU workers, else `torch` at most 64 or, on
+        /// world uses at most 16 CPU workers, else `torch` at most 64 or, on
         /// Apple silicon, for a world of at least 25,000 organisms (where
         /// each measured faster), else the reference. No result depends on
         /// it.
@@ -495,7 +495,7 @@ enum Command {
         #[arg(long, default_value = "auto", value_parser = parse_workers)]
         cpu_workers: NonZeroUsize,
         /// Where due controllers are evaluated: `metal`, `cpu`, `torch`, or
-        /// `auto` (Metal at most 4 CPU workers, else `torch` at most 64 or,
+        /// `auto` (Metal at most 16 CPU workers, else `torch` at most 64 or,
         /// on Apple silicon, from 25,000 organisms). No result depends on it.
         #[arg(long, default_value = "auto")]
         controllers: ControllerChoice,

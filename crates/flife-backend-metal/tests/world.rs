@@ -521,10 +521,10 @@ fn auto_takes_metal_only_up_to_its_worker_ceiling() {
     let small = [
         (1, Metal, Torch),
         (2, Metal, Torch),
+        (8, Metal, Torch),
         (AUTO_METAL_MAX_WORKERS, Metal, Torch),
         (AUTO_METAL_MAX_WORKERS + 1, Torch, Torch),
-        (8, Torch, Torch),
-        (16, Torch, Torch),
+        (32, Torch, Torch),
         (AUTO_TORCH_MAX_WORKERS, Torch, Torch),
         (AUTO_TORCH_MAX_WORKERS + 1, Cpu, Cpu),
         (128, Cpu, Cpu),

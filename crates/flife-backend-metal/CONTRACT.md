@@ -173,11 +173,12 @@ about 1–3% of the all-Metal tick (the whole tick's frontier and profile, below
   world hands each tick's due evaluations over in one batch (`ControllerJob` / `FlatControllerJob`: genome identity,
   arena slot, admitted controller, inputs). `ControllerChoice` (`cpu`, `torch`, `metal`, `auto`) is what the CLI and
   Studio select it with (`torch` is `flife-backend-cpu`'s `CpuBackend` on the world's workers, on any host):
-  `backend(cpu_workers, organisms, budget)` gives `auto` Metal only on a host with a device and at most
-  `AUTO_METAL_MAX_WORKERS` = 4 workers, where Metal measured faster (1–4 workers on M5 Ultra). Above 4 workers, or
-  without a Metal device, `auto` selects `torch` up to `AUTO_TORCH_MAX_WORKERS` = 64 workers (measured faster than
-  both scalar CPU reference and Metal across 8, 12, and 16 workers on Bundle A ~11k, Bundle B ~18k, and Confluent
-  65k with `evaluate_flat_f32` on M5 Ultra, 2026-11-23).
+  `backend(cpu_workers, organisms, budget)` gives `auto` Metal on a host with a device and at most
+  `AUTO_METAL_MAX_WORKERS` = 16 workers, matching the default `AUTO_WORKER_CEILING` (after AoSoA F16 + minimax
+  `[7/8]` `tanh` + Phase 5–6 CPU↔GPU overlap, Metal measured faster than both scalar CPU and `torch` across 1–16
+  workers on all tested presets on Apple M5 Ultra, 2026-11-26: 1.04×–1.77× over `torch` at 16 workers, 1.27×–1.65×
+  at 8 workers, bit-exact digests; shared-host measurements). Above 16 workers, or without a Metal device, `auto`
+  selects `torch` up to `AUTO_TORCH_MAX_WORKERS` = 64 workers.
 - On Apple silicon (`TORCH_AT_SCALE`, a build for macOS on aarch64) it also takes `torch` on any number of workers
   for a world of at least `AUTO_TORCH_MIN_ORGANISMS` = 25,000 organisms, counted live when its controllers are
   chosen. There the controllers are most of the tick.

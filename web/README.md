@@ -42,7 +42,9 @@ below 640 px the Studio's keyboard splits in two halves, which is what keeps its
 With WCAG 1.4.12's text spacing forced on (letters 0.12em, words 0.16em, lines 1.5), no text overlaps
 or is cut off at 390, 768 or 1,440 px, so a label wraps rather than truncating with an ellipsis, and a
 heading's long word may break; at 320 px only the life cycle's "Sense" and "Divide" reach past the ring's
-drawing, by 5 and 7 px.
+drawing, by 5 and 7 px. Anything that moves by itself for more than five seconds has a control that
+stops it (the films, the life cycle, the brain's flowing connections), and stands still under reduced
+motion.
 
 ## The explainers
 

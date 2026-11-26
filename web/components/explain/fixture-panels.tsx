@@ -36,7 +36,7 @@ import {
   wrap,
 } from "@/components/explain/fixture-math";
 import { useFigureWidth, useReducedMotion } from "@/lib/hooks";
-import { LINEAGE, TONE } from "@/lib/palette";
+import { LINEAGE, TONE, VIOLET_TEXT } from "@/lib/palette";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -865,7 +865,7 @@ export function MixturePanel() {
             packet 1
           </text>
           {/* Left of the point, away from the "feeds"/"poisons" labels at the right, unless it is near the left edge. */}
-          <text x={p2[0] + (dot <= -0.2 ? 8 : -8)} y={p2[1] + (perUnit(dot) < 0 ? 18 : perUnit(dot) < 0.3 ? -10 : 18)} fontSize={11} textAnchor={dot <= -0.2 ? "start" : "end"} fill={LINEAGE[1]} {...HALO}>
+          <text x={p2[0] + (dot <= -0.2 ? 8 : -8)} y={p2[1] + (perUnit(dot) < 0 ? 18 : perUnit(dot) < 0.3 ? -10 : 18)} fontSize={11} textAnchor={dot <= -0.2 ? "start" : "end"} fill={VIOLET_TEXT} {...HALO}>
             packet 2
           </text>
           {/* Under the diamond, clear of the "poisons" label at the right even on a narrow phone; where the diamond sits on

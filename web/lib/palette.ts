@@ -20,6 +20,12 @@ export const LINEAGE = [
   "#C8B6FF", // lavender
 ] as const;
 
+/**
+ * The film's violet (LINEAGE[1]) as words: the violet itself is 4.9:1 on the ink and 3.8:1 on the lightest
+ * panel, under WCAG AA's 4.5:1 for small text; 85% violet and 15% white is 6.1:1 and 4.8:1.
+ */
+export const VIOLET_TEXT = "#aa75e9";
+
 /** The page's semantic colours for the diagrams: the rule, its plausible wrong version, energy, chemistry. */
 export const TONE = {
   rule: "#4ade80",

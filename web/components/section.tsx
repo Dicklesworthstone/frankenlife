@@ -3,13 +3,13 @@ import type { CSSProperties, ReactNode } from "react";
 import { GreenTitle, MicroLabel } from "@/components/franken";
 import { Reveal } from "@/components/reveal";
 import type { Chapter } from "@/lib/content";
-import { LINEAGE } from "@/lib/palette";
+import { LINEAGE, VIOLET_TEXT } from "@/lib/palette";
 import { cn } from "@/lib/utils";
 
 // A chapter's colour is also the colour of its kicker, numbers and figure eyebrows, so it has to read as text on
-// every panel (WCAG AA, 4.5:1). The film's violet (#9B5DE5) is 3.8:1 on the lightest panel; 85% violet and 15%
-// white is 4.8:1, and still the film's violet beside the dock's sphere (which keeps the exact colour).
-const TEXT_SAFE: Partial<Record<string, string>> = { "#9B5DE5": "#aa75e9" };
+// every panel (WCAG AA, 4.5:1): the film's violet takes its text step (VIOLET_TEXT), still the violet of the dock's
+// sphere beside it (which keeps the exact colour).
+const TEXT_SAFE: Partial<Record<string, string>> = { [LINEAGE[1]]: VIOLET_TEXT };
 const chapterColour = (chapter: Chapter) => {
   const colour = LINEAGE[chapter.colour % LINEAGE.length] ?? "#4ade80";
   return TEXT_SAFE[colour] ?? colour;

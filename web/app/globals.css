@@ -261,8 +261,13 @@ body::before {
   outline-offset: 2px;
 }
 
-/* The dock (below 1,024 px, components/site-header.tsx) keeps the page's last lines clear of itself. */
+/* The dock (below 1,024 px, components/site-header.tsx; 74 px tall, more over a home indicator) keeps the page's
+   last lines clear of itself, and a control that Tab brings into view stops above it, not under it (WCAG 2.4.11:
+   at 390 px, 21 of 234 stops landed under the dock). */
 @media (max-width: 1023px) {
+  html {
+    scroll-padding-bottom: calc(5.5rem + env(safe-area-inset-bottom));
+  }
   .dock-clearance {
     padding-bottom: calc(5.5rem + env(safe-area-inset-bottom));
   }

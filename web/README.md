@@ -120,6 +120,15 @@ loupe) waits for its lazy `<img>`. Measured on frankenlife.org on 2026-11-26, co
 each: the largest paint (the poster) now comes at 3.8 s on a 390 px phone under that throttling (10.1 s
 before), and at 1.1–1.2 s on a 1,024 or 1,440 px desktop over 10 Mbps with 40 ms round trips (3.0–3.1 s
 at 1,440 before; 1.5–1.8 s with the AVIF poster while the ladder's JPEG still came with the page).
+Safari's engine behaves the same, checked on the live site in headless WebKit (Playwright 1.65.1's build
+2388) at 390 and 1,440 px:
+- with the MP4 held back, the poster shows under the video, which is transparent until its first frame;
+- the film plays once its data comes;
+- a pause pressed before the poster arrives stays;
+- under reduced motion it loads its first frame without playing;
+- the ladder swaps to its JPEG once it is on screen.
+
+Firefox has not been checked.
 
 Three v2 films of denser worlds (`presets/morphogenesis-tissue-v2-dense.toml`,
 `presets/supercolony-v2-dense.toml`, rendered 2026-11-24) were taken down the same day: in motion they

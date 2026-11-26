@@ -230,7 +230,7 @@ impl HeldOutput {
 
     /// Overwrite `self` in place with variable-width stateless `outputs`
     /// (`ACTION_WIDTH..=MAX_ACTION_WIDTH`), avoiding a 280-byte stack temporary
-    /// and copy in hot controller decode loops.
+    /// and dead tail zeroing in hot controller decode loops.
     ///
     /// # Errors
     /// As [`HeldOutput::evaluated_slice`].
@@ -245,6 +245,37 @@ impl HeldOutput {
                 ),
             });
         }
+        let prev_out = usize::from(self.output_len);
+        let prev_state = usize::from(self.state_len);
+        if outputs.len() == ACTION_WIDTH
+            && let Some(src) = outputs.first_chunk::<ACTION_WIDTH>()
+        {
+            if let Some(index) = src.iter().position(|value| !value.is_finite()) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "held controller output",
+                    detail: format!("output {index} is {}", src[index]),
+                });
+            }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "ACTION_WIDTH (36) <= u8::MAX"
+            )]
+            {
+                self.output_len = ACTION_WIDTH as u8;
+            }
+            self.evaluated_at = Some(tick);
+            if let Some(dst) = self.outputs.first_chunk_mut::<ACTION_WIDTH>() {
+                *dst = *src;
+            }
+            if prev_out > ACTION_WIDTH {
+                self.outputs[ACTION_WIDTH..prev_out].fill(0.0);
+            }
+            if prev_state > 0 {
+                self.state_len = 0;
+                self.state[..prev_state].fill(0.0);
+            }
+            return Ok(());
+        }
         if let Some(index) = outputs.iter().position(|value| !value.is_finite()) {
             return Err(CoreError::NumericalInvalid {
                 quantity: "held controller output",
@@ -257,10 +288,52 @@ impl HeldOutput {
         self.evaluated_at = Some(tick);
         self.output_len = output_len;
         self.outputs[..outputs.len()].copy_from_slice(outputs);
-        self.outputs[outputs.len()..].fill(0.0);
-        self.state_len = 0;
-        self.state = [0.0; MAXIMUM_RECURRENT_STATE_WIDTH];
+        if prev_out > outputs.len() {
+            self.outputs[outputs.len()..prev_out].fill(0.0);
+        }
+        if prev_state > 0 {
+            self.state_len = 0;
+            self.state[..prev_state].fill(0.0);
+        }
         Ok(())
+    }
+
+    /// Copy `src` into `self`, moving only the active output/state prefix and
+    /// clearing any shrunk tail so the canonical zero-tail invariant holds
+    /// bit-for-bit without copying unused V2/recurrent slots on V1 worlds.
+    #[inline]
+    pub fn copy_active_from(&mut self, src: &Self) {
+        let prev_out = usize::from(self.output_len);
+        let prev_state = usize::from(self.state_len);
+        let src_out = usize::from(src.output_len);
+        let src_state = usize::from(src.state_len);
+        self.evaluated_at = src.evaluated_at;
+        self.output_len = src.output_len;
+        self.state_len = src.state_len;
+        if src_out == ACTION_WIDTH
+            && prev_out <= ACTION_WIDTH
+            && src_state == 0
+            && prev_state == 0
+            && let (Some(dst), Some(src_arr)) = (
+                self.outputs.first_chunk_mut::<ACTION_WIDTH>(),
+                src.outputs.first_chunk::<ACTION_WIDTH>(),
+            )
+        {
+            *dst = *src_arr;
+            return;
+        }
+        if src_out > 0 {
+            self.outputs[..src_out].copy_from_slice(&src.outputs[..src_out]);
+        }
+        if prev_out > src_out {
+            self.outputs[src_out..prev_out].fill(0.0);
+        }
+        if src_state > 0 {
+            self.state[..src_state].copy_from_slice(&src.state[..src_state]);
+        }
+        if prev_state > src_state {
+            self.state[src_state..prev_state].fill(0.0);
+        }
     }
 
     /// Overwrite `self` in place with variable-width `outputs` and bounded
@@ -757,7 +830,7 @@ impl Population {
                         tile.velocities[i] = organism.velocity;
                         tile.energies[i] = organism.energy;
                         tile.energy_change_rates[i] = organism.energy_change_rate;
-                        tile.held[i] = organism.held;
+                        tile.held[i].copy_active_from(&organism.held);
                         tile.cooldown_deadlines[i] = organism.cooldown_deadline;
                         if tracks_excitable {
                             tile.secretory_readiness[i] = organism.secretory_readiness;
@@ -797,7 +870,7 @@ impl Population {
             flife_core::pool::scope_workers(workers, "apply population tick", |scope| {
                 scope.spawn(move || {
                     for (&slot_u32, organism) in ordered_slots.iter().zip(survivors) {
-                        held[slot_u32 as usize] = organism.held;
+                        held[slot_u32 as usize].copy_active_from(&organism.held);
                     }
                 });
                 scope.spawn(move || {
@@ -856,7 +929,7 @@ impl Population {
                                 &mut cursor,
                                 organism.id,
                             ) {
-                                held[slot] = organism.held;
+                                held[slot].copy_active_from(&organism.held);
                             }
                         }
                     });
@@ -1543,7 +1616,7 @@ impl Population {
                     512,
                     |start, chunk| {
                         for (offset, dst) in chunk.iter_mut().enumerate() {
-                            *dst = self.read(start + offset);
+                            self.read_into(start + offset, dst);
                         }
                     },
                 )?;
@@ -1557,7 +1630,7 @@ impl Population {
                 512,
                 |start, chunk| {
                     for (offset, dst) in chunk.iter_mut().enumerate() {
-                        *dst = self.read(slots_slice[start + offset] as usize);
+                        self.read_into(slots_slice[start + offset] as usize, dst);
                     }
                 },
             )?;
@@ -2331,6 +2404,42 @@ impl Population {
         }
     }
 
+    /// Populate `dst` directly from column storage at `slot`, copying only the
+    /// active prefix of `HeldOutput` and avoiding a 432-byte stack temporary.
+    #[inline]
+    fn read_into(&self, slot: usize, dst: &mut Organism) {
+        dst.id = self.occupants[slot].unwrap_or(OrganismId::new(u64::MAX));
+        dst.genome = self.genome_ids[slot];
+        dst.parent = self.parents[slot];
+        dst.lineage = self.lineages[slot];
+        dst.generation = self.generations[slot];
+        dst.birth_tick = self.birth_ticks[slot];
+        dst.position = self.positions[slot];
+        dst.velocity = self.velocities[slot];
+        dst.energy = self.energies[slot];
+        dst.energy_change_rate = self.energy_change_rates[slot];
+        dst.held.copy_active_from(&self.held[slot]);
+        dst.phase = self.phases[slot];
+        dst.cooldown_deadline = self.cooldown_deadlines[slot];
+        if self.tracks_excitable {
+            dst.secretory_readiness = self.secretory_readiness[slot];
+            dst.emission_cooldown_deadline = self.emission_cooldown_deadlines[slot];
+        } else {
+            dst.secretory_readiness = INITIAL_SECRETORY_READINESS;
+            dst.emission_cooldown_deadline = Tick::new(0);
+        }
+        dst.polarity = if self.tracks_polarity {
+            self.polarities[slot]
+        } else {
+            DEFAULT_POLARITY
+        };
+        dst.last_neighbor_h0 = if self.tracks_notch_delta {
+            self.last_neighbor_h0[slot]
+        } else {
+            0.0
+        };
+    }
+
     /// Write only the mutable columns of `slot` for an existing live organism
     /// whose immutable lineage fields were already validated unchanged.
     #[inline]
@@ -2339,7 +2448,7 @@ impl Population {
         self.velocities[slot] = organism.velocity;
         self.energies[slot] = organism.energy;
         self.energy_change_rates[slot] = organism.energy_change_rate;
-        self.held[slot] = organism.held;
+        self.held[slot].copy_active_from(&organism.held);
         self.cooldown_deadlines[slot] = organism.cooldown_deadline;
         if self.tracks_excitable {
             self.secretory_readiness[slot] = organism.secretory_readiness;
@@ -2461,5 +2570,47 @@ impl Population {
         }
         self.genomes.truncate(length);
         self.arena_slots.truncate(length);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn held_output_copy_active_from_and_write_evaluated_slice_preserve_exact_zero_tails() {
+        // Start from a wider V2 recurrent HeldOutput with nonzero tail & state.
+        let wide_out = [1.25_f32; MAX_ACTION_WIDTH];
+        let full_state = [0.5_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
+        let wide = HeldOutput::evaluated_recurrent_slice(Tick::new(5), &wide_out, &full_state)
+            .expect("valid wide recurrent held");
+
+        // Copy wider -> narrower (V1) and verify exact PartialEq with fresh V1 HeldOutput.
+        let v1_vals = [0.75_f32; ACTION_WIDTH];
+        let v1 = HeldOutput::evaluated(Tick::new(6), v1_vals).expect("valid v1");
+        let mut dst = wide;
+        dst.copy_active_from(&v1);
+        assert_eq!(dst, v1);
+
+        // Copy V1 -> V1 (fast path) preserves exact equality.
+        let v1_next = HeldOutput::evaluated(Tick::new(7), [-0.25_f32; ACTION_WIDTH]).expect("v1b");
+        dst.copy_active_from(&v1_next);
+        assert_eq!(dst, v1_next);
+
+        // Copy V1 -> INVALID clears outputs and evaluated_at.
+        dst.copy_active_from(&HeldOutput::INVALID);
+        assert_eq!(dst, HeldOutput::INVALID);
+
+        // Copy INVALID -> wide recurrent restores everything cleanly.
+        dst.copy_active_from(&wide);
+        assert_eq!(dst, wide);
+
+        // Overwrite wide recurrent directly via write_evaluated_slice (V1 width).
+        dst.write_evaluated_slice(Tick::new(8), &v1_vals)
+            .expect("overwrite v1");
+        assert_eq!(
+            dst,
+            HeldOutput::evaluated(Tick::new(8), v1_vals).expect("expected v1")
+        );
     }
 }

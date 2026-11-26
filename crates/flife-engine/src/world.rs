@@ -3933,7 +3933,8 @@ impl World {
                                         out.energy = energy;
                                         out.energy_change_rate =
                                             (energy - committed.energy) * inv_dt;
-                                        out.held = organism.decision(decisions).held;
+                                        out.held
+                                            .copy_active_from(&organism.decision(decisions).held);
                                         out.phase = committed.phase;
                                         out.cooldown_deadline = organism.cooldown_deadline;
                                         out.secretory_readiness = organism.secretory_readiness;
@@ -3963,7 +3964,8 @@ impl World {
                                         out.energy = energy;
                                         out.energy_change_rate =
                                             (energy - committed.energy) / seconds;
-                                        out.held = organism.decision(decisions).held;
+                                        out.held
+                                            .copy_active_from(&organism.decision(decisions).held);
                                         out.phase = committed.phase;
                                         out.cooldown_deadline = organism.cooldown_deadline;
                                         out.secretory_readiness = organism.secretory_readiness;
@@ -4045,7 +4047,8 @@ impl World {
                                     Some(inv_dt) => (energy - committed.energy) * inv_dt,
                                     None => (energy - committed.energy) / seconds,
                                 };
-                                out.held = organism.decision(decisions).held;
+                                out.held
+                                    .copy_active_from(&organism.decision(decisions).held);
                                 out.phase = committed.phase;
                                 out.cooldown_deadline = organism.cooldown_deadline;
                                 out.secretory_readiness = organism.secretory_readiness;
@@ -8233,7 +8236,7 @@ fn pass1_flat_f32<'p>(
                         from,
                         &mut dec.gradients,
                     )?;
-                    dec.held = organism.held;
+                    dec.held.copy_active_from(&organism.held);
                     dec.evaluated = false;
                     dec.actions = decode_held(rules, organism, &organism.held)?;
                 }
@@ -8340,7 +8343,7 @@ fn pass1_flat_f32<'p>(
                         from,
                         &mut dec.gradients,
                     )?;
-                    dec.held = organism.held;
+                    dec.held.copy_active_from(&organism.held);
                     dec.evaluated = false;
                     dec.actions = decode_held(rules, organism, &organism.held)?;
                 }
@@ -8708,7 +8711,7 @@ fn pass1_flat_f32_spatial<'p>(
                         from,
                         &mut dec.gradients,
                     )?;
-                    dec.held = organism.held;
+                    dec.held.copy_active_from(&organism.held);
                     dec.evaluated = false;
                     dec.actions = decode_held(rules, organism, &organism.held)?;
                 }
@@ -8745,7 +8748,7 @@ fn pass1_flat_f32_spatial<'p>(
                     dec.evaluated = true;
                 } else {
                     encode_gradients_only_into(rules, organism, raw, from, &mut dec.gradients)?;
-                    dec.held = organism.held;
+                    dec.held.copy_active_from(&organism.held);
                     dec.evaluated = false;
                     dec.actions = decode_held(rules, organism, &organism.held)?;
                 }

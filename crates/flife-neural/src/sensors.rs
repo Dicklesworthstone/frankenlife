@@ -641,51 +641,33 @@ fn normalize_single_to_f32(
         *slot = q0 as f32;
     }
     out_gradients[0] = [gx0, gy0];
-    let mut val_acc = [q0 + (gx0 + gy0), 0.0, 0.0, 0.0];
-    for (((vc, gc), (mc, mxc)), myc) in value_slots[1..]
-        .as_chunks_mut::<4>()
-        .0
+    let mut z_buf = [0.0_f64; PLANES - 1];
+    // Separate unit-stride normalization from finiteness reduction so LLVM
+    // emits contiguous ldp/fdiv.2d/fcvtn/st2.2d without 4-way ld4.2d/st4.4s
+    // deinterleaving loads and stores.
+    for ((dst_f32, dst_z), &moment) in value_slots[1..].iter_mut().zip(&mut z_buf).zip(moments) {
+        let z = moment / regularized;
+        *dst_z = z;
+        *dst_f32 = z as f32;
+    }
+    for (((gc, &z), &mx), &my) in out_gradients[1..]
         .iter_mut()
-        .zip(out_gradients[1..].as_chunks_mut::<4>().0.iter_mut())
-        .zip(
-            moments
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(moments_x.as_chunks::<4>().0),
-        )
-        .zip(moments_y.as_chunks::<4>().0)
+        .zip(&z_buf)
+        .zip(moments_x)
+        .zip(moments_y)
     {
-        let z = [
-            mc[0] / regularized,
-            mc[1] / regularized,
-            mc[2] / regularized,
-            mc[3] / regularized,
-        ];
-        let gx = [
-            (mxc[0] - z[0] * density_x) / regularized,
-            (mxc[1] - z[1] * density_x) / regularized,
-            (mxc[2] - z[2] * density_x) / regularized,
-            (mxc[3] - z[3] * density_x) / regularized,
-        ];
-        let gy = [
-            (myc[0] - z[0] * density_y) / regularized,
-            (myc[1] - z[1] * density_y) / regularized,
-            (myc[2] - z[2] * density_y) / regularized,
-            (myc[3] - z[3] * density_y) / regularized,
-        ];
-        val_acc = [
-            val_acc[0] + z[0],
-            val_acc[1] + z[1],
-            val_acc[2] + z[2],
-            val_acc[3] + z[3],
-        ];
-        *vc = [z[0] as f32, z[1] as f32, z[2] as f32, z[3] as f32];
         *gc = [
-            [gx[0], gy[0]],
-            [gx[1], gy[1]],
-            [gx[2], gy[2]],
-            [gx[3], gy[3]],
+            (mx - z * density_x) / regularized,
+            (my - z * density_y) / regularized,
+        ];
+    }
+    let mut val_acc = [q0 + (gx0 + gy0), 0.0, 0.0, 0.0];
+    for chunk in z_buf.as_chunks::<4>().0 {
+        val_acc = [
+            val_acc[0] + chunk[0],
+            val_acc[1] + chunk[1],
+            val_acc[2] + chunk[2],
+            val_acc[3] + chunk[3],
         ];
     }
     let val_finite_ok = val_acc[0].is_finite()

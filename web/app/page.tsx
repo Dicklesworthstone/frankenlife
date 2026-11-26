@@ -729,7 +729,7 @@ export default function Home() {
             title="Honest [status]."
             kicker={
               <>
-                Foundations built and tested; full scale, endurance and export not yet. 400,000 organisms at 30 ticks a
+                Foundations built and tested; full scale and endurance not yet, and export built but not yet qualified. 400,000 organisms at 30 ticks a
                 second is a target.{" "}
                 <a className={link} href={siteConfig.readme}>
                   The README

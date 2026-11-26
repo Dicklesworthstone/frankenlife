@@ -809,8 +809,8 @@ export const gates: { id: string; name: string; state: GateState; detail: string
   {
     id: "G10",
     name: "Export alignment",
-    state: "open",
-    detail: "Not run.",
+    state: "partial",
+    detail: "Built: 1080p and 4K export on Metal, sampled on simulation time along a camera path, its timeline and provenance checked before a file is written (six tests). Open until FL-050 closes.",
   },
 ];
 

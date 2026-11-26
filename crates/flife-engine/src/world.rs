@@ -6523,6 +6523,443 @@ fn fit_settle_tiles(
     Ok(())
 }
 
+/// Fused Phase-6 L2-resident tile-local compositions + chemistry pre-pass:
+/// eliminates the separate `compositions_into` barrier and 67 MB global DRAM
+/// compositions round-trip on multi-worker `grid-cic-v1` worlds.
+///
+/// Each worker lane carves a disjoint `<= 1.0 MiB` (`<= 4,096` cells) slice of
+/// the already-reserved `cell_compositions` buffer and a disjoint `<= 64 KiB`
+/// open-addressed deduplication table from `packet_compositions` (zero new heap
+/// allocations, preserving `World::footprint` exactly). For each spatial
+/// macro-tile, distinct granted cells are deduplicated in L1D, their
+/// compositions are computed plane-by-plane with NEON `fdiv.2d` directly into
+/// the lane's L2-pinned slice, and organisms in the tile settle chemistry
+/// immediately while those compositions remain hot in L2 cache. Returns `true`
+/// if `spatial_uptake` is fully populated (skipping `compositions_into`);
+/// returns `false` (leaving `spatial_uptake` empty) to fall back cleanly to the
+/// canonical `compositions_into` + `settle_all` path.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "private Phase-6 fused L2-pinned tile-local compositions and chemistry runner"
+)]
+fn spatial_chemistry_prepass_fused(
+    rules: &Rules,
+    population: &Population,
+    observed: &FieldState,
+    grants: (&Bins, &[GrantPacket]),
+    count: usize,
+    workers: usize,
+    spatial_rows: &[u32],
+    row_to_spatial: &[u32],
+    spatial_tile_offsets: &[usize; SPATIAL_TILES + 1],
+    cell_compositions: &mut Vec<[f64; CHANNELS]>,
+    packet_compositions: &mut Vec<u32>,
+    spatial_uptake: &mut Vec<(UptakeSettlement, EnergyBudget)>,
+) -> bool {
+    const EMPTY_CELL: u32 = u32::MAX;
+    const ORG_BATCH: usize = 2_048;
+    const COMP_BATCH: usize = 32;
+
+    spatial_uptake.clear();
+    let ordered_slots = population.ordered_slots();
+    if workers <= 1
+        || count == 0
+        || row_to_spatial.len() != count
+        || spatial_rows.len() != count
+        || spatial_tile_offsets[SPATIAL_TILES] != count
+        || ordered_slots.len() != count
+        || spatial_uptake.capacity() < count
+        || rules.v2.affinity_rotation_enabled()
+        || rules.limits.affinity_norm() > rules.chemistry.affinity_norm_limit()
+        || !rules.exchange.is_grid_cic()
+    {
+        return false;
+    }
+
+    let energy_plane = observed.energy();
+    let total_cells = energy_plane.len();
+    let all_data = observed.as_slice();
+    let planes = observed.planes() as usize;
+    let active_channels = observed.carrier0_moments_count();
+    if total_cells == 0
+        || total_cells >= EMPTY_CELL as usize
+        || all_data.len() != planes.saturating_mul(total_cells)
+    {
+        return false;
+    }
+
+    // Choose per-lane L2-resident composition capacity (`<= 4,096` slots = 1 MiB)
+    // and L1D hash table (`2 * lane_slots` entries, load factor <= 50%) strictly
+    // inside the already-reserved capacities of `cell_compositions` and
+    // `packet_compositions` (zero heap growth).
+    let max_comp_per_lane = cell_compositions.capacity() / workers;
+    let max_u32_per_lane = packet_compositions.capacity() / workers;
+    // Each lane uses `2 * hash_cap + 2 * lane_slots = 6 * lane_slots` u32s
+    // inside `packet_compositions` (`hash_keys`, `hash_vals`, `tile_cells`, `touched`).
+    let mut lane_slots = 4_096_usize;
+    while lane_slots >= 512
+        && (lane_slots > max_comp_per_lane || lane_slots.saturating_mul(6) > max_u32_per_lane)
+    {
+        lane_slots >>= 1;
+    }
+    if lane_slots < 512 {
+        return false;
+    }
+    let hash_cap = lane_slots << 1;
+    let hash_mask = hash_cap - 1;
+    let u32_per_lane = hash_cap * 2 + lane_slots * 2;
+    let total_comp_slots = workers * lane_slots;
+    let total_u32_slots = workers * u32_per_lane;
+
+    let Ok(zero_budget) = EnergyBudget::new(0.0) else {
+        return false;
+    };
+    let placeholder = (
+        UptakeSettlement {
+            absorbed: 0.0,
+            gain: 0.0,
+            toxicity: flife_core::ledger::Payment {
+                requested: 0.0,
+                paid: 0.0,
+            },
+        },
+        zero_budget,
+    );
+    set_len_reuse(spatial_uptake, count, placeholder);
+    set_len_reuse(cell_compositions, total_comp_slots, [0.0; CHANNELS]);
+    set_len_reuse(packet_compositions, total_u32_slots, 0_u32);
+
+    let (by_demand, granted) = grants;
+    let max_sub_tile = count
+        .div_ceil(workers.saturating_mul(4))
+        .max(MINIMUM_ROWS_PER_LANE);
+    struct FusedChemTile<'a> {
+        row_indices: &'a [u32],
+        out: &'a mut [(UptakeSettlement, EnergyBudget)],
+    }
+    let mut tiles: Vec<FusedChemTile<'_>> = Vec::with_capacity(SPATIAL_TILES);
+    let mut rem_out = spatial_uptake.as_mut_slice();
+    for t in 0..SPATIAL_TILES {
+        let base = spatial_tile_offsets[t];
+        let end = spatial_tile_offsets[t + 1];
+        let tile_count = end.saturating_sub(base);
+        if tile_count == 0 {
+            continue;
+        }
+        let mut off = 0_usize;
+        while off < tile_count {
+            let sub_len = (tile_count - off).min(max_sub_tile);
+            let (out_head, out_tail) = rem_out.split_at_mut(sub_len);
+            rem_out = out_tail;
+            tiles.push(FusedChemTile {
+                row_indices: &spatial_rows[base + off..base + off + sub_len],
+                out: out_head,
+            });
+            off += sub_len;
+        }
+    }
+
+    struct ChemLane<'a> {
+        comps: &'a mut [[f64; CHANNELS]],
+        hash_keys: &'a mut [u32],
+        hash_vals: &'a mut [u32],
+        tile_cells: &'a mut [u32],
+        touched: &'a mut [u32],
+        initialized: bool,
+    }
+    let mut chem_lanes: Vec<ChemLane<'_>> = Vec::with_capacity(workers);
+    let mut rem_comps = cell_compositions.as_mut_slice();
+    let mut rem_u32 = packet_compositions.as_mut_slice();
+    for _ in 0..workers {
+        let (comps, next_comps) = rem_comps.split_at_mut(lane_slots);
+        rem_comps = next_comps;
+        let (lane_u32, next_u32) = rem_u32.split_at_mut(u32_per_lane);
+        rem_u32 = next_u32;
+        let (hash_keys, rest) = lane_u32.split_at_mut(hash_cap);
+        let (hash_vals, rest) = rest.split_at_mut(hash_cap);
+        let (tile_cells, touched) = rest.split_at_mut(lane_slots);
+        chem_lanes.push(ChemLane {
+            comps,
+            hash_keys,
+            hash_vals,
+            tile_cells,
+            touched,
+            initialized: false,
+        });
+    }
+
+    let pow2_field = total_cells.is_power_of_two();
+    let field_mask = total_cells.saturating_sub(1);
+
+    let compute_new_comps = |new_cells: &[u32],
+                             comps_out: &mut [[f64; CHANNELS]]|
+     -> Result<(), CoreError> {
+        let mut cells = [0_usize; COMP_BATCH];
+        let mut energies = [0.0_f64; COMP_BATCH];
+        let mut slots = [0_usize; COMP_BATCH];
+        let mut raw = [0.0_f32; COMP_BATCH];
+        let mut quotients = [0.0_f64; COMP_BATCH];
+        let n = new_cells.len();
+        let mut i = 0_usize;
+        while i < n {
+            let batch_start = i;
+            let mut batch_count = 0_usize;
+            while i < n && batch_count < COMP_BATCH {
+                let cell = new_cells[i] as usize;
+                let &e_raw = energy_plane
+                    .get(cell)
+                    .ok_or_else(|| CoreError::LayoutMismatch {
+                        buffer: "field",
+                        detail: format!("cell {cell} is not in this field"),
+                    })?;
+                let e = f64::from(e_raw);
+                if e > 0.0 {
+                    cells[batch_count] = cell;
+                    energies[batch_count] = e;
+                    slots[batch_count] = i;
+                    if active_channels < CHANNELS {
+                        comps_out[i][active_channels..].fill(0.0);
+                    }
+                    batch_count += 1;
+                } else {
+                    comps_out[i] = [0.0; CHANNELS];
+                }
+                i += 1;
+            }
+            if batch_count > 0 {
+                let contiguous = i - batch_start == batch_count;
+                for (channel, plane) in all_data[total_cells..]
+                    .chunks_exact(total_cells)
+                    .enumerate()
+                    .take(active_channels)
+                {
+                    if pow2_field && plane.len() > field_mask {
+                        for (dst, &cell) in raw[..batch_count].iter_mut().zip(&cells[..batch_count])
+                        {
+                            *dst = plane[cell & field_mask];
+                        }
+                    } else {
+                        for (dst, &cell) in raw[..batch_count].iter_mut().zip(&cells[..batch_count])
+                        {
+                            *dst = plane[cell];
+                        }
+                    }
+                    if batch_count == COMP_BATCH {
+                        for ((dst, &m), &energy) in quotients.iter_mut().zip(&raw).zip(&energies) {
+                            *dst = f64::from(m) / energy;
+                        }
+                    } else {
+                        for ((dst, &m), &energy) in quotients[..batch_count]
+                            .iter_mut()
+                            .zip(&raw[..batch_count])
+                            .zip(&energies[..batch_count])
+                        {
+                            *dst = f64::from(m) / energy;
+                        }
+                    }
+                    if contiguous {
+                        for (comp, &q) in comps_out[batch_start..batch_start + batch_count]
+                            .iter_mut()
+                            .zip(&quotients[..batch_count])
+                        {
+                            comp[channel] = q;
+                        }
+                    } else {
+                        for (&slot, &q) in
+                            slots[..batch_count].iter().zip(&quotients[..batch_count])
+                        {
+                            comps_out[slot][channel] = q;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+
+    let ok = flife_core::pool::try_parallel_tasks_with_lanes(
+        workers,
+        "phase 6 fused spatial chemistry",
+        &mut chem_lanes,
+        &mut tiles,
+        |_, tile, lane| {
+            if !lane.initialized {
+                lane.hash_keys.fill(EMPTY_CELL);
+                lane.initialized = true;
+            }
+            let mut pkt_amts = [[0.0_f64; PACKETS_PER_ORGANISM]; ORG_BATCH];
+            let mut pkt_idxs = [[0_u16; PACKETS_PER_ORGANISM]; ORG_BATCH];
+            let mut pkt_lens = [0_u8; ORG_BATCH];
+            let mut tile_distinct = 0_usize;
+            let mut computed_upto = 0_usize;
+            let tile_len = tile.row_indices.len();
+            let mut cursor = 0_usize;
+
+            while cursor < tile_len {
+                let batch_start = cursor;
+                let batch_limit = (cursor + ORG_BATCH).min(tile_len);
+                let mut staged = 0_usize;
+
+                while cursor < batch_limit {
+                    let row_idx = tile.row_indices[cursor] as usize;
+                    let bucket = by_demand.bucket(row_idx);
+                    if bucket.len() > PACKETS_PER_ORGANISM {
+                        return Err(CoreError::StateConflict {
+                            operation: "fused spatial chemistry prepass",
+                            detail: "bucket exceeded grid-cic packet count".to_owned(),
+                        });
+                    }
+                    if tile_distinct + bucket.len() > lane_slots {
+                        break;
+                    }
+                    let amts = &mut pkt_amts[staged];
+                    let idxs = &mut pkt_idxs[staged];
+                    let mut n = 0_usize;
+                    for &at in bucket {
+                        let packet =
+                            granted
+                                .get(at as usize)
+                                .ok_or_else(|| CoreError::StateConflict {
+                                    operation: "fused spatial chemistry prepass",
+                                    detail: format!("missing grant packet {at}"),
+                                })?;
+                        if packet.cell >= total_cells {
+                            return Err(CoreError::LayoutMismatch {
+                                buffer: "field",
+                                detail: format!("cell {} is not in this field", packet.cell),
+                            });
+                        }
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "packet.cell < total_cells < u32::MAX checked above"
+                        )]
+                        let cell_u32 = packet.cell as u32;
+                        let mut h =
+                            (cell_u32.wrapping_mul(2_654_435_761) >> 16) as usize & hash_mask;
+                        let local_idx = loop {
+                            let existing = lane.hash_keys[h];
+                            if existing == cell_u32 {
+                                break lane.hash_vals[h];
+                            }
+                            if existing == EMPTY_CELL {
+                                #[expect(
+                                    clippy::cast_possible_truncation,
+                                    reason = "tile_distinct < lane_slots <= 4096 <= u32::MAX"
+                                )]
+                                let idx = tile_distinct as u32;
+                                lane.hash_keys[h] = cell_u32;
+                                lane.hash_vals[h] = idx;
+                                lane.tile_cells[tile_distinct] = cell_u32;
+                                #[expect(
+                                    clippy::cast_possible_truncation,
+                                    reason = "h < hash_cap <= 8192 <= u32::MAX"
+                                )]
+                                {
+                                    lane.touched[tile_distinct] = h as u32;
+                                }
+                                tile_distinct += 1;
+                                break idx;
+                            }
+                            h = (h + 1) & hash_mask;
+                        };
+                        amts[n] = packet.granted;
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "local_idx < lane_slots <= 4096 <= u16::MAX"
+                        )]
+                        {
+                            idxs[n] = local_idx as u16;
+                        }
+                        n += 1;
+                    }
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "n <= PACKETS_PER_ORGANISM (4) <= u8::MAX"
+                    )]
+                    {
+                        pkt_lens[staged] = n as u8;
+                    }
+                    staged += 1;
+                    cursor += 1;
+                }
+
+                if tile_distinct > computed_upto {
+                    compute_new_comps(
+                        &lane.tile_cells[computed_upto..tile_distinct],
+                        &mut lane.comps[computed_upto..tile_distinct],
+                    )?;
+                    computed_upto = tile_distinct;
+                }
+
+                let comps_ready = &lane.comps[..tile_distinct];
+                let mut stack_packets = [(0.0_f64, 0_u32); PACKETS_PER_ORGANISM];
+                for (offset, (&row_u32, out_slot)) in tile.row_indices[batch_start..cursor]
+                    .iter()
+                    .zip(tile.out[batch_start..cursor].iter_mut())
+                    .enumerate()
+                {
+                    let row_idx = row_u32 as usize;
+                    let phys_slot = ordered_slots[row_idx] as usize;
+                    let Some(energy) = population.energy_at_slot(phys_slot) else {
+                        return Err(CoreError::StateConflict {
+                            operation: "fused spatial chemistry prepass",
+                            detail: format!("slot {phys_slot} missing energy"),
+                        });
+                    };
+                    if population.id_at_slot(phys_slot).is_none() {
+                        return Err(CoreError::StateConflict {
+                            operation: "read genome",
+                            detail: format!("slot {phys_slot} vacant"),
+                        });
+                    }
+                    let (genome, _) = population.genome_and_arena_at_slot(phys_slot);
+                    let genome = genome.ok_or_else(|| CoreError::StateConflict {
+                        operation: "read genome",
+                        detail: format!("slot {phys_slot} has no genome"),
+                    })?;
+                    let n = usize::from(pkt_lens[offset]);
+                    let amts = &pkt_amts[offset];
+                    let idxs = &pkt_idxs[offset];
+                    for k in 0..n {
+                        stack_packets[k] = (amts[k], u32::from(idxs[k]));
+                    }
+                    let mut budget = EnergyBudget::new(energy)?;
+                    let settlement = rules.chemistry.settle_indexed_slice(
+                        genome.traits().affinity(),
+                        &stack_packets[..n],
+                        comps_ready,
+                        &mut budget,
+                    )?;
+                    *out_slot = (settlement, budget);
+                }
+
+                // If the lane's L2 composition table filled mid-tile, reset
+                // only the touched hash entries and continue seamlessly.
+                if cursor < tile_len && tile_distinct + PACKETS_PER_ORGANISM > lane_slots {
+                    for &slot in &lane.touched[..tile_distinct] {
+                        lane.hash_keys[slot as usize] = EMPTY_CELL;
+                    }
+                    tile_distinct = 0;
+                    computed_upto = 0;
+                }
+            }
+
+            for &slot in &lane.touched[..tile_distinct] {
+                lane.hash_keys[slot as usize] = EMPTY_CELL;
+            }
+            Ok(())
+        },
+    )
+    .is_ok();
+
+    if !ok {
+        spatial_uptake.clear();
+        return false;
+    }
+    true
+}
+
 /// Precompute Phase-6 chemistry settlements in 8×8 spatial macro-tile order
 /// reusing Pass 1's `spatial_rows` and `spatial_tile_offsets`. Each tile's
 /// deduplicated `compositions` working set is ~1 MiB (L2-resident) instead of

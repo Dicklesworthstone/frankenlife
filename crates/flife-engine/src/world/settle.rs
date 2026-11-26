@@ -214,25 +214,41 @@ pub(super) fn settle_with(
             }
         }
     }
-    compositions_into(
-        observed,
-        granted,
-        grants_bins,
-        lanes.len(),
-        cell_compositions,
-        packet_compositions,
-    )?;
-    super::spatial_chemistry_prepass(
+    let fused = super::spatial_chemistry_prepass_fused(
         rules,
         population,
-        (by_demand, granted, cell_compositions, packet_compositions),
+        observed,
+        (by_demand, granted),
         working.len(),
         lanes.len(),
         spatial_rows,
         row_to_spatial,
         spatial_tile_offsets,
+        cell_compositions,
+        packet_compositions,
         spatial_uptake,
     );
+    if !fused {
+        compositions_into(
+            observed,
+            granted,
+            grants_bins,
+            lanes.len(),
+            cell_compositions,
+            packet_compositions,
+        )?;
+        super::spatial_chemistry_prepass(
+            rules,
+            population,
+            (by_demand, granted, cell_compositions, packet_compositions),
+            working.len(),
+            lanes.len(),
+            spatial_rows,
+            row_to_spatial,
+            spatial_tile_offsets,
+            spatial_uptake,
+        );
+    }
     let active_tiles = settle_all(
         rules,
         population,

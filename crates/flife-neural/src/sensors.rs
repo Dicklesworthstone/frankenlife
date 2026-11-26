@@ -976,46 +976,38 @@ fn saturate_single_gradients_f32_into(
         *x0 = ex;
         *y0 = ey;
         if unit_l {
-            for ((x_chunk, y_chunk), grad_chunk) in x_rest
-                .as_chunks_mut::<4>()
+            for ((x_pair, y_pair), grad_pair) in x_rest
+                .as_chunks_mut::<2>()
                 .0
                 .iter_mut()
-                .zip(y_rest.as_chunks_mut::<4>().0.iter_mut())
-                .zip(gradients[1..].as_chunks::<4>().0)
+                .zip(y_rest.as_chunks_mut::<2>().0.iter_mut())
+                .zip(gradients[1..].as_chunks::<2>().0)
             {
-                *x_chunk = saturate_4([
-                    grad_chunk[0][0],
-                    grad_chunk[1][0],
-                    grad_chunk[2][0],
-                    grad_chunk[3][0],
+                let [x0, y0, x1, y1] = saturate_4([
+                    grad_pair[0][0],
+                    grad_pair[0][1],
+                    grad_pair[1][0],
+                    grad_pair[1][1],
                 ])?;
-                *y_chunk = saturate_4([
-                    grad_chunk[0][1],
-                    grad_chunk[1][1],
-                    grad_chunk[2][1],
-                    grad_chunk[3][1],
-                ])?;
+                *x_pair = [x0, x1];
+                *y_pair = [y0, y1];
             }
         } else {
-            for ((x_chunk, y_chunk), grad_chunk) in x_rest
-                .as_chunks_mut::<4>()
+            for ((x_pair, y_pair), grad_pair) in x_rest
+                .as_chunks_mut::<2>()
                 .0
                 .iter_mut()
-                .zip(y_rest.as_chunks_mut::<4>().0.iter_mut())
-                .zip(gradients[1..].as_chunks::<4>().0)
+                .zip(y_rest.as_chunks_mut::<2>().0.iter_mut())
+                .zip(gradients[1..].as_chunks::<2>().0)
             {
-                *x_chunk = saturate_4([
-                    l * grad_chunk[0][0],
-                    l * grad_chunk[1][0],
-                    l * grad_chunk[2][0],
-                    l * grad_chunk[3][0],
+                let [x0, y0, x1, y1] = saturate_4([
+                    l * grad_pair[0][0],
+                    l * grad_pair[0][1],
+                    l * grad_pair[1][0],
+                    l * grad_pair[1][1],
                 ])?;
-                *y_chunk = saturate_4([
-                    l * grad_chunk[0][1],
-                    l * grad_chunk[1][1],
-                    l * grad_chunk[2][1],
-                    l * grad_chunk[3][1],
-                ])?;
+                *x_pair = [x0, x1];
+                *y_pair = [y0, y1];
             }
         }
     }
@@ -1693,46 +1685,38 @@ fn saturate_dual_gradients_f32_into(
         *x0 = ex;
         *y0 = ey;
         if unit_l {
-            for ((x_chunk, y_chunk), grad_chunk) in x_rest
-                .as_chunks_mut::<4>()
+            for ((x_pair, y_pair), grad_pair) in x_rest
+                .as_chunks_mut::<2>()
                 .0
                 .iter_mut()
-                .zip(y_rest.as_chunks_mut::<4>().0.iter_mut())
-                .zip(gradients[1..].as_chunks::<4>().0)
+                .zip(y_rest.as_chunks_mut::<2>().0.iter_mut())
+                .zip(gradients[1..].as_chunks::<2>().0)
             {
-                *x_chunk = saturate_4([
-                    grad_chunk[0][0],
-                    grad_chunk[1][0],
-                    grad_chunk[2][0],
-                    grad_chunk[3][0],
+                let [x0, y0, x1, y1] = saturate_4([
+                    grad_pair[0][0],
+                    grad_pair[0][1],
+                    grad_pair[1][0],
+                    grad_pair[1][1],
                 ])?;
-                *y_chunk = saturate_4([
-                    grad_chunk[0][1],
-                    grad_chunk[1][1],
-                    grad_chunk[2][1],
-                    grad_chunk[3][1],
-                ])?;
+                *x_pair = [x0, x1];
+                *y_pair = [y0, y1];
             }
         } else {
-            for ((x_chunk, y_chunk), grad_chunk) in x_rest
-                .as_chunks_mut::<4>()
+            for ((x_pair, y_pair), grad_pair) in x_rest
+                .as_chunks_mut::<2>()
                 .0
                 .iter_mut()
-                .zip(y_rest.as_chunks_mut::<4>().0.iter_mut())
-                .zip(gradients[1..].as_chunks::<4>().0)
+                .zip(y_rest.as_chunks_mut::<2>().0.iter_mut())
+                .zip(gradients[1..].as_chunks::<2>().0)
             {
-                *x_chunk = saturate_4([
-                    l * grad_chunk[0][0],
-                    l * grad_chunk[1][0],
-                    l * grad_chunk[2][0],
-                    l * grad_chunk[3][0],
+                let [x0, y0, x1, y1] = saturate_4([
+                    l * grad_pair[0][0],
+                    l * grad_pair[0][1],
+                    l * grad_pair[1][0],
+                    l * grad_pair[1][1],
                 ])?;
-                *y_chunk = saturate_4([
-                    l * grad_chunk[0][1],
-                    l * grad_chunk[1][1],
-                    l * grad_chunk[2][1],
-                    l * grad_chunk[3][1],
-                ])?;
+                *x_pair = [x0, x1];
+                *y_pair = [y0, y1];
             }
         }
     }

@@ -1002,6 +1002,47 @@ fn tanh_f64_as_f32_fallback(x: f64) -> Option<f32> {
 #[must_use]
 pub fn tanh_f64_as_f32_4(xs: [f64; 4]) -> Option<[f32; 4]> {
     let mags = [xs[0].abs(), xs[1].abs(), xs[2].abs(), xs[3].abs()];
+    // IEEE-754 `<= TANH_PADE_MAX` is false for NaN, ±Inf, and > 2.25, keeping
+    // the hot rational fast path to a single branch with zero saturation state.
+    if !((mags[0] <= TANH_PADE_MAX)
+        & (mags[1] <= TANH_PADE_MAX)
+        & (mags[2] <= TANH_PADE_MAX)
+        & (mags[3] <= TANH_PADE_MAX))
+    {
+        return tanh_f64_as_f32_4_outside_rat78(xs, mags);
+    }
+    let approx = tanh_rat78_4(mags);
+
+    const TIE: u64 = 1 << 28;
+    const LOW_MASK: u64 = (1 << 29) - 1;
+    const MARGIN: u64 = 65_536;
+    const MIN_NORMAL_BITS: u64 = (2.0 * (f32::MIN_POSITIVE as f64)).to_bits();
+    let b0 = approx[0].to_bits();
+    let b1 = approx[1].to_bits();
+    let b2 = approx[2].to_bits();
+    let b3 = approx[3].to_bits();
+    if (b0.wrapping_sub(1) >= MIN_NORMAL_BITS - 1)
+        & (b1.wrapping_sub(1) >= MIN_NORMAL_BITS - 1)
+        & (b2.wrapping_sub(1) >= MIN_NORMAL_BITS - 1)
+        & (b3.wrapping_sub(1) >= MIN_NORMAL_BITS - 1)
+        & ((b0 & LOW_MASK).wrapping_sub(TIE - MARGIN) > 2 * MARGIN)
+        & ((b1 & LOW_MASK).wrapping_sub(TIE - MARGIN) > 2 * MARGIN)
+        & ((b2 & LOW_MASK).wrapping_sub(TIE - MARGIN) > 2 * MARGIN)
+        & ((b3 & LOW_MASK).wrapping_sub(TIE - MARGIN) > 2 * MARGIN)
+    {
+        return Some([
+            approx[0].copysign(xs[0]) as f32,
+            approx[1].copysign(xs[1]) as f32,
+            approx[2].copysign(xs[2]) as f32,
+            approx[3].copysign(xs[3]) as f32,
+        ]);
+    }
+    finalize_tanh_f64_as_f32_4_slow(xs, mags, approx)
+}
+
+#[cold]
+#[inline(never)]
+fn tanh_f64_as_f32_4_outside_rat78(xs: [f64; 4], mags: [f64; 4]) -> Option<[f32; 4]> {
     let all_finite = (mags[0] < f64::INFINITY)
         & (mags[1] < f64::INFINITY)
         & (mags[2] < f64::INFINITY)
@@ -1013,63 +1054,22 @@ pub fn tanh_f64_as_f32_4(xs: [f64; 4]) -> Option<[f32; 4]> {
         | (mags[1] > TANH_PADE_MAX && mags[1] < TANH_SATURATES)
         | (mags[2] > TANH_PADE_MAX && mags[2] < TANH_SATURATES)
         | (mags[3] > TANH_PADE_MAX && mags[3] < TANH_SATURATES);
-    let any_sat = (mags[0] >= TANH_SATURATES)
-        | (mags[1] >= TANH_SATURATES)
-        | (mags[2] >= TANH_SATURATES)
-        | (mags[3] >= TANH_SATURATES);
     if any_large {
+        let any_sat = (mags[0] >= TANH_SATURATES)
+            | (mags[1] >= TANH_SATURATES)
+            | (mags[2] >= TANH_SATURATES)
+            | (mags[3] >= TANH_SATURATES);
         return tanh_f64_as_f32_4_large(xs, mags, any_sat);
     }
-    let a_safe = if !any_sat {
-        mags
-    } else {
-        [
-            if mags[0] >= TANH_SATURATES {
-                0.0
-            } else {
-                mags[0]
-            },
-            if mags[1] >= TANH_SATURATES {
-                0.0
-            } else {
-                mags[1]
-            },
-            if mags[2] >= TANH_SATURATES {
-                0.0
-            } else {
-                mags[2]
-            },
-            if mags[3] >= TANH_SATURATES {
-                0.0
-            } else {
-                mags[3]
-            },
-        ]
-    };
-    let approx = tanh_rat78_4(a_safe);
-
-    const TIE: u64 = 1 << 28;
-    const LOW_MASK: u64 = (1 << 29) - 1;
-    const MARGIN: u64 = 65_536;
-    let min_normal = 2.0 * f64::from(f32::MIN_POSITIVE);
-    if !any_sat
-        && ((approx[0] == 0.0 || approx[0] >= min_normal)
-            & (approx[1] == 0.0 || approx[1] >= min_normal)
-            & (approx[2] == 0.0 || approx[2] >= min_normal)
-            & (approx[3] == 0.0 || approx[3] >= min_normal)
-            & ((approx[0].to_bits() & LOW_MASK).abs_diff(TIE) > MARGIN)
-            & ((approx[1].to_bits() & LOW_MASK).abs_diff(TIE) > MARGIN)
-            & ((approx[2].to_bits() & LOW_MASK).abs_diff(TIE) > MARGIN)
-            & ((approx[3].to_bits() & LOW_MASK).abs_diff(TIE) > MARGIN))
-    {
-        return Some([
-            approx[0].copysign(xs[0]) as f32,
-            approx[1].copysign(xs[1]) as f32,
-            approx[2].copysign(xs[2]) as f32,
-            approx[3].copysign(xs[3]) as f32,
-        ]);
+    let mut out = [0.0_f32; 4];
+    for ((dst, &x), &mag) in out.iter_mut().zip(&xs).zip(&mags) {
+        *dst = if mag >= TANH_SATURATES {
+            if x.is_sign_negative() { -1.0 } else { 1.0 }
+        } else {
+            tanh_f64_as_f32(x)?
+        };
     }
-    finalize_tanh_f64_as_f32_4_slow(xs, mags, approx)
+    Some(out)
 }
 
 #[cold]

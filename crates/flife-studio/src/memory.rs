@@ -9,18 +9,19 @@
 //!   founding epoch reserves;
 //! - the view's own buffers and one frame's job
 //!   ([`WorldView::reserved_bytes`], [`WorldView::frame_bytes`]);
-//! - the frame's upload: FrankenManim's Metal route flattens the job's
-//!   rows and bins and the textures it samples on the host and copies them
-//!   to the device, each charged at the view's
-//!   [`WorldView::preparation_limit`] plus its [`WorldView::texel_bytes`].
-//!   FrankenManim bounds neither. Since its `9b116eee` the route keeps the
-//!   tables in device buffers between frames, each up to a quarter larger
-//!   than the largest table it has held, and never shrinks them
-//!   (`MetalRenderer::resident_table_bytes`). On 48 frames through one
-//!   renderer, up to 16,384 organisms at 4K, two pixels per point and a
-//!   16x zoom, at FrankenManim `d670e74e`: the host held at most 45.9%
-//!   and copied at most 43.2% of a frame's sum, and the kept buffers were
-//!   at most 51.8% of the largest sum so far;
+//! - the frame's upload: FrankenManim's Metal route compiles the rows of
+//!   the view's dot clouds (FL-033), flattens them with the job's rows and
+//!   bins and the textures it samples on the host and copies them to the
+//!   device, each charged at the view's [`WorldView::preparation_limit`]
+//!   plus its [`WorldView::texel_bytes`]. FrankenManim bounds neither.
+//!   Since its `9b116eee` the route keeps the tables in device buffers
+//!   between frames, each up to a quarter larger than the largest table it
+//!   has held, and never shrinks them (`MetalRenderer::resident_table_bytes`).
+//!   On 48 frames through one renderer, up to 16,384 organisms at 4K, two
+//!   pixels per point and a 16x zoom, at FrankenManim `48e4e2ee`: the host
+//!   held at most 65.2% (45.9% at `d670e74e`, when the job compiled the
+//!   dots) and copied at most 43.2% of a frame's sum, and the kept buffers
+//!   were at most 51.8% of the largest sum so far;
 //! - per drawable pixel, [`DEVICE_BYTES_PER_PIXEL`]: the route's RGBA16F
 //!   and RGBA8 surfaces and the window's drawables (offscreen, the one
 //!   frame read back to the host instead, 4 of the drawables' 12); and a

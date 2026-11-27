@@ -1053,7 +1053,7 @@ pub fn build_overlay_texture(
             }
         }
     }
-    Texture::from_premultiplied_linear(texels[0], texels[1], out).map_err(|error| {
+    Texture::from_premultiplied_linear_unhashed(texels[0], texels[1], out).map_err(|error| {
         CoreError::NumericalInvalid {
             quantity: "field overlay texture",
             detail: error.to_string(),
@@ -1156,7 +1156,7 @@ pub fn build_composite_overlay_texture(
             out.push([blended.r as f32, blended.g as f32, blended.b as f32, 1.0]);
         }
     }
-    Texture::from_premultiplied_linear(texels[0], texels[1], out).map_err(|error| {
+    Texture::from_premultiplied_linear_unhashed(texels[0], texels[1], out).map_err(|error| {
         CoreError::NumericalInvalid {
             quantity: "composite field overlay texture",
             detail: error.to_string(),

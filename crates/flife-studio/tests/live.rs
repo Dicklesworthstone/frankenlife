@@ -171,7 +171,7 @@ impl MotionAudit {
             || frame.shown.map(|shown| shown.id) != Some(current.id())
             || motion.fading != self.oracle.fading.len()
             || rows != expected
-            || studio.view().cloud().draws().len() != prior.len()
+            || studio.view().cloud().draws().dots.len() != prior.len()
             || !at_prior
         {
             self.wrong.push(format!(
@@ -288,7 +288,7 @@ fn live() -> Result<Vec<String>, String> {
     )?;
     live.check(
         shown_tick(&frame) == Some(0)
-            && live.studio.view().cloud().draws().len() == founders as usize,
+            && live.studio.view().cloud().draws().dots.len() == founders as usize,
         format!("the founding epoch is on screen as {founders} dots in one cloud"),
     )?;
     let reserved = live.studio.view().cloud().reserved_bytes();
@@ -446,19 +446,15 @@ fn live() -> Result<Vec<String>, String> {
     // paused, through the live Metal presenter, and never reach the world.
     let at = paused + 2;
     let epochs = live.studio.tally().epochs;
-    let organisms = live.studio.view().cloud().draws().len();
+    let organisms = live.studio.view().cloud().draws().dots.len();
     let colours = |studio: &Studio| -> Vec<[u64; 3]> {
         studio
             .view()
             .cloud()
             .draws()
+            .dots
             .iter()
-            .filter_map(|draw| match draw {
-                fmn_render::ThreeDDraw::TrueDot(dot) => {
-                    Some([dot.color.r, dot.color.g, dot.color.b].map(f64::to_bits))
-                }
-                _ => None,
-            })
+            .map(|dot| [dot.color.r, dot.color.g, dot.color.b].map(f64::to_bits))
             .collect()
     };
     let lineage = colours(&live.studio);
@@ -478,8 +474,8 @@ fn live() -> Result<Vec<String>, String> {
         frame.outcome.is_some() && studio.view().style().look == Look::Raw
     })?;
     live.check(
-        live.studio.view().cloud().halos().is_empty()
-            && live.studio.view().cloud().draws().len() == organisms,
+        live.studio.view().cloud().halos().dots.is_empty()
+            && live.studio.view().cloud().draws().dots.len() == organisms,
         "R draws the raw look: the dots without halos",
     )?;
     live.key(KEY_D, "d")?;
@@ -495,7 +491,7 @@ fn live() -> Result<Vec<String>, String> {
         .map(|&count| u64::from(count))
         .sum();
     live.check(
-        live.studio.view().cloud().draws().is_empty()
+        live.studio.view().cloud().draws().dots.is_empty()
             && counted == organisms as u64
             && frame.outcome.is_some(),
         format!(
@@ -667,17 +663,15 @@ fn live() -> Result<Vec<String>, String> {
         .studio
         .view()
         .shown_rows()
-        .zip(live.studio.view().cloud().draws())
-        .all(|((_, position), draw)| match draw {
-            fmn_render::ThreeDDraw::TrueDot(dot) => {
-                let [x, y, z] = zoomed.scene_point(position);
-                dot.center[0] == x && dot.center[1] == y && dot.center[2] == z
-            }
-            _ => false,
+        .zip(live.studio.view().cloud().draws().dots)
+        .all(|((_, position), dot)| {
+            let [x, y, z] = zoomed.scene_point(position);
+            dot.center[0] == x && dot.center[1] == y && dot.center[2] == z
         });
     live.check(
         placed
-            && live.studio.view().cloud().draws().len() == live.studio.view().shown_rows().count(),
+            && live.studio.view().cloud().draws().dots.len()
+                == live.studio.view().shown_rows().count(),
         "the paused epoch is placed again in the zoomed view: every dot at its scene point there",
     )?;
 

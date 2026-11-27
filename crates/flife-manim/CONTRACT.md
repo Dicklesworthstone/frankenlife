@@ -644,18 +644,24 @@ route.
   peak heap, the texts' layout included, is 12.21 MiB of its 15.08 MiB reserved.
 
 **Validity domain.** CPU host epochs (FL-017, both `field-ecology-v1*` baseline views and `field-ecology-v2*` optional
-`V2-16` views when `v2-visual-mappings` is enabled). The FrankenManim 3D camera route at `fmn` rev `d1e1757b`, CPU and
+`V2-16` views when `v2-visual-mappings` is enabled). The FrankenManim 3D camera route at `fmn` rev `48e4e2ee`, CPU and
 Metal. A view shows one image of the torus at zoom 1 to 4,096.
 
 **Known gaps.**
 - Lowering is CPU preparation per epoch: FrankenManim's `DotCloud`-equivalent reference route (§13.1). The layers'
   textures are rebuilt on the CPU when what they show changes (a show of a new epoch, a restyle; hidden fields track
   display scale without rebuilding an unused texture, `Look::Raw`/`Look::Sphere` share identical field and density
-  textures, and unchanged viewports reuse the cached periodic quad). Both are still uploaded with every Metal frame.
-  Completing `FL-033` requires three upstream FrankenManim (`fmn-render`, pinned `d1e1757b`) additions:
-  1. a versioned/lease-keyed dynamic `Texture` constructor or in-place GPU texture update that bypasses `Texture::from_premultiplied_linear`'s mandatory CPU SHA-256 over every texel;
-  2. a bulk GPU-resident `ParticleCloud` / instanced-dot draw primitive backed by a device buffer instead of per-organism CPU `ThreeDDraw::TrueDot` expansion into `RasterTriangle`s and `FlatThreeDFrame` host tables;
-  3. a shared-device Metal resource-lease bridge into `MetalRenderer` / `NativePreviewRenderer` accepting typed read leases from `flife-backend-metal::DeviceOwner` (FL-028) without host round-trips.
+  textures, and unchanged viewports reuse the cached periodic quad). A texture is uploaded once and kept on the device
+  while frames sample it. `FL-033` asked three upstream FrankenManim (`fmn-render`) additions; at `48e4e2ee`:
+  1. Done another way: `Texture::from_premultiplied_linear_unhashed`, keyed on its build instead of the CPU SHA-256 of
+     every texel, builds the layers' textures. There is no in-place GPU texture update: a new epoch's texture is
+     built on the CPU and uploaded whole.
+  2. Done in part: `DotCloudDraw`. The halos and the dots are two clouds (a placed, zoomed view draws its visible dots
+     as true dots); the job compiles no dot, and the Metal route compiles them on its host threads where it derives
+     the frame. Their rows are still made on the host and uploaded with every frame: no device-resident dot buffer
+     or GPU expansion.
+  3. Not done: a shared-device Metal resource-lease bridge into `MetalRenderer` / `NativePreviewRenderer` accepting
+     typed read leases from `flife-backend-metal::DeviceOwner` (FL-028) without host round-trips.
 - The overlay's text is triangles flattened for the em it was laid out at. A host lays it out again for a new pixel
   density (the Studio does). A glyph's edges are the 3D route's triangle edges, so it is not hinted or subpixel
   antialiased. A bloom blurs the text a little, as it does everything drawn before it, and the overlay is not

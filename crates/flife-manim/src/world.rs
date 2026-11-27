@@ -9,9 +9,9 @@ use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_render::{Epoch, Gap, Interpolation, Prior, interpolate};
 use fmn_core::color::{LinearRgba, PremulRgba, Srgb};
 use fmn_render::{
-    BLOOM_BAND_ROWS, BLOOM_SCRATCH_BYTES_PER_PIXEL, BLOOM_SIGMA_MAX_PIXELS, Bloom, SurfaceDraw,
-    SurfaceMesh, SurfaceVertex, ThreeDCamera, ThreeDDraw, ThreeDJob, ThreeDPreparationLimits,
-    Tiling,
+    BLOOM_BAND_ROWS, BLOOM_SCRATCH_BYTES_PER_PIXEL, BLOOM_SIGMA_MAX_PIXELS, Bloom, CloudDot,
+    SurfaceDraw, SurfaceMesh, SurfaceVertex, ThreeDCamera, ThreeDDraw, ThreeDJob,
+    ThreeDPreparationLimits, Tiling,
 };
 
 use crate::cloud::check_min_radius_points;
@@ -173,8 +173,8 @@ pub struct WorldView {
     apical_ticks: Option<SurfaceMesh>,
 }
 
-/// Conservative frustum visibility test for a camera-facing `TrueDot` at
-/// `z = 0` under our identity-orientation perspective camera.
+/// Conservative frustum visibility test for a camera-facing dot (its cloud's
+/// true dot) at `z = 0` under our identity-orientation perspective camera.
 ///
 /// Every billboard corner `center + i·right + j·up` (`i, j ∈ {-1, +1}`) lies
 /// within Euclidean distance `√2 · radius` of `center`, so `|pz| ≤ √2 · r` and
@@ -182,12 +182,9 @@ pub struct WorldView {
 /// guarantees that any rejected dot has all four corners strictly outside a
 /// single homogeneous clip plane (`|clip.x| > clip.w` or `|clip.y| > clip.w`,
 /// with `clip.w > 0`), so FrankenManim would clip both of its triangles empty.
-/// Non-finite or non-standard draws are never culled so validation stays intact.
+/// Non-finite or non-standard dots are never culled so validation stays intact.
 #[inline]
-fn dot_possibly_visible(draw: &ThreeDDraw<'_>, half_fw: f64, half_fh: f64, focal: f64) -> bool {
-    let ThreeDDraw::TrueDot(dot) = draw else {
-        return true;
-    };
+fn dot_possibly_visible(dot: &CloudDot, half_fw: f64, half_fh: f64, focal: f64) -> bool {
     let [cx, cy, cz] = dot.center;
     let r = dot.radius;
     if !cx.is_finite()
@@ -1152,6 +1149,12 @@ impl WorldView {
     /// region, then the selection ring, then the overlay's plate and text.
     /// Raw and sphere density are opaque, so the field is left out under them.
     ///
+    /// The halos and the dots are the cloud's two clouds
+    /// ([`ParticleCloud::halos`], [`ParticleCloud::draws`]; an empty one is
+    /// left out), which FrankenManim compiles where it draws the frame
+    /// (FL-033). A view placed at a zoom draws only the dots that may be on
+    /// screen, each as the true dot its cloud draws: the same frame.
+    ///
     /// # Errors
     /// [`CoreError::AllocationFailed`] when the list cannot be reserved.
     pub fn draws(&self) -> Result<Vec<ThreeDDraw<'_>>, CoreError> {
@@ -1165,20 +1168,17 @@ impl WorldView {
         let [fw, fh] = self.viewport.frame_shape();
         let (half_fw, half_fh) = (0.5 * fw, 0.5 * fh);
         let focal = self.camera.camera().frame().focal_distance();
+        let visible = |dot: &CloudDot| dot_possibly_visible(dot, half_fw, half_fh, focal);
+        let clouds = [halos, dots];
         let particle_draws = if density {
             0
         } else if cull {
-            let visible_halos = halos
+            clouds
                 .iter()
-                .filter(|draw| dot_possibly_visible(draw, half_fw, half_fh, focal))
-                .count();
-            let visible_dots = dots
-                .iter()
-                .filter(|draw| dot_possibly_visible(draw, half_fw, half_fh, focal))
-                .count();
-            visible_halos + visible_dots
+                .map(|cloud| cloud.dots.iter().filter(|dot| visible(dot)).count())
+                .sum()
         } else {
-            halos.len() + dots.len()
+            clouds.len()
         };
         let mut draws: Vec<ThreeDDraw<'_>> = Vec::new();
         let fixed = 4 + OVERLAY_DRAWS + usize::from(ticks_draw.is_some());
@@ -1196,21 +1196,23 @@ impl WorldView {
         if density {
             draws.extend(self.density.draw());
         } else if cull {
-            draws.extend(
-                halos
-                    .iter()
-                    .copied()
-                    .filter(|draw| dot_possibly_visible(draw, half_fw, half_fh, focal)),
-            );
-            draws.extend(
-                dots.iter()
-                    .copied()
-                    .filter(|draw| dot_possibly_visible(draw, half_fw, half_fh, focal)),
-            );
+            for cloud in clouds {
+                draws.extend(
+                    cloud
+                        .dots
+                        .iter()
+                        .filter(|dot| visible(dot))
+                        .map(|&dot| ThreeDDraw::TrueDot(cloud.true_dot(dot))),
+                );
+            }
             draws.extend(ticks_draw);
         } else {
-            draws.extend_from_slice(halos);
-            draws.extend_from_slice(dots);
+            draws.extend(
+                clouds
+                    .into_iter()
+                    .filter(|cloud| !cloud.dots.is_empty())
+                    .map(ThreeDDraw::DotCloud),
+            );
             draws.extend(ticks_draw);
         }
         draws.extend(self.region_draw());
@@ -1233,7 +1235,17 @@ impl WorldView {
         let draws = self.draws()?;
         let default = ThreeDPreparationLimits::default();
         let (dots, triangles) = self.preparation_counts();
-        let draw_count = u64::try_from(draws.len()).unwrap_or(u64::MAX);
+        // FrankenManim's draw rows: one a draw, but one a dot of a cloud
+        // (an empty cloud's one).
+        let draw_count = draws
+            .iter()
+            .map(|draw| match draw {
+                ThreeDDraw::DotCloud(cloud) => cloud.dots.len().max(1),
+                _ => 1,
+            })
+            .fold(0_u64, |rows, draw| {
+                rows.saturating_add(u64::try_from(draw).unwrap_or(u64::MAX))
+            });
         // Every compiled draw row and its derived raster triangles are already
         // bounded by `self.preparation_limit()` (`max_working_bytes`, admitted
         // under INV-15); lift FrankenManim's default row-count ceilings when
@@ -1426,7 +1438,11 @@ impl WorldView {
     /// apical-ticks draw when `V2-16` polarities are present, and a dot and a
     /// halo per organism the view can hold, [`JOB_BYTES_PER_DRAW`] for each
     /// of those draws, and FrankenManim's preparation, within
-    /// [`WorldView::preparation_limit`].
+    /// [`WorldView::preparation_limit`]. The halos and dots of a frame drawn
+    /// as clouds are compiled where the frame is drawn, not in the job (on
+    /// the CPU route, inside the render; on the Metal route, where it derives
+    /// the frame), and this term still charges their draws and preparation
+    /// as true dots: a host charges it beside the route's own terms.
     #[must_use]
     pub fn frame_bytes(&self) -> u64 {
         let overlay = if self.overlay { OVERLAY_DRAWS } else { 0 };
@@ -1444,7 +1460,8 @@ impl WorldView {
     }
 
     /// What [`WorldView::render_rgba8`] holds on `threads` threads on top
-    /// of [`WorldView::frame_bytes`] (FL-043): the RGBA16F frame
+    /// of [`WorldView::frame_bytes`] (FL-043), whose share for the clouds'
+    /// dots the render holds while it compiles them: the RGBA16F frame
     /// FrankenManim renders, the RGBA8 frame returned, and each thread's
     /// tile scratch, a premultiplied colour and a depth for every sample of
     /// a tile at the finest edge sampling and a flag for every pixel, and

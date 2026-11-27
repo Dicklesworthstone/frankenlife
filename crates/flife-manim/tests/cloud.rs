@@ -11,7 +11,7 @@ use flife_manim::{
     dot_radius_at_least, dot_radius_with, hex_rgb, lineage_color, lineage_slot, selection_ring,
     selection_ring_around,
 };
-use fmn_render::ThreeDDraw;
+use fmn_render::{DotCloudDraw, ThreeDDraw};
 
 #[expect(
     clippy::expect_used,
@@ -21,23 +21,14 @@ fn fit(extent: [f64; 2], drawable: [u32; 2]) -> Viewport {
     Viewport::fit(extent, drawable).expect("a valid viewport")
 }
 
-#[expect(
-    clippy::panic,
-    reason = "test helper: a failure here is a test failure"
-)]
-fn dots(draws: &[ThreeDDraw<'static>]) -> Vec<fmn_render::TrueDotDraw> {
-    draws
-        .iter()
-        .map(|draw| match draw {
-            ThreeDDraw::TrueDot(dot) => *dot,
-            other => panic!("not a true dot: {other:?}"),
-        })
-        .collect()
+/// The true dot each dot of `cloud` draws (`DotCloudDraw::true_dot`).
+fn dots(cloud: DotCloudDraw<'_>) -> Vec<fmn_render::TrueDotDraw> {
+    cloud.dots.iter().map(|&dot| cloud.true_dot(dot)).collect()
 }
 
 /// Each dot's centre, radius and colour, comparable.
-fn summary(draws: &[ThreeDDraw<'static>]) -> Vec<([f64; 3], f64, [f64; 4])> {
-    dots(draws)
+fn summary(cloud: DotCloudDraw<'_>) -> Vec<([f64; 3], f64, [f64; 4])> {
+    dots(cloud)
         .iter()
         .map(|dot| {
             let color = dot.color;
@@ -78,19 +69,19 @@ fn lowering_never_reallocates_and_the_view_is_one_scene_object() -> Result<(), C
     let first = common::epoch(&world);
     let mut view = WorldView::for_epoch(&first, [256, 256], [2, 3, 8])?;
     let reserved = view.cloud().reserved_bytes();
-    let storage = view.cloud().draws().as_ptr();
+    let storage = view.cloud().draws().dots.as_ptr();
     assert_eq!(view.cloud().capacity(), first.capacity());
     for _ in 0..6 {
         common::advance(&mut world, 8);
         let epoch = common::epoch(&world);
         view.show(&epoch)?;
-        assert_eq!(view.cloud().draws().len(), epoch.len());
+        assert_eq!(view.cloud().draws().dots.len(), epoch.len());
         assert_eq!(view.shown().map(|shown| shown.tick), Some(epoch.tick()));
         view.job()?;
     }
     view.resize([640, 360])?;
     assert_eq!(view.cloud().reserved_bytes(), reserved);
-    assert_eq!(view.cloud().draws().as_ptr(), storage);
+    assert_eq!(view.cloud().draws().dots.as_ptr(), storage);
     assert_eq!(view.scene_objects(), 5);
     Ok(())
 }
@@ -114,7 +105,7 @@ fn a_population_past_the_ceiling_is_refused_and_keeps_what_was_shown() -> Result
         ),
         "{refused:?}"
     );
-    assert!(cloud.draws().is_empty());
+    assert!(cloud.draws().dots.is_empty());
 
     // An epoch of another world is refused too, and the draws stay.
     let mut fitting = ParticleCloud::for_epoch(&epoch)?;
@@ -409,7 +400,7 @@ fn a_declared_body_keeps_its_size_past_the_point_cap() -> Result<(), CoreError> 
             .iter()
             .all(|dot| dot.radius == DOT_RADIUS_MAX_POINTS / 200.0)
     );
-    assert!(!view.cloud().draws().is_empty());
+    assert!(!view.cloud().draws().dots.is_empty());
 
     // A body of 0.2 units is 40 px: drawn at its size, past the 24 px cap,
     // and so is the selection ring around it.
@@ -587,7 +578,7 @@ fn a_body_radius_sizes_every_dot_and_the_sphere_look_lights_them() -> Result<(),
         flat,
         "same centres, radii, colours"
     );
-    assert!(view.cloud().halos().is_empty(), "no halos");
+    assert!(view.cloud().halos().dots.is_empty(), "no halos");
     assert!(view.frame_bloom().is_none(), "no bloom");
     Ok(())
 }
@@ -656,7 +647,7 @@ fn update_between_handles_out_of_order_fading_and_zero_population() -> Result<()
         &Style::default(),
     )?);
     assert_eq!(draws.len(), 3, "every fading row must be emitted");
-    assert_eq!(cloud.halos().len(), 3);
+    assert_eq!(cloud.halos().dots.len(), 3);
     for (dot, &row) in draws.iter().zip(&between.fading) {
         let [x, y] = prior.positions()[row];
         assert_eq!(
@@ -703,7 +694,7 @@ fn update_between_handles_out_of_order_fading_and_zero_population() -> Result<()
         let mut view = WorldView::for_epoch(&empty, [64, 64], [10, 20, 30])?;
         view.set_style(style);
         view.show(&empty)?;
-        assert_eq!(view.cloud().draws().len(), 0);
+        assert_eq!(view.cloud().draws().dots.len(), 0);
         let rgba = view.render_rgba8(1)?;
         assert_eq!(rgba.len(), 64 * 64 * 4);
     }

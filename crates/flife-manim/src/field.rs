@@ -696,7 +696,9 @@ impl FieldLayer {
             quantity,
             detail,
         };
-        let texture = Texture::from_premultiplied_linear(cells[0], cells[1], texels)
+        // Built afresh for new values only (FL-033): an identity, not the
+        // SHA-256 of every texel, is what keeps it on the device.
+        let texture = Texture::from_premultiplied_linear_unhashed(cells[0], cells[1], texels)
             .map_err(|error| refused("field layer texture", error.to_string()))?;
         let new_quad = if self.quad.is_none() || self.quad_key != Some(want_quad) {
             Some(self.viewport.periodic_quad(cells)?)

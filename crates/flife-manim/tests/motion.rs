@@ -15,7 +15,7 @@ use flife_core::ids::OrganismId;
 use flife_engine::{Disposition, Intervention, Stepped, World};
 use flife_manim::{HALO_ALPHA, Motion, Style, WorldView, dot_radius, mapped_color, traits};
 use flife_render::{Epoch, Gap, Interpolation, Lease, Prior, Publication, Publisher, interpolate};
-use fmn_render::{ThreeDDraw, TrueDotDraw};
+use fmn_render::{DotCloudDraw, TrueDotDraw};
 
 /// Two epochs of one world from one publisher: the world as it stands,
 /// then after `change`.
@@ -70,18 +70,9 @@ fn kill_and_introduce(world: &mut World, at: [f64; 2]) {
     }
 }
 
-#[expect(
-    clippy::panic,
-    reason = "test helper: a failure here is a test failure"
-)]
-fn dots<'a>(draws: &'a [ThreeDDraw<'static>]) -> Vec<&'a TrueDotDraw> {
-    draws
-        .iter()
-        .map(|draw| match draw {
-            ThreeDDraw::TrueDot(dot) => dot,
-            other => panic!("not a dot: {other:?}"),
-        })
-        .collect()
+/// The true dot each dot of `cloud` draws (`DotCloudDraw::true_dot`).
+fn dots(cloud: DotCloudDraw<'_>) -> Vec<TrueDotDraw> {
+    cloud.dots.iter().map(|&dot| cloud.true_dot(dot)).collect()
 }
 
 fn prior_of(epoch: &Epoch) -> Prior {
@@ -92,17 +83,12 @@ fn prior_of(epoch: &Epoch) -> Prior {
 }
 
 /// The dots and halos `view` draws, bit for bit.
-#[expect(
-    clippy::panic,
-    reason = "test helper: a failure here is a test failure"
-)]
 fn drawn(view: &WorldView) -> Vec<[u64; 8]> {
-    view.cloud()
-        .halos()
-        .iter()
-        .chain(view.cloud().draws())
-        .map(|draw| match draw {
-            ThreeDDraw::TrueDot(dot) => [
+    dots(view.cloud().halos())
+        .into_iter()
+        .chain(dots(view.cloud().draws()))
+        .map(|dot| {
+            [
                 dot.center[0].to_bits(),
                 dot.center[1].to_bits(),
                 dot.center[2].to_bits(),
@@ -111,8 +97,7 @@ fn drawn(view: &WorldView) -> Vec<[u64; 8]> {
                 dot.color.g.to_bits(),
                 dot.color.b.to_bits(),
                 dot.color.a.to_bits(),
-            ],
-            other => panic!("not a dot: {other:?}"),
+            ]
         })
         .collect()
 }

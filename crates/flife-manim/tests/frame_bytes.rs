@@ -9,9 +9,22 @@
 mod common;
 
 use flife_manim::{
-    Look, PREPARATION_BYTES_FIXED, PREPARATION_BYTES_PER_DOT, Particles, Style, WorldView,
+    ColorMapping, FieldMapping, Look, PREPARATION_BYTES_FIXED, PREPARATION_BYTES_PER_DOT,
+    Particles, Style, WorldView,
 };
-use fmn_render::{ThreeDJob, Tiling};
+use fmn_render::{ThreeDDraw, ThreeDJob, Tiling};
+
+/// The dots and halos among `draws`: a true dot each, or a cloud's dots.
+fn particles(draws: &[ThreeDDraw<'_>]) -> usize {
+    draws
+        .iter()
+        .map(|draw| match draw {
+            ThreeDDraw::DotCloud(cloud) => cloud.dots.len(),
+            ThreeDDraw::TrueDot(_) => 1,
+            ThreeDDraw::Surface(_) | ThreeDDraw::Vector(_) => 0,
+        })
+        .sum()
+}
 
 fn styles() -> [(&'static str, Style); 4] {
     [
@@ -250,16 +263,16 @@ fn a_frame_prepared_on_threads_is_the_frame_prepared_on_one() {
             }
             // A job's record: everything it prints before it renders (its
             // tile scratch then depends on the render's threads) but the
-            // threads it was prepared on, its last field and the one meant
-            // to differ; those threads; its preparation bytes and, in the
-            // points style, its frame.
+            // threads it was prepared on, the one field meant to differ (its
+            // clouds follow it); those threads; its preparation bytes and,
+            // in the points style, its frame.
             let record = |view: &WorldView| {
                 let job = view.job().expect("a job");
                 let threads = job.preparation_threads();
                 let printed = format!("{job:?}");
-                let field = format!(", threads: {threads} }}");
-                assert!(printed.ends_with(&field), "{name}: {field}");
-                let printed = printed[..printed.len() - field.len()].to_owned();
+                let field = format!(", threads: {threads}, clouds: ");
+                assert_eq!(printed.matches(&field).count(), 1, "{name}: {field}");
+                let printed = printed.replacen(&field, ", clouds: ", 1);
                 let frame =
                     (name == "points").then(|| job.render(2).expect("a frame").as_bytes().to_vec());
                 (printed, threads, job.preparation_bytes(), frame)
@@ -316,12 +329,13 @@ fn zoomed_offscreen_culling_is_bit_identical_to_unculled_rendering() {
             view.show(&epoch).expect("show");
 
             // Unplaced `set_view` must not cull stale positions.
-            let unplaced_count = view.draws().expect("draws").len();
+            let full_particles = view.cloud().halos().dots.len() + view.cloud().draws().dots.len();
+            assert_eq!(particles(&view.draws().expect("draws")), full_particles);
             let zoomed = view.viewport().with_view(center, zoom).expect("zoomed");
             view.set_view(zoomed).expect("set_view");
             assert_eq!(
-                view.draws().expect("unplaced draws").len(),
-                unplaced_count,
+                particles(&view.draws().expect("unplaced draws")),
+                full_particles,
                 "unplaced set_view must keep all draws"
             );
 
@@ -330,11 +344,8 @@ fn zoomed_offscreen_culling_is_bit_identical_to_unculled_rendering() {
             let first = flife_core::ids::OrganismId::new(epoch.ids()[0]);
             view.select(Some(first)).expect("select");
             let culled_draws = view.draws().expect("culled draws");
-            let full_particles = view.cloud().halos().len() + view.cloud().draws().len();
-            let culled_particles = culled_draws
-                .iter()
-                .filter(|d| matches!(d, fmn_render::ThreeDDraw::TrueDot(_)))
-                .count();
+            let full_particles = view.cloud().halos().dots.len() + view.cloud().draws().dots.len();
+            let culled_particles = particles(&culled_draws);
             if zoom >= 4.0 {
                 assert!(
                     culled_particles * 4 < full_particles,
@@ -347,11 +358,12 @@ fn zoomed_offscreen_culling_is_bit_identical_to_unculled_rendering() {
                     "{look:?} zoom {zoom}: expected >95% culled, kept {culled_particles}/{full_particles}"
                 );
             }
-            // Build an unculled reference job directly from every cloud halo & dot.
+            // Build an unculled reference job directly from the cloud's halos
+            // and dots, as the unculled view draws them: as clouds.
             let mut unculled = Vec::new();
             unculled.extend(view.field().draw());
-            unculled.extend_from_slice(view.cloud().halos());
-            unculled.extend_from_slice(view.cloud().draws());
+            unculled.push(ThreeDDraw::DotCloud(view.cloud().halos()));
+            unculled.push(ThreeDDraw::DotCloud(view.cloud().draws()));
             unculled.extend(view.region_draw());
             unculled.extend(view.selection_draw());
             let mut ref_job = ThreeDJob::new(view.camera().camera(), &unculled, Tiling::default())
@@ -395,8 +407,8 @@ fn offscreen_center_with_onscreen_halo_is_preserved_bit_for_bit() {
 
     let mut unculled = Vec::new();
     unculled.extend(view.field().draw());
-    unculled.extend_from_slice(view.cloud().halos());
-    unculled.extend_from_slice(view.cloud().draws());
+    unculled.push(ThreeDDraw::DotCloud(view.cloud().halos()));
+    unculled.push(ThreeDDraw::DotCloud(view.cloud().draws()));
     let ref_frame = ThreeDJob::new(view.camera().camera(), &unculled, Tiling::default())
         .expect("ref job")
         .render(2)
@@ -447,13 +459,22 @@ fn glow_frame_at_half_million_organisms_with_field_compiles_past_default_draw_ca
     view.set_style(Style::default());
     view.show(&epoch).expect("shows");
 
+    // FrankenManim's draw rows: one a dot of a cloud, and the field's.
     let draws = view.draws().expect("draws");
+    let rows: usize = draws
+        .iter()
+        .map(|draw| match draw {
+            ThreeDDraw::DotCloud(cloud) => cloud.dots.len().max(1),
+            ThreeDDraw::TrueDot(_) | ThreeDDraw::Surface(_) | ThreeDDraw::Vector(_) => 1,
+        })
+        .sum();
     assert_eq!(
-        draws.len(),
-        2 * count + 1,
-        "glow look at 2^19 organisms + field emits 1,048,577 draws (> 1 << 20)"
+        (draws.len(), rows),
+        (3, 2 * count + 1),
+        "glow look at 2^19 organisms + field: the field and two clouds, 1,048,577 draw rows \
+         (> 1 << 20)"
     );
-    assert!(draws.len() > (1_usize << 20));
+    assert!(rows > (1_usize << 20));
 
     let job = view
         .job()
@@ -464,4 +485,171 @@ fn glow_frame_at_half_million_organisms_with_field_compiles_past_default_draw_ca
         job.preparation_bytes(),
         view.preparation_limit()
     );
+}
+
+/// The SHA-256 of each [`pinned_frames`] frame's RGBA8 bytes on the CPU
+/// route: the frames at FrankenManim `d1e1757b`, when every dot was a true
+/// dot, and at `48e4e2ee` (FL-033's repin), where the view draws its halos
+/// and dots as clouds. A FrankenManim repin that changes how FrankenLife
+/// looks fails here; one meant to change it updates these with the reason
+/// in its commit.
+const PINNED_FRAME_DIGESTS: [(&str, &str); 10] = [
+    (
+        "glow, bloom 0.15",
+        "8d2282fcd82e0e996499457f8b1e355dd602af99006c6a2b6df62aa0ae5fa48b",
+    ),
+    (
+        "glow",
+        "8f882aac7025b05b9589f5f3c9c450f209e0a086eaebe088dc1dc42377efef45",
+    ),
+    (
+        "raw",
+        "54ed9436aa9ed79fd6834a145f03648ea5ce9547a956347dc9e6f117959ec04b",
+    ),
+    (
+        "sphere",
+        "b1b6a2662ad5b8b3a95d81eb45a8b590cb4b6c0aeac23f31d7122e8ccfe172da",
+    ),
+    (
+        "density",
+        "bd2b7a64fc1c2419fe5f1ba4bd34be0e1a15cc1b8084ae60bf40cec3f5744ce2",
+    ),
+    (
+        "raw density",
+        "c835090100f5c25ae363ffd907519f64b9e1d9699fbb5881ae767083edccbb68",
+    ),
+    (
+        "no field",
+        "15659575ffe00d91dfafdd20ab1ee88339a9e01efb56f67a6e05ef6d788cc0c6",
+    ),
+    (
+        "composition field",
+        "b2a3d412de6bee351c5edff26377036d38adc1041064d81642f3876a52e89026",
+    ),
+    (
+        "energy",
+        "ee0675a9a136ed520849dde0adb8f683b647b58241ef7944ef425c55bab866a6",
+    ),
+    (
+        "glow, zoom 4, selected",
+        "fb5d3f0628c0159a260a3405091cbe962d5e531e09fe406790feaaa899ba8dd0",
+    ),
+];
+
+/// [`PINNED_FRAME_DIGESTS`]' frames: 1,024 organisms after 8 ticks at
+/// 320 x 180 in the default lineage mapping, in each look, the density view,
+/// without the field, with the composition field, in the energy mapping, and
+/// zoomed with the first organism selected: dots, halos, bloom, the field's
+/// texture, the density texture and the selection ring. The frames at the
+/// fit draw the dots as clouds; the zoomed frame, culled, as true dots.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn pinned_frames() -> Vec<(&'static str, String)> {
+    let config = common::config(&[
+        ("population", "initial_count", "1024"),
+        ("population", "maximum_count", "1024"),
+    ]);
+    let mut world = common::found(&config);
+    common::advance(&mut world, 8);
+    let epoch = common::epoch(&world);
+    let raw = Style {
+        look: Look::Raw,
+        ..Style::default()
+    };
+    let cases = [
+        ("glow, bloom 0.15", Style::default(), Some(0.15)),
+        ("glow", Style::default(), None),
+        ("raw", raw, None),
+        (
+            "sphere",
+            Style {
+                look: Look::Sphere,
+                ..Style::default()
+            },
+            None,
+        ),
+        (
+            "density",
+            Style {
+                particles: Particles::Density,
+                ..Style::default()
+            },
+            None,
+        ),
+        (
+            "raw density",
+            Style {
+                particles: Particles::Density,
+                ..raw
+            },
+            None,
+        ),
+        (
+            "no field",
+            Style {
+                field: false,
+                ..Style::default()
+            },
+            None,
+        ),
+        (
+            "composition field",
+            Style {
+                field_mapping: FieldMapping::Composition,
+                ..Style::default()
+            },
+            None,
+        ),
+        (
+            // The default mapping is lineage; this is the energy ramp.
+            "energy",
+            Style {
+                mapping: ColorMapping::Energy,
+                ..Style::default()
+            },
+            None,
+        ),
+    ];
+    let digest = |view: &WorldView| {
+        flife_core::Sha256Digest::of(&view.render_rgba8(2).expect("a frame")).to_hex()
+    };
+    let mut frames = Vec::new();
+    for (label, style, bloom) in cases {
+        let mut view = WorldView::for_epoch(&epoch, [320, 180], [2, 3, 8]).expect("a view");
+        view.set_style(style);
+        view.set_bloom(bloom).expect("bloom");
+        view.show(&epoch).expect("show");
+        frames.push((label, digest(&view)));
+    }
+    let mut view = WorldView::for_epoch(&epoch, [320, 180], [2, 3, 8]).expect("a view");
+    view.show(&epoch).expect("show");
+    let zoomed = view
+        .viewport()
+        .with_view([64.0, 64.0], 4.0)
+        .expect("zoomed");
+    view.set_view(zoomed).expect("set_view");
+    view.place(&epoch).expect("place");
+    let first = flife_core::ids::OrganismId::new(epoch.ids()[0]);
+    view.select(Some(first)).expect("select");
+    frames.push(("glow, zoom 4, selected", digest(&view)));
+    frames
+}
+
+#[test]
+#[expect(
+    clippy::print_stdout,
+    reason = "test: every digest is printed before the comparison, for a repin's record"
+)]
+fn frames_keep_their_pinned_digests() {
+    let frames = pinned_frames();
+    for (label, digest) in &frames {
+        println!("frame digest {label}: {digest}");
+    }
+    let pinned: Vec<(&str, String)> = PINNED_FRAME_DIGESTS
+        .iter()
+        .map(|&(label, digest)| (label, digest.to_owned()))
+        .collect();
+    assert_eq!(frames, pinned);
 }

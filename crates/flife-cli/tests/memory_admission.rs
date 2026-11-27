@@ -1482,7 +1482,13 @@ fn a_pan_or_zoom_allocates_no_layer_texture() {
 /// One frame on the CPU route, measured: a full world at 3840 x 2160 in
 /// points and in density, and in points with the preset's bloom (FL-019),
 /// on four threads, holds no more heap above the view than the view's
-/// frame and offline bytes.
+/// frame and offline bytes, which `flife render` and `flife discover`
+/// charge together. A frame without a dot cloud keeps within each term:
+/// its job within the frame's, its rendering within the offline term. A
+/// cloud's dots are compiled when the frame is rendered, not in its job
+/// (FrankenManim `DotCloudDraw`, FL-033), so the bytes the frame term
+/// charges for them are held while rendering: such a frame is checked
+/// against the two terms' sum.
 #[test]
 fn a_cpu_frame_holds_no_more_heap_than_the_views_frame_terms() {
     let _serial = serial();
@@ -1504,6 +1510,9 @@ fn a_cpu_frame_holds_no_more_heap_than_the_views_frame_terms() {
         ALLOC.reset_peak_usage();
         let draws = view.draws().expect("draws");
         let listed = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+        let clouds = draws
+            .iter()
+            .any(|draw| matches!(draw, fmn_render::ThreeDDraw::DotCloud(_)));
         drop(draws);
         assert!(
             listed <= view.frame_bytes() - view.preparation_limit(),
@@ -1522,11 +1531,12 @@ fn a_cpu_frame_holds_no_more_heap_than_the_views_frame_terms() {
         drop(rgba);
         let offline = view.offline_bytes(4);
         println!(
-            "{} (bloom {bloom:?}): a 4K frame's draw list held {:.2} MiB; the frame {:.2} MiB, its job \
-             {:.2} of {:.2} MiB, the rest {:.2} of {:.2} MiB",
+            "{} (bloom {bloom:?}, clouds {clouds}): a 4K frame's draw list held {:.2} MiB; the frame \
+             {:.2} of {:.2} MiB, its job {:.2} of {:.2} MiB, the rest {:.2} of {:.2} MiB",
             particles.name(),
             mib(listed),
             mib(held),
+            mib(view.frame_bytes() + offline),
             mib(compiled),
             mib(view.frame_bytes()),
             mib(held - compiled),
@@ -1538,11 +1548,19 @@ fn a_cpu_frame_holds_no_more_heap_than_the_views_frame_terms() {
             particles.name()
         );
         assert!(
-            held - compiled <= offline,
-            "{}: rendering held {} above its job > {offline}",
+            held <= view.frame_bytes() + offline,
+            "{}: the frame held {held} > {} + {offline}",
             particles.name(),
-            held - compiled
+            view.frame_bytes()
         );
+        if !clouds {
+            assert!(
+                held - compiled <= offline,
+                "{}: rendering held {} above its job > {offline}",
+                particles.name(),
+                held - compiled
+            );
+        }
     }
 }
 

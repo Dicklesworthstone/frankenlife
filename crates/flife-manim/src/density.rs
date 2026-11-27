@@ -389,11 +389,13 @@ impl DensityLayer {
             }
             prev = cur;
         }
-        let texture = Texture::from_premultiplied_linear(self.bins[0], self.bins[1], texels)
-            .map_err(|error| CoreError::NumericalInvalid {
-                quantity: "density layer texture",
-                detail: error.to_string(),
-            })?;
+        // An identity, not the SHA-256 of every texel (FL-033).
+        let texture =
+            Texture::from_premultiplied_linear_unhashed(self.bins[0], self.bins[1], texels)
+                .map_err(|error| CoreError::NumericalInvalid {
+                    quantity: "density layer texture",
+                    detail: error.to_string(),
+                })?;
         let want_quad = quad_key(&self.viewport, self.bins);
         let new_quad = if self.quad.is_none() || self.quad_key != Some(want_quad) {
             Some(self.viewport.periodic_quad(self.bins)?)

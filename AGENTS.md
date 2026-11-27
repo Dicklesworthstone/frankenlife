@@ -266,7 +266,7 @@ The plan's labels apply to code comments, docs, commit messages and reports:
 |---|---|
 | Toolchain | `nightly-2026-08-31` (`rust-toolchain.toml`), shared with the FrankenSuite siblings; Rust 2024 edition; one Cargo workspace |
 | Async runtime | Asupersync v0.6.2 (`a5d23e8d`), the sole runtime, with one package id per closure. FrankenManim takes it from git and FrankenTorch from crates.io, so the root `[patch.crates-io]` maps the crates.io edge onto the same commit (plan §12.8) |
-| Sibling revisions | `franken_manim` `d1e1757b`, `frankentorch` `37e0d05e`, `franken_numpy` `6492ff31`, `frankensqlite` `074c2033`, plus FrankenManim's transitive pins; the full qualified set is in `franken-stack.lock` |
+| Sibling revisions | `franken_manim` `48e4e2ee`, `frankentorch` `37e0d05e`, `franken_numpy` `6492ff31`, `frankensqlite` `074c2033`, plus FrankenManim's transitive pins; the full qualified set is in `franken-stack.lock` |
 | Root overrides | `[patch.crates-io]` in `Cargo.toml`: asupersync → `a5d23e8d`, and the reviewed `rust-block` `b39ae859d1ee8e8cb5eef6a516471f1578d26b96`. Both live at this root because Cargo ignores a dependency's own `[patch]` (plan §12.8) |
 
 Moving a pin is a deliberate event: requalify the capability probes and keep the old results.

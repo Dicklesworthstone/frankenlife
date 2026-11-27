@@ -909,11 +909,9 @@ fn every_dot_has_one_halo_sized_by_its_energy_in_the_same_order() {
     let mut cloud = ParticleCloud::for_epoch(&lease).expect("cloud");
     cloud.update(&lease, &viewport).expect("update");
     let (dots, halos) = (cloud.draws(), cloud.halos());
-    assert_eq!(halos.len(), dots.len());
-    for (row, (dot, halo)) in dots.iter().zip(halos).enumerate() {
-        let (ThreeDDraw::TrueDot(dot), ThreeDDraw::TrueDot(halo)) = (dot, halo) else {
-            panic!("row {row} is not two dots");
-        };
+    assert_eq!(halos.dots.len(), dots.dots.len());
+    for (row, (&dot, &halo)) in dots.dots.iter().zip(halos.dots).enumerate() {
+        let (dot, halo) = (dots.true_dot(dot), halos.true_dot(halo));
         assert_eq!(halo.center, dot.center, "row {row}");
         assert_eq!(halo.radius, dot.radius * halo_factor(lease.energies()[row]));
         assert!(halo.glow_factor > 0.0 && dot.glow_factor == 0.0);
@@ -929,21 +927,12 @@ fn every_dot_has_one_halo_sized_by_its_energy_in_the_same_order() {
     assert_eq!(halo_factor(-3.0), 2.0);
 
     // A resize keeps the halos proportional to the dots.
-    let before: Vec<f64> = halos
-        .iter()
-        .map(|halo| match halo {
-            ThreeDDraw::TrueDot(halo) => halo.radius,
-            _ => 0.0,
-        })
-        .collect();
+    let before: Vec<f64> = halos.dots.iter().map(|halo| halo.radius).collect();
     let small = fit(lease.extent(), [40, 40]);
     let ratio = flife_manim::dot_radius(&small) / flife_manim::dot_radius(&viewport);
     assert!(ratio > 1.0, "the pixel floor binds on the small drawable");
     cloud.refit(&small);
-    for (halo, before) in cloud.halos().iter().zip(before) {
-        let ThreeDDraw::TrueDot(halo) = halo else {
-            panic!("not a halo");
-        };
+    for (halo, before) in cloud.halos().dots.iter().zip(before) {
         assert!((halo.radius - before * ratio).abs() <= 1e-12 * before * ratio);
     }
 }
@@ -958,6 +947,14 @@ fn a_frame_draws_the_field_then_the_halos_then_the_dots() {
     view.show(&lease).expect("show");
     assert!(view.field().draw().is_some());
     assert_eq!(view.scene_objects(), 5);
+    // The field, then the halos' glow cloud, then the dots' cloud.
+    let n = lease.len();
+    assert!(matches!(
+        view.draws().expect("draws").as_slice(),
+        [ThreeDDraw::Surface(_), ThreeDDraw::DotCloud(halos), ThreeDDraw::DotCloud(dots)]
+            if halos.dots.len() == n && halos.glow_factor > 0.0
+                && dots.dots.len() == n && dots.glow_factor == 0.0
+    ));
     let rgba = view.render_rgba8(2).expect("an offline frame");
     assert_eq!(rgba.len(), 96 * 96 * 4);
     let (pixels, rest) = rgba.as_chunks::<4>();

@@ -281,13 +281,11 @@ fn every_dot_takes_its_own_rows_colour_in_every_mapping() {
         let draws = cloud
             .update_styled(&epoch, &viewport, &style)
             .expect("update")
+            .dots
             .to_vec();
         assert_eq!(draws.len(), epoch.len());
         let mut colours = Vec::new();
-        for (index, (draw, traits)) in draws.iter().zip(&rows).enumerate() {
-            let ThreeDDraw::TrueDot(dot) = draw else {
-                panic!("row {index} is not a dot");
-            };
+        for (index, (dot, traits)) in draws.iter().zip(&rows).enumerate() {
             assert_eq!(
                 dot.color,
                 mapped_color(mapping, traits, epoch.maximum_speed()),
@@ -299,6 +297,7 @@ fn every_dot_takes_its_own_rows_colour_in_every_mapping() {
         let again = cloud
             .update_styled(&epoch, &viewport, &style)
             .expect("again")
+            .dots
             .to_vec();
         assert_eq!(
             format!("{again:?}"),
@@ -344,10 +343,16 @@ fn the_raw_look_has_no_halos_and_a_linear_grey_field() {
         ..Style::default()
     });
     view.show(&epoch).expect("show");
-    assert!(view.cloud().halos().is_empty());
-    assert_eq!(view.cloud().draws().len(), epoch.len());
-    let job_draws = view.draws().expect("draws").len();
-    assert_eq!(job_draws, 1 + epoch.len(), "the field and one dot each");
+    assert!(view.cloud().halos().dots.is_empty());
+    assert_eq!(view.cloud().draws().dots.len(), epoch.len());
+    let job_draws = view.draws().expect("draws");
+    assert!(
+        matches!(
+            job_draws.as_slice(),
+            [ThreeDDraw::Surface(_), ThreeDDraw::DotCloud(dots)] if dots.dots.len() == epoch.len()
+        ),
+        "the field and one dot each, as one cloud and no halos"
+    );
     assert!(matches!(view.field().draw(), Some(ThreeDDraw::Surface(_))));
     let scale = view.field().scale();
     assert!(scale > 0.0);
@@ -364,7 +369,7 @@ fn the_raw_look_has_no_halos_and_a_linear_grey_field() {
     // The glow look of the same epoch has a halo per dot.
     view.set_style(Style::default());
     view.show(&epoch).expect("show");
-    assert_eq!(view.cloud().halos().len(), epoch.len());
+    assert_eq!(view.cloud().halos().dots.len(), epoch.len());
 }
 
 #[test]
@@ -531,7 +536,7 @@ fn the_density_texture_wraps_without_a_seam_and_draws_in_place_of_the_dots() {
     };
     view.set_style(density);
     view.show(&epoch).expect("show");
-    assert!(view.cloud().draws().is_empty() && view.cloud().halos().is_empty());
+    assert!(view.cloud().draws().dots.is_empty() && view.cloud().halos().dots.is_empty());
     let Some(ThreeDDraw::Surface(layer)) = view.density().draw() else {
         panic!("the density layer draws one surface");
     };
@@ -677,9 +682,13 @@ fn the_density_texture_wraps_without_a_seam_and_draws_in_place_of_the_dots() {
         ..Style::default()
     });
     view.show(&epoch).expect("show");
-    assert_eq!(
-        view.draws().expect("draws").len(),
-        2 * epoch.len(),
+    let n = epoch.len();
+    assert!(
+        matches!(
+            view.draws().expect("draws").as_slice(),
+            [ThreeDDraw::DotCloud(halos), ThreeDDraw::DotCloud(dots)]
+                if halos.dots.len() == n && dots.dots.len() == n
+        ),
         "halos and dots, no field"
     );
 }

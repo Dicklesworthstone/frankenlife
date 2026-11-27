@@ -924,11 +924,8 @@ fn v2_world_view_cloud_field_density_and_apical_ticks_end_to_end() {
         let draws = cloud
             .update_styled(&first, &viewport, &style)
             .expect("cloud update");
-        assert_eq!(draws.len(), first.len());
-        for (i, (draw, row)) in draws.iter().zip(&rows).enumerate() {
-            let ThreeDDraw::TrueDot(dot) = draw else {
-                panic!("row {i} is not a dot");
-            };
+        assert_eq!(draws.dots.len(), first.len());
+        for (i, (dot, row)) in draws.dots.iter().zip(&rows).enumerate() {
             assert_eq!(
                 dot.color,
                 mapped_color(mapping, row, first.maximum_speed()),
@@ -1027,8 +1024,16 @@ fn v2_world_view_cloud_field_density_and_apical_ticks_end_to_end() {
         if polarized_count > 0 {
             saw_ticks = true;
             let draws = view.draws().expect("draws");
-            // 1 field + N dots + 1 bulk apical-ticks mesh (no halos in Sphere look).
-            assert_eq!(draws.len(), 1 + epoch.len() + 1);
+            // The field, the N dots' cloud and the bulk apical-ticks mesh (no
+            // halos in Sphere look).
+            assert!(matches!(
+                draws.as_slice(),
+                [
+                    ThreeDDraw::Surface(_),
+                    ThreeDDraw::DotCloud(dots),
+                    ThreeDDraw::Surface(_),
+                ] if dots.dots.len() == epoch.len()
+            ));
             let frame_pol = view.render_rgba8(2).expect("render polarity sphere");
             assert_eq!(frame_pol.len(), 128 * 128 * 4);
             assert_ne!(frame_pol, frame_cs);
@@ -1183,9 +1188,12 @@ fn v1_and_disabled_v2_visual_mappings_incur_zero_overhead_and_fallback_cleanly()
         });
         view.show(&epoch).expect("fallback show");
         assert!(view.apical_ticks_draw().is_none(), "{label}: no ticks");
-        assert_eq!(
-            view.draws().expect("draws").len(),
-            1 + epoch.len(),
+        assert!(
+            matches!(
+                view.draws().expect("draws").as_slice(),
+                [ThreeDDraw::Surface(_), ThreeDDraw::DotCloud(dots)]
+                    if dots.dots.len() == epoch.len()
+            ),
             "{label}: field + dots only"
         );
         assert_eq!(

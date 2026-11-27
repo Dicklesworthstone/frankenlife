@@ -253,7 +253,7 @@ fn the_world_view_keeps_its_camera_and_places_without_moving_scales() {
     assert!(radius < DOT_RADIUS);
     let fitted = Viewport::fit(epoch.extent(), [640, 480]).expect("a viewport");
     assert_eq!(dot_radius(&fitted), DOT_RADIUS.max(1.5 / fitted.scale()));
-    assert!(!view_.cloud().draws().is_empty());
+    assert!(!view_.cloud().draws().dots.is_empty());
 }
 
 /// The selection ring's vertices lie on its two circles around the scene

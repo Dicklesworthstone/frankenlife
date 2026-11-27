@@ -22,7 +22,8 @@ const PRESET: &str = include_str!("../../../presets/reference-small-world.toml")
 fn a_pan_or_zoom_copies_no_layer_texels_to_the_device() {
     // A pan or zoom keeps the layers' textures (flife-manim), and
     // FrankenManim's Metal route keeps a frame's texels on the device while
-    // the next frame samples textures of the same content. So for a pan, a
+    // the next frame samples the same textures (the same builds: the layers'
+    // textures carry an identity, not a content hash, FL-033). So for a pan, a
     // zoom or a frame between epochs, the Studio's renderer copies no layer
     // texels: its upload is a fresh renderer's less exactly the texels of
     // the layers drawn (the field's for points, the field's and the
@@ -43,7 +44,8 @@ fn a_pan_or_zoom_copies_no_layer_texels_to_the_device() {
     .expect("founds");
     // Thirty ticks apart, so the raw density's bin counts change too (three
     // ticks left each bin's count, so its grey texture, bitwise the same,
-    // and FrankenManim kept it). The first is thirty ticks in, with a field
+    // and FrankenManim kept it while textures were keyed on their content).
+    // The first is thirty ticks in, with a field
     // that varies: the founding field's texels did not change when a pan
     // moved its display scale.
     let advance = |world: &mut World| {

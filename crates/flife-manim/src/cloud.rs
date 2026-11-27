@@ -1,14 +1,15 @@
 //! One particle cloud for the whole live population (plan §13.2,
 //! `ParticleCloudView`).
 //!
-//! A [`ParticleCloud`] lowers a render epoch into FrankenManim's 3D painter
-//! sequence: one camera-facing true dot per organism, in the epoch's stable
-//! identity order. That is what FrankenManim's own `DotCloud` lowers to on
-//! its camera route, so the existing route is the reference. The cloud is
+//! A [`ParticleCloud`] lowers a render epoch into FrankenManim dot clouds
+//! (`DotCloudDraw`, FL-033): one camera-facing dot per organism, in the
+//! epoch's stable identity order. A cloud draws exactly the true dots of its
+//! dots (`DotCloudDraw::true_dot`), byte for byte on both of FrankenManim's
+//! routes, so one true dot per organism remains the reference. The cloud is
 //! one scene object however many organisms live. It owns no mobject,
 //! animation handle or draw call per organism, and a frame is one 3D job.
 //!
-//! Its draw buffer is reserved once, at the population ceiling, so lowering
+//! Its dot buffers are reserved once, at the population ceiling, so lowering
 //! never allocates. A dot's colour is the style's [`ColorMapping`] of its
 //! row; the glow look adds a halo under every dot, the raw look none.
 //!
@@ -21,7 +22,7 @@
 use flife_core::CoreError;
 use flife_render::{Epoch, Interpolation};
 use fmn_core::color::LinearRgba;
-use fmn_render::{ThreeDDraw, TrueDotDraw};
+use fmn_render::{CloudDot, DotCloudDraw};
 
 use crate::Viewport;
 use crate::mapping::{EpochColors, Look, Particles, Style};
@@ -141,9 +142,12 @@ pub(crate) fn check_min_radius_points(points: f64) -> Result<(), CoreError> {
 /// The live population as one bounded scene object.
 #[derive(Debug)]
 pub struct ParticleCloud {
-    draws: Vec<ThreeDDraw<'static>>,
+    /// One dot per organism lowered, in identity order.
+    dots: Vec<CloudDot>,
     /// One soft glow per organism, drawn under every dot; sized by energy.
-    halos: Vec<ThreeDDraw<'static>>,
+    halos: Vec<CloudDot>,
+    /// The dots' shading: [`SPHERE_SHADING`] in the sphere look, else none.
+    shading: [f64; 3],
     radius: f64,
     /// The smallest radius a dot takes on screen, in points.
     min_points: f64,
@@ -154,25 +158,25 @@ pub struct ParticleCloud {
 }
 
 impl ParticleCloud {
-    /// A cloud for up to `capacity` organisms, its draw buffer reserved now.
+    /// A cloud for up to `capacity` organisms, its dot buffers reserved now.
     ///
     /// # Errors
-    /// [`CoreError::AllocationFailed`] when the buffer cannot be reserved.
+    /// [`CoreError::AllocationFailed`] when a buffer cannot be reserved.
     pub fn with_capacity(capacity: usize) -> Result<Self, CoreError> {
         let reserve = |buffer| {
-            let mut draws = Vec::new();
-            draws
-                .try_reserve_exact(capacity)
+            let mut dots = Vec::new();
+            dots.try_reserve_exact(capacity)
                 .map_err(|_| CoreError::AllocationFailed {
                     buffer,
-                    bytes: u64::try_from(capacity.saturating_mul(size_of::<ThreeDDraw<'static>>()))
+                    bytes: u64::try_from(capacity.saturating_mul(size_of::<CloudDot>()))
                         .unwrap_or(u64::MAX),
                 })?;
-            Ok::<_, CoreError>(draws)
+            Ok::<_, CoreError>(dots)
         };
         Ok(Self {
-            draws: reserve("particle cloud draws")?,
+            dots: reserve("particle cloud draws")?,
             halos: reserve("particle cloud halos")?,
+            shading: [0.0; 3],
             radius: DOT_RADIUS,
             min_points: DOT_RADIUS_MIN_POINTS,
             body: None,
@@ -197,7 +201,7 @@ impl ParticleCloud {
         &mut self,
         epoch: &Epoch,
         viewport: &Viewport,
-    ) -> Result<&[ThreeDDraw<'static>], CoreError> {
+    ) -> Result<DotCloudDraw<'_>, CoreError> {
         self.update_styled(epoch, viewport, &Style::default())
     }
 
@@ -205,7 +209,7 @@ impl ParticleCloud {
     /// identity order, centred on the row's scene point and coloured by the
     /// style's mapping, with a halo under each for the glow look. The
     /// density style draws no dots (the density layer does). Nothing is
-    /// allocated.
+    /// allocated. Returns the dots ([`ParticleCloud::draws`]).
     ///
     /// # Errors
     /// - [`CoreError::BudgetExhausted`] when the epoch has more rows than
@@ -217,7 +221,7 @@ impl ParticleCloud {
         epoch: &Epoch,
         viewport: &Viewport,
         style: &Style,
-    ) -> Result<&[ThreeDDraw<'static>], CoreError> {
+    ) -> Result<DotCloudDraw<'_>, CoreError> {
         if epoch.len() > self.capacity {
             return Err(CoreError::BudgetExhausted {
                 budget: "particle cloud draws",
@@ -235,9 +239,9 @@ impl ParticleCloud {
                 ),
             });
         }
-        self.begin(viewport);
+        self.begin(viewport, style);
         if style.particles == Particles::Density {
-            return Ok(&self.draws);
+            return Ok(self.draws());
         }
         let (start, extent, half) = viewport.scene_transform();
         let positions = epoch.positions();
@@ -254,19 +258,23 @@ impl ParticleCloud {
                         half,
                         [f64::from(position[0]), f64::from(position[1])],
                     );
-                    self.draws
-                        .push(ThreeDDraw::TrueDot(TrueDotDraw::new(center, radius, color)));
-                    self.halos.push(ThreeDDraw::TrueDot(TrueDotDraw::glow(
+                    self.dots.push(CloudDot {
                         center,
-                        radius * halo_factor(energies[row]),
-                        LinearRgba {
+                        radius,
+                        color,
+                    });
+                    self.halos.push(CloudDot {
+                        center,
+                        radius: radius * halo_factor(energies[row]),
+                        color: LinearRgba {
                             a: HALO_ALPHA,
                             ..color
                         },
-                    )));
+                    });
                 });
             }
-            Look::Raw => {
+            // The sphere look's shading is the dots cloud's.
+            Look::Raw | Look::Sphere => {
                 colors.for_each(positions.len(), |row, color| {
                     let position = positions[row];
                     let center = Viewport::scene_point_with(
@@ -275,26 +283,15 @@ impl ParticleCloud {
                         half,
                         [f64::from(position[0]), f64::from(position[1])],
                     );
-                    self.draws
-                        .push(ThreeDDraw::TrueDot(TrueDotDraw::new(center, radius, color)));
-                });
-            }
-            Look::Sphere => {
-                colors.for_each(positions.len(), |row, color| {
-                    let position = positions[row];
-                    let center = Viewport::scene_point_with(
-                        start,
-                        extent,
-                        half,
-                        [f64::from(position[0]), f64::from(position[1])],
-                    );
-                    let mut dot = TrueDotDraw::new(center, radius, color);
-                    dot.shading = SPHERE_SHADING;
-                    self.draws.push(ThreeDDraw::TrueDot(dot));
+                    self.dots.push(CloudDot {
+                        center,
+                        radius,
+                        color,
+                    });
                 });
             }
         }
-        Ok(&self.draws)
+        Ok(self.draws())
     }
 
     /// Lower the display `fraction` of the way from `prior` to `current`
@@ -325,7 +322,7 @@ impl ParticleCloud {
         fraction: f64,
         viewport: &Viewport,
         style: &Style,
-    ) -> Result<&[ThreeDDraw<'static>], CoreError> {
+    ) -> Result<DotCloudDraw<'_>, CoreError> {
         if !(0.0..=1.0).contains(&fraction) {
             return Err(CoreError::NumericalInvalid {
                 quantity: "particle cloud display fraction",
@@ -369,9 +366,9 @@ impl ParticleCloud {
                 available: u64::try_from(self.capacity).unwrap_or(u64::MAX),
             });
         }
-        self.begin(viewport);
+        self.begin(viewport, style);
         if style.particles == Particles::Density {
-            return Ok(&self.draws);
+            return Ok(self.draws());
         }
         let (start, extent, half) = viewport.scene_transform();
         let radius = self.radius;
@@ -392,33 +389,23 @@ impl ParticleCloud {
                     [f64::from(position[0]), f64::from(position[1])],
                 );
                 let color = prior_colors.color_at(row);
-                let mut dot = TrueDotDraw::new(
+                self.dots.push(CloudDot {
                     center,
                     radius,
-                    LinearRgba {
+                    color: LinearRgba {
                         a: color.a * fade,
                         ..color
                     },
-                );
-                match style.look {
-                    Look::Glow => {
-                        self.draws.push(ThreeDDraw::TrueDot(dot));
-                        self.halos.push(ThreeDDraw::TrueDot(TrueDotDraw::glow(
-                            center,
-                            radius * halo_factor(prior_energies[row]),
-                            LinearRgba {
-                                a: halo_alpha,
-                                ..color
-                            },
-                        )));
-                    }
-                    Look::Raw => {
-                        self.draws.push(ThreeDDraw::TrueDot(dot));
-                    }
-                    Look::Sphere => {
-                        dot.shading = SPHERE_SHADING;
-                        self.draws.push(ThreeDDraw::TrueDot(dot));
-                    }
+                });
+                if style.look == Look::Glow {
+                    self.halos.push(CloudDot {
+                        center,
+                        radius: radius * halo_factor(prior_energies[row]),
+                        color: LinearRgba {
+                            a: halo_alpha,
+                            ..color
+                        },
+                    });
                 }
             }
         }
@@ -432,48 +419,48 @@ impl ParticleCloud {
                     if shown[row] {
                         let center =
                             Viewport::scene_point_with(start, extent, half, positions[row]);
-                        self.draws
-                            .push(ThreeDDraw::TrueDot(TrueDotDraw::new(center, radius, color)));
-                        self.halos.push(ThreeDDraw::TrueDot(TrueDotDraw::glow(
+                        self.dots.push(CloudDot {
                             center,
-                            radius * halo_factor(energies[row]),
-                            LinearRgba {
+                            radius,
+                            color,
+                        });
+                        self.halos.push(CloudDot {
+                            center,
+                            radius: radius * halo_factor(energies[row]),
+                            color: LinearRgba {
                                 a: HALO_ALPHA,
                                 ..color
                             },
-                        )));
+                        });
                     }
                 });
             }
-            Look::Raw => {
+            Look::Raw | Look::Sphere => {
                 current_colors.for_each(positions.len(), |row, color| {
                     if shown[row] {
                         let center =
                             Viewport::scene_point_with(start, extent, half, positions[row]);
-                        self.draws
-                            .push(ThreeDDraw::TrueDot(TrueDotDraw::new(center, radius, color)));
-                    }
-                });
-            }
-            Look::Sphere => {
-                current_colors.for_each(positions.len(), |row, color| {
-                    if shown[row] {
-                        let center =
-                            Viewport::scene_point_with(start, extent, half, positions[row]);
-                        let mut dot = TrueDotDraw::new(center, radius, color);
-                        dot.shading = SPHERE_SHADING;
-                        self.draws.push(ThreeDDraw::TrueDot(dot));
+                        self.dots.push(CloudDot {
+                            center,
+                            radius,
+                            color,
+                        });
                     }
                 });
             }
         }
-        Ok(&self.draws)
+        Ok(self.draws())
     }
 
-    /// Clear the draws for a new lowering through `viewport`.
-    fn begin(&mut self, viewport: &Viewport) {
+    /// Clear the dots for a new lowering through `viewport` in `style`.
+    fn begin(&mut self, viewport: &Viewport, style: &Style) {
         self.radius = self.radius_on(viewport);
-        self.draws.clear();
+        self.shading = if style.look == Look::Sphere {
+            SPHERE_SHADING
+        } else {
+            [0.0; 3]
+        };
+        self.dots.clear();
         self.halos.clear();
     }
 
@@ -551,31 +538,33 @@ impl ParticleCloud {
             1.0
         };
         self.radius = radius;
-        for draw in &mut self.draws {
-            if let ThreeDDraw::TrueDot(dot) = draw {
-                dot.radius = radius;
-            }
+        for dot in &mut self.dots {
+            dot.radius = radius;
         }
         if ratio.is_finite() && ratio > 0.0 {
             for halo in &mut self.halos {
-                if let ThreeDDraw::TrueDot(dot) = halo {
-                    dot.radius *= ratio;
-                }
+                halo.radius *= ratio;
             }
         }
     }
 
-    /// The current halos: for the glow look one per dot and in the same
-    /// order, for the raw look none.
+    /// The current halos as one cloud of glow dots
+    /// ([`DotCloudDraw::glow`]): for the glow look one per dot and in the
+    /// same order, for the other looks none.
     #[must_use]
-    pub fn halos(&self) -> &[ThreeDDraw<'static>] {
-        &self.halos
+    pub fn halos(&self) -> DotCloudDraw<'_> {
+        DotCloudDraw::glow(&self.halos)
     }
 
-    /// The current draws, one per organism of the last epoch lowered.
+    /// The current dots as one cloud, one per organism of the last epoch
+    /// lowered: unlit dots ([`DotCloudDraw::new`]), shaded by
+    /// [`SPHERE_SHADING`] in the sphere look.
     #[must_use]
-    pub fn draws(&self) -> &[ThreeDDraw<'static>] {
-        &self.draws
+    pub fn draws(&self) -> DotCloudDraw<'_> {
+        DotCloudDraw {
+            shading: self.shading,
+            ..DotCloudDraw::new(&self.dots)
+        }
     }
 
     /// The most organisms the cloud can hold.
@@ -584,12 +573,11 @@ impl ParticleCloud {
         self.capacity
     }
 
-    /// Bytes reserved for draws. Constant for the cloud's life.
+    /// Bytes reserved for the dots and halos. Constant for the cloud's life.
     #[must_use]
     pub fn reserved_bytes(&self) -> u64 {
         u64::try_from(
-            (self.draws.capacity() + self.halos.capacity())
-                .saturating_mul(size_of::<ThreeDDraw<'static>>()),
+            (self.dots.capacity() + self.halos.capacity()).saturating_mul(size_of::<CloudDot>()),
         )
         .unwrap_or(u64::MAX)
     }

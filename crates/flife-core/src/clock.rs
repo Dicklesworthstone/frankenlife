@@ -87,12 +87,14 @@ impl TimeStep {
         };
         if self.denominator.is_power_of_two() {
             // For any power-of-two `u32` denominator `2^k` (`0 <= k <= 31`),
-            // `1.0 / 2^k` is an exact normal f64 and `scaled >= 0` is an
-            // integer so `scaled * 2^(-k)` is never subnormal when nonzero,
-            // making multiplication 0-ulp bit-identical to division.
-            scaled * (1.0 / f64::from(self.denominator))
+            // `(1023 - k) << 52` is the exact IEEE-754 F64 bit pattern of
+            // `2^(-k)` (zero `fdiv`), and `scaled >= 0` is an integer so
+            // `scaled * 2^(-k)` is never subnormal when nonzero — 0-ulp
+            // bit-identical to `scaled / f64::from(self.denominator)`.
+            let inv = f64::from_bits(u64::from(1023 - self.denominator.trailing_zeros()) << 52);
+            scaled * inv
         } else {
-            scaled / f64::from(self.denominator)
+            div_non_pow2(scaled, self.denominator)
         }
     }
 
@@ -181,10 +183,23 @@ fn decompose(x: f64) -> (u64, i32) {
     }
 }
 
+#[cold]
+#[inline(never)]
+fn div_non_pow2(scaled: f64, denominator: u32) -> f64 {
+    scaled / f64::from(denominator)
+}
+
+#[cold]
+#[inline(never)]
+const fn err_tick_overflow(quantity: &'static str) -> CoreError {
+    CoreError::Overflow { quantity }
+}
+
 fn tick_span(ticks: u128, quantity: &'static str) -> Result<TickSpan, CoreError> {
-    u64::try_from(ticks)
-        .map(TickSpan)
-        .map_err(|_| CoreError::Overflow { quantity })
+    match u64::try_from(ticks) {
+        Ok(raw) => Ok(TickSpan(raw)),
+        Err(_) => Err(err_tick_overflow(quantity)),
+    }
 }
 
 /// A committed scientific tick.
@@ -219,11 +234,12 @@ impl Tick {
     ///
     /// # Errors
     /// [`CoreError::Overflow`] past `u64::MAX`.
+    #[inline]
     pub fn checked_add(self, span: TickSpan) -> Result<Self, CoreError> {
-        self.0
-            .checked_add(span.0)
-            .map(Self)
-            .ok_or(CoreError::Overflow { quantity: "tick" })
+        match self.0.checked_add(span.0) {
+            Some(next) => Ok(Self(next)),
+            None => Err(err_tick_overflow("tick")),
+        }
     }
 
     /// Ticks elapsed since `earlier`.
@@ -232,12 +248,10 @@ impl Tick {
     /// [`CoreError::Overflow`] when `earlier` is after this tick.
     #[inline]
     pub fn since(self, earlier: Self) -> Result<TickSpan, CoreError> {
-        self.0
-            .checked_sub(earlier.0)
-            .map(TickSpan)
-            .ok_or(CoreError::Overflow {
-                quantity: "elapsed ticks (earlier tick is later)",
-            })
+        match self.0.checked_sub(earlier.0) {
+            Some(span) => Ok(TickSpan(span)),
+            None => Err(err_tick_overflow("elapsed ticks (earlier tick is later)")),
+        }
     }
 }
 

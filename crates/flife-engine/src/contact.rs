@@ -2320,6 +2320,11 @@ pub fn relax_sweep1_with_context(
         let mut align_w = 0.0_f64;
         let has_pcp = pcp_inputs.is_some();
         let has_vel = velocity_inputs.is_some();
+        #[cold]
+        #[inline(never)]
+        const fn err_trophallaxis_overflow(quantity: &'static str) -> CoreError {
+            CoreError::Overflow { quantity }
+        }
         let mut process_pair = |other: usize,
                                 dx: f64,
                                 dy: f64,
@@ -2449,21 +2454,26 @@ pub fn relax_sweep1_with_context(
                         &tr_cfg,
                     );
                     if q_out > 0 {
-                        delta_k = delta_k.checked_sub(q_out).ok_or(CoreError::Overflow {
-                            quantity: "trophallaxis organism delta quanta",
-                        })?;
-                        let q_out_u = u64::try_from(q_out).map_err(|_| CoreError::Overflow {
-                            quantity: "trophallaxis outgoing quanta",
-                        })?;
-                        let q_tax_u = u64::try_from(q_tax).map_err(|_| CoreError::Overflow {
-                            quantity: "trophallaxis tax quanta",
-                        })?;
-                        body_out = body_out.checked_add(q_out_u).ok_or(CoreError::Overflow {
-                            quantity: "trophallaxis outgoing quanta",
-                        })?;
-                        body_tax = body_tax.checked_add(q_tax_u).ok_or(CoreError::Overflow {
-                            quantity: "trophallaxis tax quanta",
-                        })?;
+                        let Some(next_delta) = delta_k.checked_sub(q_out) else {
+                            return Err(err_trophallaxis_overflow(
+                                "trophallaxis organism delta quanta",
+                            ));
+                        };
+                        delta_k = next_delta;
+                        let Ok(q_out_u) = u64::try_from(q_out) else {
+                            return Err(err_trophallaxis_overflow("trophallaxis outgoing quanta"));
+                        };
+                        let Ok(q_tax_u) = u64::try_from(q_tax) else {
+                            return Err(err_trophallaxis_overflow("trophallaxis tax quanta"));
+                        };
+                        let Some(next_out) = body_out.checked_add(q_out_u) else {
+                            return Err(err_trophallaxis_overflow("trophallaxis outgoing quanta"));
+                        };
+                        body_out = next_out;
+                        let Some(next_tax) = body_tax.checked_add(q_tax_u) else {
+                            return Err(err_trophallaxis_overflow("trophallaxis tax quanta"));
+                        };
+                        body_tax = next_tax;
                     }
                 } else if e_j > e_i && tr_scales[other] > 0.0 {
                     let alike = get_genetic_alike().unwrap_or(0.0);
@@ -2477,15 +2487,19 @@ pub fn relax_sweep1_with_context(
                         &tr_cfg,
                     );
                     if q_in > 0 {
-                        delta_k = delta_k.checked_add(q_in).ok_or(CoreError::Overflow {
-                            quantity: "trophallaxis organism delta quanta",
-                        })?;
-                        let q_in_u = u64::try_from(q_in).map_err(|_| CoreError::Overflow {
-                            quantity: "trophallaxis incoming quanta",
-                        })?;
-                        body_in = body_in.checked_add(q_in_u).ok_or(CoreError::Overflow {
-                            quantity: "trophallaxis incoming quanta",
-                        })?;
+                        let Some(next_delta) = delta_k.checked_add(q_in) else {
+                            return Err(err_trophallaxis_overflow(
+                                "trophallaxis organism delta quanta",
+                            ));
+                        };
+                        delta_k = next_delta;
+                        let Ok(q_in_u) = u64::try_from(q_in) else {
+                            return Err(err_trophallaxis_overflow("trophallaxis incoming quanta"));
+                        };
+                        let Some(next_in) = body_in.checked_add(q_in_u) else {
+                            return Err(err_trophallaxis_overflow("trophallaxis incoming quanta"));
+                        };
+                        body_in = next_in;
                     }
                 }
             }

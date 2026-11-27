@@ -984,16 +984,23 @@ fn fixed_terms(admission: &Value) -> u64 {
 
 /// A package's crop is admitted as a phase of its own (FL-043), beside the
 /// restored world and before the pin, at `World::crop_bytes`, before the
-/// crop is made. The phases are read from a discovery under the run's own
-/// budget; the same run under a budget one byte below the crop's phase, and
-/// above the render's and the run's, refuses the package before the bundle
-/// exists and saves the discovery without it. A budget of exactly the
-/// crop's phase admits the package, its terms as before.
+/// crop is made. This world starts 256 founders in the 32 × 32 ecology and
+/// selects a radius-12 disk (~44% of the torus), so the cropped organisms'
+/// genomes beside the crop's state, field, scratch and checkpoint stream
+/// make the crop's phase several MiB larger than the 160 × 90 thumbnail's
+/// render (which depends on the 1,024 population ceiling rather than the
+/// disk's live population). The phases are read from a discovery under the
+/// run's own budget; the same run under a budget one byte below the crop's
+/// phase, and above the render's and the run's, refuses the package before
+/// the bundle exists and saves the discovery without it. A budget of
+/// exactly the crop's phase admits the package, its terms as before.
 #[test]
 fn a_package_over_the_memory_budget_is_refused_before_the_bundle_exists() {
-    const REGION: [&str; 3] = ["--region", "16,16,6", "--no-world"];
+    const REGION: [&str; 3] = ["--region", "16,16,12", "--no-world"];
+    const FOUNDERS: (&str, &str, &str) = ("population", "initial_count", "256");
+    let probe_config = ecology_with("crop-budget-probe.toml", &[FOUNDERS]);
     let probe = fresh("crop-budget-probe");
-    let run_out = run(&probe, 7);
+    let run_out = run_with(&probe_config, &probe, 7);
     let (status, out, err) = discover(&probe, &fresh("crop-budget-probe-bundle"), &REGION);
     assert_eq!(status, Some(0), "{err:?}");
     let record = one(&out, "discovery");
@@ -1017,7 +1024,10 @@ fn a_package_over_the_memory_budget_is_refused_before_the_bundle_exists() {
     let budget = |name: &str, bytes: u64| {
         let config = ecology_with(
             &format!("{name}.toml"),
-            &[("execution", "maximum_total_bytes", &bytes.to_string())],
+            &[
+                FOUNDERS,
+                ("execution", "maximum_total_bytes", &bytes.to_string()),
+            ],
         );
         let run_dir = fresh(name);
         run_with(&config, &run_dir, 7);

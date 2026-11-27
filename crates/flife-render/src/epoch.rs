@@ -1994,10 +1994,7 @@ fn project_organism_slice(
         .zip(topologies.iter_mut())
         .zip(affinities.iter_mut());
     for (
-        (
-            ((((((id_out, pos_out), vel_out), energy_out), lineage_out), gen_out), topo_out),
-            aff_out,
-        ),
+        (((((((id_out, pos_out), vel_out), energy_out), lineage_out), gen_out), topo_out), aff_out),
         row,
     ) in dst.zip(population.iter_render_rows_range(range))
     {
@@ -2010,7 +2007,10 @@ fn project_organism_slice(
                 quantity: "render topology index",
             })?;
         *id_out = row.id.get();
-        *pos_out = [fold(row.position[0], width[0]), fold(row.position[1], width[1])];
+        *pos_out = [
+            fold(row.position[0], width[0]),
+            fold(row.position[1], width[1]),
+        ];
         // Every committed component is within the speed limit, and
         // rounding to nearest is monotone, so each F32 component is
         // within the F32 limit.
@@ -3487,8 +3487,8 @@ mod tests {
 
     #[test]
     fn parallel_organism_projection_matches_serial_bit_for_bit_across_v1_and_v2() {
-        use std::num::NonZeroUsize;
         use flife_engine::{Disposition, Intervention};
+        use std::num::NonZeroUsize;
 
         // 1. Baseline field-ecology-v1 world with 4,096 organisms across both
         //    Compact and FreeList arrangements, including mid-run FreeList holes.

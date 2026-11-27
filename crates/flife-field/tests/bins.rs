@@ -1775,7 +1775,8 @@ fn reduce_run_single_and_multi_packet_matches_across_carriers_and_sequence_modes
 
     for (label, base, carrier) in cases {
         // Ascending ID submission (HAS_SEQ = false), workers = 1 reference
-        let mut dep_asc_1 = Deposits::with_capacity(&g, records.len() as u64, &limits).expect("cap");
+        let mut dep_asc_1 =
+            Deposits::with_capacity(&g, records.len() as u64, &limits).expect("cap");
         for &(org, pos, amount, dir) in &records {
             dep_asc_1
                 .push(&g, org, pos, amount, amount, &dir)
@@ -1786,7 +1787,8 @@ fn reduce_run_single_and_multi_packet_matches_across_carriers_and_sequence_modes
             .expect("apply asc w1");
 
         // Ascending ID submission (HAS_SEQ = false), workers = 4
-        let mut dep_asc_4 = Deposits::with_capacity(&g, records.len() as u64, &limits).expect("cap");
+        let mut dep_asc_4 =
+            Deposits::with_capacity(&g, records.len() as u64, &limits).expect("cap");
         for &(org, pos, amount, dir) in &records {
             dep_asc_4
                 .push(&g, org, pos, amount, amount, &dir)

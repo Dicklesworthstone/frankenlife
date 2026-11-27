@@ -3197,8 +3197,8 @@ impl World {
         // the GPU controller dispatch inside the single worker budget.
         let view = pyramid.build_on(observed, field_work.workers())?;
         let (sampled, sensor_failure) = sample_with(population, rows, &view, observed, sensors);
-        let mut overlap = (uptake_state.backend.is_none() && lanes.len() >= 2).then(|| {
-            OverlapPhase56 {
+        let mut overlap =
+            (uptake_state.backend.is_none() && lanes.len() >= 2).then(|| OverlapPhase56 {
                 observed,
                 demands,
                 grants,
@@ -3209,8 +3209,7 @@ impl World {
                 run_fused_chem: settle_state.backend.is_none(),
                 uptake_result: None,
                 fused_chem_done: false,
-            }
-        });
+            });
         let evaluated = decide_with(
             rules,
             population,
@@ -3434,15 +3433,8 @@ impl World {
         let uptake = match precomputed_uptake {
             Some(result) => result?,
             None => {
-                let summary = uptake_with(
-                    rules,
-                    rows,
-                    observed,
-                    demands,
-                    grants,
-                    uptake_state,
-                    lanes,
-                )?;
+                let summary =
+                    uptake_with(rules, rows, observed, demands, grants, uptake_state, lanes)?;
                 // The packets are in (cell, identity) order, so grouping them by
                 // demand keeps each organism's in cell order.
                 let granted = grants.packets();
@@ -5729,7 +5721,15 @@ fn uptake_with(
             }
             Err(error) => {
                 report.reference_ticks = report.reference_ticks.saturating_add(1);
-                demands_on_lanes(field, &rule, rules.exchange, rows, demands, lanes, lanes.len())?;
+                demands_on_lanes(
+                    field,
+                    &rule,
+                    rules.exchange,
+                    rows,
+                    demands,
+                    lanes,
+                    lanes.len(),
+                )?;
                 let summary = resolve_uptake_with_on_workers(
                     field,
                     rules.exchange,
@@ -5743,7 +5743,15 @@ fn uptake_with(
             }
         }
     }
-    demands_on_lanes(field, &rule, rules.exchange, rows, demands, lanes, lanes.len())?;
+    demands_on_lanes(
+        field,
+        &rule,
+        rules.exchange,
+        rows,
+        demands,
+        lanes,
+        lanes.len(),
+    )?;
     resolve_uptake_with_on_workers(field, rules.exchange, demands, grants, lanes.len())
 }
 
@@ -6745,13 +6753,8 @@ fn write_four_planes_contig(
     let (s3_q, s3_r) = s3.as_chunks::<4>();
     let (e_q, e_r) = energies.as_chunks::<4>();
     let (d_q, d_r) = dst.as_chunks_mut::<4>();
-    for (((((m0, m1), m2), m3), ek), dk) in s0_q
-        .iter()
-        .zip(s1_q)
-        .zip(s2_q)
-        .zip(s3_q)
-        .zip(e_q)
-        .zip(d_q)
+    for (((((m0, m1), m2), m3), ek), dk) in
+        s0_q.iter().zip(s1_q).zip(s2_q).zip(s3_q).zip(e_q).zip(d_q)
     {
         let q0 = [
             f64::from(m0[0]) / ek[0],
@@ -6785,13 +6788,8 @@ fn write_four_planes_contig(
             out[3] = q3[k];
         }
     }
-    for (((((&m0, &m1), &m2), &m3), &e), out_cell) in s0_r
-        .iter()
-        .zip(s1_r)
-        .zip(s2_r)
-        .zip(s3_r)
-        .zip(e_r)
-        .zip(d_r)
+    for (((((&m0, &m1), &m2), &m3), &e), out_cell) in
+        s0_r.iter().zip(s1_r).zip(s2_r).zip(s3_r).zip(e_r).zip(d_r)
     {
         let out = &mut out_cell[ch..ch + 4];
         out[0] = f64::from(m0) / e;
@@ -6880,8 +6878,10 @@ fn compute_tile_compositions(
         }
         let slots_contig = i - batch_start == batch_count;
         let c0 = cells[0];
-        let contig_in_bounds =
-            cells_contig && c0.checked_add(batch_count).is_some_and(|end| end <= total_cells);
+        let contig_in_bounds = cells_contig
+            && c0
+                .checked_add(batch_count)
+                .is_some_and(|end| end <= total_cells);
         let mut ch = 0_usize;
         while ch < quad_channels {
             let base = (ch + 1) * total_cells;
@@ -9580,290 +9580,283 @@ fn decide_batched_flat_f32(
         )?
     {
         let tile_offsets = *spatial_tile_offsets;
-        let total_input_elems =
-                total_due
-                    .checked_mul(input_width)
-                    .ok_or(CoreError::Overflow {
-                        quantity: "flat controller inputs",
-                    })?;
-            reserve_for(
-                flat_inputs_f32,
-                total_input_elems.saturating_sub(flat_inputs_f32.len()),
-                "flat controller inputs",
-            )?;
-            set_len_reuse(flat_inputs_f32, total_input_elems, 0.0_f32);
-            reserve_for(
-                flat_inputs_finite,
-                total_due.saturating_sub(flat_inputs_finite.len()),
-                "flat controller input flags",
-            )?;
-            set_len_reuse(flat_inputs_finite, total_due, 0_u8);
+        let total_input_elems = total_due
+            .checked_mul(input_width)
+            .ok_or(CoreError::Overflow {
+                quantity: "flat controller inputs",
+            })?;
+        reserve_for(
+            flat_inputs_f32,
+            total_input_elems.saturating_sub(flat_inputs_f32.len()),
+            "flat controller inputs",
+        )?;
+        set_len_reuse(flat_inputs_f32, total_input_elems, 0.0_f32);
+        reserve_for(
+            flat_inputs_finite,
+            total_due.saturating_sub(flat_inputs_finite.len()),
+            "flat controller input flags",
+        )?;
+        set_len_reuse(flat_inputs_finite, total_due, 0_u8);
 
-            // Subdivide heavily clustered spatial tiles so all workers stay
-            // load-balanced even if every organism congregates in one corner.
-            let max_sub_tile = rows
-                .len()
-                .div_ceil(worker_budget.saturating_mul(4))
-                .max(MINIMUM_ROWS_PER_LANE);
-            struct SpatialSubSpec {
-                start: usize,
-                len: usize,
+        // Subdivide heavily clustered spatial tiles so all workers stay
+        // load-balanced even if every organism congregates in one corner.
+        let max_sub_tile = rows
+            .len()
+            .div_ceil(worker_budget.saturating_mul(4))
+            .max(MINIMUM_ROWS_PER_LANE);
+        struct SpatialSubSpec {
+            start: usize,
+            len: usize,
+            due_offset: usize,
+            due_count: usize,
+        }
+        let mut sub_specs: Vec<SpatialSubSpec> = Vec::with_capacity(SPATIAL_TILES);
+        let mut due_cursor = 0_usize;
+        for t in 0..SPATIAL_TILES {
+            let count = tile_counts[t];
+            if count == 0 {
+                continue;
+            }
+            let base = tile_offsets[t];
+            if count <= max_sub_tile {
+                sub_specs.push(SpatialSubSpec {
+                    start: base,
+                    len: count,
+                    due_offset: due_cursor,
+                    due_count: tile_due[t],
+                });
+                due_cursor += tile_due[t];
+            } else {
+                let mut off = 0_usize;
+                while off < count {
+                    let sub_len = (count - off).min(max_sub_tile);
+                    let sub_due = spatial_rows[base + off..base + off + sub_len]
+                        .iter()
+                        .filter(|&&r| due(rules, &rows[r as usize], to))
+                        .count();
+                    sub_specs.push(SpatialSubSpec {
+                        start: base + off,
+                        len: sub_len,
+                        due_offset: due_cursor,
+                        due_count: sub_due,
+                    });
+                    due_cursor += sub_due;
+                    off += sub_len;
+                }
+            }
+        }
+
+        struct Pass1SpatialTile<'a, 'p> {
+            row_indices: &'a [u32],
+            decisions: &'a mut [Decision],
+            in_f32: &'a mut [f32],
+            in_fin: &'a mut [u8],
+            jobs: Vec<FlatControllerJob<'p>>,
+        }
+        let mut tiles: Vec<Pass1SpatialTile<'_, '_>> = Vec::with_capacity(sub_specs.len());
+        let mut rem_dec = decisions.as_mut_slice();
+        let mut rem_f32 = flat_inputs_f32.as_mut_slice();
+        let mut rem_fin = flat_inputs_finite.as_mut_slice();
+        for spec in &sub_specs {
+            let (my_dec, next_dec) = rem_dec.split_at_mut(spec.len);
+            rem_dec = next_dec;
+            let (my_f32, next_f32) = rem_f32.split_at_mut(spec.due_count * input_width);
+            rem_f32 = next_f32;
+            let (my_fin, next_fin) = rem_fin.split_at_mut(spec.due_count);
+            rem_fin = next_fin;
+            let mut jobs = Vec::new();
+            reserve_for(&mut jobs, spec.due_count, "controller jobs")?;
+            tiles.push(Pass1SpatialTile {
+                row_indices: &spatial_rows[spec.start..spec.start + spec.len],
+                decisions: my_dec,
+                in_f32: my_f32,
+                in_fin: my_fin,
+                jobs,
+            });
+        }
+        flife_core::pool::try_parallel_tasks(
+            worker_budget,
+            "decide spatial",
+            &mut tiles,
+            |_, tile| {
+                pass1_flat_f32_spatial(
+                    rules,
+                    population,
+                    ordered_slots,
+                    view,
+                    rows,
+                    crowding_counts,
+                    [from, to],
+                    tile.row_indices,
+                    tile.decisions,
+                    tile.in_f32,
+                    tile.in_fin,
+                    &mut tile.jobs,
+                )
+            },
+        )?;
+        let mut flat_jobs = Vec::new();
+        reserve_for(&mut flat_jobs, total_due, "controller jobs")?;
+        for mut tile in tiles {
+            flat_jobs.append(&mut tile.jobs);
+        }
+
+        let mut device_nanoseconds = 0_u64;
+        if flat_jobs.is_empty() {
+            flat_outputs.clear();
+        } else {
+            let eval_result = if device.prefers_cpu_overlap()
+                && worker_budget >= 2
+                && let Some(ov) = overlap
+            {
+                let flat_jobs_ref: &[FlatControllerJob<'_>] = &flat_jobs;
+                let flat_in_f32_ref: &[f32] = flat_inputs_f32;
+                let flat_in_fin_ref: &[u8] = flat_inputs_finite;
+                let (eval_res, ()) = flife_core::pool::overlap_off_cpu(
+                    worker_budget,
+                    "overlap controllers and phase 5-6",
+                    || {
+                        device.evaluate_flat_f32(
+                            flat_jobs_ref,
+                            input_width,
+                            flat_in_f32_ref,
+                            flat_in_fin_ref,
+                            flat_outputs,
+                        )
+                    },
+                    |cpu_workers| {
+                        run_overlapped_phase56(
+                            rules,
+                            population,
+                            rows,
+                            spatial_rows,
+                            row_to_spatial,
+                            spatial_tile_offsets,
+                            lanes,
+                            cpu_workers,
+                            ov,
+                        );
+                    },
+                )?;
+                eval_res
+            } else {
+                device.evaluate_flat_f32(
+                    &flat_jobs,
+                    input_width,
+                    flat_inputs_f32,
+                    flat_inputs_finite,
+                    flat_outputs,
+                )
+            };
+            if let Err(error) = eval_result {
+                flat_outputs.clear();
+                return Ok(Batched::Device(error));
+            }
+            device_nanoseconds = device.last_device_nanoseconds();
+            if flat_outputs.valid.len() != flat_jobs.len()
+                || flat_outputs.output_width != raw_output_width
+                || flat_outputs.values.len() != flat_jobs.len().saturating_mul(raw_output_width)
+            {
+                return Ok(Batched::Device(CoreError::StateConflict {
+                    operation: "batch controllers",
+                    detail: format!(
+                        "backend returned {} valid flags and {} values (width {}), expected {} x {raw_output_width}",
+                        flat_outputs.valid.len(),
+                        flat_outputs.values.len(),
+                        flat_outputs.output_width,
+                        flat_jobs.len(),
+                    ),
+                }));
+            }
+
+            let flat_jobs_slice: &[FlatControllerJob<'_>] = &flat_jobs;
+            let flat_in_slice: &[f32] = flat_inputs_f32;
+            let flat_out_ref: &FlatOutputs = flat_outputs;
+            struct Pass2SpatialTile<'a> {
+                row_indices: &'a [u32],
+                decisions: &'a mut [Decision],
                 due_offset: usize,
                 due_count: usize,
             }
-            let mut sub_specs: Vec<SpatialSubSpec> = Vec::with_capacity(SPATIAL_TILES);
-            let mut due_cursor = 0_usize;
-            for t in 0..SPATIAL_TILES {
-                let count = tile_counts[t];
-                if count == 0 {
-                    continue;
-                }
-                let base = tile_offsets[t];
-                if count <= max_sub_tile {
-                    sub_specs.push(SpatialSubSpec {
-                        start: base,
-                        len: count,
-                        due_offset: due_cursor,
-                        due_count: tile_due[t],
-                    });
-                    due_cursor += tile_due[t];
-                } else {
-                    let mut off = 0_usize;
-                    while off < count {
-                        let sub_len = (count - off).min(max_sub_tile);
-                        let sub_due = spatial_rows[base + off..base + off + sub_len]
-                            .iter()
-                            .filter(|&&r| due(rules, &rows[r as usize], to))
-                            .count();
-                        sub_specs.push(SpatialSubSpec {
-                            start: base + off,
-                            len: sub_len,
-                            due_offset: due_cursor,
-                            due_count: sub_due,
-                        });
-                        due_cursor += sub_due;
-                        off += sub_len;
-                    }
-                }
-            }
-
-            struct Pass1SpatialTile<'a, 'p> {
-                row_indices: &'a [u32],
-                decisions: &'a mut [Decision],
-                in_f32: &'a mut [f32],
-                in_fin: &'a mut [u8],
-                jobs: Vec<FlatControllerJob<'p>>,
-            }
-            let mut tiles: Vec<Pass1SpatialTile<'_, '_>> = Vec::with_capacity(sub_specs.len());
+            let mut pass2_tiles: Vec<Pass2SpatialTile<'_>> = Vec::with_capacity(sub_specs.len());
             let mut rem_dec = decisions.as_mut_slice();
-            let mut rem_f32 = flat_inputs_f32.as_mut_slice();
-            let mut rem_fin = flat_inputs_finite.as_mut_slice();
             for spec in &sub_specs {
                 let (my_dec, next_dec) = rem_dec.split_at_mut(spec.len);
                 rem_dec = next_dec;
-                let (my_f32, next_f32) = rem_f32.split_at_mut(spec.due_count * input_width);
-                rem_f32 = next_f32;
-                let (my_fin, next_fin) = rem_fin.split_at_mut(spec.due_count);
-                rem_fin = next_fin;
-                let mut jobs = Vec::new();
-                reserve_for(&mut jobs, spec.due_count, "controller jobs")?;
-                tiles.push(Pass1SpatialTile {
+                pass2_tiles.push(Pass2SpatialTile {
                     row_indices: &spatial_rows[spec.start..spec.start + spec.len],
                     decisions: my_dec,
-                    in_f32: my_f32,
-                    in_fin: my_fin,
-                    jobs,
+                    due_offset: spec.due_offset,
+                    due_count: spec.due_count,
                 });
             }
-            flife_core::pool::try_parallel_tasks(
+            flife_core::pool::try_parallel_tasks_with_lanes(
                 worker_budget,
-                "decide spatial",
-                &mut tiles,
-                |_, tile| {
-                    pass1_flat_f32_spatial(
-                        rules,
-                        population,
-                        ordered_slots,
-                        view,
-                        rows,
-                        crowding_counts,
-                        [from, to],
-                        tile.row_indices,
-                        tile.decisions,
-                        tile.in_f32,
-                        tile.in_fin,
-                        &mut tile.jobs,
-                    )
+                "decode controllers spatial",
+                lanes,
+                &mut pass2_tiles,
+                |_, tile, lane| {
+                    if tile.due_count == 0 {
+                        return Ok(());
+                    }
+                    let mut job_idx = tile.due_offset;
+                    for (&row_u32, decision) in
+                        tile.row_indices.iter().zip(tile.decisions.iter_mut())
+                    {
+                        if !decision.evaluated {
+                            continue;
+                        }
+                        let organism = &rows[row_u32 as usize];
+                        match flat_out_ref.row(job_idx) {
+                            Some(raw_slice) => {
+                                held_from_raw_slice_into(
+                                    rules,
+                                    organism,
+                                    to,
+                                    raw_slice,
+                                    &mut decision.held,
+                                )?;
+                            }
+                            None => {
+                                let job = flat_jobs_slice.get(job_idx).ok_or_else(|| {
+                                    CoreError::StateConflict {
+                                        operation: "batch controllers",
+                                        detail: format!("missing deferred job {job_idx}"),
+                                    }
+                                })?;
+                                let start_in = job_idx * input_width;
+                                let in_row = flat_in_slice
+                                    .get(start_in..start_in + input_width)
+                                    .ok_or_else(|| CoreError::StateConflict {
+                                        operation: "batch controllers",
+                                        detail: format!(
+                                            "missing flat inputs for deferred job {job_idx}"
+                                        ),
+                                    })?;
+                                decision.held = evaluate_reference_held_from_f32(
+                                    rules,
+                                    job.controller,
+                                    organism,
+                                    in_row,
+                                    to,
+                                    &mut lane.controller,
+                                )?;
+                            }
+                        }
+                        decode_held_into(rules, organism, &decision.held, &mut decision.actions)?;
+                        job_idx += 1;
+                    }
+                    Ok(())
                 },
             )?;
-            let mut flat_jobs = Vec::new();
-            reserve_for(&mut flat_jobs, total_due, "controller jobs")?;
-            for mut tile in tiles {
-                flat_jobs.append(&mut tile.jobs);
-            }
-
-            let mut device_nanoseconds = 0_u64;
-            if flat_jobs.is_empty() {
-                flat_outputs.clear();
-            } else {
-                let eval_result = if device.prefers_cpu_overlap()
-                    && worker_budget >= 2
-                    && let Some(ov) = overlap
-                {
-                    let flat_jobs_ref: &[FlatControllerJob<'_>] = &flat_jobs;
-                    let flat_in_f32_ref: &[f32] = flat_inputs_f32;
-                    let flat_in_fin_ref: &[u8] = flat_inputs_finite;
-                    let (eval_res, ()) = flife_core::pool::overlap_off_cpu(
-                        worker_budget,
-                        "overlap controllers and phase 5-6",
-                        || {
-                            device.evaluate_flat_f32(
-                                flat_jobs_ref,
-                                input_width,
-                                flat_in_f32_ref,
-                                flat_in_fin_ref,
-                                flat_outputs,
-                            )
-                        },
-                        |cpu_workers| {
-                            run_overlapped_phase56(
-                                rules,
-                                population,
-                                rows,
-                                spatial_rows,
-                                row_to_spatial,
-                                spatial_tile_offsets,
-                                lanes,
-                                cpu_workers,
-                                ov,
-                            );
-                        },
-                    )?;
-                    eval_res
-                } else {
-                    device.evaluate_flat_f32(
-                        &flat_jobs,
-                        input_width,
-                        flat_inputs_f32,
-                        flat_inputs_finite,
-                        flat_outputs,
-                    )
-                };
-                if let Err(error) = eval_result {
-                    flat_outputs.clear();
-                    return Ok(Batched::Device(error));
-                }
-                device_nanoseconds = device.last_device_nanoseconds();
-                if flat_outputs.valid.len() != flat_jobs.len()
-                    || flat_outputs.output_width != raw_output_width
-                    || flat_outputs.values.len() != flat_jobs.len().saturating_mul(raw_output_width)
-                {
-                    return Ok(Batched::Device(CoreError::StateConflict {
-                        operation: "batch controllers",
-                        detail: format!(
-                            "backend returned {} valid flags and {} values (width {}), expected {} x {raw_output_width}",
-                            flat_outputs.valid.len(),
-                            flat_outputs.values.len(),
-                            flat_outputs.output_width,
-                            flat_jobs.len(),
-                        ),
-                    }));
-                }
-
-                let flat_jobs_slice: &[FlatControllerJob<'_>] = &flat_jobs;
-                let flat_in_slice: &[f32] = flat_inputs_f32;
-                let flat_out_ref: &FlatOutputs = flat_outputs;
-                struct Pass2SpatialTile<'a> {
-                    row_indices: &'a [u32],
-                    decisions: &'a mut [Decision],
-                    due_offset: usize,
-                    due_count: usize,
-                }
-                let mut pass2_tiles: Vec<Pass2SpatialTile<'_>> =
-                    Vec::with_capacity(sub_specs.len());
-                let mut rem_dec = decisions.as_mut_slice();
-                for spec in &sub_specs {
-                    let (my_dec, next_dec) = rem_dec.split_at_mut(spec.len);
-                    rem_dec = next_dec;
-                    pass2_tiles.push(Pass2SpatialTile {
-                        row_indices: &spatial_rows[spec.start..spec.start + spec.len],
-                        decisions: my_dec,
-                        due_offset: spec.due_offset,
-                        due_count: spec.due_count,
-                    });
-                }
-                flife_core::pool::try_parallel_tasks_with_lanes(
-                    worker_budget,
-                    "decode controllers spatial",
-                    lanes,
-                    &mut pass2_tiles,
-                    |_, tile, lane| {
-                        if tile.due_count == 0 {
-                            return Ok(());
-                        }
-                        let mut job_idx = tile.due_offset;
-                        for (&row_u32, decision) in
-                            tile.row_indices.iter().zip(tile.decisions.iter_mut())
-                        {
-                            if !decision.evaluated {
-                                continue;
-                            }
-                            let organism = &rows[row_u32 as usize];
-                            match flat_out_ref.row(job_idx) {
-                                Some(raw_slice) => {
-                                    held_from_raw_slice_into(
-                                        rules,
-                                        organism,
-                                        to,
-                                        raw_slice,
-                                        &mut decision.held,
-                                    )?;
-                                }
-                                None => {
-                                    let job = flat_jobs_slice.get(job_idx).ok_or_else(|| {
-                                        CoreError::StateConflict {
-                                            operation: "batch controllers",
-                                            detail: format!("missing deferred job {job_idx}"),
-                                        }
-                                    })?;
-                                    let start_in = job_idx * input_width;
-                                    let in_row = flat_in_slice
-                                        .get(start_in..start_in + input_width)
-                                        .ok_or_else(|| CoreError::StateConflict {
-                                            operation: "batch controllers",
-                                            detail: format!(
-                                                "missing flat inputs for deferred job {job_idx}"
-                                            ),
-                                        })?;
-                                    decision.held = evaluate_reference_held_from_f32(
-                                        rules,
-                                        job.controller,
-                                        organism,
-                                        in_row,
-                                        to,
-                                        &mut lane.controller,
-                                    )?;
-                                }
-                            }
-                            decode_held_into(
-                                rules,
-                                organism,
-                                &decision.held,
-                                &mut decision.actions,
-                            )?;
-                            job_idx += 1;
-                        }
-                        Ok(())
-                    },
-                )?;
-            }
-            let deferred = flat_outputs.valid.iter().filter(|&&v| v == 0).count();
-            let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
-            return Ok(Batched::Done {
-                batched: count(flat_jobs.len().saturating_sub(deferred)),
-                deferred: count(deferred),
-                device_nanoseconds,
-            });
+        }
+        let deferred = flat_outputs.valid.iter().filter(|&&v| v == 0).count();
+        let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        return Ok(Batched::Done {
+            batched: count(flat_jobs.len().saturating_sub(deferred)),
+            deferred: count(deferred),
+            device_nanoseconds,
+        });
     }
 
     let max_tiles = rows.len().div_ceil(MINIMUM_ROWS_PER_LANE).max(1);
@@ -11814,7 +11807,11 @@ mod tests {
                 ((lcg >> 40) as f32) / 16_777_216.0
             };
             for c in 0..total_cells {
-                let e = if c % 37 == 0 { 0.0 } else { 0.01 + next_f32() * 5.0 };
+                let e = if c % 37 == 0 {
+                    0.0
+                } else {
+                    0.01 + next_f32() * 5.0
+                };
                 field.as_mut_slice()[c] = e;
             }
             for p in 1..planes as usize {

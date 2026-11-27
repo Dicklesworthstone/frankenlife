@@ -848,8 +848,14 @@ fn register_blocked_gemv_and_f32_inputs_match_independent_scalar_oracle_bit_for_
             let exp_bits: Vec<u32> = expected_f32.iter().map(|v| v.to_bits()).collect();
             let got_f64_bits: Vec<u32> = got_f64.as_slice().iter().map(|v| v.to_bits()).collect();
             let got_f32_bits: Vec<u32> = got_f32.as_slice().iter().map(|v| v.to_bits()).collect();
-            assert_eq!(got_f64_bits, exp_bits, "f32 widths={widths:?} trial={trial}");
-            assert_eq!(got_f32_bits, exp_bits, "f32_in widths={widths:?} trial={trial}");
+            assert_eq!(
+                got_f64_bits, exp_bits,
+                "f32 widths={widths:?} trial={trial}"
+            );
+            assert_eq!(
+                got_f32_bits, exp_bits,
+                "f32_in widths={widths:?} trial={trial}"
+            );
 
             // F16 weights: evaluate_raw AND evaluate_raw_f32_inputs match scalar oracle bit-for-bit.
             let expected_f16 =
@@ -863,8 +869,14 @@ fn register_blocked_gemv_and_f32_inputs_match_independent_scalar_oracle_bit_for_
             let exp_h_bits: Vec<u32> = expected_f16.iter().map(|v| v.to_bits()).collect();
             let got_h64_bits: Vec<u32> = got_h64.as_slice().iter().map(|v| v.to_bits()).collect();
             let got_h32_bits: Vec<u32> = got_h32.as_slice().iter().map(|v| v.to_bits()).collect();
-            assert_eq!(got_h64_bits, exp_h_bits, "f16 widths={widths:?} trial={trial}");
-            assert_eq!(got_h32_bits, exp_h_bits, "f16_in widths={widths:?} trial={trial}");
+            assert_eq!(
+                got_h64_bits, exp_h_bits,
+                "f16 widths={widths:?} trial={trial}"
+            );
+            assert_eq!(
+                got_h32_bits, exp_h_bits,
+                "f16_in widths={widths:?} trial={trial}"
+            );
         }
     }
 

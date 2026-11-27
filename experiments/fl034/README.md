@@ -267,6 +267,41 @@ from the Interactive preset.
 - These runs say nothing about speed: they ran on the CPU reference on x86-64 hosts, two at a time. The
   Desktop profile's G4/G6 qualification is FL-034's remaining work.
 
+# FL-034 G4: CPU and Metal controllers on the two evolved worlds
+
+G4 (plan §21.3) asks for CPU/Metal stage comparisons that pass declared tolerances and accounting tests,
+including contention and variable topology. In a run, `--controllers metal` puts the controllers on the GPU. The
+field, sensing, uptake and settlement stay on the CPU, because flife-backend-metal's stage backends measured
+slower and nothing selects them (`crates/flife-backend-metal/CONTRACT.md`). Their stage comparisons are that
+crate's tests. This section compares the profiles' own route over long runs of the worlds G6 uses (see
+[The worlds](#the-worlds)), at the strictest tolerance there is: the same digest.
+
+Observed on the Mac (M5 Ultra) on 2026-11-27 at load averages of 90 to 250, with release builds of `flife`, 16 CPU
+workers unless noted, 8,192 ticks:
+
+| World | Metal controllers | CPU controllers | Compared |
+|---|---|---|---|
+| Interactive (`presets/interactive-world.toml`, seed 42) | `595e2d90…3167b` | the same, on 16 and on 7 workers | tallies every 1,024 ticks, digest |
+| Desktop (`presets/desktop-world.toml` on seed 2022) | `4f7f1cf1…e7e8c9` | the same | tallies every 256 ticks, digest |
+
+- Both Interactive routes and the Desktop CPU run used the build made at 15:13 from 70fbadf's tree with 7b4a4e5's
+  repin. The Desktop Metal run used the release build that the same target held at 13:05. Its revision is not
+  recorded, so that row compares builds as well as routes.
+- The Interactive world ends with 22,559 live, after 92,229 births, 94,670 deaths and 901 topology changes (peak
+  29,784, least 3,581). The Desktop world ends with 99,065 live, after 389,045 births, 389,980 deaths and 3,925
+  topology changes (peak 119,331, least 15,252).
+- The energy ledger closed every tick in both. The normalized residual is 3.3 × 10⁻⁹ (Interactive) and
+  2.1 × 10⁻⁹ (Desktop).
+
+The Desktop world was also checked under the renderer. An offscreen Studio run (`flife-studio --resume`, the 15:13
+build) stepped it from tick 8,941 to 9,097. It ran Metal controllers on 16 workers while it rendered 3840 × 2160
+frames with camera zooms on the same GPU, and it received no world command. It ended at digest `f06b9701…a5bfe`.
+The tick-8,941 checkpoint, branched and resumed headless with CPU controllers by the same build, ends there too.
+So the Metal controllers keep parity while the renderer shares the GPU, and presentation leaves the world
+unchanged (plan §7.5).
+
+Engine commits after the builds above, commit:cdd7209 among them, are not covered.
+
 # FL-034 G6: the two profiles in a window (to run)
 
 G6 (plan §21.3) asks a qualified profile for 30 fps display and a p95 input/camera latency of at most 100 ms
@@ -295,9 +330,8 @@ live and 389,045 births, where E2 had 99,361 and 389,349.
 The model changed after E1 and E2 ran. commit:d8a88aa (2026-11-23) added plan §11.5's bounded moment-only
 cone contraction. It contracts a field cell's moments, never its energy, back inside `|m| ≤ E` when they exceed
 the cone by more than 10⁻⁶ relative, one tenth of `INV-02`'s 10⁻⁵. The Interactive world shows where the
-contraction first acts. These were observed on the Mac on 2026-11-27 with
-the release builds of 62f16ac (before d8a88aa) and 147c18d (after it), both branched from one tick-4,096
-checkpoint:
+contraction first acts. These were observed on the Mac on 2026-11-27 with the release builds of 62f16ac (before
+d8a88aa) and 147c18d (after it), both branched from one tick-4,096 checkpoint:
 
 - The two worlds are bit-identical through tick 4,135.
 - At tick 4,136 exactly one field cell differs: cell (226, 92). Its `|m| / E` is 1 + 1.01 × 10⁻⁶ before the
@@ -310,9 +344,8 @@ The adopted powers' rule runs were not rerun under the contraction, and their di
 The Nov 20 build reproduces E1's world exactly (`a8b7f6b3…5eb34`). Today's tree gives the same world with CPU
 and Metal controllers and on 7 or 16 workers.
 
-A window
-run resumes each world and keeps it on in its directory, so every run starts where the last one stopped,
-near the same population.
+A window run resumes each world and keeps it on in its directory, so every run starts where the last one
+stopped, near the same population.
 
 ## The run
 

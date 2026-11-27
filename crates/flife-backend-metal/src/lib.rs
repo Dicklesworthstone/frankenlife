@@ -110,46 +110,56 @@ const fn forward_threads(widest_hidden: usize) -> usize {
     }
 }
 
-/// Pack a binary16 genome into `out` (`u32` pairs, even element low) matching
-/// `controller_forward_half`'s coalesced AoSoA layout: any layer whose
-/// slot-relative offset and `fan_in` are both multiples of 4 is stored as
-/// `[q][out][4]` (2 `u32` words per `(q, out)`), followed by `biases`; all
-/// other layers stay row-major. Exact element count `values.len()`, zero extra
-/// slot padding beyond F16's 4-element alignment, preserving every bit and
-/// exact ascending MAC order `0..fan_in`.
-fn pack_f16_for_metal(
+/// Pack a binary16 genome directly into a pre-sized `dst` slice (`u32` pairs,
+/// even element low) matching `controller_forward_half`'s coalesced AoSoA
+/// layout: any layer whose slot-relative offset and `fan_in` are both
+/// multiples of 4 is stored as `[q][out][4]` (2 `u32` words per `(q, out)`),
+/// followed by `biases`; all other layers stay row-major.
+///
+/// Iterates sequentially row-major over source weights with zero `Vec::push`
+/// checks, preserving every bit and exact ascending MAC order `0..fan_in`.
+fn pack_f16_for_metal_into(
     topology: &DenseTopology,
     values: &[flife_core::binary16::F16],
-    out: &mut Vec<u32>,
-) -> Result<(), CoreError> {
-    out.clear();
+    dst: &mut [u32],
+) -> Result<usize, CoreError> {
     let word_count = values.len().div_ceil(2);
-    if out.capacity() < word_count {
-        reserve(out, word_count, "metal binary16 words")?;
+    if dst.len() < word_count {
+        return Err(CoreError::LayoutMismatch {
+            buffer: "metal binary16 words",
+            detail: format!(
+                "destination slice length {} shorter than required {word_count} words",
+                dst.len()
+            ),
+        });
     }
+    let mut cursor = 0_usize;
     let mut pending_lo: Option<u16> = None;
-    let push_slice =
-        |slice: &[flife_core::binary16::F16], pending: &mut Option<u16>, dst: &mut Vec<u32>| {
-            let mut iter = slice.iter();
-            if let Some(lo) = pending.take() {
-                if let Some(&hi) = iter.next() {
-                    dst.push(u32::from(lo) | (u32::from(hi.to_bits()) << 16));
-                } else {
-                    *pending = Some(lo);
-                    return;
-                }
+    let write_slice = |slice: &[flife_core::binary16::F16],
+                       pending: &mut Option<u16>,
+                       out_dst: &mut [u32],
+                       out_cursor: &mut usize| {
+        let mut iter = slice.iter();
+        if let Some(lo) = pending.take() {
+            if let Some(&hi) = iter.next() {
+                out_dst[*out_cursor] = u32::from(lo) | (u32::from(hi.to_bits()) << 16);
+                *out_cursor += 1;
+            } else {
+                *pending = Some(lo);
+                return;
             }
-            let rem = iter.as_slice();
-            let (pairs, tail) = rem.as_chunks::<2>();
-            dst.extend(
-                pairs.iter().map(|[low, high]| {
-                    u32::from(low.to_bits()) | (u32::from(high.to_bits()) << 16)
-                }),
-            );
-            if let Some(&last) = tail.first() {
-                *pending = Some(last.to_bits());
-            }
-        };
+        }
+        let rem = iter.as_slice();
+        let (pairs, tail) = rem.as_chunks::<2>();
+        let next = *out_cursor + pairs.len();
+        for (dst_word, [low, high]) in out_dst[*out_cursor..next].iter_mut().zip(pairs) {
+            *dst_word = u32::from(low.to_bits()) | (u32::from(high.to_bits()) << 16);
+        }
+        *out_cursor = next;
+        if let Some(&last) = tail.first() {
+            *pending = Some(last.to_bits());
+        }
+    };
 
     let mut layer_offset = 0_usize;
     for layer in topology.layers() {
@@ -211,23 +221,45 @@ fn pack_f16_for_metal(
                     detail: "AoSoA quad count mismatch".to_string(),
                 });
             }
-            for q in 0..quads {
-                if let Some(shifted) = weight_quads.get(q..) {
-                    for w in shifted.iter().step_by(quads) {
-                        out.push(u32::from(w[0].to_bits()) | (u32::from(w[1].to_bits()) << 16));
-                        out.push(u32::from(w[2].to_bits()) | (u32::from(w[3].to_bits()) << 16));
-                    }
+            let layer_words = weight_count / 2;
+            let row_stride = fan_out * 2;
+            let layer_dst = &mut dst[cursor..cursor + layer_words];
+            for (o, row_quads) in weight_quads.chunks_exact(quads).enumerate() {
+                let o2 = o * 2;
+                for (dst_q, w) in layer_dst.chunks_exact_mut(row_stride).zip(row_quads) {
+                    dst_q[o2] = u32::from(w[0].to_bits()) | (u32::from(w[1].to_bits()) << 16);
+                    dst_q[o2 + 1] = u32::from(w[2].to_bits()) | (u32::from(w[3].to_bits()) << 16);
                 }
             }
+            cursor += layer_words;
         } else {
-            push_slice(weights, &mut pending_lo, out);
+            write_slice(weights, &mut pending_lo, dst, &mut cursor);
         }
-        push_slice(biases, &mut pending_lo, out);
+        write_slice(biases, &mut pending_lo, dst, &mut cursor);
         layer_offset += weight_count + fan_out;
     }
     if let Some(lo) = pending_lo {
-        out.push(u32::from(lo));
+        dst[cursor] = u32::from(lo);
+        cursor += 1;
     }
+    Ok(cursor)
+}
+
+/// Pack a binary16 genome into reusable `Vec<u32>` `out` via
+/// [`pack_f16_for_metal_into`].
+fn pack_f16_for_metal(
+    topology: &DenseTopology,
+    values: &[flife_core::binary16::F16],
+    out: &mut Vec<u32>,
+) -> Result<(), CoreError> {
+    let word_count = values.len().div_ceil(2);
+    if out.capacity() < word_count {
+        out.clear();
+        reserve(out, word_count, "metal binary16 words")?;
+    }
+    out.resize(word_count, 0);
+    let written = pack_f16_for_metal_into(topology, values, out.as_mut_slice())?;
+    out.truncate(written);
     Ok(())
 }
 
@@ -1644,6 +1676,7 @@ impl MetalBackend {
             controllers,
             shard_slots,
             budget,
+            staging_workers,
             shard_count,
             held,
             buckets,
@@ -1661,6 +1694,7 @@ impl MetalBackend {
             uploads,
             ..
         } = self;
+        let workers = *staging_workers;
         let staging_state = StagingState {
             input_capacity: *input_capacity,
             output_capacity: *output_capacity,
@@ -1715,6 +1749,211 @@ impl MetalBackend {
         // at most one lease is held at a time and it is dropped before any
         // new shard allocation or before `place_and_stage` returns.
         let mut active_lease: Option<(usize, u64, ShardWriteLease)> = None;
+
+        // Bounded 2 MiB multi-shard wave buffer for parallel AoSoA binary16
+        // packing on bulk F16 uploads (tick-1 initial placement and large
+        // birth bursts). Grouping across shards is critical because spatial
+        // Pass 1 interleaves arena slots across all device shards.
+        const F16_WAVE_MAX_WORDS: usize = 524_288;
+        const F16_WAVE_MIN_PARALLEL: usize = 8;
+        struct PendingF16 {
+            topology: usize,
+            shard_key: u64,
+            job_index: usize,
+            local: usize,
+            word_offset: usize,
+            word_count: usize,
+            own: (u32, GenomeId),
+        }
+        let mut pending_f16: Vec<PendingF16> = Vec::new();
+        let mut pending_f16_words = 0_usize;
+        let mut wave_buf: Vec<u32> = Vec::new();
+        let flush_f16_wave = |buckets: &mut [Option<DeviceBucket>],
+                              active_lease: &mut Option<(usize, u64, ShardWriteLease)>,
+                              pending: &mut Vec<PendingF16>,
+                              pending_words: &mut usize,
+                              wave_buf: &mut Vec<u32>,
+                              packed: &mut Vec<u32>,
+                              uploads: &mut u64|
+         -> Result<(), CoreError> {
+            if pending.is_empty() {
+                *pending_words = 0;
+                return Ok(());
+            }
+            let total_words = *pending_words;
+            let use_parallel = pending.len() >= F16_WAVE_MIN_PARALLEL
+                && workers > 1
+                && (wave_buf.capacity() >= total_words
+                    || wave_buf
+                        .try_reserve_exact(total_words.saturating_sub(wave_buf.len()))
+                        .is_ok());
+            if use_parallel {
+                wave_buf.resize(total_words, 0);
+                struct PackTask<'a> {
+                    topology: &'a DenseTopology,
+                    values: &'a [flife_core::binary16::F16],
+                    dst: &'a mut [u32],
+                }
+                let mut tasks: Vec<PackTask<'_>> = Vec::with_capacity(pending.len());
+                let mut slice_ranges: Vec<(usize, usize)> = Vec::with_capacity(pending.len());
+                let mut rem = &mut wave_buf[..total_words];
+                let mut buf_cursor = 0_usize;
+                for item in pending.iter() {
+                    let ctrl = jobs[item.job_index].controller();
+                    let Weights::F16(values) = ctrl.parameters() else {
+                        return Err(CoreError::StateConflict {
+                            operation: "metal binary16 wave upload",
+                            detail: "non-F16 job queued in F16 upload wave".to_owned(),
+                        });
+                    };
+                    let (dst, next) = rem.split_at_mut(item.word_count);
+                    rem = next;
+                    slice_ranges.push((buf_cursor, buf_cursor + item.word_count));
+                    buf_cursor += item.word_count;
+                    tasks.push(PackTask {
+                        topology: ctrl.topology(),
+                        values,
+                        dst,
+                    });
+                }
+                flife_core::pool::try_parallel_tasks(
+                    workers,
+                    "pack metal f16 weights",
+                    &mut tasks,
+                    |_, task| {
+                        let written =
+                            pack_f16_for_metal_into(task.topology, task.values, task.dst)?;
+                        if written != task.dst.len() {
+                            return Err(CoreError::LayoutMismatch {
+                                buffer: "metal binary16 words",
+                                detail: format!(
+                                    "packed {written} words into {}-word slot",
+                                    task.dst.len()
+                                ),
+                            });
+                        }
+                        Ok(())
+                    },
+                )?;
+                // Group packed writes by `(topology, shard_key)` so each shard
+                // acquires its write lease and buffer `RwLock` at most once per
+                // wave even when spatial Pass 1 interleaves slots across shards.
+                let mut order: Vec<usize> = (0..pending.len()).collect();
+                order.sort_by_key(|&i| {
+                    let item = &pending[i];
+                    (item.topology, item.shard_key, item.word_offset, i)
+                });
+                let mut writes: Vec<(usize, &[u32])> = Vec::with_capacity(pending.len());
+                let mut pos = 0_usize;
+                while pos < order.len() {
+                    let first = &pending[order[pos]];
+                    let (g_topo, g_shard) = (first.topology, first.shard_key);
+                    let mut end = pos + 1;
+                    while end < order.len() {
+                        let next_item = &pending[order[end]];
+                        if next_item.topology != g_topo || next_item.shard_key != g_shard {
+                            break;
+                        }
+                        end += 1;
+                    }
+                    let reuse_lease = matches!(
+                        active_lease.as_ref(),
+                        Some((lt, ls, ShardWriteLease::F16(_))) if *lt == g_topo && *ls == g_shard
+                    );
+                    if !reuse_lease {
+                        drop(active_lease.take());
+                        let lease_buf = buckets
+                            .get(g_topo)
+                            .and_then(Option::as_ref)
+                            .and_then(|b| b.shards.get(g_shard))
+                            .and_then(|s| match &s.parameters {
+                                ShardParameters::F16(words) => Some(words.buffer()),
+                                ShardParameters::F32(_) => None,
+                            })
+                            .ok_or_else(|| CoreError::StateConflict {
+                                operation: "metal binary16 wave upload",
+                                detail: format!("missing F16 shard ({g_topo}, {g_shard})"),
+                            })?;
+                        *active_lease =
+                            Some((g_topo, g_shard, ShardWriteLease::F16(owner.write(lease_buf)?)));
+                    }
+                    let Some((_, _, ShardWriteLease::F16(lease))) = active_lease.as_mut() else {
+                        return Err(CoreError::StateConflict {
+                            operation: "metal binary16 wave upload",
+                            detail: "active write lease is not F16".to_owned(),
+                        });
+                    };
+                    writes.clear();
+                    for &idx in &order[pos..end] {
+                        let (s, e) = slice_ranges[idx];
+                        writes.push((pending[idx].word_offset, &wave_buf[s..e]));
+                    }
+                    lease.write_many(&writes)?;
+                    pos = end;
+                }
+            } else {
+                for item in pending.iter() {
+                    let reuse_lease = matches!(
+                        active_lease.as_ref(),
+                        Some((lt, ls, ShardWriteLease::F16(_)))
+                            if *lt == item.topology && *ls == item.shard_key
+                    );
+                    if !reuse_lease {
+                        drop(active_lease.take());
+                        let lease_buf = buckets
+                            .get(item.topology)
+                            .and_then(Option::as_ref)
+                            .and_then(|b| b.shards.get(item.shard_key))
+                            .and_then(|s| match &s.parameters {
+                                ShardParameters::F16(words) => Some(words.buffer()),
+                                ShardParameters::F32(_) => None,
+                            })
+                            .ok_or_else(|| CoreError::StateConflict {
+                                operation: "metal binary16 wave upload",
+                                detail: format!(
+                                    "missing F16 shard ({}, {})",
+                                    item.topology, item.shard_key
+                                ),
+                            })?;
+                        *active_lease = Some((
+                            item.topology,
+                            item.shard_key,
+                            ShardWriteLease::F16(owner.write(lease_buf)?),
+                        ));
+                    }
+                    let Some((_, _, ShardWriteLease::F16(lease))) = active_lease.as_mut() else {
+                        return Err(CoreError::StateConflict {
+                            operation: "metal binary16 wave upload",
+                            detail: "active write lease is not F16".to_owned(),
+                        });
+                    };
+                    let ctrl = jobs[item.job_index].controller();
+                    let Weights::F16(values) = ctrl.parameters() else {
+                        return Err(CoreError::StateConflict {
+                            operation: "metal binary16 wave upload",
+                            detail: "non-F16 job queued in F16 upload wave".to_owned(),
+                        });
+                    };
+                    pack_f16_for_metal(ctrl.topology(), values, packed)?;
+                    lease.write(item.word_offset, packed)?;
+                }
+            }
+            for item in pending.drain(..) {
+                if let Some(shard) = buckets
+                    .get_mut(item.topology)
+                    .and_then(Option::as_mut)
+                    .and_then(|b| b.shards.get_mut(item.shard_key))
+                    && let Some(occ) = shard.occupants.get_mut(item.local)
+                {
+                    if occ.replace(item.own).is_none() {
+                        shard.live_count += 1;
+                    }
+                    *uploads += 1;
+                }
+            }
+            *pending_words = 0;
+            Ok(())
+        };
 
         for (index, (job, &is_finite)) in jobs.iter().zip(finite_flags).enumerate() {
             if is_finite == 0 {
@@ -1812,10 +2051,44 @@ impl MetalBackend {
                 usize::try_from(slots_per_shard).map_err(|_| CoreError::Overflow {
                     quantity: "arena shard slots",
                 })?;
-            let needs_create_or_grow = match bucket.shards.get(shard_key) {
+            let needs_create_or_grow = match buckets
+                .get(topology)
+                .and_then(Option::as_ref)
+                .and_then(|b| b.shards.get(shard_key))
+            {
                 None => Some(None),
                 Some(shard) if local >= shard.slot_capacity => Some(Some(shard.slot_capacity)),
                 Some(_) => None,
+            };
+            if needs_create_or_grow.is_some() && !pending_f16.is_empty() {
+                flush_f16_wave(
+                    buckets,
+                    &mut active_lease,
+                    &mut pending_f16,
+                    &mut pending_f16_words,
+                    &mut wave_buf,
+                    packed,
+                    uploads,
+                )?;
+            }
+            if !pending_f16.is_empty()
+                && pending_f16.iter().any(|p| {
+                    p.topology == topology && p.shard_key == shard_key && p.local == local
+                })
+            {
+                flush_f16_wave(
+                    buckets,
+                    &mut active_lease,
+                    &mut pending_f16,
+                    &mut pending_f16_words,
+                    &mut wave_buf,
+                    packed,
+                    uploads,
+                )?;
+            }
+            let Some(bucket) = buckets.get_mut(topology).and_then(Option::as_mut) else {
+                all_dispatched = false;
+                continue;
             };
             if let Some(existing_cap) = needs_create_or_grow {
                 active_lease = None;
@@ -2057,45 +2330,102 @@ impl MetalBackend {
                     shard.live_count = shard.live_count.saturating_sub(1);
                     overwrote_existing = true;
                 }
-                let reuse_lease = matches!(
-                    active_lease,
-                    Some((lt, ls, _)) if lt == topology && ls == shard_key
-                );
-                if !reuse_lease {
-                    drop(active_lease.take());
-                    let lease = match &shard.parameters {
-                        ShardParameters::F32(buffer) => {
-                            ShardWriteLease::F32(owner.write(buffer.buffer())?)
+                if let (ShardParameters::F16(_), Weights::F16(values)) =
+                    (&shard.parameters, controller.parameters())
+                {
+                    let word_count = values.len().div_ceil(2);
+                    if workers > 1 && word_count <= F16_WAVE_MAX_WORDS {
+                        if pending_f16_words.saturating_add(word_count) > F16_WAVE_MAX_WORDS {
+                            flush_f16_wave(
+                                buckets,
+                                &mut active_lease,
+                                &mut pending_f16,
+                                &mut pending_f16_words,
+                                &mut wave_buf,
+                                packed,
+                                uploads,
+                            )?;
                         }
-                        ShardParameters::F16(words) => {
-                            ShardWriteLease::F16(owner.write(words.buffer())?)
+                        pending_f16.push(PendingF16 {
+                            topology,
+                            shard_key,
+                            job_index: index,
+                            local,
+                            word_offset: offset / 2,
+                            word_count,
+                            own: (slot.generation(), job.genome()),
+                        });
+                        pending_f16_words += word_count;
+                    } else {
+                        let reuse_lease = matches!(
+                            active_lease,
+                            Some((lt, ls, _)) if lt == topology && ls == shard_key
+                        );
+                        if !reuse_lease {
+                            drop(active_lease.take());
+                            let ShardParameters::F16(words) = &shard.parameters else {
+                                all_dispatched = false;
+                                continue;
+                            };
+                            active_lease = Some((
+                                topology,
+                                shard_key,
+                                ShardWriteLease::F16(owner.write(words.buffer())?),
+                            ));
                         }
-                    };
-                    active_lease = Some((topology, shard_key, lease));
-                }
-                match (
-                    active_lease.as_mut().map(|(_, _, lease)| lease),
-                    controller.parameters(),
-                ) {
-                    (Some(ShardWriteLease::F32(lease)), Weights::F32(values)) => {
-                        lease.write(offset, values)?;
-                    }
-                    // Two binary16 values a word, the even one low; F16 slot
-                    // stride is a multiple of 4 elements, so `offset` is always
-                    // 8-byte aligned for coalesced AoSoA `half4` loads.
-                    (Some(ShardWriteLease::F16(lease)), Weights::F16(values)) => {
+                        let Some((_, _, ShardWriteLease::F16(lease))) = active_lease.as_mut()
+                        else {
+                            all_dispatched = false;
+                            continue;
+                        };
                         pack_f16_for_metal(controller.topology(), values, packed)?;
                         lease.write(offset / 2, packed)?;
+                        *occupant = own;
+                        shard.live_count += 1;
+                        *uploads += 1;
                     }
-                    _ => {
-                        all_dispatched = false;
-                        continue;
+                } else {
+                    let reuse_lease = matches!(
+                        active_lease,
+                        Some((lt, ls, _)) if lt == topology && ls == shard_key
+                    );
+                    if !reuse_lease {
+                        drop(active_lease.take());
+                        let lease = match &shard.parameters {
+                            ShardParameters::F32(buffer) => {
+                                ShardWriteLease::F32(owner.write(buffer.buffer())?)
+                            }
+                            ShardParameters::F16(words) => {
+                                ShardWriteLease::F16(owner.write(words.buffer())?)
+                            }
+                        };
+                        active_lease = Some((topology, shard_key, lease));
                     }
+                    match (
+                        active_lease.as_mut().map(|(_, _, lease)| lease),
+                        controller.parameters(),
+                    ) {
+                        (Some(ShardWriteLease::F32(lease)), Weights::F32(values)) => {
+                            lease.write(offset, values)?;
+                        }
+                        _ => {
+                            all_dispatched = false;
+                            continue;
+                        }
+                    }
+                    *occupant = own;
+                    shard.live_count += 1;
+                    *uploads += 1;
                 }
-                *occupant = own;
-                shard.live_count += 1;
-                *uploads += 1;
             }
+            let Some(shard) = buckets
+                .get_mut(topology)
+                .and_then(Option::as_mut)
+                .and_then(|b| b.shards.get_mut(shard_key))
+            else {
+                all_dispatched = false;
+                continue;
+            };
             let row = dispatched_count;
             dispatched_count += 1;
             if !all_dispatched || overwrote_existing {
@@ -2133,6 +2463,15 @@ impl MetalBackend {
                 ]);
             }
         }
+        flush_f16_wave(
+            buckets,
+            &mut active_lease,
+            &mut pending_f16,
+            &mut pending_f16_words,
+            &mut wave_buf,
+            packed,
+            uploads,
+        )?;
         drop(active_lease);
 
         if (!all_dispatched || overwrote_existing) && !tracking_dispatched && dispatched_count > 0 {
@@ -3773,5 +4112,73 @@ mod staging_tests {
                 .iter()
                 .all(|o| o.is_some_and(|raw: RawOutputs| raw.len() == out_w2))
         );
+    }
+
+    #[test]
+    fn pack_f16_for_metal_into_matches_independent_aosoa_oracle_bit_for_bit() {
+        use flife_core::binary16::F16;
+
+        // Independent naive scalar oracle implementing the exact AoSoA spec.
+        fn oracle_pack(topology: &DenseTopology, values: &[F16]) -> Vec<u32> {
+            let mut halfs: Vec<u16> = Vec::with_capacity(values.len());
+            let mut layer_offset = 0_usize;
+            for layer in topology.layers() {
+                let fan_in = layer.inputs;
+                let fan_out = layer.outputs;
+                let w = &values[layer.weights..layer.weights + fan_in * fan_out];
+                let b = &values[layer.biases..layer.biases + fan_out];
+                if ((layer_offset | fan_in) & 3) == 0 && halfs.len().is_multiple_of(2) {
+                    let quads = fan_in / 4;
+                    for q in 0..quads {
+                        for o in 0..fan_out {
+                            let base = o * fan_in + q * 4;
+                            for k in 0..4 {
+                                halfs.push(w[base + k].to_bits());
+                            }
+                        }
+                    }
+                } else {
+                    for &v in w {
+                        halfs.push(v.to_bits());
+                    }
+                }
+                for &v in b {
+                    halfs.push(v.to_bits());
+                }
+                layer_offset += fan_in * fan_out + fan_out;
+            }
+            let mut words = Vec::with_capacity(halfs.len().div_ceil(2));
+            for pair in halfs.chunks(2) {
+                let lo = u32::from(pair[0]);
+                let hi = pair.get(1).copied().map_or(0_u32, u32::from);
+                words.push(lo | (hi << 16));
+            }
+            words
+        }
+
+        // Cover aligned AoSoA (`desktop-world` 104->[64,32]->40), odd fan_out
+        // / odd total count (`pending_lo` carry + trailing odd half), and
+        // unaligned fan_in.
+        for (in_w, hidden, out_w) in [
+            (104_u32, &[64_u32, 32][..], 40_u32),
+            (104, &[48, 24], 40),
+            (104, &[13, 7], 41),
+            (105, &[9], 37),
+        ] {
+            let topo = DenseTopology::with_io(in_w, hidden, out_w).expect("topology");
+            let values: Vec<F16> = (0..topo.parameter_count())
+                .map(|i| F16::from_bits(((i.wrapping_mul(251) ^ (i >> 3)) as u16) & 0x7BFF))
+                .collect();
+            let want = oracle_pack(&topo, &values);
+            let mut got = Vec::new();
+            super::pack_f16_for_metal(&topo, &values, &mut got).expect("pack");
+            assert_eq!(got, want, "mismatch on {in_w}->{hidden:?}->{out_w}");
+
+            let mut slice_buf = vec![0xDEAD_BEEF_u32; want.len()];
+            let written =
+                super::pack_f16_for_metal_into(&topo, &values, &mut slice_buf).expect("pack into");
+            assert_eq!(written, want.len());
+            assert_eq!(slice_buf, want, "slice mismatch on {in_w}->{hidden:?}->{out_w}");
+        }
     }
 }

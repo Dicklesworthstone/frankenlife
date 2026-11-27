@@ -1768,6 +1768,19 @@ impl<T: Element> WriteLease<T> {
         T::write(&mut memory, offset, data).map_err(metal)
     }
 
+    /// Overwrite multiple `(offset, data)` ranges under a single buffer lock,
+    /// amortizing `RwLock::write` churn across bulk parameter-shard uploads.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] if any range lies outside the buffer.
+    pub fn write_many(&mut self, writes: &[(usize, &[T])]) -> Result<(), CoreError> {
+        let mut memory = self.memory.write().unwrap_or_else(PoisonError::into_inner);
+        for &(offset, data) in writes {
+            T::write(&mut memory, offset, data).map_err(metal)?;
+        }
+        Ok(())
+    }
+
     /// How many elements the buffer holds.
     #[must_use]
     pub const fn elements(&self) -> usize {

@@ -1948,6 +1948,104 @@ fn fold(coordinate: f64, length: f32) -> f32 {
     if rounded >= length { 0.0 } else { rounded }
 }
 
+/// Minimum live organism count to fan out organism projection across
+/// `world.cpu_workers()`.
+const PARALLEL_ORGANISM_PROJECT_MIN_ROWS: usize = 1_024;
+
+/// Project a contiguous identity-ordered range `range` of live organisms into
+/// disjoint preallocated output slices, returning `(written, max_generation,
+/// parameters, energy_sum)`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "borrows all preallocated Epoch output slices for a contiguous organism range"
+)]
+fn project_organism_slice(
+    population: &flife_engine::Population,
+    range: std::ops::Range<usize>,
+    width: [f32; 2],
+    affinity_limit: f64,
+    affinity_scale: f64,
+    v2_rules: &flife_engine::V2Rules,
+    affinity_rotation: bool,
+    ids: &mut [u64],
+    positions: &mut [[f32; 2]],
+    velocities: &mut [[f32; 2]],
+    energies: &mut [f32],
+    lineages: &mut [u64],
+    generations: &mut [u32],
+    topologies: &mut [u8],
+    affinities: &mut [[f32; 3]],
+    cell_states: Option<&mut [i8]>,
+    polarities: Option<&mut [i16]>,
+) -> Result<(usize, u32, u64, f64), CoreError> {
+    let mut organism_energy = 0.0_f64;
+    let mut max_generation = 0_u32;
+    let mut parameters = 0_u64;
+    let mut cell_states_it = cell_states.map(|s| s.iter_mut());
+    let mut polarities_it = polarities.map(|s| s.iter_mut());
+    let mut written = 0_usize;
+    let dst = ids
+        .iter_mut()
+        .zip(positions.iter_mut())
+        .zip(velocities.iter_mut())
+        .zip(energies.iter_mut())
+        .zip(lineages.iter_mut())
+        .zip(generations.iter_mut())
+        .zip(topologies.iter_mut())
+        .zip(affinities.iter_mut());
+    for (
+        (
+            ((((((id_out, pos_out), vel_out), energy_out), lineage_out), gen_out), topo_out),
+            aff_out,
+        ),
+        row,
+    ) in dst.zip(population.iter_render_rows_range(range))
+    {
+        let genome = row.genome.ok_or_else(|| CoreError::StateConflict {
+            operation: "project render epoch",
+            detail: format!("{} has no genome", row.id),
+        })?;
+        let topology =
+            u8::try_from(genome.topology().index()).map_err(|_| CoreError::Overflow {
+                quantity: "render topology index",
+            })?;
+        *id_out = row.id.get();
+        *pos_out = [fold(row.position[0], width[0]), fold(row.position[1], width[1])];
+        // Every committed component is within the speed limit, and
+        // rounding to nearest is monotone, so each F32 component is
+        // within the F32 limit.
+        *vel_out = [row.velocity[0] as f32, row.velocity[1] as f32];
+        *energy_out = saturate_nonnegative(row.energy);
+        *lineage_out = row.lineage.get();
+        *gen_out = row.generation.get();
+        *topo_out = topology;
+        // Live primary recurrent cell state `h_0` (matches `World::cell_states()`
+        // without allocating a temporary Vec per published epoch).
+        let h0 = row.primary_recurrent_state;
+        // Project live V2-12 effective metabolic affinity `a_eff(h_0)` when
+        // epigenetic affinity rotation is active (matches
+        // `World::effective_affinity(id)` with zero heap allocation).
+        if affinity_rotation && h0 != 0.0 {
+            let effective =
+                flife_engine::effective_affinity(genome.traits(), h0, v2_rules, affinity_limit)?;
+            *aff_out = affinity_projection_32(&effective, affinity_scale);
+        } else {
+            *aff_out = affinity_projection_32(genome.traits().affinity(), affinity_scale);
+        }
+        if let Some(slot) = cell_states_it.as_mut().and_then(Iterator::next) {
+            *slot = quantize_cell_state(h0);
+        }
+        if let Some(slot) = polarities_it.as_mut().and_then(Iterator::next) {
+            *slot = quantize_polarity_f64(row.polarity);
+        }
+        organism_energy += row.energy;
+        max_generation = max_generation.max(row.generation.get());
+        parameters += genome.parameters().len() as u64;
+        written += 1;
+    }
+    Ok((written, max_generation, parameters, organism_energy))
+}
+
 impl Epoch {
     /// `world`'s committed state as an epoch outside any feed: what one of
     /// a publisher's slots holds, so a host can size its observers before
@@ -2087,84 +2185,178 @@ impl Epoch {
         let affinity_scale = (CHANNELS as f64).sqrt() * affinity_limit;
         let v2_rules = world.v2_rules();
         let affinity_rotation = v2_rules.affinity_rotation_enabled();
-        let mut organism_energy = 0.0_f64;
-        let mut max_generation = 0_u32;
-        let mut parameters = 0_u64;
-        let mut cell_states_it = self.cell_states.as_deref_mut().map(|s| s.iter_mut());
-        let mut polarities_it = self.polarities.as_deref_mut().map(|s| s.iter_mut());
-        let mut written = 0_usize;
-        let dst = self
-            .ids
-            .iter_mut()
-            .zip(self.positions.iter_mut())
-            .zip(self.velocities.iter_mut())
-            .zip(self.energies.iter_mut())
-            .zip(self.lineages.iter_mut())
-            .zip(self.generations.iter_mut())
-            .zip(self.topologies.iter_mut())
-            .zip(self.affinities.iter_mut());
-        for (
-            (
-                ((((((id_out, pos_out), vel_out), energy_out), lineage_out), gen_out), topo_out),
-                aff_out,
-            ),
-            (organism, genome),
-        ) in dst.zip(population.iter_with_genomes())
-        {
-            let genome = genome.ok_or_else(|| CoreError::StateConflict {
-                operation: "project render epoch",
-                detail: format!("{} has no genome", organism.id),
-            })?;
-            let topology =
-                u8::try_from(genome.topology().index()).map_err(|_| CoreError::Overflow {
-                    quantity: "render topology index",
-                })?;
-            *id_out = organism.id.get();
-            *pos_out = [
-                fold(organism.position[0], width[0]),
-                fold(organism.position[1], width[1]),
-            ];
-            // Every committed component is within the speed limit, and
-            // rounding to nearest is monotone, so each F32 component is
-            // within the F32 limit.
-            *vel_out = [organism.velocity[0] as f32, organism.velocity[1] as f32];
-            *energy_out = saturate_nonnegative(organism.energy);
-            *lineage_out = organism.lineage.get();
-            *gen_out = organism.generation.get();
-            *topo_out = topology;
-            // Live primary recurrent cell state `h_0` (matches `World::cell_states()`
-            // without allocating a temporary Vec per published epoch).
-            let h0 = organism
-                .held
-                .recurrent_state()
-                .first()
-                .copied()
-                .unwrap_or(0.0);
-            // Project live V2-12 effective metabolic affinity `a_eff(h_0)` when
-            // epigenetic affinity rotation is active (matches
-            // `World::effective_affinity(id)` with zero heap allocation).
-            if affinity_rotation && h0 != 0.0 {
-                let effective = flife_engine::effective_affinity(
-                    genome.traits(),
-                    h0,
-                    v2_rules,
-                    affinity_limit,
-                )?;
-                *aff_out = affinity_projection_32(&effective, affinity_scale);
+        let workers = world.cpu_workers();
+
+        let (written, max_generation, parameters, organism_energy) =
+            if live >= PARALLEL_ORGANISM_PROJECT_MIN_ROWS && workers > 1 {
+                let tile_count = workers
+                    .saturating_mul(4)
+                    .min(64)
+                    .min(live.div_ceil(512))
+                    .max(1);
+                let tile_len = live.div_ceil(tile_count);
+                struct OrganismTile<'a> {
+                    start: usize,
+                    end: usize,
+                    ids: &'a mut [u64],
+                    positions: &'a mut [[f32; 2]],
+                    velocities: &'a mut [[f32; 2]],
+                    energies: &'a mut [f32],
+                    lineages: &'a mut [u64],
+                    generations: &'a mut [u32],
+                    topologies: &'a mut [u8],
+                    affinities: &'a mut [[f32; 3]],
+                    cell_states: Option<&'a mut [i8]>,
+                    polarities: Option<&'a mut [i16]>,
+                    written: usize,
+                    max_generation: u32,
+                    parameters: u64,
+                }
+                let mut tiles: Vec<OrganismTile<'_>> = Vec::with_capacity(tile_count);
+                let mut rem_ids = self.ids.as_mut_slice();
+                let mut rem_pos = self.positions.as_mut_slice();
+                let mut rem_vel = self.velocities.as_mut_slice();
+                let mut rem_eng = self.energies.as_mut_slice();
+                let mut rem_lin = self.lineages.as_mut_slice();
+                let mut rem_gen = self.generations.as_mut_slice();
+                let mut rem_top = self.topologies.as_mut_slice();
+                let mut rem_aff = self.affinities.as_mut_slice();
+                let mut rem_cs = self.cell_states.as_deref_mut();
+                let mut rem_pol = self.polarities.as_deref_mut();
+                let mut start = 0_usize;
+                while start < live {
+                    let len = (live - start).min(tile_len);
+                    let (my_ids, next_ids) = rem_ids.split_at_mut(len);
+                    rem_ids = next_ids;
+                    let (my_pos, next_pos) = rem_pos.split_at_mut(len);
+                    rem_pos = next_pos;
+                    let (my_vel, next_vel) = rem_vel.split_at_mut(len);
+                    rem_vel = next_vel;
+                    let (my_eng, next_eng) = rem_eng.split_at_mut(len);
+                    rem_eng = next_eng;
+                    let (my_lin, next_lin) = rem_lin.split_at_mut(len);
+                    rem_lin = next_lin;
+                    let (my_gen, next_gen) = rem_gen.split_at_mut(len);
+                    rem_gen = next_gen;
+                    let (my_top, next_top) = rem_top.split_at_mut(len);
+                    rem_top = next_top;
+                    let (my_aff, next_aff) = rem_aff.split_at_mut(len);
+                    rem_aff = next_aff;
+                    let my_cs = match rem_cs.take() {
+                        Some(slice) => {
+                            let (head, tail) = slice.split_at_mut(len);
+                            rem_cs = Some(tail);
+                            Some(head)
+                        }
+                        None => None,
+                    };
+                    let my_pol = match rem_pol.take() {
+                        Some(slice) => {
+                            let (head, tail) = slice.split_at_mut(len);
+                            rem_pol = Some(tail);
+                            Some(head)
+                        }
+                        None => None,
+                    };
+                    tiles.push(OrganismTile {
+                        start,
+                        end: start + len,
+                        ids: my_ids,
+                        positions: my_pos,
+                        velocities: my_vel,
+                        energies: my_eng,
+                        lineages: my_lin,
+                        generations: my_gen,
+                        topologies: my_top,
+                        affinities: my_aff,
+                        cell_states: my_cs,
+                        polarities: my_pol,
+                        written: 0,
+                        max_generation: 0,
+                        parameters: 0,
+                    });
+                    start += len;
+                }
+                let parallel_ok = flife_core::pool::try_parallel_tasks(
+                    workers,
+                    "project render organisms",
+                    &mut tiles,
+                    |_, tile| {
+                        let (w, mg, params, _) = project_organism_slice(
+                            population,
+                            tile.start..tile.end,
+                            width,
+                            affinity_limit,
+                            affinity_scale,
+                            v2_rules,
+                            affinity_rotation,
+                            tile.ids,
+                            tile.positions,
+                            tile.velocities,
+                            tile.energies,
+                            tile.lineages,
+                            tile.generations,
+                            tile.topologies,
+                            tile.affinities,
+                            tile.cell_states.as_deref_mut(),
+                            tile.polarities.as_deref_mut(),
+                        )?;
+                        tile.written = w;
+                        tile.max_generation = mg;
+                        tile.parameters = params;
+                        Ok(())
+                    },
+                )
+                .is_ok();
+                let total_written: usize = tiles.iter().map(|t| t.written).sum();
+                if parallel_ok && total_written == live {
+                    let max_gen = tiles.iter().map(|t| t.max_generation).max().unwrap_or(0);
+                    let params: u64 = tiles.iter().map(|t| t.parameters).sum();
+                    // Preserve exact left-to-right `f64` sum order across any worker count.
+                    let energy_sum = population.energy_sum_ordered_f64();
+                    (total_written, max_gen, params, energy_sum)
+                } else {
+                    project_organism_slice(
+                        population,
+                        0..live,
+                        width,
+                        affinity_limit,
+                        affinity_scale,
+                        v2_rules,
+                        affinity_rotation,
+                        &mut self.ids,
+                        &mut self.positions,
+                        &mut self.velocities,
+                        &mut self.energies,
+                        &mut self.lineages,
+                        &mut self.generations,
+                        &mut self.topologies,
+                        &mut self.affinities,
+                        self.cell_states.as_deref_mut(),
+                        self.polarities.as_deref_mut(),
+                    )?
+                }
             } else {
-                *aff_out = affinity_projection_32(genome.traits().affinity(), affinity_scale);
-            }
-            if let Some(slot) = cell_states_it.as_mut().and_then(Iterator::next) {
-                *slot = quantize_cell_state(h0);
-            }
-            if let Some(slot) = polarities_it.as_mut().and_then(Iterator::next) {
-                *slot = quantize_polarity_f64(organism.polarity);
-            }
-            organism_energy += organism.energy;
-            max_generation = max_generation.max(organism.generation.get());
-            parameters += genome.parameters().len() as u64;
-            written += 1;
-        }
+                project_organism_slice(
+                    population,
+                    0..live,
+                    width,
+                    affinity_limit,
+                    affinity_scale,
+                    v2_rules,
+                    affinity_rotation,
+                    &mut self.ids,
+                    &mut self.positions,
+                    &mut self.velocities,
+                    &mut self.energies,
+                    &mut self.lineages,
+                    &mut self.generations,
+                    &mut self.topologies,
+                    &mut self.affinities,
+                    self.cell_states.as_deref_mut(),
+                    self.polarities.as_deref_mut(),
+                )?
+            };
         if written != live {
             self.ids.truncate(written);
             self.positions.truncate(written);
@@ -3291,5 +3483,104 @@ mod tests {
                 assert_eq!(got.to_bits(), want.to_bits());
             }
         }
+    }
+
+    #[test]
+    fn parallel_organism_projection_matches_serial_bit_for_bit_across_v1_and_v2() {
+        use std::num::NonZeroUsize;
+        use flife_engine::{Disposition, Intervention};
+
+        // 1. Baseline field-ecology-v1 world with 4,096 organisms across both
+        //    Compact and FreeList arrangements, including mid-run FreeList holes.
+        let cfg = ValidatedConfig::from_toml(PRESET).expect("valid preset");
+        for arrangement in [Arrangement::Compact, Arrangement::FreeList] {
+            let mut world = World::found(
+                &cfg,
+                arrangement,
+                NumericalProfile::reference_f32().expect("profile"),
+            )
+            .expect("v1 world");
+            let removal = Intervention::RemoveOrganisms {
+                center: [64.0, 64.0],
+                radius: 20.0,
+                disposition: Disposition::Recycle,
+            };
+            let intro = Intervention::IntroduceOrganisms {
+                cell: [32, 32],
+                count: 64,
+                energy: 1.0,
+            };
+            world.step_with(&[removal]).expect("step removal");
+            world.step_with(&[intro]).expect("step intro");
+            assert!(
+                world.population().len() >= PARALLEL_ORGANISM_PROJECT_MIN_ROWS,
+                "expected >= 1024 live organisms"
+            );
+
+            world
+                .set_cpu_workers(NonZeroUsize::new(1).expect("1"))
+                .expect("1 worker");
+            let serial = Epoch::standalone(&world).expect("serial standalone");
+            serial.check().expect("serial epoch check");
+
+            world
+                .set_cpu_workers(NonZeroUsize::new(4).expect("4"))
+                .expect("4 workers");
+            let parallel = Epoch::standalone(&world).expect("parallel standalone");
+            parallel.check().expect("parallel epoch check");
+
+            assert_eq!(parallel, serial, "{arrangement:?} standalone v1 mismatch");
+            assert_eq!(
+                parallel.metrics().organism_energy.to_bits(),
+                serial.metrics().organism_energy.to_bits(),
+                "{arrangement:?} v1 organism_energy ULP mismatch"
+            );
+
+            // Reusing an already-filled slot across a second step must also match bit-for-bit.
+            world.step().expect("step 3");
+            let mut reused_par = parallel;
+            reused_par
+                .project(&world, RenderEpoch::new(2), None, None)
+                .expect("reused parallel project");
+            world
+                .set_cpu_workers(NonZeroUsize::new(1).expect("1"))
+                .expect("1 worker");
+            let mut reused_ser = serial;
+            reused_ser
+                .project(&world, RenderEpoch::new(2), None, None)
+                .expect("reused serial project");
+            assert_eq!(reused_par, reused_ser, "{arrangement:?} reused v1 mismatch");
+            assert_eq!(
+                reused_par.metrics().organism_energy.to_bits(),
+                reused_ser.metrics().organism_energy.to_bits(),
+                "{arrangement:?} reused v1 organism_energy ULP mismatch"
+            );
+        }
+
+        // 2. Full V2 world (cell_states, polarities, affinity_rotation, trail, vascular)
+        //    stepped so non-zero recurrent state `h_0` exercises `effective_affinity`.
+        let mut v2 = v2_all_world();
+        v2.step().expect("v2 step 1");
+        v2.step().expect("v2 step 2");
+        assert!(v2.population().len() >= PARALLEL_ORGANISM_PROJECT_MIN_ROWS);
+
+        v2.set_cpu_workers(NonZeroUsize::new(1).expect("1"))
+            .expect("1 worker");
+        let v2_serial = Epoch::standalone(&v2).expect("v2 serial standalone");
+        v2_serial.check().expect("v2 serial check");
+        assert!(v2_serial.cell_states().is_some());
+        assert!(v2_serial.polarities().is_some());
+
+        v2.set_cpu_workers(NonZeroUsize::new(4).expect("4"))
+            .expect("4 workers");
+        let v2_parallel = Epoch::standalone(&v2).expect("v2 parallel standalone");
+        v2_parallel.check().expect("v2 parallel check");
+
+        assert_eq!(v2_parallel, v2_serial, "v2 standalone epoch mismatch");
+        assert_eq!(
+            v2_parallel.metrics().organism_energy.to_bits(),
+            v2_serial.metrics().organism_energy.to_bits(),
+            "v2 organism_energy ULP mismatch"
+        );
     }
 }

@@ -97,7 +97,7 @@ pub use motion::{
 };
 pub use population::{
     Arrangement, Ascending, Collected, DEFAULT_POLARITY, Entrant, HeldOutput, Organism,
-    POPULATION_DIGEST_SCHEMA, Population,
+    POPULATION_DIGEST_SCHEMA, Population, RenderRow,
 };
 pub use reproduction::{
     Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, Capacity,

@@ -1150,6 +1150,32 @@ fn reserve<T>(capacity: usize) -> Result<Vec<T>, CoreError> {
     Ok(column)
 }
 
+/// Lightweight borrowed render-projection view of one live organism at an
+/// identity-ordered index, reading only the columns needed by render-epoch
+/// projection without copying [`HeldOutput`]'s action outputs or lineage-audit
+/// fields.
+#[derive(Debug, Clone, Copy)]
+pub struct RenderRow<'a> {
+    /// Stable organism identity.
+    pub id: OrganismId,
+    /// Committed world position `[x, y]`.
+    pub position: [f64; 2],
+    /// Committed world velocity `[vx, vy]`.
+    pub velocity: [f64; 2],
+    /// Committed organism energy.
+    pub energy: f64,
+    /// Lineage identity.
+    pub lineage: LineageId,
+    /// Generation count.
+    pub generation: Generation,
+    /// Primary recurrent cell state `h_0` (`0.0` when recurrence is disabled).
+    pub primary_recurrent_state: f32,
+    /// Committed polarity vector (`DEFAULT_POLARITY` when polarity is disabled).
+    pub polarity: [f64; 2],
+    /// Live genome reference, if present.
+    pub genome: Option<&'a Genome>,
+}
+
 impl Population {
     /// An empty population of at most `capacity` organisms, its columns
     /// reserved up front.
@@ -1482,6 +1508,60 @@ impl Population {
             let genome = self.genomes.get(slot).and_then(Option::as_ref);
             (self.read(slot), genome)
         })
+    }
+
+    /// Borrowed render-projection rows for `range` in ascending identity order,
+    /// clamped to `0..self.len()`, avoiding materializing full [`Organism`]
+    /// structs (including [`HeldOutput`]) during parallel render-epoch
+    /// projection.
+    pub fn iter_render_rows_range(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> impl Iterator<Item = RenderRow<'_>> + '_ {
+        let end = range.end.min(self.ordered_slots.len());
+        let start = range.start.min(end);
+        self.ordered_slots[start..end].iter().map(|&slot_u32| {
+            let slot = slot_u32 as usize;
+            let primary_recurrent_state = self.held[slot]
+                .recurrent_state()
+                .first()
+                .copied()
+                .unwrap_or(0.0);
+            let polarity = if self.tracks_polarity {
+                self.polarities[slot]
+            } else {
+                DEFAULT_POLARITY
+            };
+            RenderRow {
+                id: self.occupants[slot].unwrap_or(OrganismId::new(u64::MAX)),
+                position: self.positions[slot],
+                velocity: self.velocities[slot],
+                energy: self.energies[slot],
+                lineage: self.lineages[slot],
+                generation: self.generations[slot],
+                primary_recurrent_state,
+                polarity,
+                genome: self.genomes.get(slot).and_then(Option::as_ref),
+            }
+        })
+    }
+
+    /// Plain left-to-right `Σ E` over every live organism in ascending identity
+    /// order, matching serial `f64` accumulation bit-for-bit without copying
+    /// other organism columns.
+    #[must_use]
+    pub fn energy_sum_ordered_f64(&self) -> f64 {
+        let mut total = 0.0_f64;
+        if self.is_compact_dense() {
+            for &energy in &self.energies {
+                total += energy;
+            }
+        } else {
+            for &slot in &self.ordered_slots {
+                total += self.energies[slot as usize];
+            }
+        }
+        total
     }
 
     /// `id`'s genome's arena slot.

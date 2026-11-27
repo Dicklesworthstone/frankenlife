@@ -570,3 +570,121 @@ fn spatial_pass1_and_parallel_population_publish_match_serial_bit_for_bit() {
         );
     }
 }
+
+/// CPU-reference worlds at `>= 8,192` organisms and `>= 32,768` cells use the
+/// 8×8 spatial macro-tile reference path (`decide_all_spatial`) and fused L2
+/// Phase-6 chemistry (`spatial_chemistry_prepass_fused`) with zero extra heap
+/// allocation and bit-for-bit identical digests to serial `w = 1` across both
+/// `Compact` and `FreeList` slot arrangements (including mid-run removals and
+/// re-introductions).
+#[test]
+fn cpu_reference_spatial_decide_and_fused_chemistry_match_serial_and_hold_footprint() {
+    use flife_engine::{Disposition, Intervention};
+
+    let toml = PRESET
+        .replace("grid_width = 128", "grid_width = 256")
+        .replace("grid_height = 128", "grid_height = 256")
+        .replace("width = 128.0", "width = 256.0")
+        .replace("height = 128.0", "height = 256.0")
+        .replace("initial_count = 4096", "initial_count = 8192")
+        .replace("maximum_count = 16384", "maximum_count = 9216")
+        .replace(
+            "evaluation_interval_ticks = 1",
+            "evaluation_interval_ticks = 2",
+        )
+        .replace("hidden_widths = [64, 32]", "hidden_widths = [8]");
+    let cfg = ValidatedConfig::from_toml(&toml).expect("spatial cpu ref config");
+
+    for arrangement in [Arrangement::Compact, Arrangement::FreeList] {
+        let mut serial = World::found(
+            &cfg,
+            arrangement,
+            NumericalProfile::reference_f32().expect("profile"),
+        )
+        .expect("serial world");
+        let mut parallel = World::found(
+            &cfg,
+            arrangement,
+            NumericalProfile::reference_f32().expect("profile"),
+        )
+        .expect("parallel world");
+        parallel
+            .set_cpu_workers(NonZeroUsize::new(4).expect("4"))
+            .expect("4 workers");
+
+        let bound = parallel.footprint();
+        let founded = parallel.allocated();
+        assert_eq!(founded.field, bound.field, "{arrangement:?} field bound");
+        assert_eq!(
+            founded.scratch, bound.scratch,
+            "{arrangement:?} scratch bound"
+        );
+
+        let mut removed_on_tick3 = 0_usize;
+        for tick in 1..=5 {
+            if tick == 3 {
+                let removal = Intervention::RemoveOrganisms {
+                    center: [64.0, 64.0],
+                    radius: 16.0,
+                    disposition: Disposition::Recycle,
+                };
+                assert!(matches!(
+                    serial.step_with(&[removal]).expect("serial rem"),
+                    Stepped::Published(_)
+                ));
+                let Stepped::Published(report) =
+                    parallel.step_with(&[removal]).expect("parallel rem")
+                else {
+                    panic!("expected published tick 3");
+                };
+                removed_on_tick3 = report.deaths.len();
+            } else if tick == 4 {
+                let intro = Intervention::IntroduceOrganisms {
+                    cell: [64, 64],
+                    count: 32,
+                    energy: 1.0,
+                };
+                assert!(matches!(
+                    serial.step_with(&[intro]).expect("serial intro"),
+                    Stepped::Published(_)
+                ));
+                assert!(matches!(
+                    parallel.step_with(&[intro]).expect("parallel intro"),
+                    Stepped::Published(_)
+                ));
+            } else {
+                assert!(matches!(
+                    serial.step().expect("serial step"),
+                    Stepped::Published(_)
+                ));
+                assert!(matches!(
+                    parallel.step().expect("parallel step"),
+                    Stepped::Published(_)
+                ));
+            }
+            let now = parallel.allocated();
+            assert_eq!(
+                now.field, founded.field,
+                "{arrangement:?} tick {tick} field grew"
+            );
+            assert_eq!(
+                now.scratch, founded.scratch,
+                "{arrangement:?} tick {tick} scratch grew"
+            );
+            assert!(
+                now.state <= bound.state,
+                "{arrangement:?} tick {tick} state exceeded bound"
+            );
+            assert_eq!(
+                parallel.digest(),
+                serial.digest(),
+                "{arrangement:?} tick {tick}: spatial CPU ref diverged from serial"
+            );
+        }
+        assert!(
+            removed_on_tick3 > 0,
+            "{arrangement:?} expected Phase-1 removal to exercise holes"
+        );
+        assert_eq!(parallel.controller_report().batched, 0);
+    }
+}

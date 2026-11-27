@@ -675,10 +675,10 @@ the 5% cv bar). Otherwise `auto` takes `torch` at up to 64 workers on Apple sili
 the reference on 8, 12 and 16 workers, and at up to 4 elsewhere, where Linux x86-64 measured it faster only on one
 and four (below). On Apple silicon it also takes `torch` on any number of workers for a world of at least 25,000
 organisms, where the controllers are most of the tick: on 16 workers of an M5 Ultra it measured 1.02–1.03× the
-reference at 25,000 and 1.09–1.15× at 100,000 (`flife-backend-metal`'s contract has the runs). Whatever the choice and the `--cpu-workers` count, the
-world is the same bit for bit; the run's `start` record names the backend and `end` counts what it evaluated.
-Before `99962d9`, measured over 512 ticks of the preset on an M5 Ultra under other load (median of three
-interleaved runs, cv ≤ 2.5%), with all 4,096 founders alive:
+reference at 25,000 and 1.09–1.15× at 100,000 (`flife-backend-metal`'s contract has the runs). Whatever the
+choice and the `--cpu-workers` count, the world is the same bit for bit; the run's `start` record names the
+backend and `end` counts what it evaluated. Before `99962d9`, measured over 512 ticks of the preset on an M5 Ultra
+under other load (median of three interleaved runs, cv ≤ 2.5%), with all 4,096 founders alive:
 
 | `--cpu-workers` | `--controllers cpu` | `--controllers metal` |
 |---|---|---|

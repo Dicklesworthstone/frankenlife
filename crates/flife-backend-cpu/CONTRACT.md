@@ -154,8 +154,8 @@ block faster and every cv at most 2.9% (`flife-backend-metal`'s contract has all
 (`flife-backend-metal`). Two and three workers were not measured; that ceiling assumes they lie between one and
 four, where the ratio fell from 1.41× to 1.11× on Linux and from 1.62× to 1.26× on macOS. On Apple silicon the
 ceiling is `AUTO_TORCH_MAX_WORKERS` = 64: with `evaluate_flat_f32` and the persistent worker pool, `phase_profile`
-measured `torch` 1.11–1.42× the reference on 8, 12 and 16 workers on an M5 Ultra (2026-11-23; the constant's
-documentation has the rows). Above 16 workers it is not measured.
+measured `torch` 1.11–1.42× the reference on 8, 12 and 16 workers on an M5 Ultra (2026-11-23; the rows are in the
+constant's documentation in `flife-backend-metal`). Above 16 workers it is not measured.
 
 **Validity domain.** The `dense-104-36-v1` catalog's shapes, the reference F32 profile, any CPU Rust targets.
 

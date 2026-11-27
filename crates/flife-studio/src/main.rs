@@ -726,6 +726,14 @@ enum Record<'a> {
         wall_seconds: f64,
         /// Each frame's work (FL-024's G6 evidence); absent before a frame.
         frame_times: Option<FrameTimeSummary>,
+        /// Within each rendered frame's work, the host's time deriving
+        /// FrankenManim's Metal tables from the view's job (FL-034); absent
+        /// before one.
+        frame_prepare: Option<FrameTimeSummary>,
+        /// Within each rendered frame's work, the device's own time for its
+        /// 3D raster kernel and bloom, from the GPU's start of each command
+        /// buffer to its end (FL-034); absent before one.
+        frame_device: Option<FrameTimeSummary>,
         /// With `--offscreen-zooms`: the moves posted, those whose frame
         /// did not move the view, and their latency.
         camera_moves: Option<u64>,
@@ -1258,15 +1266,23 @@ fn main() -> ExitCode {
             return code;
         }
     };
-    let (mut times, mut latency, mut bounds) =
-        match FrameTimes::new().and_then(|a| Ok((a, FrameTimes::new()?, FrameTimes::new()?))) {
-            Ok(all) => all,
-            Err(error) => {
-                let code = fail(error.kind(), error.to_string(), 1);
-                let _ = studio.close();
-                return code;
-            }
-        };
+    let (mut times, mut latency, mut bounds, mut prepares, mut devices) = match FrameTimes::new()
+        .and_then(|a| {
+            Ok((
+                a,
+                FrameTimes::new()?,
+                FrameTimes::new()?,
+                FrameTimes::new()?,
+                FrameTimes::new()?,
+            ))
+        }) {
+        Ok(all) => all,
+        Err(error) => {
+            let code = fail(error.kind(), error.to_string(), 1);
+            let _ = studio.close();
+            return code;
+        }
+    };
     // Every drawn camera move's latency bound, a window's included, whose
     // input carries no event time (FL-024's G6).
     let mut bound = MoveLatencyBound::new();
@@ -1286,6 +1302,12 @@ fn main() -> ExitCode {
             }
         };
         let ended = Instant::now();
+        if let Some(prepare) = frame.prepare {
+            prepares.record(prepare);
+        }
+        if let Some(device) = frame.device {
+            devices.record(device);
+        }
         // `started` precedes the frame's poll, so the bound only widens.
         if let Some(took) = bound.frame(started, ended, frame.moved, frame.drawn) {
             bounds.record(took);
@@ -1586,6 +1608,8 @@ fn main() -> ExitCode {
                 readback_bytes: closed.frames.readback_bytes,
                 wall_seconds: clock.elapsed().as_secs_f64(),
                 frame_times: times.summary(),
+                frame_prepare: prepares.summary(),
+                frame_device: devices.summary(),
                 camera_moves: cli.offscreen_zooms.then_some(moves),
                 camera_moves_unmoved: cli.offscreen_zooms.then_some(unmoved),
                 camera_latency: latency.summary(),

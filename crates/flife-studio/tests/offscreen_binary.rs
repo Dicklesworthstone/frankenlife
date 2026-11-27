@@ -223,11 +223,32 @@ fn an_offscreen_run_reports_its_frames_and_closes_on_the_direct_world() {
         0.0 < p50 && p50 <= p95 && p95 <= p99 && p99 <= max,
         "{times}"
     );
+    // Within each rendered frame's work: the host's derivation of its Metal
+    // tables and its kernel's time on the device. Each is at most its
+    // frame's work, so no percentile of either is above the same percentile
+    // of the frames'.
+    let parts = ["frame_prepare", "frame_device"].map(|key| {
+        let part = &end[key];
+        assert_eq!(number(part, "frames"), frames, "{key}: {part}");
+        let quantiles = ["p50_ms", "p95_ms", "p99_ms", "max_ms"].map(|key| float(part, key));
+        let [q50, q95, q99, qmax] = quantiles;
+        assert!(
+            0.0 < q50 && q50 <= q95 && q95 <= q99 && q99 <= qmax,
+            "{key}: {part}"
+        );
+        for (part_ms, frame_ms) in quantiles.into_iter().zip([p50, p95, p99, max]) {
+            assert!(part_ms <= frame_ms, "{key}: {part} above {times}");
+        }
+        q50
+    });
     println!(
         "offscreen 640x400 at 2x for {wall:.2} s: {frames} frames, tick {}; frame work p50 {p50:.1} \
-         ms, p95 {p95:.1}, p99 {p99:.1}, max {max:.1}; {moves} camera moves, arrival to drawn \
-         p50 {l50:.1} ms, p95 {l95:.1}, max {lmax:.1}; bound p95 {b95:.1}",
-        number(end, "tick")
+         ms, p95 {p95:.1}, p99 {p99:.1}, max {max:.1}, of which derivation p50 {:.1} ms and \
+         device p50 {:.1}; {moves} camera moves, arrival to drawn p50 {l50:.1} ms, p95 \
+         {l95:.1}, max {lmax:.1}; bound p95 {b95:.1}",
+        number(end, "tick"),
+        parts[0],
+        parts[1]
     );
 
     // The world it closed on is the directly stepped one.

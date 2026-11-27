@@ -89,7 +89,7 @@ directory, with its pending commands and its checkpoint chain.
   (`StudioOptions::surface = Surface::Offscreen { scale }`): any thread and a Metal device; the content area is
   `size` points at `scale` pixels a point, and `title` and `resizable` are unused.
 - The presenter's typed input and its pixel density. They come from frankentorch `ft-kernel-metal` at rev
-  `37e0d05e`, through FrankenManim `fmn-render` at rev `85294a96`.
+  `37e0d05e`, through FrankenManim `fmn-render` at rev `fc2342ee`.
   - The kinds are pointer moved, button, scroll, key, modifiers changed, focus gained, focus lost, pointer capture
     lost and resized (with logical size, backing scale and drawable size).
   - The presenter queues at most `INPUT_QUEUE_CAPACITY` = 1024 events between polls. It coalesces motion, scroll and
@@ -480,8 +480,12 @@ directory, with its pending commands and its checkpoint chain.
     (`unstroked`), the controller evaluations the backend
     returned and deferred, and its failure if it failed, and the same copy totals; `frame_times` (FL-024's G6
     evidence: `FrameTimes`' median, 95th and 99th percentiles and longest, in milliseconds, of each frame's work
-    from draining input to the overlay set, without the wait for the next frame); and with
-    `--offscreen-zooms` the `camera_moves` posted, those whose frame did not move the view
+    from draining input to the overlay set, without the wait for the next frame); `frame_prepare` and
+    `frame_device` (FL-034), the same percentiles over each rendered frame of two parts of its work, as
+    FrankenManim's Metal report gives them: the host's time deriving the route's tables from the view's job
+    (`MetalReport::prepare`), and the device's own time for the 3D raster kernel and the bloom, from the GPU's
+    start of each command buffer to its end (`MetalReport::device_seconds`), each absent before a frame is
+    rendered; and with `--offscreen-zooms` the `camera_moves` posted, those whose frame did not move the view
     (`camera_moves_unmoved`), and `camera_latency`, each move's time from its arrival to the end of the frame
     that drew it, as the same percentiles; and in a window or offscreen, `camera_latency_bound`, each drawn
     move's `MoveLatencyBound` (from the poll before the one that drained it to the end of the frame that drew
@@ -973,7 +977,8 @@ presentation state, not scientific state.
   read back per frame; the `clock` records count frames; the `end` counts every frame rendered, no keys and no
   dropped input, a move in every third frame interval with none unmoved and every move but perhaps the last
   drawn, and ordered percentiles; `camera_latency_bound` over exactly the drawn moves, each of its percentiles
-  at least `camera_latency`'s (planted: the bound fed no moves, caught); and the world it closed on is the
+  at least `camera_latency`'s (planted: the bound fed no moves, caught); `frame_prepare` and `frame_device` over
+  every frame rendered, ordered, positive and none above the same percentile of `frame_times`; and the world it closed on is the
   configuration stepped directly to its tick, digest for digest.
 - `tests/telemetry_binary.rs` (3 tests, FL-024, FL-019, Metal compute, no window): `flife-studio --offscreen 2.5 --timeline
   T` on the preset at 32 x 32 with 384 founders that start above the birth threshold and pay 1.5 a second to live

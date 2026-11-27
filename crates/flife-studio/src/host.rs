@@ -72,7 +72,7 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::keep::Keeping;
 
@@ -213,6 +213,23 @@ pub struct Frame {
     /// Whether the frame was drawn: presented to the window's drawable, or
     /// rendered offscreen.
     pub drawn: bool,
+    /// A rendered frame's host time deriving FrankenManim's Metal tables
+    /// from the view's job (`MetalReport::prepare`), when the route timed
+    /// it; `None` when nothing was rendered.
+    pub prepare: Option<Duration>,
+    /// A rendered frame's device time for its 3D raster kernel and bloom
+    /// (`MetalReport::device_seconds`), when the route measured it; `None`
+    /// when nothing was rendered.
+    pub device: Option<Duration>,
+}
+
+/// A rendered frame's derivation and device times, as its Metal report
+/// gives them ([`Frame::prepare`], [`Frame::device`]).
+fn route_times(metal: &MetalReport) -> (Option<Duration>, Option<Duration>) {
+    let device = metal
+        .device_seconds
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
+    (metal.prepare, device)
 }
 
 /// Frame counts for the Studio's life.
@@ -1385,6 +1402,7 @@ impl Studio {
         }
 
         let mut drawn = false;
+        let mut times = (None, None);
         let outcome = if state == PresentationState::Visible {
             let job = self.view.job()?;
             let frame = self.tally.drawn();
@@ -1394,6 +1412,7 @@ impl Studio {
                         .render_three_d(&job)
                         .map_err(|error| conflict("present a studio frame", error))?;
                     self.tally.count_copies(&report.metal);
+                    times = route_times(&report.metal);
                     match report.outcome {
                         PresentOutcome::Presented => {
                             self.tally.presented += 1;
@@ -1413,6 +1432,7 @@ impl Studio {
                 Target::Offscreen(offscreen) => {
                     let report = offscreen.render(&job)?;
                     self.tally.count_copies(&report);
+                    times = route_times(&report);
                     self.tally.rendered += 1;
                     drawn = true;
                     if let Some(recorded) = &mut self.recorded {
@@ -1454,6 +1474,8 @@ impl Studio {
             measuring,
             outcome,
             drawn,
+            prepare: times.0,
+            device: times.1,
         })
     }
 

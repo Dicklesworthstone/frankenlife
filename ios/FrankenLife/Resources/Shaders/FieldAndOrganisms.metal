@@ -39,16 +39,18 @@ struct FrameUniforms {
     float  pixelScale;         // display scale factor (e.g. 3.0 on iPhone Pro Max)
 
     // Interactive overlays (selected organism, followed heir, measurement disk, touch brush)
+    // Layout verified by XCTest (160 bytes total, zero hidden padding).
     float2 selectedPos;
-    uint   hasSelected;
-    uint   hasFollowed;
-
+    float2 selectedPrevPos;
     float2 followedPos;
+    float2 followedPrevPos;
     float2 measureCenter;
+    float2 brushCenter;
 
     float  measureRadius;      // > 0 when measurement disk active
     float  brushRadius;        // > 0 when brush preview active
-    float2 brushCenter;
+    uint   hasSelected;
+    uint   hasFollowed;
 
     uint   organismCount;      // base live organism count per torus tile
     uint   tilesX;             // odd periodic tile repeat along X (1, 3, 5)
@@ -699,9 +701,12 @@ fragment float4 composite_fragment(
     float2 worldPos = u.cameraCenter + pixelOffset * u.worldUnitsPerPixel;
     float pxWorld = u.worldUnitsPerPixel;
 
-    // 1. Selected organism animated precision reticle
+    // 1. Selected organism animated precision reticle (120Hz toroidal interpolation matching organism_vertex)
     if (u.hasSelected != 0u) {
-        float dWorld = toroidal_dist(worldPos, u.selectedPos, u.worldExtent);
+        float2 selDelta = u.selectedPos - u.selectedPrevPos;
+        selDelta -= u.worldExtent * round(selDelta / u.worldExtent);
+        float2 selPos = u.selectedPrevPos + selDelta * u.interpAlpha;
+        float dWorld = toroidal_dist(worldPos, selPos, u.worldExtent);
         float dPx = dWorld / pxWorld;
         float pulse = 1.0f + 0.08f * sin(u.timeSeconds * 4.5f);
         float ringR = max(14.0f * u.pixelScale, u.pointRadiusPx * u.pixelScale * 2.2f) * pulse;
@@ -710,9 +715,12 @@ fragment float4 composite_fragment(
         col = mix(col, float3(0.45f, 0.95f, 1.0f) * min(u.edrHeadroom, 1.4f), ring * 0.92f);
     }
 
-    // 2. Followed lineage heir golden beacon ring
+    // 2. Followed lineage heir golden beacon ring (120Hz toroidal interpolation)
     if (u.hasFollowed != 0u) {
-        float dWorld = toroidal_dist(worldPos, u.followedPos, u.worldExtent);
+        float2 folDelta = u.followedPos - u.followedPrevPos;
+        folDelta -= u.worldExtent * round(folDelta / u.worldExtent);
+        float2 folPos = u.followedPrevPos + folDelta * u.interpAlpha;
+        float dWorld = toroidal_dist(worldPos, folPos, u.worldExtent);
         float dPx = dWorld / pxWorld;
         float ringR = max(18.0f * u.pixelScale, u.pointRadiusPx * u.pixelScale * 2.7f);
         float stroke = 1.8f * u.pixelScale;

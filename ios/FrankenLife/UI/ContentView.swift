@@ -30,13 +30,42 @@ struct ContentView: View {
                     .padding(.top, 6)
 
                     if let banner = engine.statusBanner {
-                        Text(banner)
-                            .font(.caption.weight(.medium))
+                        Button {
+                            engine.dismissStatusBanner()
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: engine.isStatusBannerError ? "exclamationmark.triangle.fill" : "info.circle.fill")
+                                    .font(.caption.weight(.bold))
+                                Text(banner)
+                                    .font(.caption.weight(.medium))
+                                    .multilineTextAlignment(.leading)
+                            }
                             .foregroundStyle(.white)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 8)
-                            .background(.red.opacity(0.82), in: Capsule())
-                            .padding(.top, 8)
+                            .background(
+                                (engine.isStatusBannerError ? Color.red : Color.orange).opacity(0.84),
+                                in: Capsule()
+                            )
+                        }
+                        .padding(.top, 8)
+                    }
+
+                    if engine.isLoadingWorld {
+                        HStack(spacing: 9) {
+                            ProgressView()
+                                .tint(Color(hex: 0x9BF6FF))
+                                .scaleEffect(0.85)
+                            Text("Founding \(engine.loadingPresetName ?? "World")…")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.white)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .overlay(Capsule().strokeBorder(.white.opacity(0.20), lineWidth: 0.7))
+                        .padding(.top, 10)
+                        .transition(.opacity)
                     }
 
                     Spacer()

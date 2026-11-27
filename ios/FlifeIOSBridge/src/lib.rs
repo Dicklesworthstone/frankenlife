@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use flife_core::binary16::F16;
 use flife_core::ids::{GenomeId, OrganismId, RenderEpoch};
+use flife_core::pool;
 use flife_core::{CoreError, RunConfig, V2Feature, validate};
 use flife_engine::{
     Arrangement, Disposition, Intervention, NumericalProfile, OrganismSnapshot, RegionMeasurement,
@@ -76,7 +77,8 @@ pub struct FlifeMetalVtable {
     pub recommended_working_set_bytes: u64,
     pub device_name: *const c_char,
 
-    pub alloc_shard: Option<unsafe extern "C" fn(ctx: *mut c_void, bytes: u64) -> u64>,
+    pub alloc_shard:
+        Option<unsafe extern "C" fn(ctx: *mut c_void, bytes: u64, out_contents: *mut *mut u8) -> u64>,
     pub free_shard: Option<unsafe extern "C" fn(ctx: *mut c_void, handle: u64)>,
     pub write_shard: Option<
         unsafe extern "C" fn(
@@ -520,11 +522,30 @@ fn validate_shape_words(topology: &DenseTopology, length: usize) -> Option<[u32;
 
 struct IosMetalShard {
     handle: u64,
+    /// Direct unified-memory CPU pointer (`MTLBuffer.contents()`) for lock-free
+    /// parallel shard packing on Apple Silicon, or null to fall back to `write_shard`.
+    contents: *mut u8,
     slot_capacity: usize,
     bytes: u64,
     live_count: usize,
     occupants: Vec<Option<(u32, GenomeId)>>,
     staged: Vec<u32>,
+}
+
+// Safety: `IosMetalShard` is owned exclusively by `IosMetalControllerBackend`
+// on the single simulation worker thread; `contents` points into a shared
+// `MTLBuffer` whose lifetime is tied to `handle` (freed on drop/shrink/grow).
+unsafe impl Send for IosMetalShard {}
+
+struct PendingShardUpload {
+    job_idx: usize,
+    topo_idx: usize,
+    shard_key: u64,
+    local: usize,
+    shard_handle: u64,
+    shard_contents: usize, // *mut u8 encoded as usize for Send across worker pool
+    shard_bytes: u64,
+    offset_elems: u64,
 }
 
 struct IosMetalBucket {
@@ -539,10 +560,12 @@ struct IosMetalBucket {
 struct IosMetalControllerBackend {
     vtable: FlifeMetalVtable,
     device_name: String,
+    cpu_workers: usize,
     buckets: Vec<Option<IosMetalBucket>>,
     held_bytes: u64,
     last_gpu_ns: u64,
     packed_f16: Vec<u32>,
+    pending_uploads: Vec<PendingShardUpload>,
     staged_inputs: Vec<f32>,
     staged_outputs: Vec<f32>,
     staged_faults: Vec<u32>,
@@ -560,7 +583,7 @@ impl std::fmt::Debug for IosMetalControllerBackend {
 }
 
 impl IosMetalControllerBackend {
-    fn new(vtable: FlifeMetalVtable) -> Result<Self, CoreError> {
+    fn new(vtable: FlifeMetalVtable, cpu_workers: usize) -> Result<Self, CoreError> {
         if vtable.alloc_shard.is_none()
             || vtable.free_shard.is_none()
             || vtable.write_shard.is_none()
@@ -577,10 +600,12 @@ impl IosMetalControllerBackend {
         Ok(Self {
             vtable,
             device_name,
+            cpu_workers: cpu_workers.max(1),
             buckets: Vec::new(),
             held_bytes: 0,
             last_gpu_ns: 0,
             packed_f16: Vec::new(),
+            pending_uploads: Vec::new(),
             staged_inputs: Vec::new(),
             staged_outputs: Vec::new(),
             staged_faults: Vec::new(),
@@ -589,20 +614,21 @@ impl IosMetalControllerBackend {
         })
     }
 
-    fn alloc_device_shard(&self, bytes: u64) -> Result<u64, CoreError> {
+    fn alloc_device_shard(&self, bytes: u64) -> Result<(u64, *mut u8), CoreError> {
         let Some(f) = self.vtable.alloc_shard else {
             return Err(CoreError::MissingCapability {
                 capability: "ios-metal-alloc: missing alloc_shard".to_owned(),
             });
         };
-        let handle = unsafe { f(self.vtable.ctx, bytes) };
+        let mut contents: *mut u8 = ptr::null_mut();
+        let handle = unsafe { f(self.vtable.ctx, bytes, &mut contents) };
         if handle == 0 {
             Err(CoreError::AllocationFailed {
                 buffer: "ios metal parameter shard",
                 bytes,
             })
         } else {
-            Ok(handle)
+            Ok((handle, contents))
         }
     }
 
@@ -694,8 +720,7 @@ impl IosMetalControllerBackend {
         let max_buf = self
             .vtable
             .max_buffer_bytes
-            .min(SHARD_BYTES_CAP)
-            .max(16 * 1024 * 1024);
+            .clamp(16 * 1024 * 1024, SHARD_BYTES_CAP);
 
         let bucket = self.buckets[topo_idx].get_or_insert_with(|| {
             let elem_limit = (max_buf / dtype.bytes()).min(u64::from(u32::MAX));
@@ -733,22 +758,13 @@ impl IosMetalControllerBackend {
         ok.then_some(topo_idx)
     }
 
-    fn upload_genome_to_shard(
+    fn upload_genome_to_shard_fallback(
         &mut self,
-        topo_idx: usize,
-        shard_key: u64,
+        handle: u64,
         offset_elems: u64,
         topology: &DenseTopology,
         weights: Weights<'_>,
     ) -> Result<(), CoreError> {
-        let handle = self.buckets[topo_idx]
-            .as_ref()
-            .and_then(|b| b.shards.get(&shard_key))
-            .map(|s| s.handle)
-            .ok_or_else(|| CoreError::StateConflict {
-                operation: "ios metal upload",
-                detail: "missing shard handle".to_owned(),
-            })?;
         match weights {
             Weights::F32(values) => {
                 let byte_offset = offset_elems * 4;
@@ -775,6 +791,184 @@ impl IosMetalControllerBackend {
             }
         }
         Ok(())
+    }
+
+    fn write_genome_direct(
+        shard_contents: *mut u8,
+        shard_bytes: u64,
+        offset_elems: u64,
+        topology: &DenseTopology,
+        weights: Weights<'_>,
+        scratch: &mut Vec<u32>,
+    ) -> Result<(), CoreError> {
+        match weights {
+            Weights::F32(values) => {
+                let byte_offset = offset_elems.checked_mul(4).ok_or(CoreError::Overflow {
+                    quantity: "ios metal f32 byte offset",
+                })?;
+                let byte_len = (values.len() as u64)
+                    .checked_mul(4)
+                    .ok_or(CoreError::Overflow {
+                        quantity: "ios metal f32 byte len",
+                    })?;
+                let end = byte_offset
+                    .checked_add(byte_len)
+                    .ok_or(CoreError::Overflow {
+                        quantity: "ios metal f32 byte end",
+                    })?;
+                if end > shard_bytes {
+                    return Err(CoreError::LayoutMismatch {
+                        buffer: "ios metal f32 shard",
+                        detail: format!("write end {end} exceeds shard bytes {shard_bytes}"),
+                    });
+                }
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        values.as_ptr().cast::<u8>(),
+                        shard_contents.add(byte_offset as usize),
+                        byte_len as usize,
+                    );
+                }
+            }
+            Weights::F16(values) => {
+                let word_count = values.len().div_ceil(2);
+                let byte_offset = offset_elems.checked_mul(2).ok_or(CoreError::Overflow {
+                    quantity: "ios metal f16 byte offset",
+                })?;
+                let byte_len = (word_count as u64)
+                    .checked_mul(4)
+                    .ok_or(CoreError::Overflow {
+                        quantity: "ios metal f16 byte len",
+                    })?;
+                let end = byte_offset
+                    .checked_add(byte_len)
+                    .ok_or(CoreError::Overflow {
+                        quantity: "ios metal f16 byte end",
+                    })?;
+                if end > shard_bytes {
+                    return Err(CoreError::LayoutMismatch {
+                        buffer: "ios metal f16 shard",
+                        detail: format!("write end {end} exceeds shard bytes {shard_bytes}"),
+                    });
+                }
+                let dst_ptr = unsafe { shard_contents.add(byte_offset as usize) };
+                if (dst_ptr as usize).is_multiple_of(align_of::<u32>()) {
+                    let dst_words =
+                        unsafe { std::slice::from_raw_parts_mut(dst_ptr.cast::<u32>(), word_count) };
+                    pack_f16_for_metal_into(topology, values, dst_words)?;
+                } else {
+                    if scratch.len() < word_count {
+                        scratch.resize(word_count, 0);
+                    }
+                    let written =
+                        pack_f16_for_metal_into(topology, values, &mut scratch[..word_count])?;
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            scratch.as_ptr().cast::<u8>(),
+                            dst_ptr,
+                            written * 4,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_pending_uploads(&mut self, jobs: &[FlatControllerJob<'_>]) -> Result<(), CoreError> {
+        if self.pending_uploads.is_empty() {
+            return Ok(());
+        }
+
+        // Refresh final shard pointers/handles and drop any upload that was
+        // superseded by a later occupant in the same batch (guaranteeing strictly
+        // disjoint destination ranges for parallel unified-memory packing).
+        let mut live_uploads = std::mem::take(&mut self.pending_uploads);
+        live_uploads.retain_mut(|u| {
+            let job = &jobs[u.job_idx];
+            let Some(bucket) = self.buckets.get(u.topo_idx).and_then(Option::as_ref) else {
+                return false;
+            };
+            let Some(shard) = bucket.shards.get(&u.shard_key) else {
+                return false;
+            };
+            if shard.occupants.get(u.local).copied().flatten()
+                != Some((job.slot.generation(), job.genome))
+            {
+                return false;
+            }
+            u.shard_handle = shard.handle;
+            u.shard_contents = shard.contents as usize;
+            u.shard_bytes = shard.bytes;
+            true
+        });
+
+        let all_direct = live_uploads.iter().all(|u| u.shard_contents != 0);
+        let result = if all_direct && live_uploads.len() >= 16 && self.cpu_workers > 1 {
+            let workers = self.cpu_workers.min(live_uploads.len());
+            let chunk_len = live_uploads.len().div_ceil(workers);
+            let mut results: Vec<Result<(), CoreError>> = vec![Ok(()); workers];
+            let uploads_ref = &live_uploads;
+            pool::parallel_for_each_mut(
+                workers,
+                "ios metal parallel shard pack",
+                &mut results,
+                |chunk_idx, slot_res| {
+                    let start = chunk_idx * chunk_len;
+                    if start >= uploads_ref.len() {
+                        return;
+                    }
+                    let end = (start + chunk_len).min(uploads_ref.len());
+                    let mut scratch = Vec::new();
+                    for u in &uploads_ref[start..end] {
+                        let job = &jobs[u.job_idx];
+                        if let Err(err) = Self::write_genome_direct(
+                            u.shard_contents as *mut u8,
+                            u.shard_bytes,
+                            u.offset_elems,
+                            job.controller.topology(),
+                            job.controller.parameters(),
+                            &mut scratch,
+                        ) {
+                            *slot_res = Err(err);
+                            return;
+                        }
+                    }
+                },
+            )?;
+            results.into_iter().collect::<Result<(), CoreError>>()
+        } else {
+            let mut res = Ok(());
+            for u in &live_uploads {
+                let job = &jobs[u.job_idx];
+                let step = if u.shard_contents != 0 {
+                    Self::write_genome_direct(
+                        u.shard_contents as *mut u8,
+                        u.shard_bytes,
+                        u.offset_elems,
+                        job.controller.topology(),
+                        job.controller.parameters(),
+                        &mut self.packed_f16,
+                    )
+                } else {
+                    self.upload_genome_to_shard_fallback(
+                        u.shard_handle,
+                        u.offset_elems,
+                        job.controller.topology(),
+                        job.controller.parameters(),
+                    )
+                };
+                if let Err(err) = step {
+                    res = Err(err);
+                    break;
+                }
+            }
+            res
+        };
+
+        live_uploads.clear();
+        self.pending_uploads = live_uploads;
+        result
     }
 
     fn run_flat(
@@ -827,31 +1021,7 @@ impl IosMetalControllerBackend {
         }
         self.dispatched_indices.clear();
         self.touched.clear();
-
-        // Pre-scan batch max slot per (topology, shard) so founding waves allocate
-        // each shard at its final power-of-two capacity ONCE (zero cascading 256->512->...->16k reallocs).
-        let mut batch_max_local: HashMap<(usize, u64), usize> = HashMap::new();
-        for (job, &is_finite) in jobs.iter().zip(inputs_finite) {
-            if is_finite == 0 {
-                continue;
-            }
-            let topo = job.controller.topology();
-            if topo.input_width() != input_width || topo.raw_output_width() != output_width {
-                continue;
-            }
-            let Some(topo_idx) = self.ensure_bucket(job) else {
-                continue;
-            };
-            if let Some(geometry) = self.buckets[topo_idx].as_ref().and_then(|b| b.geometry) {
-                let at = geometry.locate(job.slot.slot());
-                if let Ok(local) = usize::try_from(at.slot_in_shard) {
-                    batch_max_local
-                        .entry((topo_idx, at.shard))
-                        .and_modify(|m| *m = (*m).max(local))
-                        .or_insert(local);
-                }
-            }
-        }
+        self.pending_uploads.clear();
 
         let mut overwrote_existing = false;
 
@@ -898,11 +1068,26 @@ impl IosMetalControllerBackend {
                 .map(|s| s.slot_capacity);
 
             if existing_cap.is_none_or(|cap| local >= cap) {
-                let target_local = batch_max_local
-                    .get(&(topo_idx, at.shard))
-                    .copied()
-                    .unwrap_or(local)
-                    .max(local);
+                // Lazy look-ahead ONLY when allocating or growing a shard (zero steady-state overhead):
+                // find the max slot for this (topology, shard) across remaining jobs so each shard
+                // allocates ONCE at its final power-of-two capacity.
+                let mut target_local = local;
+                for (later_job, &later_fin) in jobs[index + 1..].iter().zip(&inputs_finite[index + 1..])
+                {
+                    if later_fin == 0 {
+                        continue;
+                    }
+                    if later_job.slot.topology() as usize != topo_idx {
+                        continue;
+                    }
+                    let later_at = geometry.locate(later_job.slot.slot());
+                    if later_at.shard == at.shard
+                        && let Ok(ll) = usize::try_from(later_at.slot_in_shard)
+                        && ll < slots_per_shard
+                    {
+                        target_local = target_local.max(ll);
+                    }
+                }
                 let needed = (target_local + 1)
                     .next_power_of_two()
                     .clamp(256, slots_per_shard);
@@ -913,8 +1098,8 @@ impl IosMetalControllerBackend {
                         quantity: "ios metal shard bytes",
                     })?
                     .max(16);
-                let new_handle = match self.alloc_device_shard(new_bytes) {
-                    Ok(h) => h,
+                let (new_handle, new_contents) = match self.alloc_device_shard(new_bytes) {
+                    Ok(pair) => pair,
                     Err(_) => continue, // defer gracefully if device memory tight
                 };
 
@@ -944,6 +1129,7 @@ impl IosMetalControllerBackend {
                         .and_then(|b| b.shards.get_mut(&at.shard))
                     {
                         shard.handle = new_handle;
+                        shard.contents = new_contents;
                         shard.slot_capacity = needed;
                         shard.bytes = new_bytes;
                         shard.occupants.resize(needed, None);
@@ -955,6 +1141,7 @@ impl IosMetalControllerBackend {
                             at.shard,
                             IosMetalShard {
                                 handle: new_handle,
+                                contents: new_contents,
                                 slot_capacity: needed,
                                 bytes: new_bytes,
                                 live_count: 0,
@@ -967,39 +1154,30 @@ impl IosMetalControllerBackend {
             }
 
             let own = Some((job.slot.generation(), job.genome));
-            let needs_upload = {
-                let Some(shard) = self.buckets[topo_idx]
-                    .as_mut()
-                    .and_then(|b| b.shards.get_mut(&at.shard))
-                else {
-                    continue;
-                };
+            if let Some(shard) = self.buckets[topo_idx]
+                .as_mut()
+                .and_then(|b| b.shards.get_mut(&at.shard))
+            {
                 if shard.occupants[local] != own {
                     if shard.occupants[local].take().is_some() {
                         shard.live_count = shard.live_count.saturating_sub(1);
                         overwrote_existing = true;
                     }
-                    true
-                } else {
-                    false
-                }
-            };
-
-            if needs_upload {
-                self.upload_genome_to_shard(
-                    topo_idx,
-                    at.shard,
-                    at.offset,
-                    topo,
-                    job.controller.parameters(),
-                )?;
-                if let Some(shard) = self.buckets[topo_idx]
-                    .as_mut()
-                    .and_then(|b| b.shards.get_mut(&at.shard))
-                {
                     shard.occupants[local] = own;
                     shard.live_count += 1;
+                    self.pending_uploads.push(PendingShardUpload {
+                        job_idx: index,
+                        topo_idx,
+                        shard_key: at.shard,
+                        local,
+                        shard_handle: shard.handle,
+                        shard_contents: shard.contents as usize,
+                        shard_bytes: shard.bytes,
+                        offset_elems: at.offset,
+                    });
                 }
+            } else {
+                continue;
             }
 
             let row = self.dispatched_indices.len();
@@ -1021,6 +1199,10 @@ impl IosMetalControllerBackend {
                 ]);
             }
         }
+
+        // Flush all newborn / mutated controller weights in parallel directly into
+        // Apple Silicon unified memory (`MTLBuffer.contents()`), zero FFI hops!
+        self.flush_pending_uploads(jobs)?;
 
         if overwrote_existing {
             // Rebuild staged lists cleanly dropping any evicted earlier duplicate slot.
@@ -1312,17 +1494,18 @@ struct LiveTelemetry {
     is_capacity_paused: bool,
 }
 
+type InspectReplySlot = Arc<(Mutex<Option<Option<OrganismSnapshot>>>, Condvar)>;
+type MeasureReplySlot = Arc<(Mutex<Option<Result<RegionMeasurement, CoreError>>>, Condvar)>;
+
 enum SyncQuery {
-    Inspect(OrganismId, Arc<(Mutex<Option<Option<OrganismSnapshot>>>, Condvar)>),
-    Measure(
-        [f64; 2],
-        f64,
-        Arc<(Mutex<Option<Result<RegionMeasurement, CoreError>>>, Condvar)>,
-    ),
+    Inspect(OrganismId, InspectReplySlot),
+    Measure([f64; 2], f64, MeasureReplySlot),
 }
 
 struct SharedControl {
     playing: bool,
+    capacity_paused: bool,
+    worker_stepping: bool,
     step_requests: u64,
     target_tps: f64, // 0.0 = uncapped
     shutdown: bool,
@@ -1437,7 +1620,6 @@ fn worker_loop(
 ) {
     let mut ema_tps = 0.0_f64;
     let mut prev_device_ns = 0_u64;
-    let mut capacity_paused = false;
 
     loop {
         let (should_step, target_tps, interventions, watch_upd, follow_upd, queries) = {
@@ -1446,8 +1628,12 @@ fn worker_loop(
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
+            if guard.worker_stepping {
+                guard.worker_stepping = false;
+                cvar.notify_all();
+            }
             while !guard.shutdown
-                && !guard.playing
+                && (!guard.playing || guard.capacity_paused)
                 && guard.step_requests == 0
                 && guard.queries.is_empty()
                 && guard.watch_update.is_none()
@@ -1461,7 +1647,7 @@ fn worker_loop(
                     Err(p) => p.into_inner(),
                 };
                 if guard.shutdown
-                    || guard.playing
+                    || (guard.playing && !guard.capacity_paused)
                     || guard.step_requests > 0
                     || !guard.queries.is_empty()
                     || guard.watch_update.is_some()
@@ -1476,16 +1662,22 @@ fn worker_loop(
             }
             if guard.shutdown {
                 let pending_q = std::mem::take(&mut guard.queries);
+                guard.worker_stepping = false;
+                cvar.notify_all();
                 drop(guard);
                 process_sync_queries(&world, pending_q);
                 break;
             }
             let do_step = if guard.step_requests > 0 {
                 guard.step_requests -= 1;
+                guard.capacity_paused = false;
                 true
             } else {
-                guard.playing && !capacity_paused
+                guard.playing && !guard.capacity_paused
             };
+            if do_step {
+                guard.worker_stepping = true;
+            }
             let target_tps = guard.target_tps;
             let interventions = if do_step {
                 std::mem::take(&mut guard.pending_interventions)
@@ -1519,21 +1711,24 @@ fn worker_loop(
             let elapsed = t0.elapsed();
             let wall_ms = elapsed.as_secs_f64() * 1000.0;
 
-            match step_result {
+            let paused_now = match step_result {
                 Ok(Stepped::Published(report)) => {
-                    capacity_paused = false;
                     publisher.count(&report);
                     let _ = publisher.offer(&world);
+                    false
                 }
-                Ok(Stepped::Paused(_)) => {
-                    capacity_paused = true;
+                Ok(Stepped::Paused(_)) | Err(_) => {
+                    // Explicitly halt playing so the worker parks cleanly on the condvar
+                    // instead of busy-spinning at 100% CPU.
+                    if let Ok(mut g) = control.0.lock() {
+                        g.capacity_paused = true;
+                        g.playing = false;
+                        control.1.notify_all();
+                    }
                     let _ = publisher.offer(&world);
+                    true
                 }
-                Err(_) => {
-                    capacity_paused = true;
-                    let _ = publisher.offer(&world);
-                }
-            }
+            };
 
             let ctrl = world.controller_report();
             let delta_gpu_ns = ctrl.device_nanoseconds.saturating_sub(prev_device_ns);
@@ -1545,11 +1740,15 @@ fn worker_loop(
                 ema_tps * 0.85 + inst_tps * 0.15
             };
 
-            let is_playing_now = control
+            let (is_playing_now, cap_paused_now) = control
                 .0
                 .lock()
-                .map(|g| g.playing)
-                .unwrap_or(false);
+                .map(|mut g| {
+                    g.worker_stepping = false;
+                    control.1.notify_all();
+                    (g.playing, g.capacity_paused || paused_now)
+                })
+                .unwrap_or((false, paused_now));
 
             if let Ok(mut tel) = telemetry.lock() {
                 tel.sim_ticks_per_second = ema_tps;
@@ -1561,7 +1760,7 @@ fn worker_loop(
                 tel.metal_total_device_ns = ctrl.device_nanoseconds;
                 tel.metal_active = ctrl.backend.is_some() && ctrl.failure.is_none();
                 tel.is_playing = is_playing_now;
-                tel.is_capacity_paused = capacity_paused;
+                tel.is_capacity_paused = cap_paused_now;
             }
 
             if target_tps > 0.0 {
@@ -1579,10 +1778,14 @@ fn worker_loop(
                 }
             }
         } else {
-            let is_playing_now = control.0.lock().map(|g| g.playing).unwrap_or(false);
+            let (is_playing_now, cap_paused_now) = control
+                .0
+                .lock()
+                .map(|g| (g.playing, g.capacity_paused))
+                .unwrap_or((false, false));
             if let Ok(mut tel) = telemetry.lock() {
                 tel.is_playing = is_playing_now;
-                tel.is_capacity_paused = capacity_paused;
+                tel.is_capacity_paused = cap_paused_now;
             }
         }
     }
@@ -1631,7 +1834,7 @@ pub unsafe extern "C" fn flife_session_create(
         let mut metal_attached = false;
         if !metal_opt.is_null() {
             let vtable = unsafe { *metal_opt };
-            if let Ok(backend) = IosMetalControllerBackend::new(vtable) {
+            if let Ok(backend) = IosMetalControllerBackend::new(vtable, workers.get()) {
                 world.set_controller_backend(Some(Box::new(backend)));
                 metal_attached = true;
             }
@@ -1648,6 +1851,8 @@ pub unsafe extern "C" fn flife_session_create(
         let control = Arc::new((
             Mutex::new(SharedControl {
                 playing: true,
+                capacity_paused: false,
+                worker_stepping: false,
                 step_requests: 0,
                 target_tps: 0.0,
                 shutdown: false,
@@ -1741,11 +1946,53 @@ pub unsafe extern "C" fn flife_session_set_playing(session: *mut FlifeSession, p
     let (lock, cvar) = &*s.control;
     if let Ok(mut g) = lock.lock() {
         g.playing = playing;
+        if playing {
+            g.capacity_paused = false;
+        }
         cvar.notify_all();
     }
     if let Ok(mut t) = s.telemetry.lock() {
         t.is_playing = playing;
+        if playing {
+            t.is_capacity_paused = false;
+        }
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flife_session_pause_and_quiesce(
+    session: *mut FlifeSession,
+    timeout_ms: u32,
+) -> bool {
+    if session.is_null() {
+        return true;
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let s = unsafe { &*session };
+        let (lock, cvar) = &*s.control;
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.playing = false;
+        guard.step_requests = 0;
+        cvar.notify_all();
+        if let Ok(mut t) = s.telemetry.lock() {
+            t.is_playing = false;
+        }
+        let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+        while guard.worker_stepping && !guard.shutdown && s.running.load(Ordering::Acquire) {
+            let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            guard = match cvar.wait_timeout(guard, rem) {
+                Ok((g, _)) => g,
+                Err(p) => p.into_inner().0,
+            };
+        }
+        !guard.worker_stepping
+    }));
+    result.unwrap_or(false)
 }
 
 #[unsafe(no_mangle)]
@@ -1757,6 +2004,7 @@ pub unsafe extern "C" fn flife_session_step_once(session: *mut FlifeSession) {
     let (lock, cvar) = &*s.control;
     if let Ok(mut g) = lock.lock() {
         g.playing = false;
+        g.capacity_paused = false;
         g.step_requests = g.step_requests.saturating_add(1);
         cvar.notify_all();
     }
@@ -2384,7 +2632,8 @@ pub unsafe extern "C" fn flife_verify_metal_parity(
         let mut world_metal =
             World::found_on(&validated, Arrangement::Compact, profile, workers)
                 .map_err(|e| e.to_string())?;
-        let backend = IosMetalControllerBackend::new(vtable).map_err(|e| e.to_string())?;
+        let backend =
+            IosMetalControllerBackend::new(vtable, workers.get()).map_err(|e| e.to_string())?;
         world_metal.set_controller_backend(Some(Box::new(backend)));
 
         let mut world_cpu =

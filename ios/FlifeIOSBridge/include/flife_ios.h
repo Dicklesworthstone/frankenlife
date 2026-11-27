@@ -31,8 +31,10 @@ typedef struct FlifeMetalVtable {
     uint64_t recommended_working_set_bytes;
     const char *device_name;
 
-    /* Allocate a shared Metal parameter shard buffer; returns non-zero handle or 0 on error. */
-    uint64_t (*alloc_shard)(void *ctx, uint64_t bytes);
+    /* Allocate a shared Metal parameter shard buffer; returns non-zero handle or 0 on error.
+     * If `out_contents` is non-NULL, stores the unified-memory CPU pointer (`MTLBuffer.contents()`)
+     * for direct lock-free parallel shard packing. */
+    uint64_t (*alloc_shard)(void *ctx, uint64_t bytes, uint8_t **out_contents);
     /* Release a previously allocated shard handle. */
     void (*free_shard)(void *ctx, uint64_t handle);
     /* Write `len` bytes into `handle` at `byte_offset`. Returns 0 on success. */
@@ -293,6 +295,8 @@ FlifeSession *flife_session_create(
 void flife_session_destroy(FlifeSession *session);
 
 void flife_session_set_playing(FlifeSession *session, bool playing);
+/* Pause simulation and wait up to `timeout_ms` for any active GPU tick to finish (iOS background safety). */
+bool flife_session_pause_and_quiesce(FlifeSession *session, uint32_t timeout_ms);
 void flife_session_step_once(FlifeSession *session);
 void flife_session_set_target_tps(FlifeSession *session, double target_tps);
 

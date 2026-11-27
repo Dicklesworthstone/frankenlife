@@ -103,6 +103,10 @@ struct MetalCanvasView: UIViewRepresentable {
         if uiView.preferredFramesPerSecond != engine.targetDisplayFPS {
             uiView.preferredFramesPerSecond = engine.targetDisplayFPS
         }
+        let shouldPause = engine.isAppBackgrounded
+        if uiView.isPaused != shouldPause {
+            uiView.isPaused = shouldPause
+        }
     }
 
     @MainActor
@@ -112,6 +116,8 @@ struct MetalCanvasView: UIViewRepresentable {
         private var lastPanPoint: CGPoint = .zero
         private var measureOriginWorld: SIMD2<Double>?
         private var lastBrushApplyTime: CFTimeInterval = 0
+        private var wasNavigationPan: Bool = false
+        private var lockedToNavigation: Bool = false
 
         init(engine: FrankenLifeEngine) {
             self.engine = engine
@@ -133,12 +139,12 @@ struct MetalCanvasView: UIViewRepresentable {
             guard let view = mtkView, view.drawableSize.width > 0 else { return nil }
             let scale = view.contentScaleFactor
             let px = CGPoint(x: pt.x * scale, y: pt.y * scale)
-            return engine.renderer.camera.screenPointToWorld(px, viewportPx: view.drawableSize)
+            return engine.renderer.readCamera().screenPointToWorld(px, viewportPx: view.drawableSize)
         }
 
         @objc func handleTap(_ gr: UITapGestureRecognizer) {
             guard let view = mtkView, let worldPt = viewPointToWorld(gr.location(in: view)) else { return }
-            let upp = engine.renderer.camera.worldUnitsPerPixel(viewport: view.drawableSize)
+            let upp = engine.renderer.readCamera().worldUnitsPerPixel(viewport: view.drawableSize)
             let pickRadius = max(24.0 * Double(view.contentScaleFactor) * upp, 0.8)
 
             switch engine.activeTool {
@@ -171,21 +177,40 @@ struct MetalCanvasView: UIViewRepresentable {
             guard let view = mtkView else { return }
             let loc = gr.location(in: view)
 
-            // Always allow 2-finger pan even when an intervention brush is selected!
-            let isNavigationPan = (engine.activeTool == .explore) || (gr.numberOfTouches >= 2)
+            if gr.state == .began {
+                lockedToNavigation = (engine.activeTool == .explore) || (gr.numberOfTouches >= 2)
+                wasNavigationPan = lockedToNavigation
+                lastPanPoint = loc
+            } else if gr.numberOfTouches >= 2 {
+                // Once a second finger joins, lock this gesture to navigation until release
+                // so lifting one finger never accidentally fires Remove/Feed/Measure.
+                lockedToNavigation = true
+            }
 
-            if isNavigationPan {
-                switch gr.state {
-                case .began:
+            if gr.state == .ended || gr.state == .cancelled {
+                engine.setBrushPreview(at: .zero, active: false)
+                measureOriginWorld = nil
+                wasNavigationPan = false
+                lockedToNavigation = false
+                return
+            }
+
+            if lockedToNavigation {
+                if !wasNavigationPan {
+                    // Transitioning mid-gesture from 1-finger brush to 2-finger pan:
+                    // clear brush ring and re-anchor pan point so camera never teleports!
+                    engine.setBrushPreview(at: .zero, active: false)
+                    measureOriginWorld = nil
                     lastPanPoint = loc
-                case .changed:
+                    wasNavigationPan = true
+                    return
+                }
+                if gr.state == .changed {
                     let dxPt = loc.x - lastPanPoint.x
                     let dyPt = loc.y - lastPanPoint.y
                     lastPanPoint = loc
                     let s = view.contentScaleFactor
                     engine.panCamera(dxPx: Double(dxPt * s), dyPx: Double(dyPt * s), viewportPx: view.drawableSize)
-                default:
-                    break
                 }
                 return
             }
@@ -200,8 +225,9 @@ struct MetalCanvasView: UIViewRepresentable {
                     engine.updateMeasurement(center: worldPt, radius: 1.5)
                 case .changed:
                     if let origin = measureOriginWorld {
-                        let lw = engine.renderer.camera.worldWidth
-                        let lh = engine.renderer.camera.worldHeight
+                        let cam = engine.renderer.readCamera()
+                        let lw = cam.worldWidth
+                        let lh = cam.worldHeight
                         var dx = worldPt.x - origin.x
                         var dy = worldPt.y - origin.y
                         dx -= lw * (dx / lw).rounded()
@@ -209,8 +235,6 @@ struct MetalCanvasView: UIViewRepresentable {
                         let r = max(0.5, min(hypot(dx, dy), 0.45 * min(lw, lh)))
                         engine.updateMeasurement(center: origin, radius: r)
                     }
-                case .ended, .cancelled:
-                    measureOriginWorld = nil
                 default:
                     break
                 }
@@ -227,8 +251,6 @@ struct MetalCanvasView: UIViewRepresentable {
                         engine.applyActiveTool(at: worldPt)
                         lastBrushApplyTime = now
                     }
-                case .ended, .cancelled:
-                    engine.setBrushPreview(at: worldPt, active: false)
                 default:
                     break
                 }

@@ -70,7 +70,8 @@ final class FrankenLifeMetalParityTests: XCTestCase {
         guard let session = toml.withCString({ cToml in
             flife_session_create(cToml, &vtable, 4, &errBuf, errBuf.count)
         }) else {
-            XCTFail("flife_session_create failed: \(String(cString: errBuf))")
+            let errBytes = errBuf.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+            XCTFail("flife_session_create failed: \(String(decoding: errBytes, as: UTF8.self))")
             return
         }
         defer { flife_session_destroy(session) }
@@ -117,5 +118,81 @@ final class FrankenLifeMetalParityTests: XCTestCase {
         XCTAssertTrue(flife_session_measure_region(session, view.world_width * 0.5, view.world_height * 0.5, 8.0, &measure))
         XCTAssertTrue(measure.valid)
         XCTAssertGreaterThan(measure.cells, 0)
+
+        // Verify background pause & quiesce parks the worker cleanly and resumes deterministically
+        XCTAssertTrue(flife_session_pause_and_quiesce(session, 1000))
+        flife_session_step_once(session)
+        var advanced = false
+        for _ in 0..<40 {
+            if let h = flife_session_acquire_latest_epoch(session, view.epoch_id, &view) {
+                let tickNow = view.tick
+                flife_epoch_release(h)
+                if tickNow >= 3 {
+                    advanced = true
+                    break
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.025)
+        }
+        XCTAssertTrue(advanced, "Session should advance cleanly after pause_and_quiesce")
+    }
+
+    func testMetalFrameUniformsLayoutMatchesShader() {
+        // Exact 160-byte alignment contract with `FrameUniforms` in FieldAndOrganisms.metal
+        XCTAssertEqual(MemoryLayout<MetalFrameUniforms>.stride, 160)
+        XCTAssertEqual(MemoryLayout<MetalFrameUniforms>.offset(of: \.selectedPos), 80)
+        XCTAssertEqual(MemoryLayout<MetalFrameUniforms>.offset(of: \.selectedPrevPos), 88)
+        XCTAssertEqual(MemoryLayout<MetalFrameUniforms>.offset(of: \.followedPos), 96)
+        XCTAssertEqual(MemoryLayout<MetalFrameUniforms>.offset(of: \.followedPrevPos), 104)
+        XCTAssertEqual(MemoryLayout<MetalFrameUniforms>.offset(of: \.measureCenter), 112)
+        XCTAssertEqual(MemoryLayout<MetalFrameUniforms>.offset(of: \.brushCenter), 120)
+        XCTAssertEqual(MemoryLayout<MetalFrameUniforms>.offset(of: \.measureRadius), 128)
+        XCTAssertEqual(MemoryLayout<MetalFrameUniforms>.offset(of: \.organismCount), 144)
+        XCTAssertEqual(MemoryLayout<MetalOrganismInstance>.stride, 64)
+    }
+
+    func testConcurrentMetalControllerDispatchSafety() throws {
+        // Stress-tests `MetalControllerEngine.dispatchLock` under two simultaneous parity runs
+        // sharing ONE `MetalControllerEngine` instance (verifying zero buffer corruption or race).
+        final class OutcomesBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var items: [FlifeParityResult] = []
+            func append(_ r: FlifeParityResult) {
+                lock.lock()
+                items.append(r)
+                lock.unlock()
+            }
+            func snapshot() -> [FlifeParityResult] {
+                lock.lock()
+                defer { lock.unlock() }
+                return items
+            }
+        }
+
+        let sharedEngine = try MetalControllerEngine(bundle: Bundle.main)
+        let toml = try loadPresetTOML("reference-small-world")
+        let group = DispatchGroup()
+        let box = OutcomesBox()
+
+        for _ in 0..<2 {
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                var vtable = sharedEngine.makeVtable()
+                var res = FlifeParityResult()
+                toml.withCString { cToml in
+                    flife_verify_metal_parity(cToml, &vtable, 6, 2, &res)
+                }
+                box.append(res)
+                group.leave()
+            }
+        }
+        XCTAssertEqual(group.wait(timeout: .now() + .seconds(30)), .success)
+        let outcomes = box.snapshot()
+        XCTAssertEqual(outcomes.count, 2)
+        for res in outcomes {
+            XCTAssertTrue(res.success, "Concurrent parity failed: \(cArrayToString(res.error))")
+            XCTAssertTrue(res.digest_matched, "Concurrent Metal dispatch caused digest mismatch!")
+            XCTAssertGreaterThan(res.metal_batched, 0)
+        }
     }
 }

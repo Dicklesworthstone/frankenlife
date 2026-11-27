@@ -26,7 +26,9 @@ struct CameraState: Sendable {
 
     var selectedOrganismId: UInt64?
     var selectedPos: SIMD2<Float>?
+    var selectedPrevPos: SIMD2<Float>?
     var followedPos: SIMD2<Float>?
+    var followedPrevPos: SIMD2<Float>?
 
     var measureCenter: SIMD2<Float>?
     var measureRadius: Float = 0.0
@@ -50,7 +52,7 @@ struct CameraState: Sendable {
     }
 }
 
-/// Must match `FrameUniforms` in `FieldAndOrganisms.metal` byte-for-byte.
+/// Must match `FrameUniforms` in `FieldAndOrganisms.metal` byte-for-byte (160 bytes).
 struct MetalFrameUniforms {
     var viewportSize: SIMD2<Float> = .zero
     var worldExtent: SIMD2<Float> = SIMD2(64, 64)
@@ -74,15 +76,16 @@ struct MetalFrameUniforms {
     var pixelScale: Float = 3.0
 
     var selectedPos: SIMD2<Float> = .zero
-    var hasSelected: UInt32 = 0
-    var hasFollowed: UInt32 = 0
-
+    var selectedPrevPos: SIMD2<Float> = .zero
     var followedPos: SIMD2<Float> = .zero
+    var followedPrevPos: SIMD2<Float> = .zero
     var measureCenter: SIMD2<Float> = .zero
+    var brushCenter: SIMD2<Float> = .zero
 
     var measureRadius: Float = 0.0
     var brushRadius: Float = 0.0
-    var brushCenter: SIMD2<Float> = .zero
+    var hasSelected: UInt32 = 0
+    var hasFollowed: UInt32 = 0
 
     var organismCount: UInt32 = 0
     var tilesX: UInt32 = 1
@@ -162,22 +165,31 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
     private let bloomUpPipeline: MTLRenderPipelineState
     private let compositePipeline: MTLRenderPipelineState
 
-    // Triple-buffered GPU instance buffers (`storageModeShared` unified memory!)
+    // Triple-buffered GPU instance buffers + field textures (`storageModeShared` unified memory).
+    // With `inFlightSemaphore(value: 3)` waited before any upload, at most 2 prior GPU frames
+    // can be in-flight, reading at most `{ (active - 1) % 3, active }`. Therefore advancing each
+    // resource's own write slot to `(active + 1) % 3` on upload guarantees 0 CPU/GPU hazards
+    // even when sim TPS and 120Hz display FPS differ arbitrarily.
     private let inFlightSemaphore = DispatchSemaphore(value: 3)
     private var organismBuffers: [MTLBuffer?] = [nil, nil, nil]
-    private var activeBufferIndex: Int = 0
+    private var activeOrganismSlot: Int = 0
     private var currentOrganismCount: Int = 0
 
-    // Previous epoch IDs & positions for O(N) toroidal interpolation matching
+    // Previous & current epoch IDs/positions for O(N) toroidal interpolation & accurate picking
     private var prevIds: [UInt64] = []
     private var prevPositions: [SIMD2<Float>] = []
     private var currIds: [UInt64] = []
     private var currPositions: [SIMD2<Float>] = []
+    private var currMatchedPrevPositions: [SIMD2<Float>] = []
+    private var lastInterpAlpha: Float = 1.0
 
-    // Field textures
-    private var energyTexture: MTLTexture?
-    private var compTexture: MTLTexture?
-    private var v2OverlayTexture: MTLTexture?
+    // Triple-buffered field textures (zero CPU replace vs GPU fragment read race!)
+    private var energyTextures: [MTLTexture?] = [nil, nil, nil]
+    private var compTextures: [MTLTexture?] = [nil, nil, nil]
+    private var v2OverlayTextures: [MTLTexture?] = [nil, nil, nil]
+    private var activeEnergySlot: Int = 0
+    private var activeCompSlot: Int = 0
+    private var activeV2Slot: Int = 0
     private var fieldTexSize: (Int, Int) = (0, 0)
     private var compStaging: [Float16] = []
     private var v2Staging: [Float] = []
@@ -215,8 +227,8 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
     private var lastTelemetryPush: CFTimeInterval = 0.0
     private var latestTelemetry = LiveTelemetrySnapshot()
 
-    var style = RenderStyleState()
-    var camera = CameraState()
+    private var style = RenderStyleState()
+    private var camera = CameraState()
     var onTelemetryUpdate: ((LiveTelemetrySnapshot) -> Void)?
 
     init(device: MTLDevice) throws {
@@ -275,6 +287,57 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
         super.init()
     }
 
+    func readCamera() -> CameraState {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return camera
+    }
+
+    func mutateCamera(_ body: (inout CameraState) -> Void) {
+        stateLock.lock()
+        body(&camera)
+        stateLock.unlock()
+    }
+
+    func updateStyle(_ newStyle: RenderStyleState) {
+        stateLock.lock()
+        style = newStyle
+        stateLock.unlock()
+    }
+
+    func readStyle() -> RenderStyleState {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return style
+    }
+
+    /// Look up an organism's `(currPos, prevPos)` pair in O(log N) via binary search on
+    /// strictly-increasing `currIds` so selecting while paused lights up the reticle immediately.
+    func positionPair(forOrganismId id: UInt64) -> (curr: SIMD2<Float>, prev: SIMD2<Float>)? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !currIds.isEmpty,
+              currIds.count == currPositions.count,
+              currIds.count == currMatchedPrevPositions.count else {
+            return nil
+        }
+        var lo = 0
+        var hi = currIds.count - 1
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2
+            let midId = currIds[mid]
+            if midId == id {
+                return (currPositions[mid], currMatchedPrevPositions[mid])
+            } else if midId < id {
+                lo = mid + 1
+            } else {
+                if mid == 0 { break }
+                hi = mid - 1
+            }
+        }
+        return nil
+    }
+
     func attachSession(_ ptr: OpaquePointer?, worldWidth: Double, worldHeight: Double) {
         stateLock.lock()
         sessionPtr = ptr
@@ -284,10 +347,13 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
         prevPositions.removeAll(keepingCapacity: true)
         currIds.removeAll(keepingCapacity: true)
         currPositions.removeAll(keepingCapacity: true)
+        currMatchedPrevPositions.removeAll(keepingCapacity: true)
+        lastInterpAlpha = 1.0
         energyDisplayScale = 0.0
         trailDisplayScale = 0.0
         vascularDisplayScale = 0.0
         lastFieldChannelUploaded = 255
+        fieldTexSize = (0, 0)
         camera.worldWidth = worldWidth
         camera.worldHeight = worldHeight
         camera.centerX = worldWidth * 0.5
@@ -295,26 +361,40 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
         camera.zoom = 1.0
         camera.selectedOrganismId = nil
         camera.selectedPos = nil
+        camera.selectedPrevPos = nil
         camera.followedPos = nil
+        camera.followedPrevPos = nil
         camera.measureCenter = nil
         camera.measureRadius = 0
+        camera.brushRadius = 0
         epochWorldExtent = SIMD2(Float(worldWidth), Float(worldHeight))
         stateLock.unlock()
     }
 
-    /// Pick the nearest organism to a tap in world coordinates within `maxWorldRadius`.
+    /// Pick the nearest organism to a tap in world coordinates within `maxWorldRadius`,
+    /// using the same 120Hz toroidal interpolated positions drawn on screen.
     func pickOrganism(near worldPos: SIMD2<Double>, maxWorldRadius: Double) -> UInt64? {
         stateLock.lock()
         defer { stateLock.unlock() }
-        guard !currIds.isEmpty, currIds.count == currPositions.count else { return nil }
+        guard !currIds.isEmpty,
+              currIds.count == currPositions.count,
+              currIds.count == currMatchedPrevPositions.count else { return nil }
         let lw = Double(epochWorldExtent.x)
         let lh = Double(epochWorldExtent.y)
+        let alpha = Double(lastInterpAlpha)
         var bestDistSq = maxWorldRadius * maxWorldRadius
         var bestId: UInt64? = nil
         for i in 0..<currIds.count {
-            let p = currPositions[i]
-            var dx = Double(p.x) - worldPos.x
-            var dy = Double(p.y) - worldPos.y
+            let cur = currPositions[i]
+            let prev = currMatchedPrevPositions[i]
+            var stepX = Double(cur.x - prev.x)
+            var stepY = Double(cur.y - prev.y)
+            stepX -= lw * (stepX / lw).rounded()
+            stepY -= lh * (stepY / lh).rounded()
+            let px = Double(prev.x) + stepX * alpha
+            let py = Double(prev.y) + stepY * alpha
+            var dx = px - worldPos.x
+            var dy = py - worldPos.y
             dx -= lw * (dx / lw).rounded()
             dy -= lh * (dy / lh).rounded()
             let d2 = dx * dx + dy * dy
@@ -373,7 +453,7 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
 
     private func ensureFieldTextures(texelsX: Int, texelsY: Int) {
         guard texelsX > 0, texelsY > 0 else { return }
-        if fieldTexSize.0 == texelsX && fieldTexSize.1 == texelsY && energyTexture != nil {
+        if fieldTexSize.0 == texelsX && fieldTexSize.1 == texelsY && energyTextures[0] != nil {
             return
         }
         fieldTexSize = (texelsX, texelsY)
@@ -381,21 +461,28 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
         let eDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: texelsX, height: texelsY, mipmapped: false)
         eDesc.usage = [.shaderRead]
         eDesc.storageMode = .shared
-        energyTexture = device.makeTexture(descriptor: eDesc)
 
         let cDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: texelsX, height: texelsY, mipmapped: false)
         cDesc.usage = [.shaderRead]
         cDesc.storageMode = .shared
-        compTexture = device.makeTexture(descriptor: cDesc)
 
         let vDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg32Float, width: texelsX, height: texelsY, mipmapped: false)
         vDesc.usage = [.shaderRead]
         vDesc.storageMode = .shared
-        v2OverlayTexture = device.makeTexture(descriptor: vDesc)
+
+        for s in 0..<3 {
+            energyTextures[s] = device.makeTexture(descriptor: eDesc)
+            compTextures[s] = device.makeTexture(descriptor: cDesc)
+            v2OverlayTextures[s] = device.makeTexture(descriptor: vDesc)
+        }
+        activeEnergySlot = 0
+        activeCompSlot = 0
+        activeV2Slot = 0
     }
 
     private func uploadCompTexture(channel: UInt8) {
-        guard let compTex = compTexture, cachedTexelsX > 0, cachedTexelsY > 0 else { return }
+        let nextCompSlot = (activeCompSlot + 1) % 3
+        guard let compTex = compTextures[nextCompSlot], cachedTexelsX > 0, cachedTexelsY > 0 else { return }
         let count = cachedTexelsX * cachedTexelsY
         guard cachedComposition.count >= count * 3 else { return }
         let need = count * 4
@@ -423,6 +510,7 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
                 )
             }
         }
+        activeCompSlot = nextCompSlot
         lastFieldChannelUploaded = channel
     }
 
@@ -435,7 +523,7 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
         guard let ptr else { return }
         var view = FlifeEpochView()
         guard let handle = flife_session_acquire_latest_epoch(ptr, seen, &view) else {
-            // Even when paused, refresh component texture if user scrubbed field channel!
+            // Even when paused, refresh component texture into the next guaranteed-idle slot!
             if currentStyle.fieldMode == 2 && currentStyle.fieldChannel != lastFieldChannelUploaded {
                 uploadCompTexture(channel: currentStyle.fieldChannel)
             }
@@ -453,31 +541,37 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
         lastEpochArrivalTime = now
 
         let count = Int(view.organism_count)
-        let nextBufIdx = (activeBufferIndex + 1) % 3
+        let nextOrgSlot = (activeOrganismSlot + 1) % 3
         let neededBytes = max(MemoryLayout<MetalOrganismInstance>.stride, count * MemoryLayout<MetalOrganismInstance>.stride)
-        if organismBuffers[nextBufIdx] == nil || organismBuffers[nextBufIdx]!.length < neededBytes {
+        if organismBuffers[nextOrgSlot] == nil || organismBuffers[nextOrgSlot]!.length < neededBytes {
             let cap = max(4096, count.nextPowerOfTwo) * MemoryLayout<MetalOrganismInstance>.stride
-            organismBuffers[nextBufIdx] = device.makeBuffer(length: cap, options: .storageModeShared)
+            organismBuffers[nextOrgSlot] = device.makeBuffer(length: cap, options: .storageModeShared)
         }
 
-        // Swap prev <- curr for O(N) strictly-increasing ID merge interpolation
-        swap(&prevIds, &currIds)
-        swap(&prevPositions, &currPositions)
-        currIds.removeAll(keepingCapacity: true)
-        currPositions.removeAll(keepingCapacity: true)
-        currIds.reserveCapacity(count)
-        currPositions.reserveCapacity(count)
+        // Build new ID/position arrays into local scratch first, then swap under stateLock
+        // so `pickOrganism` and `positionPair` never observe partially populated arrays.
+        var nextIds: [UInt64] = []
+        var nextPositions: [SIMD2<Float>] = []
+        var nextMatchedPrev: [SIMD2<Float>] = []
+        nextIds.reserveCapacity(count)
+        nextPositions.reserveCapacity(count)
+        nextMatchedPrev.reserveCapacity(count)
 
         stateLock.lock()
         let selectedId = camera.selectedOrganismId
         let followedId: UInt64? = (view.has_followed && view.followed_alive) ? view.followed_organism_id : nil
+        // Previous epoch snapshot (already committed on the render thread)
+        prevIds = currIds
+        prevPositions = currPositions
         stateLock.unlock()
 
         var newSelectedPos: SIMD2<Float>? = nil
+        var newSelectedPrevPos: SIMD2<Float>? = nil
         var newFollowedPos: SIMD2<Float>? = nil
+        var newFollowedPrevPos: SIMD2<Float>? = nil
 
         if count > 0,
-           let dstBuf = organismBuffers[nextBufIdx],
+           let dstBuf = organismBuffers[nextOrgSlot],
            let ids = view.ids,
            let positions = view.positions,
            let velocities = view.velocities,
@@ -499,8 +593,8 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
                 let px = positions[i * 2]
                 let py = positions[i * 2 + 1]
                 let curPos = SIMD2<Float>(px, py)
-                currIds.append(id)
-                currPositions.append(curPos)
+                nextIds.append(id)
+                nextPositions.append(curPos)
 
                 while pIdx < prevCount && prevIds[pIdx] < id {
                     pIdx += 1
@@ -515,6 +609,7 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
                     prevPos = curPos
                     birthAlpha = seen == 0 ? 1.0 : 0.72
                 }
+                nextMatchedPrev.append(prevPos)
 
                 let lin = lineages[i]
                 let topo = UInt32(topologies[i])
@@ -528,10 +623,12 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
                 if let sel = selectedId, sel == id {
                     flags |= 1
                     newSelectedPos = curPos
+                    newSelectedPrevPos = prevPos
                 }
                 if let fol = followedId, fol == id {
                     flags |= 2
                     newFollowedPos = curPos
+                    newFollowedPrevPos = prevPos
                 }
 
                 dst[i] = MetalOrganismInstance(
@@ -550,23 +647,25 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
                     flags: flags
                 )
             }
-            activeBufferIndex = nextBufIdx
+            activeOrganismSlot = nextOrgSlot
         }
         currentOrganismCount = count
 
-        // Upload bounded field textures
+        // Upload bounded field textures into each texture's own next guaranteed-idle slot
         let tx = Int(view.field_texels_x)
         let ty = Int(view.field_texels_y)
         let texCount = tx * ty
         if tx > 0 && ty > 0 {
             ensureFieldTextures(texelsX: tx, texelsY: ty)
-            if let ePtr = view.field_energy, let eTex = energyTexture {
+            let nextEnergySlot = (activeEnergySlot + 1) % 3
+            if let ePtr = view.field_energy, let eTex = energyTextures[nextEnergySlot] {
                 eTex.replace(
                     region: MTLRegionMake2D(0, 0, tx, ty),
                     mipmapLevel: 0,
                     withBytes: ePtr,
                     bytesPerRow: tx * MemoryLayout<Float>.stride
                 )
+                activeEnergySlot = nextEnergySlot
                 var maxE: Float = 0.0
                 for i in 0..<texCount {
                     let v = ePtr[i]
@@ -587,7 +686,8 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
                 uploadCompTexture(channel: currentStyle.fieldChannel)
             }
 
-            if let v2Tex = v2OverlayTexture {
+            let nextV2Slot = (activeV2Slot + 1) % 3
+            if let v2Tex = v2OverlayTextures[nextV2Slot] {
                 let need = texCount * 2
                 if v2Staging.count < need { v2Staging = [Float](repeating: 0, count: need) }
                 var maxTrail: Float = 0.0
@@ -615,11 +715,15 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
                             )
                         }
                     }
+                    activeV2Slot = nextV2Slot
                 }
             }
         }
 
         stateLock.lock()
+        currIds = nextIds
+        currPositions = nextPositions
+        currMatchedPrevPositions = nextMatchedPrev
         lastEpochId = view.epoch_id
         epochMaxSpeed = Float(view.maximum_speed)
         epochAttemptEnergy = Float(view.attempt_energy)
@@ -627,7 +731,9 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
         camera.worldWidth = view.world_width
         camera.worldHeight = view.world_height
         camera.selectedPos = newSelectedPos
+        camera.selectedPrevPos = newSelectedPrevPos
         camera.followedPos = newFollowedPos
+        camera.followedPrevPos = newFollowedPrevPos
         if let fPos = newFollowedPos {
             // Smoothly track followed lineage heir across toroidal seams
             let lw = view.world_width
@@ -686,7 +792,28 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
     func draw(in view: MTKView) {
         let now = CACurrentMediaTime()
 
-        // Track display FPS honestly
+        // Wait for one of the 3 in-flight frame slots BEFORE writing any triple-buffered
+        // organism buffer or field texture! If all 3 GPU frames are still busy, drop this
+        // display tick cleanly (never inflate the semaphore count!).
+        guard inFlightSemaphore.wait(timeout: .now() + .milliseconds(32)) == .success else {
+            return
+        }
+
+        let drawableSize = view.drawableSize
+        guard drawableSize.width >= 2, drawableSize.height >= 2 else {
+            inFlightSemaphore.signal()
+            return
+        }
+        ensureOffscreenTargets(width: Int(drawableSize.width), height: Int(drawableSize.height))
+
+        guard let drawable = view.currentDrawable,
+              let renderPassDesc = view.currentRenderPassDescriptor,
+              let sceneTex = sceneTexture else {
+            inFlightSemaphore.signal()
+            return
+        }
+
+        // Track display FPS honestly (counts presented frames only)
         frameCountWindow += 1
         let fpsElapsed = now - fpsWindowStart
         if fpsElapsed >= 0.4 {
@@ -695,27 +822,17 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
             fpsWindowStart = now
         }
 
-        let currentStyle = style
+        let currentStyle = readStyle()
         ingestLatestEpochIfAvailable(now: now, currentStyle: currentStyle)
 
-        let drawableSize = view.drawableSize
-        guard drawableSize.width >= 2, drawableSize.height >= 2 else { return }
-        ensureOffscreenTargets(width: Int(drawableSize.width), height: Int(drawableSize.height))
-
-        guard let drawable = view.currentDrawable,
-              let renderPassDesc = view.currentRenderPassDescriptor,
-              let sceneTex = sceneTexture else {
-            return
-        }
-
-        _ = inFlightSemaphore.wait(timeout: .now() + .milliseconds(32))
         guard let cmdBuf = commandQueue.makeCommandBuffer() else {
             inFlightSemaphore.signal()
             return
         }
         cmdBuf.label = "flife.render.frame"
-        cmdBuf.addCompletedHandler { [weak self] _ in
-            self?.inFlightSemaphore.signal()
+        let sem = inFlightSemaphore
+        cmdBuf.addCompletedHandler { _ in
+            sem.signal()
         }
 
         // Detect iPhone Pro Max HDR / EDR headroom
@@ -732,6 +849,10 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
         let attemptE = epochAttemptEnergy
         let extent = epochWorldExtent
         let playing = latestTelemetry.isPlaying
+        let alpha: Float = (currentStyle.interpolate120Hz && playing)
+            ? Float(min(max((now - lastEpochArrivalTime) / max(epochIntervalEMA, 0.004), 0.0), 1.0))
+            : 1.0
+        lastInterpAlpha = alpha
         latestTelemetry.renderFPS = measuredFPS
         latestTelemetry.edrHeadroom = Double(edrHeadroom)
         let shouldPushTel = (now - lastTelemetryPush) >= 0.08
@@ -753,10 +874,6 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
             default: return max(energyDisplayScale, 1e-4)
             }
         }()
-
-        let alpha: Float = (currentStyle.interpolate120Hz && playing)
-            ? Float(min(max((now - lastEpochArrivalTime) / max(epochIntervalEMA, 0.004), 0.0), 1.0))
-            : 1.0
 
         let upp = Float(cam.worldUnitsPerPixel(viewport: drawableSize))
         let visibleWorldW = Float(drawableSize.width) * upp
@@ -792,13 +909,15 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
             timeSeconds: Float(now - startTime),
             pixelScale: Float(view.contentScaleFactor),
             selectedPos: cam.selectedPos ?? .zero,
-            hasSelected: cam.selectedPos != nil ? 1 : 0,
-            hasFollowed: cam.followedPos != nil ? 1 : 0,
+            selectedPrevPos: cam.selectedPrevPos ?? cam.selectedPos ?? .zero,
             followedPos: cam.followedPos ?? .zero,
+            followedPrevPos: cam.followedPrevPos ?? cam.followedPos ?? .zero,
             measureCenter: cam.measureCenter ?? .zero,
+            brushCenter: cam.brushCenter ?? .zero,
             measureRadius: cam.measureRadius,
             brushRadius: cam.brushRadius,
-            brushCenter: cam.brushCenter ?? .zero,
+            hasSelected: cam.selectedPos != nil ? 1 : 0,
+            hasFollowed: cam.followedPos != nil ? 1 : 0,
             organismCount: UInt32(max(currentOrganismCount, 1)),
             tilesX: tilesX,
             tilesY: tilesY,
@@ -814,8 +933,10 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
 
         if let enc = cmdBuf.makeRenderCommandEncoder(descriptor: scenePass) {
             enc.label = "ScenePass"
-            // 1. Toroidal Field
-            if let eTex = energyTexture, let cTex = compTexture, let v2Tex = v2OverlayTexture {
+            // 1. Toroidal Field (sampling triple-buffered textures owned by completed slots)
+            if let eTex = energyTextures[activeEnergySlot],
+               let cTex = compTextures[activeCompSlot],
+               let v2Tex = v2OverlayTextures[activeV2Slot] {
                 enc.setRenderPipelineState(fieldPipeline)
                 enc.setFragmentBytes(&uniforms, length: MemoryLayout<MetalFrameUniforms>.stride, index: 0)
                 enc.setFragmentTexture(eTex, index: 0)
@@ -825,7 +946,7 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
             }
 
             // 2. Single-draw-call Instanced SDF Organisms (tiled seamlessly across torus!)
-            if currentOrganismCount > 0, let orgBuf = organismBuffers[activeBufferIndex] {
+            if currentOrganismCount > 0, let orgBuf = organismBuffers[activeOrganismSlot] {
                 enc.setRenderPipelineState(currentStyle.lookMode == 0 ? organismGlowPipeline : organismOpaquePipeline)
                 enc.setVertexBytes(&uniforms, length: MemoryLayout<MetalFrameUniforms>.stride, index: 0)
                 enc.setVertexBuffer(orgBuf, offset: 0, index: 1)

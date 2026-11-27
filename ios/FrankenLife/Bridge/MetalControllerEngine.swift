@@ -25,6 +25,7 @@ final class MetalControllerEngine: @unchecked Sendable {
     private let forwardHalfPipeline: MTLComputePipelineState
 
     private let lock = NSLock()
+    private let dispatchLock = NSLock()
     private var nextHandle: UInt64 = 1
     private var shards: [UInt64: MTLBuffer] = [:]
 
@@ -64,11 +65,6 @@ final class MetalControllerEngine: @unchecked Sendable {
         guard let queue = dev.makeCommandQueue() else {
             throw EngineError.commandQueueFailed
         }
-        self.device = dev
-        self.commandQueue = queue
-        self.commandQueue.label = "com.frankenlife.ios.compute"
-        self.capabilities = Self.probeCapabilities(device: dev)
-        self.deviceNameCString = strdup(dev.name)
 
         let mslSource = try Self.loadControllerMSL(preferredBundle: bundle)
         let options = MTLCompileOptions()
@@ -81,21 +77,27 @@ final class MetalControllerEngine: @unchecked Sendable {
         do {
             library = try dev.makeLibrary(source: mslSource, options: options)
         } catch {
-            free(self.deviceNameCString)
             throw EngineError.shaderCompileFailed(error.localizedDescription)
         }
 
         guard let fwdFn = library.makeFunction(name: "controller_forward") else {
-            free(self.deviceNameCString)
             throw EngineError.pipelineMissing("controller_forward")
         }
         guard let fwdHalfFn = library.makeFunction(name: "controller_forward_half") else {
-            free(self.deviceNameCString)
             throw EngineError.pipelineMissing("controller_forward_half")
         }
 
-        self.forwardPipeline = try dev.makeComputePipelineState(function: fwdFn)
-        self.forwardHalfPipeline = try dev.makeComputePipelineState(function: fwdHalfFn)
+        let fwdPipe = try dev.makeComputePipelineState(function: fwdFn)
+        let fwdHalfPipe = try dev.makeComputePipelineState(function: fwdHalfFn)
+
+        self.device = dev
+        self.commandQueue = queue
+        self.commandQueue.label = "com.frankenlife.ios.compute"
+        self.capabilities = Self.probeCapabilities(device: dev)
+        self.forwardPipeline = fwdPipe
+        self.forwardHalfPipeline = fwdHalfPipe
+        // Allocate C string LAST after every throwing call so a throwing init never leaks.
+        self.deviceNameCString = strdup(dev.name)
     }
 
     deinit {
@@ -162,10 +164,10 @@ final class MetalControllerEngine: @unchecked Sendable {
             max_buffer_bytes: capabilities.maxBufferLength,
             recommended_working_set_bytes: capabilities.recommendedWorkingSetBytes,
             device_name: UnsafePointer(deviceNameCString),
-            alloc_shard: { ctx, bytes in
+            alloc_shard: { ctx, bytes, outContents in
                 guard let ctx else { return 0 }
                 let engine = Unmanaged<MetalControllerEngine>.fromOpaque(ctx).takeUnretainedValue()
-                return engine.allocShard(bytes: bytes)
+                return engine.allocShard(bytes: bytes, outContents: outContents)
             },
             free_shard: { ctx, handle in
                 guard let ctx else { return }
@@ -204,12 +206,22 @@ final class MetalControllerEngine: @unchecked Sendable {
 
     // MARK: - Shard Buffer Lifecycle (Unified Memory `storageModeShared`)
 
-    private func allocShard(bytes: UInt64) -> UInt64 {
-        let clampedLen = max(16, Int(min(bytes, capabilities.maxBufferLength)))
-        guard let buf = device.makeBuffer(length: clampedLen, options: .storageModeShared) else {
+    private func allocShard(
+        bytes: UInt64,
+        outContents: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?
+    ) -> UInt64 {
+        guard bytes <= capabilities.maxBufferLength else {
+            outContents?.pointee = nil
             return 0
         }
-        memset(buf.contents(), 0, clampedLen)
+        let allocLen = max(16, Int(bytes))
+        guard let buf = device.makeBuffer(length: allocLen, options: .storageModeShared) else {
+            outContents?.pointee = nil
+            return 0
+        }
+        let rawPtr = buf.contents()
+        memset(rawPtr, 0, allocLen)
+        outContents?.pointee = rawPtr.assumingMemoryBound(to: UInt8.self)
         lock.lock()
         defer { lock.unlock() }
         let h = nextHandle
@@ -278,6 +290,9 @@ final class MetalControllerEngine: @unchecked Sendable {
         faults: UnsafeMutablePointer<UInt32>,
         outGpuNs: UnsafeMutablePointer<UInt64>
     ) -> Int32 {
+        dispatchLock.lock()
+        defer { dispatchLock.unlock() }
+
         if dispatchCount == 0 || totalJobs == 0 {
             outGpuNs.pointee = 0
             return 0

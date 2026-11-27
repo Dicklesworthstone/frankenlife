@@ -269,6 +269,12 @@ struct ParityVerificationReport: Sendable {
     }
 }
 
+/// Explicit Sendable box for transferring sole ownership of a C `FlifeSession*` across
+/// actor boundaries during off-main-thread world founding / teardown.
+private struct SendableSessionBox: @unchecked Sendable {
+    let ptr: OpaquePointer
+}
+
 /// Main Observable engine controller coordinating the Rust simulation worker,
 /// native Apple Metal compute backend, 120Hz ProMotion HDR Metal renderer,
 /// and SwiftUI Observatory chrome.
@@ -289,6 +295,7 @@ final class FrankenLifeEngine {
 
     // Playback & Display pacing (pure presentation — INV-09)
     var isPlaying: Bool = true
+    var isAppBackgrounded: Bool = false
     var preferredFPS: Int = 120
     var thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
     var cinemaMode: Bool = false
@@ -309,7 +316,7 @@ final class FrankenLifeEngine {
             if activeTool != .measure {
                 clearMeasurement()
             }
-            renderer.camera.brushRadius = 0
+            renderer.mutateCamera { $0.brushRadius = 0 }
             selectionHaptic.selectionChanged()
         }
     }
@@ -339,7 +346,9 @@ final class FrankenLifeEngine {
     private(set) var tpsHistory: [Double] = []
     private(set) var gpuMsHistory: [Double] = []
     private(set) var statusBanner: String?
+    private(set) var isStatusBannerError: Bool = false
     private(set) var isLoadingWorld: Bool = false
+    private(set) var loadingPresetName: String?
 
     // On-device Metal vs CPU bit-exactness self-test
     private(set) var isRunningParityTest: Bool = false
@@ -350,6 +359,8 @@ final class FrankenLifeEngine {
     private let selectionHaptic = UISelectionFeedbackGenerator()
     private var thermalObserver: NSObjectProtocol?
     private var lastInspectorRefreshTime: CFTimeInterval = 0
+    private var loadGeneration: UInt64 = 0
+    private var wasPlayingBeforeBackground: Bool = true
 
     var targetDisplayFPS: Int {
         // Honest thermal adaptation: scales DISPLAY refresh only; never changes Δt or simulation rules (INV-09).
@@ -403,6 +414,7 @@ final class FrankenLifeEngine {
     }
 
     func shutdown() {
+        loadGeneration &+= 1
         if let obs = thermalObserver {
             NotificationCenter.default.removeObserver(obs)
             thermalObserver = nil
@@ -412,6 +424,38 @@ final class FrankenLifeEngine {
             flife_session_destroy(ptr)
             sessionPtr = nil
         }
+    }
+
+    /// Quiesce both Metal compute and 120Hz Metal rendering before iOS suspends the app,
+    /// preventing background GPU execution termination (`kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted`).
+    func handleScenePhaseChange(_ phase: ScenePhase) {
+        switch phase {
+        case .background:
+            if !isAppBackgrounded {
+                wasPlayingBeforeBackground = isPlaying
+                isAppBackgrounded = true
+                if let ptr = sessionPtr {
+                    _ = flife_session_pause_and_quiesce(ptr, 400)
+                }
+            }
+        case .active:
+            if isAppBackgrounded {
+                isAppBackgrounded = false
+                if let ptr = sessionPtr, wasPlayingBeforeBackground && !telemetry.isCapacityPaused && !telemetry.faulted {
+                    isPlaying = true
+                    flife_session_set_playing(ptr, true)
+                }
+            }
+        case .inactive:
+            break
+        @unknown default:
+            break
+        }
+    }
+
+    func dismissStatusBanner() {
+        statusBanner = nil
+        isStatusBannerError = false
     }
 
     // MARK: - Preset Discovery (Real Rust TOML Validation)
@@ -475,14 +519,16 @@ final class FrankenLifeEngine {
     }
 
     func loadPreset(_ preset: PresetDescriptor) {
+        loadGeneration &+= 1
+        let gen = loadGeneration
         isLoadingWorld = true
+        loadingPresetName = preset.displayName
         statusBanner = nil
+        isStatusBannerError = false
 
-        if let old = sessionPtr {
-            renderer.attachSession(nil, worldWidth: preset.worldWidth, worldHeight: preset.worldHeight)
-            flife_session_destroy(old)
-            sessionPtr = nil
-        }
+        let oldBox = sessionPtr.map(SendableSessionBox.init(ptr:))
+        sessionPtr = nil
+        renderer.attachSession(nil, worldWidth: preset.worldWidth, worldHeight: preset.worldHeight)
 
         selectedOrganism = nil
         regionMeasurement = nil
@@ -491,12 +537,10 @@ final class FrankenLifeEngine {
         tpsHistory.removeAll(keepingCapacity: true)
         gpuMsHistory.removeAll(keepingCapacity: true)
 
-        // Apply the preset's native visual mapping if sensible
+        // Apply the preset's native visual mapping and validate independent V2 field modes
         colorMapping = OrganismColorMapping.fromRegistry(preset.defaultColorMapping)
-        if preset.hasTrailCarrier && fieldMode == .energy {
-            // Keep Energy as default clean background; user can toggle Trails / Vascular in Style sheet
-            fieldMode = .energy
-        } else if !preset.hasTrailCarrier && (fieldMode == .trailCarrier || fieldMode == .vascularConductance) {
+        if (fieldMode == .trailCarrier && !preset.hasTrailCarrier)
+            || (fieldMode == .vascularConductance && !preset.hasVascularField) {
             fieldMode = .energy
         }
 
@@ -506,30 +550,56 @@ final class FrankenLifeEngine {
         let wantMetal = useMetalCompute
         let workers = UInt32(max(1, cpuWorkers))
         let compute = self.computeEngine
+        let toml = preset.tomlContent
 
-        var errBuf = [CChar](repeating: 0, count: 512)
-        let created: OpaquePointer? = preset.tomlContent.withCString { cToml in
-            if wantMetal, let compute {
-                var vtable = compute.makeVtable()
-                return flife_session_create(cToml, &vtable, workers, &errBuf, errBuf.count)
-            } else {
-                return flife_session_create(cToml, nil, workers, &errBuf, errBuf.count)
+        // Found the world off the main actor so 43k–100k founder worlds never freeze UI touch input!
+        Task.detached(priority: .userInitiated) {
+            if let oldBox {
+                flife_session_destroy(oldBox.ptr)
+            }
+
+            var errBuf = [CChar](repeating: 0, count: 512)
+            let createdPtr: OpaquePointer? = toml.withCString { cToml in
+                if wantMetal, let compute {
+                    var vtable = compute.makeVtable()
+                    return flife_session_create(cToml, &vtable, workers, &errBuf, errBuf.count)
+                } else {
+                    return flife_session_create(cToml, nil, workers, &errBuf, errBuf.count)
+                }
+            }
+            let createdBox = createdPtr.map(SendableSessionBox.init(ptr:))
+            let errMessage: String? = createdBox == nil ? {
+                let bytes = errBuf.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+                return String(decoding: bytes, as: UTF8.self)
+            }() : nil
+
+            await MainActor.run { [weak self] in
+                guard let self else {
+                    if let createdBox { flife_session_destroy(createdBox.ptr) }
+                    return
+                }
+                guard gen == self.loadGeneration else {
+                    // Superseded by a newer preset selection; discard cleanly.
+                    if let createdBox { flife_session_destroy(createdBox.ptr) }
+                    return
+                }
+                if let createdBox {
+                    self.sessionPtr = createdBox.ptr
+                    self.activePreset = preset
+                    let shouldPlay = !self.isAppBackgrounded
+                    self.isPlaying = shouldPlay
+                    flife_session_set_playing(createdBox.ptr, shouldPlay)
+                    self.renderer.attachSession(createdBox.ptr, worldWidth: preset.worldWidth, worldHeight: preset.worldHeight)
+                    self.syncRenderStyle()
+                    self.impactMedium.impactOccurred()
+                } else {
+                    self.statusBanner = "Failed to found \(preset.displayName): \(errMessage ?? "unknown error")"
+                    self.isStatusBannerError = true
+                }
+                self.isLoadingWorld = false
+                self.loadingPresetName = nil
             }
         }
-
-        if let created {
-            self.sessionPtr = created
-            self.activePreset = preset
-            self.isPlaying = true
-            flife_session_set_playing(created, true)
-            renderer.attachSession(created, worldWidth: preset.worldWidth, worldHeight: preset.worldHeight)
-            syncRenderStyle()
-            impactMedium.impactOccurred()
-        } else {
-            let msg = String(cString: errBuf)
-            statusBanner = "Failed to found \(preset.displayName): \(msg)"
-        }
-        isLoadingWorld = false
     }
 
     func reloadActivePreset() {
@@ -543,6 +613,9 @@ final class FrankenLifeEngine {
     func togglePlayPause() {
         guard let ptr = sessionPtr else { return }
         isPlaying.toggle()
+        if isPlaying && !isStatusBannerError {
+            statusBanner = nil
+        }
         flife_session_set_playing(ptr, isPlaying)
         impactLight.impactOccurred()
     }
@@ -560,40 +633,46 @@ final class FrankenLifeEngine {
         if isFollowingSelected {
             stopFollowing()
         }
-        let upp = renderer.camera.worldUnitsPerPixel(viewport: viewportPx)
-        let lw = renderer.camera.worldWidth
-        let lh = renderer.camera.worldHeight
-        var nx = (renderer.camera.centerX - dxPx * upp).truncatingRemainder(dividingBy: lw)
-        var ny = (renderer.camera.centerY - dyPx * upp).truncatingRemainder(dividingBy: lh)
-        if nx < 0 { nx += lw }
-        if ny < 0 { ny += lh }
-        renderer.camera.centerX = nx
-        renderer.camera.centerY = ny
+        renderer.mutateCamera { cam in
+            let upp = cam.worldUnitsPerPixel(viewport: viewportPx)
+            let lw = cam.worldWidth
+            let lh = cam.worldHeight
+            var nx = (cam.centerX - dxPx * upp).truncatingRemainder(dividingBy: lw)
+            var ny = (cam.centerY - dyPx * upp).truncatingRemainder(dividingBy: lh)
+            if nx < 0 { nx += lw }
+            if ny < 0 { ny += lh }
+            cam.centerX = nx
+            cam.centerY = ny
+        }
     }
 
     func zoomCamera(by factor: Double, anchorPx: CGPoint, viewportPx: CGSize) {
-        let before = renderer.camera.screenPointToWorld(anchorPx, viewportPx: viewportPx)
-        renderer.camera.zoom = min(max(renderer.camera.zoom * factor, 0.65), 18.0)
-        let after = renderer.camera.screenPointToWorld(anchorPx, viewportPx: viewportPx)
-        let lw = renderer.camera.worldWidth
-        let lh = renderer.camera.worldHeight
-        var dx = before.x - after.x
-        var dy = before.y - after.y
-        dx -= lw * (dx / lw).rounded()
-        dy -= lh * (dy / lh).rounded()
-        var nx = (renderer.camera.centerX + dx).truncatingRemainder(dividingBy: lw)
-        var ny = (renderer.camera.centerY + dy).truncatingRemainder(dividingBy: lh)
-        if nx < 0 { nx += lw }
-        if ny < 0 { ny += lh }
-        renderer.camera.centerX = nx
-        renderer.camera.centerY = ny
+        renderer.mutateCamera { cam in
+            let before = cam.screenPointToWorld(anchorPx, viewportPx: viewportPx)
+            cam.zoom = min(max(cam.zoom * factor, 0.65), 18.0)
+            let after = cam.screenPointToWorld(anchorPx, viewportPx: viewportPx)
+            let lw = cam.worldWidth
+            let lh = cam.worldHeight
+            var dx = before.x - after.x
+            var dy = before.y - after.y
+            dx -= lw * (dx / lw).rounded()
+            dy -= lh * (dy / lh).rounded()
+            var nx = (cam.centerX + dx).truncatingRemainder(dividingBy: lw)
+            var ny = (cam.centerY + dy).truncatingRemainder(dividingBy: lh)
+            if nx < 0 { nx += lw }
+            if ny < 0 { ny += lh }
+            cam.centerX = nx
+            cam.centerY = ny
+        }
     }
 
     func resetCamera() {
         stopFollowing()
-        renderer.camera.centerX = renderer.camera.worldWidth * 0.5
-        renderer.camera.centerY = renderer.camera.worldHeight * 0.5
-        renderer.camera.zoom = 1.0
+        renderer.mutateCamera { cam in
+            cam.centerX = cam.worldWidth * 0.5
+            cam.centerY = cam.worldHeight * 0.5
+            cam.zoom = 1.0
+        }
         impactLight.impactOccurred()
     }
 
@@ -609,7 +688,14 @@ final class FrankenLifeEngine {
     }
 
     func selectOrganism(id: UInt64) {
-        renderer.camera.selectedOrganismId = id
+        let posPair = renderer.positionPair(forOrganismId: id)
+        renderer.mutateCamera { cam in
+            cam.selectedOrganismId = id
+            if let pair = posPair {
+                cam.selectedPos = pair.curr
+                cam.selectedPrevPos = pair.prev
+            }
+        }
         if let ptr = sessionPtr {
             flife_session_set_watch(ptr, true, id)
         }
@@ -618,8 +704,11 @@ final class FrankenLifeEngine {
 
     func dismissInspector() {
         stopFollowing()
-        renderer.camera.selectedOrganismId = nil
-        renderer.camera.selectedPos = nil
+        renderer.mutateCamera { cam in
+            cam.selectedOrganismId = nil
+            cam.selectedPos = nil
+            cam.selectedPrevPos = nil
+        }
         selectedOrganism = nil
         if let ptr = sessionPtr {
             flife_session_set_watch(ptr, false, 0)
@@ -632,6 +721,13 @@ final class FrankenLifeEngine {
             stopFollowing()
         } else {
             isFollowingSelected = true
+            let posPair = renderer.positionPair(forOrganismId: org.id)
+            renderer.mutateCamera { cam in
+                if let pair = posPair {
+                    cam.followedPos = pair.curr
+                    cam.followedPrevPos = pair.prev
+                }
+            }
             flife_session_set_follow(ptr, true, org.id)
             impactMedium.impactOccurred()
         }
@@ -640,7 +736,10 @@ final class FrankenLifeEngine {
     func stopFollowing() {
         guard isFollowingSelected else { return }
         isFollowingSelected = false
-        renderer.camera.followedPos = nil
+        renderer.mutateCamera { cam in
+            cam.followedPos = nil
+            cam.followedPrevPos = nil
+        }
         if let ptr = sessionPtr {
             flife_session_set_follow(ptr, false, 0)
         }
@@ -654,71 +753,106 @@ final class FrankenLifeEngine {
         impactMedium.impactOccurred()
     }
 
+    private func buildOrganismDetail(from info: FlifeOrganismInfo) -> OrganismDetail {
+        let widths = (0..<Int(min(info.hidden_layer_count, 4))).map { i -> UInt32 in
+            switch i {
+            case 0: return info.hidden_widths.0
+            case 1: return info.hidden_widths.1
+            case 2: return info.hidden_widths.2
+            default: return info.hidden_widths.3
+            }
+        }
+        let aff: [Double] = withUnsafeBytes(of: info.affinity) { raw in
+            Array(raw.bindMemory(to: Double.self))
+        }
+        return OrganismDetail(
+            id: info.id,
+            tick: info.tick,
+            genomeId: info.genome_id,
+            parentId: info.has_parent ? info.parent_id : nil,
+            lineageId: info.lineage_id,
+            generation: info.generation,
+            birthTick: info.birth_tick,
+            ageTicks: info.age_ticks,
+            posX: info.pos_x,
+            posY: info.pos_y,
+            velX: info.vel_x,
+            velY: info.vel_y,
+            energy: info.energy,
+            energyChangeRate: info.energy_change_rate,
+            topologyIndex: info.topology_index,
+            hiddenWidths: widths,
+            parameterCount: info.parameter_count,
+            localDensity: info.local_density,
+            localRequest: info.local_request,
+            localGain: info.local_gain,
+            localToxicity: info.local_toxicity,
+            affinity: aff,
+            secretoryReadiness: info.has_secretory_readiness ? info.secretory_readiness : nil,
+            neighborH0: info.has_neighbor_h0 ? info.neighbor_h0 : nil,
+            childrenBorn: info.has_descendants ? info.children_born : nil,
+            childrenAlive: info.has_descendants ? info.children_alive : nil,
+            descendantsBorn: info.has_descendants ? info.descendants_born : nil,
+            descendantsAlive: info.has_descendants ? info.descendants_alive : nil
+        )
+    }
+
     private func refreshSelectedOrganism() {
-        guard let ptr = sessionPtr, let targetId = renderer.camera.selectedOrganismId else { return }
+        guard let ptr = sessionPtr, let targetId = renderer.readCamera().selectedOrganismId else { return }
         var info = FlifeOrganismInfo()
         if flife_session_inspect_organism(ptr, targetId, &info), info.found {
-            let widths = (0..<Int(min(info.hidden_layer_count, 4))).map { i -> UInt32 in
-                switch i {
-                case 0: return info.hidden_widths.0
-                case 1: return info.hidden_widths.1
-                case 2: return info.hidden_widths.2
-                default: return info.hidden_widths.3
+            selectedOrganism = buildOrganismDetail(from: info)
+            // Ensure reticle position is populated even when paused
+            let pos = SIMD2<Float>(Float(info.pos_x), Float(info.pos_y))
+            renderer.mutateCamera { cam in
+                if cam.selectedPos == nil {
+                    cam.selectedPos = pos
+                    cam.selectedPrevPos = pos
                 }
             }
-            let aff: [Double] = withUnsafeBytes(of: info.affinity) { raw in
-                Array(raw.bindMemory(to: Double.self))
-            }
-            selectedOrganism = OrganismDetail(
-                id: info.id,
-                tick: info.tick,
-                genomeId: info.genome_id,
-                parentId: info.has_parent ? info.parent_id : nil,
-                lineageId: info.lineage_id,
-                generation: info.generation,
-                birthTick: info.birth_tick,
-                ageTicks: info.age_ticks,
-                posX: info.pos_x,
-                posY: info.pos_y,
-                velX: info.vel_x,
-                velY: info.vel_y,
-                energy: info.energy,
-                energyChangeRate: info.energy_change_rate,
-                topologyIndex: info.topology_index,
-                hiddenWidths: widths,
-                parameterCount: info.parameter_count,
-                localDensity: info.local_density,
-                localRequest: info.local_request,
-                localGain: info.local_gain,
-                localToxicity: info.local_toxicity,
-                affinity: aff,
-                secretoryReadiness: info.has_secretory_readiness ? info.secretory_readiness : nil,
-                neighborH0: info.has_neighbor_h0 ? info.neighbor_h0 : nil,
-                childrenBorn: info.has_descendants ? info.children_born : nil,
-                childrenAlive: info.has_descendants ? info.children_alive : nil,
-                descendantsBorn: info.has_descendants ? info.descendants_born : nil,
-                descendantsAlive: info.has_descendants ? info.descendants_alive : nil
-            )
         } else if isFollowingSelected, let heirId = telemetry.followedOrganismId, telemetry.followedAlive, heirId != targetId {
-            // Smoothly hand off inspector selection to followed heir!
-            renderer.camera.selectedOrganismId = heirId
+            // Smoothly hand off inspector selection to followed heir and inspect immediately!
+            let posPair = renderer.positionPair(forOrganismId: heirId)
+            renderer.mutateCamera { cam in
+                cam.selectedOrganismId = heirId
+                if let pair = posPair {
+                    cam.selectedPos = pair.curr
+                    cam.selectedPrevPos = pair.prev
+                }
+            }
             flife_session_set_watch(ptr, true, heirId)
+            var heirInfo = FlifeOrganismInfo()
+            if flife_session_inspect_organism(ptr, heirId, &heirInfo), heirInfo.found {
+                selectedOrganism = buildOrganismDetail(from: heirInfo)
+            }
+        } else if !isFollowingSelected && selectedOrganism != nil {
+            // Selected organism died while not following; close stale ghost inspector cleanly.
+            dismissInspector()
         }
     }
 
     func setBrushPreview(at worldPos: SIMD2<Double>, active: Bool) {
-        if active {
-            renderer.camera.brushCenter = SIMD2(Float(worldPos.x), Float(worldPos.y))
-            renderer.camera.brushRadius = Float(activeTool == .removeDisk ? brushRadiusWorld : max(1.2, brushRadiusWorld * 0.5))
-        } else {
-            renderer.camera.brushRadius = 0
+        let radius = Float(activeTool == .removeDisk ? brushRadiusWorld : max(1.2, brushRadiusWorld * 0.5))
+        renderer.mutateCamera { cam in
+            if active {
+                cam.brushCenter = SIMD2(Float(worldPos.x), Float(worldPos.y))
+                cam.brushRadius = radius
+            } else {
+                cam.brushRadius = 0
+            }
         }
     }
 
     func applyActiveTool(at worldPos: SIMD2<Double>) {
-        guard let ptr = sessionPtr, let preset = activePreset else { return }
-        let gx = UInt32(min(max(Int(worldPos.x / preset.worldWidth * Double(preset.gridWidth)), 0), Int(preset.gridWidth) - 1))
-        let gy = UInt32(min(max(Int(worldPos.y / preset.worldHeight * Double(preset.gridHeight)), 0), Int(preset.gridHeight) - 1))
+        guard let ptr = sessionPtr, let preset = activePreset,
+              preset.gridWidth > 0, preset.gridHeight > 0,
+              preset.worldWidth > 0, preset.worldHeight > 0 else { return }
+        var wx = worldPos.x.truncatingRemainder(dividingBy: preset.worldWidth)
+        if wx < 0 { wx += preset.worldWidth }
+        var wy = worldPos.y.truncatingRemainder(dividingBy: preset.worldHeight)
+        if wy < 0 { wy += preset.worldHeight }
+        let gx = UInt32(min(max(Int(floor(wx / preset.worldWidth * Double(preset.gridWidth))), 0), Int(preset.gridWidth) - 1))
+        let gy = UInt32(min(max(Int(floor(wy / preset.worldHeight * Double(preset.gridHeight))), 0), Int(preset.gridHeight) - 1))
 
         switch activeTool {
         case .injectEnergy:
@@ -735,7 +869,7 @@ final class FrankenLifeEngine {
             _ = flife_session_introduce_organisms(ptr, gx, gy, UInt32(introduceCount), 2.5)
             impactMedium.impactOccurred()
         case .removeDisk:
-            _ = flife_session_remove_organisms(ptr, worldPos.x, worldPos.y, brushRadiusWorld, removeDisposition)
+            _ = flife_session_remove_organisms(ptr, wx, wy, brushRadiusWorld, removeDisposition)
             impactMedium.impactOccurred()
         case .explore, .measure:
             break
@@ -744,8 +878,10 @@ final class FrankenLifeEngine {
 
     func updateMeasurement(center: SIMD2<Double>, radius: Double) {
         guard let ptr = sessionPtr else { return }
-        renderer.camera.measureCenter = SIMD2(Float(center.x), Float(center.y))
-        renderer.camera.measureRadius = Float(radius)
+        renderer.mutateCamera { cam in
+            cam.measureCenter = SIMD2(Float(center.x), Float(center.y))
+            cam.measureRadius = Float(radius)
+        }
         var m = FlifeRegionMeasure()
         if flife_session_measure_region(ptr, center.x, center.y, radius, &m), m.valid {
             regionMeasurement = RegionMeasureDetail(
@@ -763,8 +899,10 @@ final class FrankenLifeEngine {
     }
 
     func clearMeasurement() {
-        renderer.camera.measureCenter = nil
-        renderer.camera.measureRadius = 0
+        renderer.mutateCamera { cam in
+            cam.measureCenter = nil
+            cam.measureRadius = 0
+        }
         regionMeasurement = nil
     }
 
@@ -772,7 +910,7 @@ final class FrankenLifeEngine {
 
     func runLiveParitySelfTest() {
         guard !isRunningParityTest,
-              let compute = computeEngine,
+              computeEngine != nil,
               let preset = presets.first(where: { $0.id == "reference-small-world" }) ?? activePreset else {
             return
         }
@@ -780,27 +918,49 @@ final class FrankenLifeEngine {
         parityReport = nil
         let toml = preset.tomlContent
         let workers = UInt32(max(1, cpuWorkers))
+        let dev = self.metalDevice
 
+        // Instantiate a dedicated isolated MetalControllerEngine so parity verification
+        // never contends with the live world's GPU command queue or staging buffers!
         Task.detached(priority: .userInitiated) {
-            var vtable = compute.makeVtable()
-            var res = FlifeParityResult()
-            toml.withCString { cToml in
-                flife_verify_metal_parity(cToml, &vtable, 16, workers, &res)
+            let report: ParityVerificationReport
+            do {
+                let isolatedCompute = try MetalControllerEngine(device: dev)
+                var vtable = isolatedCompute.makeVtable()
+                var res = FlifeParityResult()
+                toml.withCString { cToml in
+                    flife_verify_metal_parity(cToml, &vtable, 16, workers, &res)
+                }
+                report = ParityVerificationReport(
+                    matched: res.success && res.digest_matched,
+                    ticksVerified: res.ticks_verified,
+                    liveFinal: res.live_final,
+                    metalBatched: res.metal_batched,
+                    metalDeferred: res.metal_deferred,
+                    metalDeviceMs: Double(res.metal_device_ns) * 1e-6,
+                    metalWallMs: Double(res.metal_wall_ns) * 1e-6,
+                    cpuWallMs: Double(res.cpu_wall_ns) * 1e-6,
+                    ledgerResidual: res.ledger_residual,
+                    metalDigestPrefix: String(cArrayToString(res.metal_digest_hex).prefix(16)),
+                    cpuDigestPrefix: String(cArrayToString(res.cpu_digest_hex).prefix(16)),
+                    error: res.success ? nil : cArrayToString(res.error)
+                )
+            } catch {
+                report = ParityVerificationReport(
+                    matched: false,
+                    ticksVerified: 0,
+                    liveFinal: 0,
+                    metalBatched: 0,
+                    metalDeferred: 0,
+                    metalDeviceMs: 0,
+                    metalWallMs: 0,
+                    cpuWallMs: 0,
+                    ledgerResidual: 0,
+                    metalDigestPrefix: "",
+                    cpuDigestPrefix: "",
+                    error: error.localizedDescription
+                )
             }
-            let report = ParityVerificationReport(
-                matched: res.success && res.digest_matched,
-                ticksVerified: res.ticks_verified,
-                liveFinal: res.live_final,
-                metalBatched: res.metal_batched,
-                metalDeferred: res.metal_deferred,
-                metalDeviceMs: Double(res.metal_device_ns) * 1e-6,
-                metalWallMs: Double(res.metal_wall_ns) * 1e-6,
-                cpuWallMs: Double(res.cpu_wall_ns) * 1e-6,
-                ledgerResidual: res.ledger_residual,
-                metalDigestPrefix: String(cArrayToString(res.metal_digest_hex).prefix(16)),
-                cpuDigestPrefix: String(cArrayToString(res.cpu_digest_hex).prefix(16)),
-                error: res.success ? nil : cArrayToString(res.error)
-            )
             await MainActor.run { [weak self] in
                 self?.parityReport = report
                 self?.isRunningParityTest = false
@@ -811,7 +971,7 @@ final class FrankenLifeEngine {
     // MARK: - Internal Synchronization
 
     private func syncRenderStyle() {
-        renderer.style = RenderStyleState(
+        renderer.updateStyle(RenderStyleState(
             colorMapping: colorMapping.rawValue,
             lookMode: lookMode.rawValue,
             fieldMode: fieldMode.rawValue,
@@ -820,12 +980,29 @@ final class FrankenLifeEngine {
             bloomStrength: Float(bloomStrength),
             pointRadiusPt: Float(pointRadiusPt),
             interpolate120Hz: interpolate120Hz
-        )
+        ))
     }
 
     private func handleTelemetryUpdate(_ snap: LiveTelemetrySnapshot) {
         let tickChanged = snap.tick != telemetry.tick
+        let wasCapPaused = telemetry.isCapacityPaused
         self.telemetry = snap
+
+        // Sync capacity-pause or numerical fault state honestly into UI controls
+        if snap.isCapacityPaused && !wasCapPaused {
+            isPlaying = false
+            statusBanner = snap.faulted
+                ? "Simulation halted due to a numerical fault (INV-01/03)"
+                : "Paused at population capacity (INV-12) — remove organisms or switch preset"
+            isStatusBannerError = snap.faulted
+        }
+
+        // Cleanly disengage follow mode if the followed lineage has gone extinct
+        if isFollowingSelected, let originId = snap.followedOriginId, !snap.followedAlive {
+            stopFollowing()
+            statusBanner = "Followed lineage #\(originId) ended"
+            isStatusBannerError = false
+        }
 
         if tickChanged {
             appendSparkline(&populationHistory, Double(snap.liveCount))

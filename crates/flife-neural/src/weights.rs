@@ -249,6 +249,18 @@ pub trait Weight: Copy + Send + Sync + std::fmt::Debug + 'static {
 /// across columns in exact ascending order).
 const F16_TILE_COLS: usize = 128;
 
+/// Stack-resident 4 KiB L1D tile buffer reused across repeated `F16`
+/// [`crate::ReferenceController`] evaluations in one worker loop so each
+/// organism does not zero 4 KiB on entry.
+pub type F16TileScratch = [f32; 8 * F16_TILE_COLS];
+
+/// Create a zero-initialized [`F16TileScratch`] once per worker tile.
+#[inline]
+#[must_use]
+pub const fn new_f16_tile_scratch() -> F16TileScratch {
+    [0.0_f32; 8 * F16_TILE_COLS]
+}
+
 impl Weight for f32 {
     const DTYPE: WeightDtype = WeightDtype::F32;
     type TileScratch = ();

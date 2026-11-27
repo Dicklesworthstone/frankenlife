@@ -1001,3 +1001,57 @@ fn reference_controller_fast_bound_check_matches_scalar_oracle_on_boundaries() {
         }
     }
 }
+
+#[test]
+fn evaluate_raw_f32_inputs_with_tile_reuses_poisoned_scratch_bit_exact() {
+    use flife_core::binary16::F16;
+    use flife_neural::{Weights, new_f16_tile_scratch};
+
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next_f64 = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let bits = (state >> 11) as f64 / ((1_u64 << 53) as f64);
+        (bits * 2.0 - 1.0) * 0.5
+    };
+    let mut tile = new_f16_tile_scratch();
+    for widths in [&[1][..], &[5][..], &[13, 9][..], &[64, 32][..], &[140][..]] {
+        let topo = topology(widths);
+        let params_f16: Vec<F16> = (0..topo.parameter_count())
+            .map(|i| match i % 37 {
+                0 => F16::ZERO,
+                1 => F16::from_bits(0x8000),
+                2 => F16::from_bits(0x0001),
+                3 => F16::from_bits(0x83FF),
+                _ => F16::from_f64(next_f64()),
+            })
+            .collect();
+        let params_wide: Vec<f32> = params_f16.iter().map(|h| h.to_f32()).collect();
+        let ctrl_f16 =
+            ReferenceController::new(&topo, Weights::F16(&params_f16), BOUND).expect("f16");
+        let ctrl_f32 = ReferenceController::new(&topo, &params_wide, BOUND).expect("f32");
+        let mut scratch = ControllerScratch::new(&topo).expect("scratch");
+        for trial in 0..4 {
+            // Poison every tile slot with NaN / Inf / huge floats before every call.
+            for (idx, slot) in tile.iter_mut().enumerate() {
+                *slot = match idx % 3 {
+                    0 => f32::NAN,
+                    1 => f32::INFINITY,
+                    _ => -1.0e30,
+                };
+            }
+            let inputs_f32: Vec<f32> = (0..SENSOR_WIDTH).map(|_| next_f64() as f32).collect();
+            let expected = ctrl_f32
+                .evaluate_raw_f32_inputs(&inputs_f32, &mut scratch)
+                .expect("f32 ref");
+            let got = ctrl_f16
+                .evaluate_raw_f32_inputs_with_tile(&inputs_f32, &mut scratch, &mut tile)
+                .expect("f16 tiled");
+            let exp_bits: Vec<u32> = expected.as_slice().iter().map(|v| v.to_bits()).collect();
+            let got_bits: Vec<u32> = got.as_slice().iter().map(|v| v.to_bits()).collect();
+            assert_eq!(
+                got_bits, exp_bits,
+                "poisoned tile mismatch widths={widths:?} trial={trial}"
+            );
+        }
+    }
+}

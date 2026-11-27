@@ -58,4 +58,4 @@ pub use sensors::{
     observe_for_controller_f32, observe_for_controller_f32_into, observe_gradients_only,
     observe_gradients_only_into,
 };
-pub use weights::{Weight, WeightDtype, Weights};
+pub use weights::{F16TileScratch, Weight, WeightDtype, Weights, new_f16_tile_scratch};

@@ -114,10 +114,10 @@ use flife_genome::{
 use flife_neural::actions::EMISSION_SPEND;
 use flife_neural::{
     ActionDecoding, ArenaSlot, ControllerBackend, ControllerJob, ControllerScratch, DecodedActions,
-    DualObservation, FlatControllerJob, FlatOutputs, Intrinsic, MAX_ACTION_WIDTH, MAX_SENSOR_WIDTH,
-    MAXIMUM_RECURRENT_STATE_WIDTH, Observation, RawOutputs, ReferenceController, SENSOR_WIDTH,
-    SensorLayout, SensorScales, decode_with_layout, decode_with_layout_f32_into,
-    observe_dual_for_controller, observe_dual_for_controller_f32_into,
+    DualObservation, F16TileScratch, FlatControllerJob, FlatOutputs, Intrinsic, MAX_ACTION_WIDTH,
+    MAX_SENSOR_WIDTH, MAXIMUM_RECURRENT_STATE_WIDTH, Observation, RawOutputs, ReferenceController,
+    SENSOR_WIDTH, SensorLayout, SensorScales, decode_with_layout, decode_with_layout_f32_into,
+    new_f16_tile_scratch, observe_dual_for_controller, observe_dual_for_controller_f32_into,
     observe_dual_gradients_only_into, observe_for_controller, observe_for_controller_f32_into,
     observe_gradients_only_into, update_recurrent_state, widen_slice,
 };
@@ -6493,6 +6493,7 @@ fn decide_from_raw_into(
     local_crowding: Option<u32>,
     [from, to]: [Tick; 2],
     controller: &mut ControllerScratch,
+    f16_tile: &mut F16TileScratch,
     out: &mut Decision,
 ) -> Result<(), CoreError> {
     if !due(rules, organism, to) {
@@ -6515,7 +6516,7 @@ fn decide_from_raw_into(
             &mut out.gradients,
         )?;
         let eval = genome.controller(&rules.catalog, &rules.limits)?;
-        let raw_out = eval.evaluate_raw_f32_inputs(&inputs_f32, controller)?;
+        let raw_out = eval.evaluate_raw_f32_inputs_with_tile(&inputs_f32, controller, f16_tile)?;
         held_from_raw_slice_into(rules, organism, to, raw_out.as_slice(), &mut out.held)?;
         out.evaluated = true;
         return decode_held_into(rules, organism, &out.held, &mut out.actions);
@@ -8219,6 +8220,7 @@ fn decide_all(
                 tile.evaluated = local_eval;
                 return Ok(());
             }
+            let mut f16_tile = new_f16_tile_scratch();
             if let Some(Sampled::Single(samples)) = sampled {
                 for (index, (organism, slot)) in run.iter().zip(dec_out.iter_mut()).enumerate() {
                     let genome = live
@@ -8240,6 +8242,7 @@ fn decide_all(
                         crowding_counts.get(start + index).copied(),
                         ticks,
                         controller,
+                        &mut f16_tile,
                         slot,
                     )?;
                     local_eval += usize::from(slot.evaluated);
@@ -8286,6 +8289,7 @@ fn decide_all(
                         crowding_counts.get(base + i).copied(),
                         ticks,
                         controller,
+                        &mut f16_tile,
                         &mut dec_chunk[i],
                     )?;
                     local_eval += usize::from(dec_chunk[i].evaluated);
@@ -8563,6 +8567,7 @@ fn decide_all_spatial(
         &mut tiles,
         |_, tile, lane| {
             let DecisionLane { controller, .. } = lane;
+            let mut f16_tile = new_f16_tile_scratch();
             let mut local_eval = 0_usize;
             let mut queries = [SensorQuery {
                 position: [0.0, 0.0],
@@ -8629,6 +8634,7 @@ fn decide_all_spatial(
                             crowding_counts.get(row_idx).copied(),
                             ticks,
                             controller,
+                            &mut f16_tile,
                             &mut dec_chunk[i],
                         )?;
                         local_eval += usize::from(dec_chunk[i].evaluated);

@@ -43,7 +43,7 @@ use flife_core::{CoreError, ValidatedConfig};
 
 use crate::actions::{ACTION_WIDTH, ActionLayout, MAX_ACTION_WIDTH, MAX_CONTROLLER_OUTPUT_WIDTH};
 use crate::sensors::{MAX_SENSOR_WIDTH, SENSOR_WIDTH, SensorLayout};
-use crate::weights::{Weight, WeightDtype, Weights};
+use crate::weights::{F16TileScratch, Weight, WeightDtype, Weights, new_f16_tile_scratch};
 
 /// The baseline stateless dense MLP controller family.
 pub const INDEPENDENT_DENSE_MLP_V1: &str = "independent-dense-mlp-v1";
@@ -977,10 +977,11 @@ impl<'a> ReferenceController<'a> {
         }
         match self.parameters {
             Weights::F32(parameters) => {
-                self.evaluate_raw_f32(parameters, &rounded[..expected], scratch)
+                self.evaluate_raw_f32(parameters, &rounded[..expected], scratch, &mut ())
             }
             Weights::F16(parameters) => {
-                self.evaluate_raw_f32(parameters, &rounded[..expected], scratch)
+                let mut tile = new_f16_tile_scratch();
+                self.evaluate_raw_f32(parameters, &rounded[..expected], scratch, &mut tile)
             }
         }
     }
@@ -1000,6 +1001,25 @@ impl<'a> ReferenceController<'a> {
         &self,
         inputs: &[f32],
         scratch: &mut ControllerScratch,
+    ) -> Result<RawOutputs, CoreError> {
+        let mut tile = new_f16_tile_scratch();
+        self.evaluate_raw_f32_inputs_with_tile(inputs, scratch, &mut tile)
+    }
+
+    /// As [`ReferenceController::evaluate_raw_f32_inputs`], reusing a
+    /// caller-owned stack [`F16TileScratch`] across repeated evaluations in a
+    /// worker tile so `F16` evaluation does not zero 4 KiB per organism.
+    ///
+    /// Every element read from `f16_tile` is overwritten first by
+    /// `F16::widen_slice_into`, so prior contents never affect outputs.
+    ///
+    /// # Errors
+    /// As [`ReferenceController::evaluate_raw_f32_inputs`].
+    pub fn evaluate_raw_f32_inputs_with_tile(
+        &self,
+        inputs: &[f32],
+        scratch: &mut ControllerScratch,
+        f16_tile: &mut F16TileScratch,
     ) -> Result<RawOutputs, CoreError> {
         let expected = self.topology.input_width();
         if inputs.len() != expected {
@@ -1021,8 +1041,8 @@ impl<'a> ReferenceController<'a> {
             }
         }
         match self.parameters {
-            Weights::F32(parameters) => self.evaluate_raw_f32(parameters, inputs, scratch),
-            Weights::F16(parameters) => self.evaluate_raw_f32(parameters, inputs, scratch),
+            Weights::F32(parameters) => self.evaluate_raw_f32(parameters, inputs, scratch, &mut ()),
+            Weights::F16(parameters) => self.evaluate_raw_f32(parameters, inputs, scratch, f16_tile),
         }
     }
 
@@ -1153,10 +1173,11 @@ impl<'a> ReferenceController<'a> {
         let total_in = sensor_width + width;
         let raw = match self.parameters {
             Weights::F32(parameters) => {
-                self.evaluate_raw_f32(parameters, &rounded[..total_in], scratch)?
+                self.evaluate_raw_f32(parameters, &rounded[..total_in], scratch, &mut ())?
             }
             Weights::F16(parameters) => {
-                self.evaluate_raw_f32(parameters, &rounded[..total_in], scratch)?
+                let mut tile = new_f16_tile_scratch();
+                self.evaluate_raw_f32(parameters, &rounded[..total_in], scratch, &mut tile)?
             }
         };
         let action_width = self.topology.action_width();
@@ -1240,6 +1261,7 @@ impl<'a> ReferenceController<'a> {
         parameters: &[W],
         inputs: &[f32],
         scratch: &mut ControllerScratch,
+        tile_scratch: &mut W::TileScratch,
     ) -> Result<RawOutputs, CoreError> {
         let Some((output_layer, hidden_layers)) = self.topology.layers.split_last() else {
             return Err(CoreError::LayoutMismatch {
@@ -1255,7 +1277,6 @@ impl<'a> ReferenceController<'a> {
         }
         scratch.reserve(self.topology.widest_hidden)?;
         let ControllerScratch { first, second } = scratch;
-        let mut tile_scratch = W::new_tile_scratch();
 
         let mut source: &[f32] = inputs;
         for (layer, activations) in hidden_layers.iter().zip([first, second]) {
@@ -1265,7 +1286,7 @@ impl<'a> ReferenceController<'a> {
                 layer,
                 source,
                 activations.as_mut_slice(),
-                &mut tile_scratch,
+                tile_scratch,
             )?;
             activate_hidden_in_place(activations.as_mut_slice())?;
             source = activations.as_slice();
@@ -1273,13 +1294,7 @@ impl<'a> ReferenceController<'a> {
 
         let mut raw = RawOutputs::zeroed(output_layer.outputs)?;
         let out_slice = raw.as_mut_slice();
-        affine_into(
-            parameters,
-            output_layer,
-            source,
-            out_slice,
-            &mut tile_scratch,
-        )?;
+        affine_into(parameters, output_layer, source, out_slice, tile_scratch)?;
         if !all_f32_finite(out_slice) {
             for (output, &z) in out_slice.iter().enumerate() {
                 if !z.is_finite() {

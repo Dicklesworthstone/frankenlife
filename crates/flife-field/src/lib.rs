@@ -50,6 +50,7 @@ pub mod grid;
 pub mod invariants;
 pub mod layout;
 pub mod numerics;
+pub mod partition;
 pub mod pyramid;
 pub mod seeding;
 pub mod settle;
@@ -78,6 +79,14 @@ pub use grid::{
 };
 pub use invariants::{ConeContractionSummary, ConeTolerance, FieldScan, FieldSummary};
 pub use layout::{Arrangement, Axis, DeclaredLayout, FieldLayout, Ownership};
+pub use partition::{
+    BoundaryDemandMsg, BoundaryDepositMsg, BoundaryGrantMsg, CommBudgetBreakdown, CommBudgetInput,
+    DepositCommStats, HaloMode, InterconnectEstimate, InterconnectProfile, MigratingOrganism,
+    MigrationStats, PartitionedDeposit, PartitionedOrganism, PartitionedUptakeResult,
+    ResidentTileField, TileBounds, TileField, TilePartition, TransportPartitionStats,
+    UptakeCommStats, apply_partitioned_deposits, estimate_comm_budget, migrate_organisms,
+    resolve_partitioned_uptake, transport_partitioned,
+};
 pub use pyramid::{
     Corners, DualRawSample, LevelGrid, MAX_PLANES, PyramidView, RawSample, SensorBackend,
     SensorPyramid, SensorQuery,

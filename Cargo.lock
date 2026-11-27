@@ -832,6 +832,7 @@ dependencies = [
  "flife-backend-metal",
  "flife-core",
  "flife-engine",
+ "flife-field",
  "flife-genome",
  "flife-manim",
  "flife-render",

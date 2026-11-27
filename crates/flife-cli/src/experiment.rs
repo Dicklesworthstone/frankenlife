@@ -1914,15 +1914,25 @@ pub fn import_shards(
     import_shards_into(experiment, directory, &runs_dir, &mut catalog, shard_dirs)
 }
 
-fn verify_and_import_row(
+/// Verified import payload ready to commit durably into the destination
+/// directory and catalog (all schema, identity, `RunResult`, manifest, and
+/// record-file SHA-256 checks passed before any destination mutation).
+struct VerifiedImport<'a> {
+    row: &'a CatalogedRun,
+    file_name: String,
+    src_bytes: Vec<u8>,
+    already_cataloged: bool,
+}
+
+fn verify_import_row<'a>(
     experiment: &Experiment,
     planned: &Planned,
     shard_dir: &Path,
     dest_runs_dir: &Path,
-    catalog: &mut ExperimentCatalog,
-    existing_by_ordinal: &mut BTreeMap<u64, CatalogedRun>,
-    row: &CatalogedRun,
-) -> Result<bool, CoreError> {
+    existing_by_ordinal: &BTreeMap<u64, CatalogedRun>,
+    staged_by_ordinal: &BTreeMap<u64, &'a CatalogedRun>,
+    row: &'a CatalogedRun,
+) -> Result<VerifiedImport<'a>, CoreError> {
     let condition = experiment
         .conditions
         .get(planned.condition)
@@ -1944,8 +1954,9 @@ fn verify_and_import_row(
         });
     }
     let expected_config_hash = experiment
-        .configuration(planned.condition, planned.seed)
-        .map_or_else(|_| String::new(), |cfg| cfg.config_hash().to_hex());
+        .configuration(planned.condition, planned.seed)?
+        .config_hash()
+        .to_hex();
     if row.config_hash != expected_config_hash {
         return Err(CoreError::StateConflict {
             operation: "import experiment shard",
@@ -1958,6 +1969,28 @@ fn verify_and_import_row(
             ),
         });
     }
+    let parsed_result: RunResult =
+        serde_json::from_str(&row.result).map_err(|error| CoreError::StateConflict {
+            operation: "import experiment shard",
+            detail: format!(
+                "shard {} run {} result is invalid RunResult JSON: {error}",
+                shard_dir.display(),
+                row.ordinal
+            ),
+        })?;
+    if parsed_result.status != row.status {
+        return Err(CoreError::StateConflict {
+            operation: "import experiment shard",
+            detail: format!(
+                "shard {} run {} status `{}` disagrees with result status `{}`",
+                shard_dir.display(),
+                row.ordinal,
+                row.status,
+                parsed_result.status
+            ),
+        });
+    }
+    let expected_exp_id = experiment.identity.to_hex();
     let expected_job_id = experiment
         .job_id(
             planned.ordinal,
@@ -1975,38 +2008,103 @@ fn verify_and_import_row(
                 row.ordinal
             ),
         })?;
-    if let Some(found_job_id) = manifest_val
-        .get("identity")
-        .and_then(|id| id.get("job_id"))
+    let manifest_conflict = |detail: String| CoreError::StateConflict {
+        operation: "import experiment shard",
+        detail: format!("shard {} run {} {detail}", shard_dir.display(), row.ordinal),
+    };
+    let identity = manifest_val.get("identity").ok_or_else(|| {
+        manifest_conflict("manifest missing required `identity` object".to_owned())
+    })?;
+    let found_exp = identity
+        .get("experiment_identity")
         .and_then(serde_json::Value::as_str)
-        && found_job_id != expected_job_id
-    {
-        return Err(CoreError::StateConflict {
-            operation: "import experiment shard",
-            detail: format!(
-                "shard {} run {} job_id {found_job_id} does not match expected {expected_job_id}",
-                shard_dir.display(),
-                row.ordinal
-            ),
-        });
+        .ok_or_else(|| {
+            manifest_conflict("manifest missing `identity.experiment_identity`".to_owned())
+        })?;
+    if found_exp != expected_exp_id {
+        return Err(manifest_conflict(format!(
+            "manifest experiment_identity {found_exp} != {expected_exp_id}"
+        )));
     }
-    if let Some(artifact_sha) = manifest_val
+    let found_ord = identity
+        .get("ordinal")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| manifest_conflict("manifest missing `identity.ordinal`".to_owned()))?;
+    if found_ord != row.ordinal {
+        return Err(manifest_conflict(format!(
+            "manifest ordinal {found_ord} != {}",
+            row.ordinal
+        )));
+    }
+    let found_cond = identity
+        .get("condition")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| manifest_conflict("manifest missing `identity.condition`".to_owned()))?;
+    if found_cond != row.condition {
+        return Err(manifest_conflict(format!(
+            "manifest condition `{found_cond}` != `{}`",
+            row.condition
+        )));
+    }
+    let found_split = identity
+        .get("split")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| manifest_conflict("manifest missing `identity.split`".to_owned()))?;
+    if found_split != row.split {
+        return Err(manifest_conflict(format!(
+            "manifest split `{found_split}` != `{}`",
+            row.split
+        )));
+    }
+    let found_seed = identity
+        .get("seed")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| manifest_conflict("manifest missing `identity.seed`".to_owned()))?;
+    if found_seed != row.seed {
+        return Err(manifest_conflict(format!(
+            "manifest seed {found_seed} != {}",
+            row.seed
+        )));
+    }
+    if let Some(job_id_val) = identity.get("job_id") {
+        let found_job_id = job_id_val.as_str().ok_or_else(|| {
+            manifest_conflict("manifest `identity.job_id` is not a string".to_owned())
+        })?;
+        if found_job_id != expected_job_id {
+            return Err(manifest_conflict(format!(
+                "job_id {found_job_id} does not match expected {expected_job_id}"
+            )));
+        }
+    }
+    let manifest_res = manifest_val
+        .get("results")
+        .and_then(|results| results.get("result"))
+        .ok_or_else(|| {
+            manifest_conflict("manifest missing required `results.result`".to_owned())
+        })?;
+    let parsed_manifest_res: RunResult =
+        serde_json::from_value(manifest_res.clone()).map_err(|error| {
+            manifest_conflict(format!("manifest result is invalid RunResult: {error}"))
+        })?;
+    if parsed_manifest_res != parsed_result {
+        return Err(manifest_conflict(
+            "manifest result disagrees with cataloged result".to_owned(),
+        ));
+    }
+    let artifact_sha = manifest_val
         .get("artifacts")
         .and_then(serde_json::Value::as_array)
         .and_then(|arr| arr.first())
         .and_then(|a| a.get("sha256"))
         .and_then(serde_json::Value::as_str)
-        && artifact_sha != row.records_sha256
-    {
-        return Err(CoreError::StateConflict {
-            operation: "import experiment shard",
-            detail: format!(
-                "shard {} run {} manifest artifact SHA-256 {artifact_sha} differs from catalog {}",
-                shard_dir.display(),
-                row.ordinal,
-                row.records_sha256
-            ),
-        });
+        .ok_or_else(|| {
+            manifest_conflict("manifest missing required `artifacts[0].sha256`".to_owned())
+        })?;
+    if artifact_sha != row.records_sha256 {
+        return Err(manifest_conflict(format!(
+            "manifest artifact SHA-256 {artifact_sha} differs from catalog {}",
+            row.records_sha256
+        )));
     }
 
     let file_name = format!("run-{:06}.ndjson", row.ordinal);
@@ -2032,40 +2130,33 @@ fn verify_and_import_row(
         });
     }
 
-    if let Some(existing) = existing_by_ordinal.get(&row.ordinal) {
-        if existing == row {
-            let dest_records = dest_runs_dir.join(&file_name);
-            if dest_records.exists() {
-                let dest_bytes =
-                    std::fs::read(&dest_records).map_err(|error| CoreError::StorageFailed {
-                        operation: "read destination run records",
-                        path: dest_records.display().to_string(),
-                        reason: error.to_string(),
-                    })?;
-                if Sha256Digest::of(&dest_bytes).to_hex() != row.records_sha256 {
-                    return Err(CoreError::StateConflict {
-                        operation: "import experiment shard",
-                        detail: format!(
-                            "destination {} SHA-256 differs from cataloged run {}",
-                            dest_records.display(),
-                            row.ordinal
-                        ),
-                    });
-                }
-            } else {
-                write_durably(&dest_records, &src_bytes)?;
-            }
-            return Ok(false);
-        }
+    if let Some(staged) = staged_by_ordinal.get(&row.ordinal)
+        && *staged != row
+    {
         return Err(CoreError::StateConflict {
             operation: "import experiment shard",
             detail: format!(
-                "shard {} run {} conflicts with an existing cataloged run",
+                "shard {} run {} conflicts with another shard in the same import batch",
                 shard_dir.display(),
                 row.ordinal
             ),
         });
     }
+
+    let already_cataloged = match existing_by_ordinal.get(&row.ordinal) {
+        Some(existing) if existing == row => true,
+        Some(_) => {
+            return Err(CoreError::StateConflict {
+                operation: "import experiment shard",
+                detail: format!(
+                    "shard {} run {} conflicts with an existing cataloged run",
+                    shard_dir.display(),
+                    row.ordinal
+                ),
+            });
+        }
+        None => false,
+    };
 
     let dest_records = dest_runs_dir.join(&file_name);
     if dest_records.exists() {
@@ -2079,21 +2170,50 @@ fn verify_and_import_row(
             return Err(CoreError::StateConflict {
                 operation: "import experiment shard",
                 detail: format!(
-                    "destination {} exists with mismatched SHA-256 before importing run {}",
+                    "destination {} exists with mismatched SHA-256 for run {}",
                     dest_records.display(),
                     row.ordinal
                 ),
             });
         }
-    } else {
-        write_durably(&dest_records, &src_bytes)?;
     }
 
-    catalog.record(row)?;
-    existing_by_ordinal.insert(row.ordinal, row.clone());
-    Ok(true)
+    Ok(VerifiedImport {
+        row,
+        file_name,
+        src_bytes,
+        already_cataloged,
+    })
 }
 
+fn commit_verified_imports(
+    dest_runs_dir: &Path,
+    catalog: &mut ExperimentCatalog,
+    existing_by_ordinal: &mut BTreeMap<u64, CatalogedRun>,
+    verified: Vec<VerifiedImport<'_>>,
+) -> Result<(usize, usize), CoreError> {
+    let mut imported = 0_usize;
+    let mut skipped_existing = 0_usize;
+    for item in verified {
+        let dest_records = dest_runs_dir.join(&item.file_name);
+        if !dest_records.exists() {
+            write_durably(&dest_records, &item.src_bytes)?;
+        }
+        if item.already_cataloged || existing_by_ordinal.contains_key(&item.row.ordinal) {
+            skipped_existing += 1;
+        } else {
+            catalog.record(item.row)?;
+            existing_by_ordinal.insert(item.row.ordinal, item.row.clone());
+            imported += 1;
+        }
+    }
+    Ok((imported, skipped_existing))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "two-pass atomic verify-before-write shard import covering discovery and [select]-gated held-out splits"
+)]
 fn import_shards_into(
     experiment: &Experiment,
     dest_dir: &Path,
@@ -2157,11 +2277,11 @@ fn import_shards_into(
         .into_iter()
         .map(|run| (run.ordinal, run))
         .collect();
-    let mut imported = 0_usize;
-    let mut skipped_existing = 0_usize;
 
-    // Pass 1: verify and import all discovery runs first so `[select]`
-    // resolution is deterministic before validating held-out runs.
+    // Pass 1 (pure read-only verification): verify EVERY discovery row and
+    // reject any unknown split across ALL shards before mutating `dest`.
+    let mut staged_discovery: BTreeMap<u64, &CatalogedRun> = BTreeMap::new();
+    let mut verified_discovery: Vec<VerifiedImport<'_>> = Vec::new();
     for (shard_dir, runs) in &shard_rows {
         for row in runs {
             if row.split == DISCOVERY {
@@ -2176,19 +2296,17 @@ fn import_shards_into(
                                 row.ordinal
                             ),
                         })?;
-                if verify_and_import_row(
+                let item = verify_import_row(
                     experiment,
                     planned,
                     shard_dir,
                     dest_runs_dir,
-                    catalog,
-                    &mut existing_by_ordinal,
+                    &existing_by_ordinal,
+                    &staged_discovery,
                     row,
-                )? {
-                    imported += 1;
-                } else {
-                    skipped_existing += 1;
-                }
+                )?;
+                staged_discovery.entry(row.ordinal).or_insert(row);
+                verified_discovery.push(item);
             } else if row.split != HELD_OUT {
                 return Err(CoreError::StateConflict {
                     operation: "import experiment shard",
@@ -2203,14 +2321,18 @@ fn import_shards_into(
         }
     }
 
-    // Pass 2: verify and import held-out runs once discovery is in place.
+    // Pass 2 (pure read-only verification): resolve held-out plan from
+    // `existing + staged_discovery` and verify EVERY held-out row BEFORE
+    // committing either pass, so a bad held-out shard leaves zero partial writes!
+    let mut verified_held_out: Vec<VerifiedImport<'_>> = Vec::new();
     let any_held_out = shard_rows
         .iter()
         .any(|(_, runs)| runs.iter().any(|row| row.split == HELD_OUT));
     if any_held_out {
-        let all_discovery_present = discovery
-            .iter()
-            .all(|p| existing_by_ordinal.contains_key(&p.ordinal));
+        let all_discovery_present = discovery.iter().all(|p| {
+            existing_by_ordinal.contains_key(&p.ordinal)
+                || staged_discovery.contains_key(&p.ordinal)
+        });
         if experiment.spec.select.is_some() && !all_discovery_present {
             return Err(CoreError::StateConflict {
                 operation: "import experiment shard",
@@ -2219,9 +2341,13 @@ fn import_shards_into(
                     .to_owned(),
             });
         }
-        let current_runs = catalog.runs()?;
         let selection = if experiment.spec.select.is_some() {
-            select(experiment, &current_runs)?
+            let mut combined: BTreeMap<u64, CatalogedRun> = existing_by_ordinal.clone();
+            for (&ord, &row) in &staged_discovery {
+                combined.entry(ord).or_insert_with(|| row.clone());
+            }
+            let combined_vec: Vec<CatalogedRun> = combined.into_values().collect();
+            select(experiment, &combined_vec)?
         } else {
             None
         };
@@ -2234,6 +2360,7 @@ fn import_shards_into(
         );
         let held_out_by_ord: BTreeMap<u64, Planned> =
             held_out.iter().map(|&p| (p.ordinal, p)).collect();
+        let mut staged_held_out: BTreeMap<u64, &CatalogedRun> = BTreeMap::new();
         for (shard_dir, runs) in &shard_rows {
             for row in runs {
                 if row.split != HELD_OUT {
@@ -2250,27 +2377,40 @@ fn import_shards_into(
                                 row.ordinal
                             ),
                         })?;
-                if verify_and_import_row(
+                let item = verify_import_row(
                     experiment,
                     planned,
                     shard_dir,
                     dest_runs_dir,
-                    catalog,
-                    &mut existing_by_ordinal,
+                    &existing_by_ordinal,
+                    &staged_held_out,
                     row,
-                )? {
-                    imported += 1;
-                } else {
-                    skipped_existing += 1;
-                }
+                )?;
+                staged_held_out.entry(row.ordinal).or_insert(row);
+                verified_held_out.push(item);
             }
         }
     }
 
+    // Commit phase: every shard and every row is verified before any file or
+    // catalog write occurs.
+    let (imp_disc, skip_disc) = commit_verified_imports(
+        dest_runs_dir,
+        catalog,
+        &mut existing_by_ordinal,
+        verified_discovery,
+    )?;
+    let (imp_held, skip_held) = commit_verified_imports(
+        dest_runs_dir,
+        catalog,
+        &mut existing_by_ordinal,
+        verified_held_out,
+    )?;
+
     Ok(ImportSummary {
         shards: shard_rows.len(),
-        imported,
-        skipped_existing,
+        imported: imp_disc + imp_held,
+        skipped_existing: skip_disc + skip_held,
     })
 }
 

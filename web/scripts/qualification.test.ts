@@ -69,11 +69,21 @@ describe("FL-056 browser capability and artifact-size qualification", () => {
   test("every R2-streamed film satisfies single-PUT size, Range-seek encoding, and 1080p mobile decode budgets", () => {
     expect(verifyFilmVideos(films, MEDIA_R2_DIR, true)).toEqual([]);
 
+    const hasFlagPair = (args: readonly string[], flag: string, value: string): boolean => {
+      for (let i = 0; i + 1 < args.length; i++) {
+        if (args[i] === flag && args[i + 1] === value) return true;
+      }
+      return false;
+    };
+
     for (const manifest of films) {
+      const fpsStr = String(manifest.video.fps);
       expect(manifest.video.bytes).toBeGreaterThan(0);
       expect(manifest.video.bytes).toBeLessThanOrEqual(UPLOAD_LIMIT);
-      expect(manifest.video.encode).toContain("+faststart");
-      expect(manifest.video.encode).toContain("yuv420p");
+      expect(hasFlagPair(manifest.video.encode, "-movflags", "+faststart")).toBe(true);
+      expect(hasFlagPair(manifest.video.encode, "-pix_fmt", "yuv420p")).toBe(true);
+      expect(hasFlagPair(manifest.video.encode, "-g", fpsStr)).toBe(true);
+      expect(hasFlagPair(manifest.video.encode, "-keyint_min", fpsStr)).toBe(true);
 
       expect(manifest.video.small).toBeDefined();
       const phone = manifest.video.small!;
@@ -82,8 +92,10 @@ describe("FL-056 browser capability and artifact-size qualification", () => {
       expect(phone.width).toBeLessThanOrEqual(1920);
       expect(phone.height).toBeLessThanOrEqual(1080);
       expect(phone.bytes).toBeLessThan(manifest.video.bytes * 0.7);
-      expect(phone.encode).toContain("+faststart");
-      expect(phone.encode).toContain("yuv420p");
+      expect(hasFlagPair(phone.encode, "-movflags", "+faststart")).toBe(true);
+      expect(hasFlagPair(phone.encode, "-pix_fmt", "yuv420p")).toBe(true);
+      expect(hasFlagPair(phone.encode, "-g", fpsStr)).toBe(true);
+      expect(hasFlagPair(phone.encode, "-keyint_min", fpsStr)).toBe(true);
     }
   });
 

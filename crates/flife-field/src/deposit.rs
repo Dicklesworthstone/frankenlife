@@ -817,7 +817,7 @@ fn fit<T>(vector: &mut Vec<T>, count: usize) -> Result<(), CoreError> {
 
 /// `offered` over `stencil`'s cells: every cell but the largest-weight one
 /// gets `offered w_c`, and that one gets the remainder, rounded down.
-fn split(stencil: &ExchangeStencil, offered: f64) -> [f64; 4] {
+pub(crate) fn split(stencil: &ExchangeStencil, offered: f64) -> [f64; 4] {
     let weights = stencil.weights();
     let mut largest = 0;
     for (index, &weight) in weights.iter().enumerate() {
@@ -894,7 +894,7 @@ fn add_up(a: f64, b: f64) -> f64 {
 
 /// The largest F32 value at or below `value`, for `value ≥ 0`.
 #[inline]
-fn round_down_f32(value: f64) -> f32 {
+pub(crate) fn round_down_f32(value: f64) -> f32 {
     if value >= f64::from(f32::MAX) {
         return f32::MAX;
     }

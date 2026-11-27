@@ -181,6 +181,31 @@ fn reproducible_job_identity_and_supervised_parallel_report_parity() {
         "supervised parallel ensemble must produce byte-identical report.json"
     );
 
+    // If Metal is available on this host, verify Asupersync-supervised parallel
+    // execution (`parallel = 2`) with Metal controllers produces byte-identical
+    // `report.json` to CPU serial execution!
+    if flife_backend_metal::MetalControllers::open().is_ok() {
+        let metal_dir = root.join("parallel-metal");
+        let metal_outcome = run_ensemble(
+            &exp,
+            &metal_dir,
+            &EnsembleOptions {
+                cpu_workers: NonZeroUsize::new(1),
+                controllers: ControllerChoice::Metal,
+                parallel: NonZeroUsize::new(2).expect("2"),
+                ..EnsembleOptions::default()
+            },
+            |_| {},
+        )
+        .expect("parallel metal ensemble succeeds");
+        assert!(matches!(metal_outcome, EnsembleOutcome::Complete(_)));
+        assert_eq!(
+            fs::read(metal_dir.join(REPORT_FILE)).expect("metal report"),
+            serial_json,
+            "supervised parallel Metal ensemble must match CPU serial report byte-for-bit"
+        );
+    }
+
     // Every cataloged run manifest carries the exact reproducible `job_id`.
     let cat =
         ExperimentCatalog::read(&parallel_dir.join(EXPERIMENT_CATALOG_FILE)).expect("read catalog");
@@ -307,17 +332,82 @@ fn disjoint_multi_machine_sharding_verified_import_and_tamper_refusal() {
     assert_eq!(reimport.imported, 0);
     assert_eq!(reimport.skipped_existing, 15);
 
-    // Tamper detection: flipping 1 byte in shard-1's records must be refused!
+    // Tamper detection + verify-before-write atomicity: pass VALID shards 2 & 3
+    // BEFORE tampered shard 1 — import must refuse AND leave zero partial writes
+    // in `tamper_dest`!
     let tampered_file = shard_dirs[0].join(RUNS_DIR).join("run-000001.ndjson");
     let mut raw = fs::read(&tampered_file).expect("read shard-1 run-1");
     raw[0] ^= 0xFF;
     fs::write(&tampered_file, raw).expect("corrupt shard-1 run-1");
     let tamper_dest = root.join("tamper-check");
-    let tamper_err = import_shards(&exp, &tamper_dest, &shard_dirs)
+    let ordered_shards = vec![
+        shard_dirs[1].clone(),
+        shard_dirs[2].clone(),
+        shard_dirs[0].clone(),
+    ];
+    let tamper_err = import_shards(&exp, &tamper_dest, &ordered_shards)
         .expect_err("corrupted shard records must be refused");
     assert!(
         matches!(tamper_err, CoreError::StateConflict { .. }),
         "expected StateConflict for tampered shard, got {tamper_err:?}"
+    );
+    let tamper_cat = ExperimentCatalog::read(&tamper_dest.join(EXPERIMENT_CATALOG_FILE))
+        .expect("tamper_dest catalog");
+    assert!(
+        tamper_cat.runs().expect("tamper_dest runs").is_empty(),
+        "verify-before-write import must leave zero cataloged runs when any shard fails verification"
+    );
+    assert_eq!(
+        fs::read_dir(tamper_dest.join(RUNS_DIR))
+            .expect("read tamper runs")
+            .count(),
+        0,
+        "verify-before-write import must leave zero copied record files when any shard fails verification"
+    );
+
+    // Stripped `{}` manifest tamper refusal (Pass-2 audit regression): even
+    // when record bytes and catalog SHA-256 match, a shard whose run manifest
+    // omits required provenance (`identity`, `results.result`, `artifacts`)
+    // must be refused with zero partial writes!
+    let stripped_shard = root.join("stripped-manifest-shard");
+    fs::create_dir_all(stripped_shard.join(RUNS_DIR)).expect("mkdir stripped shard");
+    let shard2_cat =
+        ExperimentCatalog::read(&shard_dirs[1].join(EXPERIMENT_CATALOG_FILE)).expect("read s2");
+    let shard2_runs = shard2_cat.runs().expect("s2 runs");
+    let mut bad_cat = ExperimentCatalog::open(
+        &stripped_shard.join(EXPERIMENT_CATALOG_FILE),
+        &exp.identity().to_hex(),
+        exp.design(),
+    )
+    .expect("open stripped cat");
+    for (idx, mut run) in shard2_runs.into_iter().enumerate() {
+        let fname = format!("run-{:06}.ndjson", run.ordinal);
+        fs::copy(
+            shard_dirs[1].join(RUNS_DIR).join(&fname),
+            stripped_shard.join(RUNS_DIR).join(&fname),
+        )
+        .expect("copy valid record");
+        if idx == 0 {
+            run.manifest = "{}".to_owned();
+        }
+        bad_cat.record(&run).expect("record stripped row");
+    }
+    let stripped_dest = root.join("stripped-check");
+    let stripped_err = import_shards(
+        &exp,
+        &stripped_dest,
+        &[shard_dirs[2].clone(), stripped_shard],
+    )
+    .expect_err("stripped {} manifest must be refused");
+    assert!(
+        matches!(stripped_err, CoreError::StateConflict { .. }),
+        "expected StateConflict for stripped manifest, got {stripped_err:?}"
+    );
+    let stripped_dest_cat =
+        ExperimentCatalog::read(&stripped_dest.join(EXPERIMENT_CATALOG_FILE)).expect("dest cat");
+    assert!(
+        stripped_dest_cat.runs().expect("dest runs").is_empty(),
+        "stripped-manifest refusal must leave zero cataloged runs in destination"
     );
 
     // Two-stage `[select]` sharded workflow: discovery shards -> import -> held-out shards -> merge.

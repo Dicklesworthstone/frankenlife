@@ -160,7 +160,7 @@ impl Default for Grants {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Share {
+pub(crate) struct Share {
     quanta: u64,
     remainder: f64,
 }
@@ -1171,7 +1171,7 @@ fn check_energy(cell: usize, energy: f32) -> Result<(), CoreError> {
 const STACK_CELL_PACKETS: usize = 32;
 
 /// Resolve one cell's packets, which are in identity order.
-fn resolve_cell(
+pub(crate) fn resolve_cell(
     packets: &mut [GrantPacket],
     cell: usize,
     energy: f32,

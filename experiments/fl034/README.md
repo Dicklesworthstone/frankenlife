@@ -290,8 +290,27 @@ The Interactive world is the preset on its own seed, as E1 ran it above. The Des
 seed 2022. Neither reaches E1's or E2's end state on today's tree. On the Mac at 7b4a4e5, the Interactive world
 ends at tick 8,192 with 22,559 live (digest `595e2d90…3167b`, the same with CPU and with Metal controllers),
 where E1 had 22,779 (`a8b7f6b3…5eb34`). A Mac run of the Desktop world earlier on 2026-11-27 ended with 99,065
-live and 389,045 births, where E2 had 99,361 and 389,349. Each pair matches at peak and least live, so the runs
-part late; FL-034 records the search for the change. A window
+live and 389,045 births, where E2 had 99,361 and 389,349.
+
+The model changed after E1 and E2 ran. commit:d8a88aa (2026-11-23) added plan §11.5's bounded moment-only
+cone contraction. It contracts a field cell's moments, never its energy, back inside `|m| ≤ E` when they exceed
+the cone by more than 10⁻⁶ relative, one tenth of `INV-02`'s 10⁻⁵. The Interactive world shows where the
+contraction first acts. These were observed on the Mac on 2026-11-27 with
+the release builds of 62f16ac (before d8a88aa) and 147c18d (after it), both branched from one tick-4,096
+checkpoint:
+
+- The two worlds are bit-identical through tick 4,135.
+- At tick 4,136 exactly one field cell differs: cell (226, 92). Its `|m| / E` is 1 + 1.01 × 10⁻⁶ before the
+  change and 1 − 4 × 10⁻⁸ after it. All 32 of its moments are scaled by the same factor, and its energy is
+  unchanged.
+- Its four neighbours, 0.4 to 3.8 × 10⁻⁷ outside the cone, are the same in both.
+- At tick 4,137 the five organisms within about 5 world units of that cell move or decide differently.
+
+The adopted powers' rule runs were not rerun under the contraction, and their digests no longer reproduce.
+The Nov 20 build reproduces E1's world exactly (`a8b7f6b3…5eb34`). Today's tree gives the same world with CPU
+and Metal controllers and on 7 or 16 workers.
+
+A window
 run resumes each world and keeps it on in its directory, so every run starts where the last one stopped,
 near the same population.
 

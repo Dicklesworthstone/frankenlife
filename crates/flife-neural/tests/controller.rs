@@ -1055,3 +1055,105 @@ fn evaluate_raw_f32_inputs_with_tile_reuses_poisoned_scratch_bit_exact() {
         }
     }
 }
+
+#[test]
+fn widen_4rows_interleaved_into_matches_scalar_across_all_65536_f16_patterns_and_lengths() {
+    use flife_core::binary16::F16;
+
+    // 1. Exhaustive sweep over all 65,536 F16 bit patterns distributed across 4 rows.
+    let all: Vec<F16> = (0..=u16::MAX).map(F16::from_bits).collect();
+    let n_all = all.len() / 4;
+    let r0 = &all[0..n_all];
+    let r1 = &all[n_all..2 * n_all];
+    let r2 = &all[2 * n_all..3 * n_all];
+    let r3 = &all[3 * n_all..4 * n_all];
+    let mut dst = vec![[f32::NAN; 4]; n_all];
+    F16::widen_4rows_interleaved_into(r0, r1, r2, r3, &mut dst);
+    let mut dst_contig = vec![[f32::NAN; 4]; n_all];
+    F16::widen_4rows_contiguous_interleaved_into(&all, n_all, &mut dst_contig);
+    for col in 0..n_all {
+        let want = [
+            r0[col].to_f32().to_bits(),
+            r1[col].to_f32().to_bits(),
+            r2[col].to_f32().to_bits(),
+            r3[col].to_f32().to_bits(),
+        ];
+        assert_eq!(dst[col].map(f32::to_bits), want, "exhaustive col {col}");
+        assert_eq!(
+            dst_contig[col].map(f32::to_bits),
+            want,
+            "exhaustive contig col {col}"
+        );
+    }
+
+    // 2. Every length 0..=67 with pure-normal blocks AND single-lane special-value
+    //    injections (0, -0, min/max subnormal, +inf, -inf, NaN) in every row/offset.
+    let normal = F16::from_f64(0.375);
+    let specials = [
+        F16::from_bits(0x0000),
+        F16::from_bits(0x8000),
+        F16::from_bits(0x0001),
+        F16::from_bits(0x83FF),
+        F16::from_bits(0x7C00),
+        F16::from_bits(0xFC00),
+        F16::from_bits(0x7E01),
+    ];
+    for len in 0..=67 {
+        let mut rows = std::array::from_fn::<_, 4, _>(|_| vec![normal; len]);
+        for (r, row) in rows.iter_mut().enumerate() {
+            for (c, slot) in row.iter_mut().enumerate() {
+                *slot = F16::from_bits(0x0400 + (((r * 131 + c * 17) as u16) % 0x7000));
+            }
+        }
+        let mut out = vec![[0.0_f32; 4]; len];
+        let mut flat: Vec<F16> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        let mut out_contig = vec![[0.0_f32; 4]; len];
+        F16::widen_4rows_interleaved_into(&rows[0], &rows[1], &rows[2], &rows[3], &mut out);
+        F16::widen_4rows_contiguous_interleaved_into(&flat, len, &mut out_contig);
+        for c in 0..len {
+            let want = [
+                rows[0][c].to_f32().to_bits(),
+                rows[1][c].to_f32().to_bits(),
+                rows[2][c].to_f32().to_bits(),
+                rows[3][c].to_f32().to_bits(),
+            ];
+            assert_eq!(out[c].map(f32::to_bits), want, "normal len={len} col={c}");
+            assert_eq!(
+                out_contig[c].map(f32::to_bits),
+                want,
+                "normal contig len={len} col={c}"
+            );
+        }
+        if len > 0 {
+            for (idx, &sp) in specials.iter().enumerate() {
+                let row_i = idx % 4;
+                let col_i = (idx * 7) % len;
+                let saved = rows[row_i][col_i];
+                rows[row_i][col_i] = sp;
+                flat[row_i * len + col_i] = sp;
+                F16::widen_4rows_interleaved_into(&rows[0], &rows[1], &rows[2], &rows[3], &mut out);
+                F16::widen_4rows_contiguous_interleaved_into(&flat, len, &mut out_contig);
+                for c in 0..len {
+                    let want = [
+                        rows[0][c].to_f32().to_bits(),
+                        rows[1][c].to_f32().to_bits(),
+                        rows[2][c].to_f32().to_bits(),
+                        rows[3][c].to_f32().to_bits(),
+                    ];
+                    assert_eq!(
+                        out[c].map(f32::to_bits),
+                        want,
+                        "special len={len} row={row_i} pos={col_i} col={c}"
+                    );
+                    assert_eq!(
+                        out_contig[c].map(f32::to_bits),
+                        want,
+                        "special contig len={len} row={row_i} pos={col_i} col={c}"
+                    );
+                }
+                rows[row_i][col_i] = saved;
+                flat[row_i * len + col_i] = saved;
+            }
+        }
+    }
+}

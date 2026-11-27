@@ -99,91 +99,17 @@ pub trait Weight: Copy + Send + Sync + std::fmt::Debug + 'static {
         biases: &[Self; 8],
         input: &[f32],
         out_block: &mut [f32; 8],
-        _scratch: &mut Self::TileScratch,
+        scratch: &mut Self::TileScratch,
     ) {
         let n = input.len();
-        let (in_q, in_r) = input.as_chunks::<4>();
-        let mut z0 = [
-            biases[0].widen(),
-            biases[1].widen(),
-            biases[2].widen(),
-            biases[3].widen(),
-        ];
-        let mut z1 = [
-            biases[4].widen(),
-            biases[5].widen(),
-            biases[6].widen(),
-            biases[7].widen(),
-        ];
-        let (r0_q, r0_r) = weights[0..n].as_chunks::<4>();
-        let (r1_q, r1_r) = weights[n..2 * n].as_chunks::<4>();
-        let (r2_q, r2_r) = weights[2 * n..3 * n].as_chunks::<4>();
-        let (r3_q, r3_r) = weights[3 * n..4 * n].as_chunks::<4>();
-        let (r4_q, r4_r) = weights[4 * n..5 * n].as_chunks::<4>();
-        let (r5_q, r5_r) = weights[5 * n..6 * n].as_chunks::<4>();
-        let (r6_q, r6_r) = weights[6 * n..7 * n].as_chunks::<4>();
-        let (r7_q, r7_r) = weights[7 * n..8 * n].as_chunks::<4>();
-
-        for ((((((((&x, w0), w1), w2), w3), w4), w5), w6), w7) in in_q
-            .iter()
-            .zip(r0_q)
-            .zip(r1_q)
-            .zip(r2_q)
-            .zip(r3_q)
-            .zip(r4_q)
-            .zip(r5_q)
-            .zip(r6_q)
-            .zip(r7_q)
-        {
-            let a0 = Self::widen_4(*w0);
-            let a1 = Self::widen_4(*w1);
-            let a2 = Self::widen_4(*w2);
-            let a3 = Self::widen_4(*w3);
-            let p0 = [a0[0] * x[0], a0[1] * x[1], a0[2] * x[2], a0[3] * x[3]];
-            let p1 = [a1[0] * x[0], a1[1] * x[1], a1[2] * x[2], a1[3] * x[3]];
-            let p2 = [a2[0] * x[0], a2[1] * x[1], a2[2] * x[2], a2[3] * x[3]];
-            let p3 = [a3[0] * x[0], a3[1] * x[1], a3[2] * x[2], a3[3] * x[3]];
-            for k in 0..4 {
-                z0 = [z0[0] + p0[k], z0[1] + p1[k], z0[2] + p2[k], z0[3] + p3[k]];
-            }
-            let a4 = Self::widen_4(*w4);
-            let a5 = Self::widen_4(*w5);
-            let a6 = Self::widen_4(*w6);
-            let a7 = Self::widen_4(*w7);
-            let p4 = [a4[0] * x[0], a4[1] * x[1], a4[2] * x[2], a4[3] * x[3]];
-            let p5 = [a5[0] * x[0], a5[1] * x[1], a5[2] * x[2], a5[3] * x[3]];
-            let p6 = [a6[0] * x[0], a6[1] * x[1], a6[2] * x[2], a6[3] * x[3]];
-            let p7 = [a7[0] * x[0], a7[1] * x[1], a7[2] * x[2], a7[3] * x[3]];
-            for k in 0..4 {
-                z1 = [z1[0] + p4[k], z1[1] + p5[k], z1[2] + p6[k], z1[3] + p7[k]];
-            }
-        }
-        for ((((((((&x, &w0), &w1), &w2), &w3), &w4), &w5), &w6), &w7) in in_r
-            .iter()
-            .zip(r0_r)
-            .zip(r1_r)
-            .zip(r2_r)
-            .zip(r3_r)
-            .zip(r4_r)
-            .zip(r5_r)
-            .zip(r6_r)
-            .zip(r7_r)
-        {
-            z0 = [
-                z0[0] + w0.widen() * x,
-                z0[1] + w1.widen() * x,
-                z0[2] + w2.widen() * x,
-                z0[3] + w3.widen() * x,
-            ];
-            z1 = [
-                z1[0] + w4.widen() * x,
-                z1[1] + w5.widen() * x,
-                z1[2] + w6.widen() * x,
-                z1[3] + w7.widen() * x,
-            ];
-        }
-        out_block[0..4].copy_from_slice(&z0);
-        out_block[4..8].copy_from_slice(&z1);
+        let b0 = [biases[0], biases[1], biases[2], biases[3]];
+        let b1 = [biases[4], biases[5], biases[6], biases[7]];
+        let mut o0 = [0.0_f32; 4];
+        let mut o1 = [0.0_f32; 4];
+        Self::affine_block4(&weights[0..4 * n], &b0, input, &mut o0, scratch);
+        Self::affine_block4(&weights[4 * n..8 * n], &b1, input, &mut o1, scratch);
+        out_block[0..4].copy_from_slice(&o0);
+        out_block[4..8].copy_from_slice(&o1);
     }
 
     /// Accumulate 4 output rows of a dense affine layer into `out_block`
@@ -212,17 +138,14 @@ pub trait Weight: Copy + Send + Sync + std::fmt::Debug + 'static {
         let (r2_q, r2_r) = weights[2 * n..3 * n].as_chunks::<4>();
         let (r3_q, r3_r) = weights[3 * n..4 * n].as_chunks::<4>();
         for ((((&x, w0), w1), w2), w3) in in_q.iter().zip(r0_q).zip(r1_q).zip(r2_q).zip(r3_q) {
-            let a0 = Self::widen_4(*w0);
-            let a1 = Self::widen_4(*w1);
-            let a2 = Self::widen_4(*w2);
-            let a3 = Self::widen_4(*w3);
-            let p0 = [a0[0] * x[0], a0[1] * x[1], a0[2] * x[2], a0[3] * x[3]];
-            let p1 = [a1[0] * x[0], a1[1] * x[1], a1[2] * x[2], a1[3] * x[3]];
-            let p2 = [a2[0] * x[0], a2[1] * x[1], a2[2] * x[2], a2[3] * x[3]];
-            let p3 = [a3[0] * x[0], a3[1] * x[1], a3[2] * x[2], a3[3] * x[3]];
-            for k in 0..4 {
-                z0 = [z0[0] + p0[k], z0[1] + p1[k], z0[2] + p2[k], z0[3] + p3[k]];
-            }
+            z0 = accumulate_4x4(
+                z0,
+                Self::widen_4(*w0),
+                Self::widen_4(*w1),
+                Self::widen_4(*w2),
+                Self::widen_4(*w3),
+                x,
+            );
         }
         for ((((&x, &w0), &w1), &w2), &w3) in in_r.iter().zip(r0_r).zip(r1_r).zip(r2_r).zip(r3_r) {
             z0 = [
@@ -293,6 +216,109 @@ impl Weight for f32 {
     }
 }
 
+/// Accumulate 4 rows × 4 columns in strict ascending column order (`0..4`)
+/// using an explicit in-register 4×4 transpose (`trn1`/`trn2` on AArch64 NEON,
+/// `unpcklps`/`unpckhps` + `movlhps`/`movhlps` on x86_64) to avoid scalar lane
+/// insert chains while preserving exact separate-mul-then-add F32 semantics.
+#[inline(always)]
+fn accumulate_4x4(
+    mut z: [f32; 4],
+    w0: [f32; 4],
+    w1: [f32; 4],
+    w2: [f32; 4],
+    w3: [f32; 4],
+    x: [f32; 4],
+) -> [f32; 4] {
+    let p0 = [w0[0] * x[0], w0[1] * x[1], w0[2] * x[2], w0[3] * x[3]];
+    let p1 = [w1[0] * x[0], w1[1] * x[1], w1[2] * x[2], w1[3] * x[3]];
+    let p2 = [w2[0] * x[0], w2[1] * x[1], w2[2] * x[2], w2[3] * x[3]];
+    let p3 = [w3[0] * x[0], w3[1] * x[1], w3[2] * x[2], w3[3] * x[3]];
+    let t0 = [p0[0], p1[0], p0[2], p1[2]];
+    let t1 = [p0[1], p1[1], p0[3], p1[3]];
+    let t2 = [p2[0], p3[0], p2[2], p3[2]];
+    let t3 = [p2[1], p3[1], p2[3], p3[3]];
+    let c0 = [t0[0], t0[1], t2[0], t2[1]];
+    let c1 = [t1[0], t1[1], t3[0], t3[1]];
+    let c2 = [t0[2], t0[3], t2[2], t2[3]];
+    let c3 = [t1[2], t1[3], t3[2], t3[3]];
+    z = [z[0] + c0[0], z[1] + c0[1], z[2] + c0[2], z[3] + c0[3]];
+    z = [z[0] + c1[0], z[1] + c1[1], z[2] + c1[2], z[3] + c1[3]];
+    z = [z[0] + c2[0], z[1] + c2[1], z[2] + c2[2], z[3] + c2[3]];
+    z = [z[0] + c3[0], z[1] + c3[1], z[2] + c3[2], z[3] + c3[3]];
+    z
+}
+
+/// Accumulate 8 rows from two column-interleaved L1D strips
+/// (`cols_lo[col] = [w0..w3]`, `cols_hi[col] = [w4..w7]`) in strict ascending
+/// column order (separate multiply then add, no FMA). Pure sequential NEON
+/// loads (`ldp q`) + indexed `fmul.4s` + interleaved `fadd.4s` with zero
+/// lane shuffles and zero strided row pointers.
+#[inline(never)]
+fn affine_block8_interleaved(
+    cols_lo: &[[f32; 4]],
+    cols_hi: &[[f32; 4]],
+    z0_inout: &mut [f32; 4],
+    z1_inout: &mut [f32; 4],
+    input: &[f32],
+) {
+    let mut z0 = *z0_inout;
+    let mut z1 = *z1_inout;
+    let (in_q, in_r) = input.as_chunks::<4>();
+    let (lo_q, lo_r) = cols_lo.as_chunks::<4>();
+    let (hi_q, hi_r) = cols_hi.as_chunks::<4>();
+    for ((&x, a), b) in in_q.iter().zip(lo_q).zip(hi_q) {
+        for k in 0..4 {
+            let xk = x[k];
+            let ca = a[k];
+            let cb = b[k];
+            let pa = [ca[0] * xk, ca[1] * xk, ca[2] * xk, ca[3] * xk];
+            let pb = [cb[0] * xk, cb[1] * xk, cb[2] * xk, cb[3] * xk];
+            z0 = [z0[0] + pa[0], z0[1] + pa[1], z0[2] + pa[2], z0[3] + pa[3]];
+            z1 = [z1[0] + pb[0], z1[1] + pb[1], z1[2] + pb[2], z1[3] + pb[3]];
+        }
+    }
+    for ((&xk, &ca), &cb) in in_r.iter().zip(lo_r).zip(hi_r) {
+        z0 = [
+            z0[0] + ca[0] * xk,
+            z0[1] + ca[1] * xk,
+            z0[2] + ca[2] * xk,
+            z0[3] + ca[3] * xk,
+        ];
+        z1 = [
+            z1[0] + cb[0] * xk,
+            z1[1] + cb[1] * xk,
+            z1[2] + cb[2] * xk,
+            z1[3] + cb[3] * xk,
+        ];
+    }
+    *z0_inout = z0;
+    *z1_inout = z1;
+}
+
+#[inline(never)]
+fn affine_block4_interleaved(cols: &[[f32; 4]], z_inout: &mut [f32; 4], input: &[f32]) {
+    let mut z = *z_inout;
+    let (in_q, in_r) = input.as_chunks::<4>();
+    let (c_q, c_r) = cols.as_chunks::<4>();
+    for (&x, a) in in_q.iter().zip(c_q) {
+        for k in 0..4 {
+            let xk = x[k];
+            let ca = a[k];
+            let pa = [ca[0] * xk, ca[1] * xk, ca[2] * xk, ca[3] * xk];
+            z = [z[0] + pa[0], z[1] + pa[1], z[2] + pa[2], z[3] + pa[3]];
+        }
+    }
+    for (&xk, &ca) in in_r.iter().zip(c_r) {
+        z = [
+            z[0] + ca[0] * xk,
+            z[1] + ca[1] * xk,
+            z[2] + ca[2] * xk,
+            z[3] + ca[3] * xk,
+        ];
+    }
+    *z_inout = z;
+}
+
 impl Weight for F16 {
     const DTYPE: WeightDtype = WeightDtype::F16;
     type TileScratch = [f32; 8 * F16_TILE_COLS];
@@ -321,30 +347,48 @@ impl Weight for F16 {
         buf: &mut Self::TileScratch,
     ) {
         let n = input.len();
-        let b0 = Self::to_f32_4([biases[0], biases[1], biases[2], biases[3]]);
-        let b1 = Self::to_f32_4([biases[4], biases[5], biases[6], biases[7]]);
-        let mut acc = [b0[0], b0[1], b0[2], b0[3], b1[0], b1[1], b1[2], b1[3]];
+        let mut z0 = Self::to_f32_4([biases[0], biases[1], biases[2], biases[3]]);
+        let mut z1 = Self::to_f32_4([biases[4], biases[5], biases[6], biases[7]]);
+        let (cols_buf, _) = buf.as_chunks_mut::<4>();
+        let (lo_buf, hi_buf) = cols_buf.split_at_mut(F16_TILE_COLS);
         if n <= F16_TILE_COLS {
-            // Single contiguous linear widen of all 8*n weights into 4 KiB
-            // L1D stack scratch, followed by pure L1D-resident F32 GEMV.
-            Self::widen_slice_into(&weights[..8 * n], &mut buf[..8 * n]);
-            f32::affine_block8(&buf[..8 * n], &acc, input, out_block, &mut ());
+            Self::widen_4rows_contiguous_interleaved_into(&weights[0..4 * n], n, &mut lo_buf[..n]);
+            Self::widen_4rows_contiguous_interleaved_into(
+                &weights[4 * n..8 * n],
+                n,
+                &mut hi_buf[..n],
+            );
+            affine_block8_interleaved(&lo_buf[..n], &hi_buf[..n], &mut z0, &mut z1, input);
         } else {
             let mut col = 0_usize;
             while col < n {
                 let len = (n - col).min(F16_TILE_COLS);
-                for row in 0..8 {
-                    let src = &weights[row * n + col..row * n + col + len];
-                    let dst = &mut buf[row * len..(row + 1) * len];
-                    Self::widen_slice_into(src, dst);
-                }
-                let next_in = &input[col..col + len];
-                let prev = acc;
-                f32::affine_block8(&buf[..8 * len], &prev, next_in, &mut acc, &mut ());
+                Self::widen_4rows_interleaved_into(
+                    &weights[col..col + len],
+                    &weights[n + col..n + col + len],
+                    &weights[2 * n + col..2 * n + col + len],
+                    &weights[3 * n + col..3 * n + col + len],
+                    &mut lo_buf[..len],
+                );
+                Self::widen_4rows_interleaved_into(
+                    &weights[4 * n + col..4 * n + col + len],
+                    &weights[5 * n + col..5 * n + col + len],
+                    &weights[6 * n + col..6 * n + col + len],
+                    &weights[7 * n + col..7 * n + col + len],
+                    &mut hi_buf[..len],
+                );
+                affine_block8_interleaved(
+                    &lo_buf[..len],
+                    &hi_buf[..len],
+                    &mut z0,
+                    &mut z1,
+                    &input[col..col + len],
+                );
                 col += len;
             }
-            *out_block = acc;
         }
+        out_block[0..4].copy_from_slice(&z0);
+        out_block[4..8].copy_from_slice(&z1);
     }
 
     #[inline]
@@ -356,26 +400,31 @@ impl Weight for F16 {
         buf: &mut Self::TileScratch,
     ) {
         let n = input.len();
-        let mut acc = Self::to_f32_4(*biases);
+        let mut z = Self::to_f32_4(*biases);
+        let (cols_buf, _) = buf.as_chunks_mut::<4>();
         if n <= F16_TILE_COLS {
-            Self::widen_slice_into(&weights[..4 * n], &mut buf[..4 * n]);
-            f32::affine_block4(&buf[..4 * n], &acc, input, out_block, &mut ());
+            Self::widen_4rows_contiguous_interleaved_into(
+                &weights[0..4 * n],
+                n,
+                &mut cols_buf[..n],
+            );
+            affine_block4_interleaved(&cols_buf[..n], &mut z, input);
         } else {
             let mut col = 0_usize;
             while col < n {
                 let len = (n - col).min(F16_TILE_COLS);
-                for row in 0..4 {
-                    let src = &weights[row * n + col..row * n + col + len];
-                    let dst = &mut buf[row * len..(row + 1) * len];
-                    Self::widen_slice_into(src, dst);
-                }
-                let next_in = &input[col..col + len];
-                let prev = acc;
-                f32::affine_block4(&buf[..4 * len], &prev, next_in, &mut acc, &mut ());
+                Self::widen_4rows_interleaved_into(
+                    &weights[col..col + len],
+                    &weights[n + col..n + col + len],
+                    &weights[2 * n + col..2 * n + col + len],
+                    &weights[3 * n + col..3 * n + col + len],
+                    &mut cols_buf[..len],
+                );
+                affine_block4_interleaved(&cols_buf[..len], &mut z, &input[col..col + len]);
                 col += len;
             }
-            *out_block = acc;
         }
+        *out_block = z;
     }
 
     #[inline]

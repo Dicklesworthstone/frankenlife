@@ -113,6 +113,170 @@ impl F16 {
         f32::from_bits((shifted & 0x8FFF_FFFF).wrapping_add(NORMAL_BIAS_DELTA_F32))
     }
 
+    /// Return `true` iff every element of `src` is a normal finite binary16
+    /// value (`0x0400 <= (bits & 0x7FFF) <= 0x7BFF`).
+    ///
+    /// A flat scalar `max` reduction over `src` lets LLVM's loop vectorizer
+    /// emit contiguous `ldp q` + `bic.8h` + `add.8h` + `umax.8h` with a single
+    /// horizontal `umaxv.8h` at the end while streaming `src` into L1D.
+    #[inline]
+    #[must_use]
+    pub fn all_normal(src: &[Self]) -> bool {
+        let mut max_u = 0_u16;
+        for &h in src {
+            let u = (h.0 & 0x7FFF).wrapping_sub(0x0400);
+            max_u = max_u.max(u);
+        }
+        max_u < 0x7800
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn widen_4rows_interleaved_slow(
+        r0: &[Self],
+        r1: &[Self],
+        r2: &[Self],
+        r3: &[Self],
+        dst: &mut [[f32; 4]],
+    ) {
+        let len = r0
+            .len()
+            .min(r1.len())
+            .min(r2.len())
+            .min(r3.len())
+            .min(dst.len());
+        let (q0, rem0) = r0[..len].as_chunks::<4>();
+        let (q1, rem1) = r1[..len].as_chunks::<4>();
+        let (q2, rem2) = r2[..len].as_chunks::<4>();
+        let (q3, rem3) = r3[..len].as_chunks::<4>();
+        let (qd, remd) = dst[..len].as_chunks_mut::<4>();
+        for ((((s0, s1), s2), s3), out) in q0.iter().zip(q1).zip(q2).zip(q3).zip(qd) {
+            let a0 = Self::to_f32_4(*s0);
+            let a1 = Self::to_f32_4(*s1);
+            let a2 = Self::to_f32_4(*s2);
+            let a3 = Self::to_f32_4(*s3);
+            for k in 0..4 {
+                out[k] = [a0[k], a1[k], a2[k], a3[k]];
+            }
+        }
+        for ((((&h0, &h1), &h2), &h3), out) in rem0.iter().zip(rem1).zip(rem2).zip(rem3).zip(remd) {
+            *out = Self::to_f32_4([h0, h1, h2, h3]);
+        }
+    }
+
+    /// Widen four contiguous equal-length binary16 rows packed in
+    /// `rows[0..4 * n]` into column-interleaved `[f32; 4]` entries in
+    /// `dst[0..n]`, bit-identical per element to [`F16::to_f32`].
+    #[inline(never)]
+    pub fn widen_4rows_contiguous_interleaved_into(rows: &[Self], n: usize, dst: &mut [[f32; 4]]) {
+        let len = n.min(rows.len() / 4).min(dst.len());
+        let used = &rows[..4 * len];
+        let r0 = &used[0..len];
+        let r1 = &used[len..2 * len];
+        let r2 = &used[2 * len..3 * len];
+        let r3 = &used[3 * len..4 * len];
+        let out = &mut dst[..len];
+        if Self::all_normal(used) {
+            Self::widen_4rows_normal_st4(r0, r1, r2, r3, out);
+            return;
+        }
+        Self::widen_4rows_interleaved_chunked(r0, r1, r2, r3, out);
+    }
+
+    /// Widen four equal-length binary16 rows into column-interleaved `[f32; 4]`
+    /// slices (`dst[col] = [r0[col], r1[col], r2[col], r3[col]]`) in one single
+    /// pass, bit-identical per element to [`F16::to_f32`] across all 65,536
+    /// binary16 patterns.
+    #[inline(never)]
+    pub fn widen_4rows_interleaved_into(
+        r0: &[Self],
+        r1: &[Self],
+        r2: &[Self],
+        r3: &[Self],
+        dst: &mut [[f32; 4]],
+    ) {
+        let len = r0
+            .len()
+            .min(r1.len())
+            .min(r2.len())
+            .min(r3.len())
+            .min(dst.len());
+        let (r0, r1, r2, r3, dst) = (
+            &r0[..len],
+            &r1[..len],
+            &r2[..len],
+            &r3[..len],
+            &mut dst[..len],
+        );
+        if Self::all_normal(r0)
+            && Self::all_normal(r1)
+            && Self::all_normal(r2)
+            && Self::all_normal(r3)
+        {
+            Self::widen_4rows_normal_st4(r0, r1, r2, r3, dst);
+            return;
+        }
+        Self::widen_4rows_interleaved_chunked(r0, r1, r2, r3, dst);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn widen_4rows_interleaved_chunked(
+        r0: &[Self],
+        r1: &[Self],
+        r2: &[Self],
+        r3: &[Self],
+        dst: &mut [[f32; 4]],
+    ) {
+        let (c0, t0) = r0.as_chunks::<16>();
+        let (c1, t1) = r1.as_chunks::<16>();
+        let (c2, t2) = r2.as_chunks::<16>();
+        let (c3, t3) = r3.as_chunks::<16>();
+        let (cd, td) = dst.as_chunks_mut::<16>();
+        for ((((s0, s1), s2), s3), out) in c0.iter().zip(c1).zip(c2).zip(c3).zip(cd) {
+            if Self::all_normal(s0)
+                && Self::all_normal(s1)
+                && Self::all_normal(s2)
+                && Self::all_normal(s3)
+            {
+                Self::widen_4rows_normal_st4(s0, s1, s2, s3, out);
+            } else {
+                Self::widen_4rows_interleaved_slow(s0, s1, s2, s3, out);
+            }
+        }
+        if !t0.is_empty() {
+            if Self::all_normal(t0)
+                && Self::all_normal(t1)
+                && Self::all_normal(t2)
+                && Self::all_normal(t3)
+            {
+                Self::widen_4rows_normal_st4(t0, t1, t2, t3, td);
+            } else {
+                Self::widen_4rows_interleaved_slow(t0, t1, t2, t3, td);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn widen_4rows_normal_st4(
+        s0: &[Self],
+        s1: &[Self],
+        s2: &[Self],
+        s3: &[Self],
+        out: &mut [[f32; 4]],
+    ) {
+        for ((((&h0, &h1), &h2), &h3), slot) in
+            s0.iter().zip(s1).zip(s2).zip(s3).zip(out.iter_mut())
+        {
+            *slot = [
+                Self::to_f32_assuming_normal(h0),
+                Self::to_f32_assuming_normal(h1),
+                Self::to_f32_assuming_normal(h2),
+                Self::to_f32_assuming_normal(h3),
+            ];
+        }
+    }
+
     /// Cold exact fallback for a 32-element chunk containing at least one
     /// zero, subnormal, infinity, or NaN value.
     #[cold]

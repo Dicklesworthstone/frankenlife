@@ -98,82 +98,76 @@ impl F16 {
         ]
     }
 
-    /// Whether every element of a 4×4 binary16 tile is normal finite
-    /// (`1 <= exponent <= 30`, i.e. `0x0400 <= (bits & 0x7FFF) <= 0x7BFF`),
-    /// so widening is an exact exponent-rebias shift with no zero, subnormal,
-    /// infinity, or NaN special cases.
+    /// Exact 3-op F32 widening for a single binary16 value already proven
+    /// normal finite (`0x0400 <= (bits & 0x7FFF) <= 0x7BFF`).
+    ///
+    /// Sign-extending `bits` to `i32` and shifting left by 13 yields
+    /// `0x0000_0000 | (mag << 13)` for positive normals and
+    /// `0xF000_0000 | (mag << 13)` for negative normals. Masking with
+    /// `0x8FFF_FFFF` (ARM64 `bic #0x70, lsl #24`) leaves `(sign << 31) |
+    /// (mag << 13)`, and adding `0x3800_0000` never carries into bit 31
+    /// because `0x0080_0000 <= (mag << 13) <= 0x0F7F_E000`.
     #[inline(always)]
-    #[must_use]
-    pub fn all_normal_4x4(rows: [[Self; 4]; 4]) -> bool {
-        let mut worst = [0_u16; 4];
-        for row in rows {
-            for (slot, h) in worst.iter_mut().zip(row) {
-                let u = (h.0 & 0x7FFF).wrapping_sub(0x0400);
-                if u > *slot {
-                    *slot = u;
-                }
-            }
-        }
-        worst[0].max(worst[1]).max(worst[2]).max(worst[3]) < 0x7800
+    fn to_f32_assuming_normal(h: Self) -> f32 {
+        let shifted = (i32::from(h.0.cast_signed()) << 13).cast_unsigned();
+        f32::from_bits((shifted & 0x8FFF_FFFF).wrapping_add(NORMAL_BIAS_DELTA_F32))
     }
 
-    /// Exact F32 widening for four binary16 values already proven normal finite
-    /// (`0x0400 <= (bits & 0x7FFF) <= 0x7BFF`). Private so callers cannot violate
-    /// the precondition.
-    #[inline(always)]
-    fn to_f32_4_assuming_normal(xs: [Self; 4]) -> [f32; 4] {
-        let mut out = [0.0_f32; 4];
-        for (dst, h) in out.iter_mut().zip(xs) {
-            let b = u32::from(h.0);
-            let sign = (b & 0x8000) << 16;
-            let mag = b & 0x7FFF;
-            *dst = f32::from_bits(sign | ((mag << 13).wrapping_add(NORMAL_BIAS_DELTA_F32)));
-        }
-        out
-    }
-
-    /// Cold exact fallback for [`F16::to_f32_4x4`] when at least one lane in
-    /// the 4×4 tile is zero, subnormal, infinity, or NaN.
+    /// Cold exact fallback for a 32-element chunk containing at least one
+    /// zero, subnormal, infinity, or NaN value.
     #[cold]
     #[inline(never)]
-    fn to_f32_4x4_slow(rows: [[Self; 4]; 4]) -> [[f32; 4]; 4] {
-        [
-            Self::to_f32_4(rows[0]),
-            Self::to_f32_4(rows[1]),
-            Self::to_f32_4(rows[2]),
-            Self::to_f32_4(rows[3]),
-        ]
-    }
-
-    /// Widen a 4×4 tile of binary16 values to F32 if and only if every element
-    /// is normal finite (`1 <= exponent <= 30`). Returns `None` if any lane is
-    /// zero, subnormal, infinity, or NaN so callers can dispatch to an
-    /// out-of-line exact fallback without repeating the tile scan.
-    #[inline(always)]
-    #[must_use]
-    pub fn to_f32_4x4_if_normal(rows: [[Self; 4]; 4]) -> Option<[[f32; 4]; 4]> {
-        if Self::all_normal_4x4(rows) {
-            Some([
-                Self::to_f32_4_assuming_normal(rows[0]),
-                Self::to_f32_4_assuming_normal(rows[1]),
-                Self::to_f32_4_assuming_normal(rows[2]),
-                Self::to_f32_4_assuming_normal(rows[3]),
-            ])
-        } else {
-            None
+    fn widen_32_slow(src: &[Self; 32], dst: &mut [f32; 32]) {
+        let (s4, _) = src.as_chunks::<4>();
+        let (d4, _) = dst.as_chunks_mut::<4>();
+        for (s, d) in s4.iter().zip(d4) {
+            *d = Self::to_f32_4(*s);
         }
     }
 
-    /// Widen a 4×4 tile of binary16 values to F32, bit-identical per element
-    /// to [`F16::to_f32`] across all 65,536 binary16 bit patterns.
+    /// Widen `src` into `dst` (up to `src.len().min(dst.len())` elements),
+    /// bit-identical per element to [`F16::to_f32`] across all 65,536 binary16
+    /// patterns.
     ///
-    /// When all 16 values are normal finite binary16 values, widens via pure
-    /// exponent-rebias arithmetic with no Sterbenz subnormal FADD or Inf/NaN
-    /// masks; otherwise delegates to [`F16::to_f32_4`].
-    #[inline(always)]
-    #[must_use]
-    pub fn to_f32_4x4(rows: [[Self; 4]; 4]) -> [[f32; 4]; 4] {
-        Self::to_f32_4x4_if_normal(rows).unwrap_or_else(|| Self::to_f32_4x4_slow(rows))
+    /// Processes 32 contiguous elements at a time with an 8-lane `u16` normal
+    /// check: when all 32 lanes are normal finite binary16 values, widens via
+    /// pure contiguous 3-op exponent rebias (`sshll #13` + `bic #0x70<<24` +
+    /// `add #0x3800_0000`), falling back to [`F16::to_f32_4`] otherwise.
+    /// Kept out-of-line so downstream GEMV accumulators cannot deform the
+    /// contiguous vector widening into strided GPR extracts.
+    #[inline(never)]
+    pub fn widen_slice_into(src: &[Self], dst: &mut [f32]) {
+        let len = src.len().min(dst.len());
+        let (src_chunks, src_rem) = src[..len].as_chunks::<32>();
+        let (dst_chunks, dst_rem) = dst[..len].as_chunks_mut::<32>();
+        for (s, d) in src_chunks.iter().zip(dst_chunks) {
+            let mut worst = [0_u16; 8];
+            for group in s.as_chunks::<8>().0 {
+                for (slot, &h) in worst.iter_mut().zip(group) {
+                    let u = (h.0 & 0x7FFF).wrapping_sub(0x0400);
+                    *slot = (*slot).max(u);
+                }
+            }
+            let max_u = worst[0]
+                .max(worst[1])
+                .max(worst[2].max(worst[3]))
+                .max(worst[4].max(worst[5]).max(worst[6].max(worst[7])));
+            if max_u < 0x7800 {
+                for (dst_slot, &h) in d.iter_mut().zip(s) {
+                    *dst_slot = Self::to_f32_assuming_normal(h);
+                }
+            } else {
+                Self::widen_32_slow(s, d);
+            }
+        }
+        let (s4, sr) = src_rem.as_chunks::<4>();
+        let (d4, dr) = dst_rem.as_chunks_mut::<4>();
+        for (s, d) in s4.iter().zip(d4) {
+            *d = Self::to_f32_4(*s);
+        }
+        for (dst_slot, &h) in dr.iter_mut().zip(sr) {
+            *dst_slot = h.to_f32();
+        }
     }
 
     /// The value as F64, exactly.

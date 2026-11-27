@@ -221,7 +221,7 @@ fn rounding_is_once_from_f64_not_through_f32() {
 }
 
 #[test]
-fn to_f32_4x4_matches_independent_decode_for_all_patterns_and_mixed_tiles() {
+fn widen_slice_into_matches_independent_decode_for_all_patterns_and_mixed_chunks() {
     let independent_bits = |bits: u16| -> u32 {
         let sign = u32::from(bits & 0x8000) << 16;
         match (bits & 0x7C00) >> 10 {
@@ -231,47 +231,24 @@ fn to_f32_4x4_matches_independent_decode_for_all_patterns_and_mixed_tiles() {
         }
     };
 
-    // Sweep every 16-pattern block across all 65,536 binary16 bit patterns
-    // (4,096 tiles), covering both fast normal tiles and slow boundary tiles.
-    let mut normal_tiles = 0_u32;
-    let mut special_tiles = 0_u32;
-    for base in (0_u32..=u32::from(u16::MAX)).step_by(16) {
-        let mut tile = [[F16::ZERO; 4]; 4];
-        let mut expect_all_normal = true;
-        for (r, row) in tile.iter_mut().enumerate() {
-            for (c, slot) in row.iter_mut().enumerate() {
-                let bits = (base + (r * 4 + c) as u32) as u16;
-                *slot = F16::from_bits(bits);
-                let exp = (bits >> 10) & 0x1F;
-                if exp == 0 || exp == 0x1F {
-                    expect_all_normal = false;
-                }
-            }
-        }
-        assert_eq!(F16::all_normal_4x4(tile), expect_all_normal);
-        if expect_all_normal {
-            normal_tiles += 1;
-        } else {
-            special_tiles += 1;
-        }
-        let got = F16::to_f32_4x4(tile);
-        for (r, (t_row, g_row)) in tile.iter().zip(&got).enumerate() {
-            for (c, (&h, &g)) in t_row.iter().zip(g_row).enumerate() {
-                let bits = h.to_bits();
-                assert_eq!(
-                    g.to_bits(),
-                    independent_bits(bits),
-                    "tile base={base:#06x} ({r},{c}) bits={bits:#06x}"
-                );
-            }
-        }
+    // Exhaustively widen all 65,536 binary16 bit patterns in one slice (2,048
+    // 32-element chunks covering both pure-normal fast chunks and boundary
+    // zero/subnormal/Inf/NaN slow chunks).
+    let all: Vec<F16> = (0..=u16::MAX).map(F16::from_bits).collect();
+    let mut widened = vec![0.0_f32; all.len()];
+    F16::widen_slice_into(&all, &mut widened);
+    for (i, (&h, &g)) in all.iter().zip(&widened).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            independent_bits(h.to_bits()),
+            "all[{i}] bits={:#06x}",
+            h.to_bits()
+        );
     }
-    assert!(normal_tiles > 3_500);
-    assert!(special_tiles > 200);
 
-    // Inject each tricky special value (+0, -0, min/max subnormal, ±Inf,
-    // signaling/quiet NaN with both signs, smallest/largest normals) into every
-    // one of the 16 tile positions amidst 15 normal values.
+    // Inject every special value (+0, -0, min/max subnormals, boundary normals,
+    // ±Inf, sNaN/qNaN) into every lane 0..32 of an otherwise-normal 32-element
+    // chunk so every position's check + slow fallback is proven bit-exact.
     let specials = [
         0x0000_u16, // +0.0
         0x8000,     // -0.0
@@ -279,40 +256,47 @@ fn to_f32_4x4_matches_independent_decode_for_all_patterns_and_mixed_tiles() {
         0x8001,     // smallest -subnormal
         0x03FF,     // largest +subnormal
         0x83FF,     // largest -subnormal
-        0x0400,     // smallest +normal (fast path!)
-        0x8400,     // smallest -normal (fast path!)
-        0x7BFF,     // largest +normal (fast path!)
-        0xFBFF,     // largest -normal (fast path!)
+        0x0400,     // smallest +normal (fast path)
+        0x8400,     // smallest -normal (fast path)
+        0x7BFF,     // largest +normal (fast path)
+        0xFBFF,     // largest -normal (fast path)
         0x7C00,     // +Inf
         0xFC00,     // -Inf
-        0x7C01,     // +sNaN payload 1
-        0xFC01,     // -sNaN payload 1
+        0x7C01,     // +sNaN
+        0xFC01,     // -sNaN
         0x7E00,     // +qNaN
-        0xFFFF,     // -qNaN all ones
+        0xFFFF,     // -qNaN
     ];
     for &special in &specials {
-        let special_is_normal = {
-            let exp = (special >> 10) & 0x1F;
-            exp != 0 && exp != 0x1F
-        };
-        for pos in 0..16 {
-            let mut tile = [[F16::from_bits(0x3C00); 4]; 4];
-            tile[pos / 4][pos % 4] = F16::from_bits(special);
-            assert_eq!(
-                F16::all_normal_4x4(tile),
-                special_is_normal,
-                "special={special:#06x} pos={pos}"
-            );
-            let got = F16::to_f32_4x4(tile);
-            for (r, (t_row, g_row)) in tile.iter().zip(&got).enumerate() {
-                for (c, (&h, &g)) in t_row.iter().zip(g_row).enumerate() {
-                    assert_eq!(
-                        g.to_bits(),
-                        independent_bits(h.to_bits()),
-                        "special={special:#06x} pos={pos} at ({r},{c})"
-                    );
-                }
+        for pos in 0..32 {
+            let mut src = [F16::from_bits(0x3C00); 32];
+            src[pos] = F16::from_bits(special);
+            let mut dst = [f32::NAN; 32];
+            F16::widen_slice_into(&src, &mut dst);
+            for (lane, (&h, &g)) in src.iter().zip(&dst).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    independent_bits(h.to_bits()),
+                    "special={special:#06x} pos={pos} lane={lane}"
+                );
             }
+        }
+    }
+
+    // Exercise unaligned tail lengths 0..=67 (32-chunks + 4-chunks + 1-tail).
+    for len in 0..=67 {
+        let src: Vec<F16> = (0..len)
+            .map(|i| F16::from_bits(specials[i % specials.len()]))
+            .collect();
+        let mut dst = vec![0.0_f32; len];
+        F16::widen_slice_into(&src, &mut dst);
+        for (i, (&h, &g)) in src.iter().zip(&dst).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                independent_bits(h.to_bits()),
+                "len={len} i={i} bits={:#06x}",
+                h.to_bits()
+            );
         }
     }
 }

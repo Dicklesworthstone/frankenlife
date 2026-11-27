@@ -1253,18 +1253,31 @@ impl<'a> ReferenceController<'a> {
         }
         scratch.reserve(self.topology.widest_hidden)?;
         let ControllerScratch { first, second } = scratch;
+        let mut tile_scratch = W::new_tile_scratch();
 
         let mut source: &[f32] = inputs;
         for (layer, activations) in hidden_layers.iter().zip([first, second]) {
             activations.resize(layer.outputs, 0.0);
-            affine_into(parameters, layer, source, activations.as_mut_slice())?;
+            affine_into(
+                parameters,
+                layer,
+                source,
+                activations.as_mut_slice(),
+                &mut tile_scratch,
+            )?;
             activate_hidden_in_place(activations.as_mut_slice())?;
             source = activations.as_slice();
         }
 
         let mut raw = RawOutputs::zeroed(output_layer.outputs)?;
         let out_slice = raw.as_mut_slice();
-        affine_into(parameters, output_layer, source, out_slice)?;
+        affine_into(
+            parameters,
+            output_layer,
+            source,
+            out_slice,
+            &mut tile_scratch,
+        )?;
         if !all_f32_finite(out_slice) {
             for (output, &z) in out_slice.iter().enumerate() {
                 if !z.is_finite() {
@@ -1454,15 +1467,12 @@ fn activate_hidden_in_place(values: &mut [f32]) -> Result<(), CoreError> {
 /// accumulators, with a 4-row block and scalar tail) over 4-input chunks so
 /// FADD latency is hidden on ARM64 NEON and x86_64 SSE/AVX while preserving
 /// exact 0-ULP left-to-right IEEE-754 summation per row.
-#[expect(
-    clippy::too_many_lines,
-    reason = "8-row, 4-row, and 1-row register-blocked 0-ULP affine kernels over generic Weight"
-)]
 fn affine_into<W: Weight>(
     parameters: &[W],
     layer: &LayerShape,
     input: &[f32],
     out: &mut [f32],
+    tile_scratch: &mut W::TileScratch,
 ) -> Result<(), CoreError> {
     let mismatch = |detail: String| CoreError::LayoutMismatch {
         buffer: "controller parameters",
@@ -1502,7 +1512,6 @@ fn affine_into<W: Weight>(
         )));
     }
 
-    let (in_q, in_r) = input.as_chunks::<4>();
     let mut o = 0_usize;
     let block8_stride = 8 * n;
     for ((w_block, b_block), o_block) in weights
@@ -1510,94 +1519,16 @@ fn affine_into<W: Weight>(
         .zip(biases.as_chunks::<8>().0)
         .zip(out.as_chunks_mut::<8>().0)
     {
-        let mut z0 = [
-            b_block[0].widen(),
-            b_block[1].widen(),
-            b_block[2].widen(),
-            b_block[3].widen(),
-        ];
-        let mut z1 = [
-            b_block[4].widen(),
-            b_block[5].widen(),
-            b_block[6].widen(),
-            b_block[7].widen(),
-        ];
-        let (r0_q, r0_r) = w_block[0..n].as_chunks::<4>();
-        let (r1_q, r1_r) = w_block[n..2 * n].as_chunks::<4>();
-        let (r2_q, r2_r) = w_block[2 * n..3 * n].as_chunks::<4>();
-        let (r3_q, r3_r) = w_block[3 * n..4 * n].as_chunks::<4>();
-        let (r4_q, r4_r) = w_block[4 * n..5 * n].as_chunks::<4>();
-        let (r5_q, r5_r) = w_block[5 * n..6 * n].as_chunks::<4>();
-        let (r6_q, r6_r) = w_block[6 * n..7 * n].as_chunks::<4>();
-        let (r7_q, r7_r) = w_block[7 * n..8 * n].as_chunks::<4>();
-
-        for ((((((((&x, w0), w1), w2), w3), w4), w5), w6), w7) in in_q
-            .iter()
-            .zip(r0_q)
-            .zip(r1_q)
-            .zip(r2_q)
-            .zip(r3_q)
-            .zip(r4_q)
-            .zip(r5_q)
-            .zip(r6_q)
-            .zip(r7_q)
-        {
-            z0 = W::mac_4x4(z0, [*w0, *w1, *w2, *w3], x);
-            z1 = W::mac_4x4(z1, [*w4, *w5, *w6, *w7], x);
-        }
-        for ((((((((&x, &w0), &w1), &w2), &w3), &w4), &w5), &w6), &w7) in in_r
-            .iter()
-            .zip(r0_r)
-            .zip(r1_r)
-            .zip(r2_r)
-            .zip(r3_r)
-            .zip(r4_r)
-            .zip(r5_r)
-            .zip(r6_r)
-            .zip(r7_r)
-        {
-            z0 = [
-                z0[0] + w0.widen() * x,
-                z0[1] + w1.widen() * x,
-                z0[2] + w2.widen() * x,
-                z0[3] + w3.widen() * x,
-            ];
-            z1 = [
-                z1[0] + w4.widen() * x,
-                z1[1] + w5.widen() * x,
-                z1[2] + w6.widen() * x,
-                z1[3] + w7.widen() * x,
-            ];
-        }
-        o_block[0..4].copy_from_slice(&z0);
-        o_block[4..8].copy_from_slice(&z1);
+        W::affine_block8(w_block, b_block, input, o_block, tile_scratch);
         o += 8;
     }
 
     while o + 4 <= layer.outputs {
         let w_block = &weights[o * n..(o + 4) * n];
-        let mut z0 = [
-            biases[o].widen(),
-            biases[o + 1].widen(),
-            biases[o + 2].widen(),
-            biases[o + 3].widen(),
-        ];
-        let (r0_q, r0_r) = w_block[0..n].as_chunks::<4>();
-        let (r1_q, r1_r) = w_block[n..2 * n].as_chunks::<4>();
-        let (r2_q, r2_r) = w_block[2 * n..3 * n].as_chunks::<4>();
-        let (r3_q, r3_r) = w_block[3 * n..4 * n].as_chunks::<4>();
-        for ((((&x, w0), w1), w2), w3) in in_q.iter().zip(r0_q).zip(r1_q).zip(r2_q).zip(r3_q) {
-            z0 = W::mac_4x4(z0, [*w0, *w1, *w2, *w3], x);
-        }
-        for ((((&x, &w0), &w1), &w2), &w3) in in_r.iter().zip(r0_r).zip(r1_r).zip(r2_r).zip(r3_r) {
-            z0 = [
-                z0[0] + w0.widen() * x,
-                z0[1] + w1.widen() * x,
-                z0[2] + w2.widen() * x,
-                z0[3] + w3.widen() * x,
-            ];
-        }
-        out[o..o + 4].copy_from_slice(&z0);
+        let b_block = [biases[o], biases[o + 1], biases[o + 2], biases[o + 3]];
+        let mut o_block = [0.0_f32; 4];
+        W::affine_block4(w_block, &b_block, input, &mut o_block, tile_scratch);
+        out[o..o + 4].copy_from_slice(&o_block);
         o += 4;
     }
 

@@ -1195,7 +1195,7 @@ pub fn observe_dual_for_controller_f32_into(
         intrinsic,
         scales,
         trail_energy_density_scale,
-        Some(value_slots),
+        value_slots,
         out_gradients,
     )?;
     let (vx, vy, de, t1x, t1y) = saturate_dual_gradients_f32_into(
@@ -1207,11 +1207,8 @@ pub fn observe_dual_for_controller_f32_into(
         x_slots,
         y_slots,
     )?;
-    let mut acc =
+    let acc =
         scalars.val_acc + (scalars.energy_norm + scalars.age_norm) + (scalars.q1 + scalars.z1_norm);
-    for &[gx, gy] in out_gradients.iter() {
-        acc += gx + gy;
-    }
     if !acc.is_finite() {
         check_finite_dual_from_raw_slow(raw, intrinsic, scales, trail_energy_density_scale)?;
     }
@@ -1273,12 +1270,11 @@ pub fn observe_dual_gradients_only_into(
     trail_energy_density_scale: f64,
     out_gradients: &mut [[f64; 2]; PLANES],
 ) -> Result<(), CoreError> {
-    let scalars = normalize_dual_to_f32(
+    let scalars = normalize_dual_gradients_into(
         raw,
         intrinsic,
         scales,
         trail_energy_density_scale,
-        None,
         out_gradients,
     )?;
     let l = scales.gradient_length;
@@ -1307,11 +1303,8 @@ pub fn observe_dual_gradients_only_into(
             }
         }
     }
-    let mut parts_acc =
+    let parts_acc =
         scalars.val_acc + (scalars.energy_norm + scalars.age_norm) + (scalars.q1 + scalars.z1_norm);
-    for &[gx, gy] in out_gradients.iter() {
-        parts_acc += gx + gy;
-    }
     if !parts_acc.is_finite() {
         return check_finite_dual_from_raw_slow(raw, intrinsic, scales, trail_energy_density_scale);
     }
@@ -1365,21 +1358,94 @@ struct DualScalars {
     z1_norm: f64,
 }
 
+#[cold]
+#[inline(never)]
+fn validate_dual_denoms_err(
+    density0: f64,
+    density1: f64,
+    intrinsic: &Intrinsic,
+    trail_energy_density_scale: f64,
+) -> CoreError {
+    if !trail_energy_density_scale.is_finite() || trail_energy_density_scale <= 0.0 {
+        return err_sensor_invalid(
+            "v2.carriers.trail_energy_density_scale",
+            format!("{trail_energy_density_scale} is not a positive scale"),
+        );
+    }
+    if !density0.is_finite() || density0 < 0.0 {
+        return err_sensor_invalid(
+            "sensed energy density",
+            format!("{density0} is not a density"),
+        );
+    }
+    if !density1.is_finite() || density1 < 0.0 {
+        return err_sensor_invalid(
+            "sensed trail energy density",
+            format!("{density1} is not a density"),
+        );
+    }
+    if !intrinsic.energy.is_finite() || intrinsic.energy < 0.0 {
+        return err_sensor_invalid(
+            "internal energy",
+            format!("{} is not an energy", intrinsic.energy),
+        );
+    }
+    if !intrinsic.age_seconds.is_finite() || intrinsic.age_seconds < 0.0 {
+        return err_sensor_invalid("age", format!("{} is not an age", intrinsic.age_seconds));
+    }
+    err_sensor_invalid(
+        "sensor normalization denominator",
+        "density, energy, or age scale sum overflowed".to_owned(),
+    )
+}
+
+#[inline(always)]
+fn validate_dual_denoms(
+    density0: f64,
+    density1: f64,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    trail_energy_density_scale: f64,
+) -> Result<(f64, f64, f64, f64, f64, f64), CoreError> {
+    let shifted0 = density0 + scales.energy_density;
+    let reg0 = density0 + scales.composition_floor;
+    let shifted1 = density1 + trail_energy_density_scale;
+    let reg1 = density1 + scales.composition_floor;
+    let energy_denom = intrinsic.energy + scales.internal_energy;
+    let age_denom = intrinsic.age_seconds + scales.age_seconds;
+    let ok = (trail_energy_density_scale > 0.0)
+        & trail_energy_density_scale.is_finite()
+        & (density0 >= 0.0)
+        & (density1 >= 0.0)
+        & (intrinsic.energy >= 0.0)
+        & (intrinsic.age_seconds >= 0.0)
+        & shifted0.is_finite()
+        & reg0.is_finite()
+        & shifted1.is_finite()
+        & reg1.is_finite()
+        & energy_denom.is_finite()
+        & age_denom.is_finite();
+    if ok {
+        Ok((shifted0, reg0, shifted1, reg1, energy_denom, age_denom))
+    } else {
+        Err(validate_dual_denoms_err(
+            density0,
+            density1,
+            intrinsic,
+            trail_energy_density_scale,
+        ))
+    }
+}
+
 #[inline]
 fn normalize_dual_to_f32(
     raw: &DualRawSample,
     intrinsic: &Intrinsic,
     scales: &SensorScales,
     trail_energy_density_scale: f64,
-    mut value_slots: Option<&mut [f32]>,
+    value_slots: &mut [f32],
     out_gradients: &mut [[f64; 2]; PLANES],
 ) -> Result<DualScalars, CoreError> {
-    if !trail_energy_density_scale.is_finite() || trail_energy_density_scale <= 0.0 {
-        return Err(err_sensor_invalid(
-            "v2.carriers.trail_energy_density_scale",
-            format!("{trail_energy_density_scale} is not a positive scale"),
-        ));
-    }
     let density0 = raw.values[0];
     let density0_x = raw.dx[0];
     let density0_y = raw.dy[0];
@@ -1387,91 +1453,87 @@ fn normalize_dual_to_f32(
     let density1 = raw.values[c1_e];
     let density1_x = raw.dx[c1_e];
     let density1_y = raw.dy[c1_e];
-    if !density0.is_finite() || density0 < 0.0 {
-        return Err(err_sensor_invalid(
-            "sensed energy density",
-            format!("{density0} is not a density"),
-        ));
-    }
-    if !density1.is_finite() || density1 < 0.0 {
-        return Err(err_sensor_invalid(
-            "sensed trail energy density",
-            format!("{density1} is not a density"),
-        ));
-    }
-    if !intrinsic.energy.is_finite() || intrinsic.energy < 0.0 {
-        return Err(err_sensor_invalid(
-            "internal energy",
-            format!("{} is not an energy", intrinsic.energy),
-        ));
-    }
-    if !intrinsic.age_seconds.is_finite() || intrinsic.age_seconds < 0.0 {
-        return Err(err_sensor_invalid(
-            "age",
-            format!("{} is not an age", intrinsic.age_seconds),
-        ));
-    }
-    let shifted0 = density0 + scales.energy_density;
-    let reg0 = density0 + scales.composition_floor;
-    let shifted1 = density1 + trail_energy_density_scale;
-    let reg1 = density1 + scales.composition_floor;
-    let energy_denom = intrinsic.energy + scales.internal_energy;
-    let age_denom = intrinsic.age_seconds + scales.age_seconds;
-    if !shifted0.is_finite()
-        || !reg0.is_finite()
-        || !shifted1.is_finite()
-        || !reg1.is_finite()
-        || !energy_denom.is_finite()
-        || !age_denom.is_finite()
-    {
-        return Err(err_sensor_invalid(
-            "sensor normalization denominator",
-            "density, energy, or age scale sum overflowed".to_owned(),
-        ));
-    }
+    let (shifted0, reg0, shifted1, reg1, energy_denom, age_denom) = validate_dual_denoms(
+        density0,
+        density1,
+        intrinsic,
+        scales,
+        trail_energy_density_scale,
+    )?;
+
     let slope0 = scales.energy_density / (shifted0 * shifted0);
     let q0 = density0 / shifted0;
-    let mut val_acc = q0;
-    if let Some(slots) = value_slots.as_deref_mut()
-        && let Some(slot) = slots.first_mut()
-    {
+    let gx0 = slope0 * density0_x;
+    let gy0 = slope0 * density0_y;
+    if let Some(slot) = value_slots.first_mut() {
         *slot = q0 as f32;
     }
-    out_gradients[0] = [slope0 * density0_x, slope0 * density0_y];
+    out_gradients[0] = [gx0, gy0];
+    let mut val_acc = [q0 + (gx0 + gy0), 0.0_f64];
 
-    let c0_count = CARRIER0_MOMENT_CHANNELS as usize;
-    for k in 0..c0_count {
-        let p = 1 + k;
-        let z = raw.values[p] / reg0;
-        val_acc += z;
-        if let Some(slots) = value_slots.as_deref_mut()
-            && let Some(slot) = slots.get_mut(p)
-        {
-            *slot = z as f32;
-        }
-        out_gradients[p] = [
-            (raw.dx[p] - z * density0_x) / reg0,
-            (raw.dy[p] - z * density0_y) / reg0,
+    // Carrier 0: 24 chemical channels processed in 2-channel pairs so LLVM emits
+    // clean `fdiv.2d` + `st2.2d` with zero per-channel `Option` or bounds checks.
+    let c0_end = 1 + CARRIER0_MOMENT_CHANNELS as usize;
+    for ((((dst_f32, gc), &m), &mx), &my) in value_slots[1..c0_end]
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(out_gradients[1..c0_end].as_chunks_mut::<2>().0)
+        .zip(raw.values[1..c0_end].as_chunks::<2>().0)
+        .zip(raw.dx[1..c0_end].as_chunks::<2>().0)
+        .zip(raw.dy[1..c0_end].as_chunks::<2>().0)
+    {
+        let z0 = m[0] / reg0;
+        let z1 = m[1] / reg0;
+        *dst_f32 = [z0 as f32, z1 as f32];
+        let g0 = [
+            (mx[0] - z0 * density0_x) / reg0,
+            (my[0] - z0 * density0_y) / reg0,
+        ];
+        let g1 = [
+            (mx[1] - z1 * density0_x) / reg0,
+            (my[1] - z1 * density0_y) / reg0,
+        ];
+        gc[0] = g0;
+        gc[1] = g1;
+        val_acc = [
+            val_acc[0] + (z0 + (g0[0] + g0[1])),
+            val_acc[1] + (z1 + (g1[0] + g1[1])),
         ];
     }
 
+    // Carrier 1: 8 persistent trail channels processed in 2-channel pairs while
+    // keeping strict ascending `z1_sq` summation order (0-ULP bit-exact).
     let c1_first = CARRIER1_FIRST_MOMENT_PLANE as usize;
-    let c1_count = CARRIER1_MOMENT_CHANNELS as usize;
+    let c1_end = c1_first + CARRIER1_MOMENT_CHANNELS as usize;
     let mut z1_sq = 0.0_f64;
-    for j in 0..c1_count {
-        let src = c1_first + j;
-        let dst = 1 + c0_count + j;
-        let z = raw.values[src] / reg1;
-        z1_sq += z * z;
-        val_acc += z;
-        if let Some(slots) = value_slots.as_deref_mut()
-            && let Some(slot) = slots.get_mut(dst)
-        {
-            *slot = z as f32;
-        }
-        out_gradients[dst] = [
-            (raw.dx[src] - z * density1_x) / reg1,
-            (raw.dy[src] - z * density1_y) / reg1,
+    for ((((dst_f32, gc), &m), &mx), &my) in value_slots[c0_end..]
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(out_gradients[c0_end..].as_chunks_mut::<2>().0)
+        .zip(raw.values[c1_first..c1_end].as_chunks::<2>().0)
+        .zip(raw.dx[c1_first..c1_end].as_chunks::<2>().0)
+        .zip(raw.dy[c1_first..c1_end].as_chunks::<2>().0)
+    {
+        let z0 = m[0] / reg1;
+        let z1 = m[1] / reg1;
+        z1_sq += z0 * z0;
+        z1_sq += z1 * z1;
+        *dst_f32 = [z0 as f32, z1 as f32];
+        let g0 = [
+            (mx[0] - z0 * density1_x) / reg1,
+            (my[0] - z0 * density1_y) / reg1,
+        ];
+        let g1 = [
+            (mx[1] - z1 * density1_x) / reg1,
+            (my[1] - z1 * density1_y) / reg1,
+        ];
+        gc[0] = g0;
+        gc[1] = g1;
+        val_acc = [
+            val_acc[0] + (z0 + (g0[0] + g0[1])),
+            val_acc[1] + (z1 + (g1[0] + g1[1])),
         ];
     }
 
@@ -1485,7 +1547,115 @@ fn normalize_dual_to_f32(
         f64::NAN
     };
     Ok(DualScalars {
-        val_acc,
+        val_acc: val_acc[0] + val_acc[1],
+        energy_norm: intrinsic.energy / energy_denom,
+        age_norm: intrinsic.age_seconds / age_denom,
+        q1,
+        dq1_x,
+        dq1_y,
+        z1_norm,
+    })
+}
+
+#[inline]
+fn normalize_dual_gradients_into(
+    raw: &DualRawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    trail_energy_density_scale: f64,
+    out_gradients: &mut [[f64; 2]; PLANES],
+) -> Result<DualScalars, CoreError> {
+    let density0 = raw.values[0];
+    let density0_x = raw.dx[0];
+    let density0_y = raw.dy[0];
+    let c1_e = CARRIER1_ENERGY_PLANE as usize;
+    let density1 = raw.values[c1_e];
+    let density1_x = raw.dx[c1_e];
+    let density1_y = raw.dy[c1_e];
+    let (shifted0, reg0, shifted1, reg1, energy_denom, age_denom) = validate_dual_denoms(
+        density0,
+        density1,
+        intrinsic,
+        scales,
+        trail_energy_density_scale,
+    )?;
+
+    let slope0 = scales.energy_density / (shifted0 * shifted0);
+    let q0 = density0 / shifted0;
+    let gx0 = slope0 * density0_x;
+    let gy0 = slope0 * density0_y;
+    out_gradients[0] = [gx0, gy0];
+    let mut val_acc = [q0 + (gx0 + gy0), 0.0_f64];
+
+    let c0_end = 1 + CARRIER0_MOMENT_CHANNELS as usize;
+    for (((gc, &m), &mx), &my) in out_gradients[1..c0_end]
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(raw.values[1..c0_end].as_chunks::<2>().0)
+        .zip(raw.dx[1..c0_end].as_chunks::<2>().0)
+        .zip(raw.dy[1..c0_end].as_chunks::<2>().0)
+    {
+        let z0 = m[0] / reg0;
+        let z1 = m[1] / reg0;
+        let g0 = [
+            (mx[0] - z0 * density0_x) / reg0,
+            (my[0] - z0 * density0_y) / reg0,
+        ];
+        let g1 = [
+            (mx[1] - z1 * density0_x) / reg0,
+            (my[1] - z1 * density0_y) / reg0,
+        ];
+        gc[0] = g0;
+        gc[1] = g1;
+        val_acc = [
+            val_acc[0] + (z0 + (g0[0] + g0[1])),
+            val_acc[1] + (z1 + (g1[0] + g1[1])),
+        ];
+    }
+
+    let c1_first = CARRIER1_FIRST_MOMENT_PLANE as usize;
+    let c1_end = c1_first + CARRIER1_MOMENT_CHANNELS as usize;
+    let mut z1_sq = 0.0_f64;
+    for (((gc, &m), &mx), &my) in out_gradients[c0_end..]
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(raw.values[c1_first..c1_end].as_chunks::<2>().0)
+        .zip(raw.dx[c1_first..c1_end].as_chunks::<2>().0)
+        .zip(raw.dy[c1_first..c1_end].as_chunks::<2>().0)
+    {
+        let z0 = m[0] / reg1;
+        let z1 = m[1] / reg1;
+        z1_sq += z0 * z0;
+        z1_sq += z1 * z1;
+        let g0 = [
+            (mx[0] - z0 * density1_x) / reg1,
+            (my[0] - z0 * density1_y) / reg1,
+        ];
+        let g1 = [
+            (mx[1] - z1 * density1_x) / reg1,
+            (my[1] - z1 * density1_y) / reg1,
+        ];
+        gc[0] = g0;
+        gc[1] = g1;
+        val_acc = [
+            val_acc[0] + (z0 + (g0[0] + g0[1])),
+            val_acc[1] + (z1 + (g1[0] + g1[1])),
+        ];
+    }
+
+    let slope1 = trail_energy_density_scale / (shifted1 * shifted1);
+    let q1 = density1 / shifted1;
+    let dq1_x = slope1 * density1_x;
+    let dq1_y = slope1 * density1_y;
+    let z1_norm = if z1_sq.is_finite() {
+        z1_sq.sqrt().min(1.0)
+    } else {
+        f64::NAN
+    };
+    Ok(DualScalars {
+        val_acc: val_acc[0] + val_acc[1],
         energy_norm: intrinsic.energy / energy_denom,
         age_norm: intrinsic.age_seconds / age_denom,
         q1,

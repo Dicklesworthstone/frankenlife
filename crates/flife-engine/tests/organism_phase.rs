@@ -1198,3 +1198,84 @@ fn acceleration_slice_catches_nonfinite_gradients_even_at_zero_response() {
         })
     ));
 }
+
+#[test]
+fn acceleration_v2_catches_nonfinite_gradients_and_invalid_inputs() {
+    use flife_field::settle::{MotorSteeringConstants, MotorSteeringInputs};
+
+    let motion = Motion::new(step(1, 1), 0.0, 4.0, 4.0, 1.0, 2.0).expect("motion");
+    let zero_resp = MotionResponse::new([0.0; RESPONSE_TERMS], &motion).expect("zero response");
+    let constants = MotorSteeringConstants {
+        energy_gradient_gain: 0.5,
+        chemical_gradient_gain: 0.5,
+        chiral_contour_gain: 0.25,
+        heading_propulsion_fraction: 0.2,
+        internal_energy_scale: 1.0,
+    };
+    let active_motor = MotorSteeringInputs {
+        energy_gradient: 0.25,
+        chemical_gradient: -0.5,
+        chiral_contour: 0.125,
+        heading_propulsion: 0.5,
+    };
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for axis in 0..2 {
+            for slot in [0, 1, 17, RESPONSE_TERMS - 1] {
+                let mut grad = [[0.0; 2]; RESPONSE_TERMS];
+                grad[slot][axis] = bad;
+                assert!(
+                    matches!(
+                        motion.acceleration_v2(
+                            1.0,
+                            &zero_resp,
+                            &grad,
+                            [0.1, -0.2],
+                            2.0,
+                            &constants,
+                            active_motor,
+                        ),
+                        Err(CoreError::NumericalInvalid {
+                            quantity: "sensor gradient",
+                            ..
+                        })
+                    ),
+                    "acceleration_v2 must refuse nonfinite gradient {bad} at slot {slot} axis {axis}"
+                );
+            }
+        }
+    }
+    let clean_grad = [[0.1, -0.2]; RESPONSE_TERMS];
+    assert!(matches!(
+        motion.acceleration_v2(
+            1.0,
+            &zero_resp,
+            &clean_grad,
+            [0.1, -0.2],
+            2.0,
+            &constants,
+            MotorSteeringInputs {
+                energy_gradient: 1.5,
+                ..active_motor
+            },
+        ),
+        Err(CoreError::NumericalInvalid {
+            quantity: "motor.energy_gradient",
+            ..
+        })
+    ));
+    assert!(matches!(
+        motion.acceleration_v2(
+            1.0,
+            &zero_resp,
+            &clean_grad,
+            [0.1, -0.2],
+            -0.1,
+            &constants,
+            active_motor,
+        ),
+        Err(CoreError::NumericalInvalid {
+            quantity: "post-maintenance energy",
+            ..
+        })
+    ));
+}

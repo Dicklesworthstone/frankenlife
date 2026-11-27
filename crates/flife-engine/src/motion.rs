@@ -269,72 +269,143 @@ impl Motion {
         constants: &MotorSteeringConstants,
         motor: MotorSteeringInputs,
     ) -> Result<[f64; 2], CoreError> {
-        for (name, value) in [
-            ("motor.energy_gradient", motor.energy_gradient),
-            ("motor.chemical_gradient", motor.chemical_gradient),
-            ("motor.chiral_contour", motor.chiral_contour),
-            ("motor.heading_propulsion", motor.heading_propulsion),
-        ] {
-            if !value.is_finite() || value.abs() > 1.0 {
-                return Err(CoreError::NumericalInvalid {
-                    quantity: name,
-                    detail: format!("{value} is outside [-1, 1]"),
-                });
+        #[cold]
+        #[inline(never)]
+        fn err_motor_range(quantity: &'static str, value: f64) -> CoreError {
+            CoreError::NumericalInvalid {
+                quantity,
+                detail: format!("{value} is outside [-1, 1]"),
             }
         }
+        #[cold]
+        #[inline(never)]
+        fn err_v2_inputs(
+            uptake_ratio: f64,
+            velocity: [f64; 2],
+            remaining: f64,
+            internal_energy_scale: f64,
+            g0: [f64; 2],
+            motor: MotorSteeringInputs,
+        ) -> CoreError {
+            for (name, value) in [
+                ("motor.energy_gradient", motor.energy_gradient),
+                ("motor.chemical_gradient", motor.chemical_gradient),
+                ("motor.chiral_contour", motor.chiral_contour),
+                ("motor.heading_propulsion", motor.heading_propulsion),
+            ] {
+                if !value.is_finite() || value.abs() > 1.0 {
+                    return err_motor_range(name, value);
+                }
+            }
+            if !(0.0..=1.0).contains(&uptake_ratio) {
+                return CoreError::NumericalInvalid {
+                    quantity: "uptake ratio",
+                    detail: format!("{uptake_ratio} is outside [0, 1]"),
+                };
+            }
+            if !velocity[0].is_finite() || !velocity[1].is_finite() {
+                return CoreError::NumericalInvalid {
+                    quantity: "organism velocity",
+                    detail: format!("{velocity:?} is not finite"),
+                };
+            }
+            if !remaining.is_finite() || remaining < 0.0 {
+                return CoreError::NumericalInvalid {
+                    quantity: "post-maintenance energy",
+                    detail: format!("{remaining} is not finite and nonnegative"),
+                };
+            }
+            if !internal_energy_scale.is_finite() || internal_energy_scale <= 0.0 {
+                return CoreError::NumericalInvalid {
+                    quantity: "sensors.internal_energy_scale",
+                    detail: format!("{internal_energy_scale} must be finite and positive"),
+                };
+            }
+            CoreError::NumericalInvalid {
+                quantity: "sensor gradient",
+                detail: format!("{g0:?} is not finite"),
+            }
+        }
+        #[cold]
+        #[inline(never)]
+        fn err_nonfinite_gradient(gradient: [f64; 2]) -> CoreError {
+            CoreError::NumericalInvalid {
+                quantity: "sensor gradient",
+                detail: format!("{gradient:?} is not finite"),
+            }
+        }
+        #[cold]
+        #[inline(never)]
+        fn err_v_sq_overflow(velocity: [f64; 2]) -> CoreError {
+            CoreError::NumericalInvalid {
+                quantity: "organism velocity",
+                detail: format!("{velocity:?} norm squared overflowed"),
+            }
+        }
+        #[cold]
+        #[inline(never)]
+        fn err_g_sq_overflow(gsum_x: f64, gsum_y: f64) -> CoreError {
+            CoreError::NumericalInvalid {
+                quantity: "chemical gradient sum",
+                detail: format!("[{gsum_x}, {gsum_y}] norm squared overflowed"),
+            }
+        }
+        #[cold]
+        #[inline(never)]
+        fn err_e_denom(e_denom: f64) -> CoreError {
+            CoreError::NumericalInvalid {
+                quantity: "energy gate denominator",
+                detail: format!("{e_denom} is invalid"),
+            }
+        }
+
         if motor.is_zero() {
             return self.acceleration(uptake_ratio, response, gradients);
         }
-        if !(0.0..=1.0).contains(&uptake_ratio) {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "uptake ratio",
-                detail: format!("{uptake_ratio} is outside [0, 1]"),
-            });
-        }
-        if !velocity[0].is_finite() || !velocity[1].is_finite() {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "organism velocity",
-                detail: format!("{velocity:?} is not finite"),
-            });
-        }
-        if !remaining.is_finite() || remaining < 0.0 {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "post-maintenance energy",
-                detail: format!("{remaining} is not finite and nonnegative"),
-            });
-        }
-        if !constants.internal_energy_scale.is_finite() || constants.internal_energy_scale <= 0.0 {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "sensors.internal_energy_scale",
-                detail: format!(
-                    "{} must be finite and positive",
-                    constants.internal_energy_scale
-                ),
-            });
+        let g0 = gradients[0];
+        let inputs_ok = (motor.energy_gradient.abs() <= 1.0)
+            & (motor.chemical_gradient.abs() <= 1.0)
+            & (motor.chiral_contour.abs() <= 1.0)
+            & (motor.heading_propulsion.abs() <= 1.0)
+            & (0.0..=1.0).contains(&uptake_ratio)
+            & velocity[0].is_finite()
+            & velocity[1].is_finite()
+            & remaining.is_finite()
+            & (remaining >= 0.0)
+            & constants.internal_energy_scale.is_finite()
+            & (constants.internal_energy_scale > 0.0)
+            & g0[0].is_finite()
+            & g0[1].is_finite();
+        if !inputs_ok {
+            return Err(err_v2_inputs(
+                uptake_ratio,
+                velocity,
+                remaining,
+                constants.internal_energy_scale,
+                g0,
+                motor,
+            ));
         }
 
-        let g0 = gradients[0];
-        if !g0[0].is_finite() || !g0[1].is_finite() {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "sensor gradient",
-                detail: format!("{g0:?} is not finite"),
-            });
-        }
         let ge_x = response.0[0] * g0[0];
         let ge_y = response.0[0] * g0[1];
 
-        let mut gc_x = 0.0_f64;
-        let mut gc_y = 0.0_f64;
-        for (&coefficient, &gradient) in response.0[1..].iter().zip(&gradients[1..]) {
-            if !gradient[0].is_finite() || !gradient[1].is_finite() {
-                return Err(CoreError::NumericalInvalid {
-                    quantity: "sensor gradient",
-                    detail: format!("{gradient:?} is not finite"),
-                });
-            }
-            gc_x += coefficient * gradient[0];
-            gc_y += coefficient * gradient[1];
+        // Accumulate all 32 chemical gradient terms in exact ascending order
+        // without per-channel error branches so LLVM emits 2-wide NEON
+        // (`ldr q` + `fmul.2d` + `fadd.2d`). Any nonfinite gradient produces
+        // `NaN` or `±Inf` (including `0.0 * ±Inf = NaN`), caught monotonically.
+        let mut gc = [0.0_f64; 2];
+        for (&c, &g) in response.0[1..].iter().zip(&gradients[1..]) {
+            gc = [gc[0] + c * g[0], gc[1] + c * g[1]];
         }
+        if !(gc[0].is_finite() && gc[1].is_finite()) {
+            for &gradient in &gradients[1..] {
+                if !gradient[0].is_finite() || !gradient[1].is_finite() {
+                    return Err(err_nonfinite_gradient(gradient));
+                }
+            }
+        }
+        let [gc_x, gc_y] = gc;
 
         let gsum_x = ge_x + gc_x;
         let gsum_y = ge_y + gc_y;
@@ -343,10 +414,7 @@ impl Motion {
 
         let v_sq = velocity[0] * velocity[0] + velocity[1] * velocity[1];
         if !v_sq.is_finite() {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "organism velocity",
-                detail: format!("{velocity:?} norm squared overflowed"),
-            });
+            return Err(err_v_sq_overflow(velocity));
         }
         let v_norm = v_sq.sqrt();
         let (hx, hy) = if HEADING_EPS < v_norm {
@@ -354,10 +422,7 @@ impl Motion {
         } else {
             let g_sq = gsum_x * gsum_x + gsum_y * gsum_y;
             if !g_sq.is_finite() {
-                return Err(CoreError::NumericalInvalid {
-                    quantity: "chemical gradient sum",
-                    detail: format!("[{gsum_x}, {gsum_y}] norm squared overflowed"),
-                });
+                return Err(err_g_sq_overflow(gsum_x, gsum_y));
             }
             let g_norm = g_sq.sqrt();
             if HEADING_EPS < g_norm {
@@ -378,10 +443,7 @@ impl Motion {
 
         let e_denom = remaining + constants.internal_energy_scale;
         if !e_denom.is_finite() || e_denom == 0.0 {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "energy gate denominator",
-                detail: format!("{e_denom} is invalid"),
-            });
+            return Err(err_e_denom(e_denom));
         }
         let energy_gate = remaining / e_denom;
         let prop_mag = ((constants.heading_propulsion_fraction * self.maximum_acceleration)

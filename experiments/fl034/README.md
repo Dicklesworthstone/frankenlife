@@ -266,3 +266,61 @@ from the Interactive preset.
 - The rule tests only `final_live`.
 - These runs say nothing about speed: they ran on the CPU reference on x86-64 hosts, two at a time. The
   Desktop profile's G4/G6 qualification is FL-034's remaining work.
+
+# FL-034 G6: the two profiles in a window (to run)
+
+G6 (plan §21.3) asks a qualified profile for 30 fps display and a p95 input/camera latency of at most 100 ms
+during live inference. It is shown in a real window. A window takes the operator's focus, so agent sessions
+measure only offscreen, and those numbers are not G6 evidence. This is the run that shows it.
+
+## The worlds
+
+Each profile is measured on an evolved world, not a founding one (see [Why](#why)). Run each world to tick 8,192
+once on the Mac, from the repository, with a release `flife`, keeping it in a run directory:
+
+```text
+flife run presets/interactive-world.toml --ticks 8192 --every 1024 --cpu-workers 16 \
+  --run-dir INTERACTIVE_RUN --checkpoint-every 0
+sed 's/^seed = 42$/seed = 2022/' presets/desktop-world.toml > desktop-2022.toml
+flife run desktop-2022.toml --ticks 8192 --every 1024 --cpu-workers 16 \
+  --run-dir DESKTOP_RUN --checkpoint-every 0
+```
+
+The Interactive world is the preset on its own seed, as E1 ran it above. The Desktop world is on E2's held-out
+seed 2022. Neither reaches E1's or E2's end state on today's tree. On the Mac at 7b4a4e5, the Interactive world
+ends at tick 8,192 with 22,559 live (digest `595e2d90…3167b`, the same with CPU and with Metal controllers),
+where E1 had 22,779 (`a8b7f6b3…5eb34`). A Mac run of the Desktop world earlier on 2026-11-27 ended with 99,065
+live and 389,045 births, where E2 had 99,361 and 389,349. Each pair matches at peak and least live, so the runs
+part late; FL-034 records the search for the change. A window
+run resumes each world and keeps it on in its directory, so every run starts where the last one stopped,
+near the same population.
+
+## The run
+
+With nothing else heavy on the Mac (note the load average before and after):
+
+```text
+FLIFE_G6_INTERACTIVE_RUN=INTERACTIVE_RUN FLIFE_G6_DESKTOP_RUN=DESKTOP_RUN \
+  cargo test --release --locked -p flife-studio --features synthetic-input --test window_g6
+```
+
+Where cargo is the rch shim, keep this build on the Mac as `scripts/studio.sh` does
+(`env -u RCH_REQUIRE_REMOTE RCH_SHIM_LOCAL_IDE=1`, with `CARGO_TARGET_DIR` on the build disk).
+
+`crates/flife-studio/tests/window_g6.rs` runs FL-024's three small-world cases first. It then resumes each world
+in a window at its `[presentation]` size (1920 × 1080 points, 3840 × 2160 pixels at 2× Retina), with Metal
+controllers on 16 workers. Each world runs for 20 s, paced to 30 fps, with the HUD drawn. The test posts a real
+AppKit scroll at the content's centre in every third frame interval, zooming in and out in turn.
+
+## Declared before the run
+
+A profile shows G6 when its case prints a `G6 [...]` line and passes every check:
+
+- it presents at least 98% of the paced rate, 29.4 fps;
+- the `MoveLatencyBound` p95 is at most 100 ms;
+- no input is dropped or refused, and every move posted moves the view;
+- no frame is read back.
+
+One run is made on each world, and the Mac's load is recorded with it. Its `G6 [...]` lines and the commit go on
+FL-034 (`flife-2je`). A failing case leaves G6 unshown for that profile. It is not retried until something has
+changed.

@@ -13,6 +13,16 @@
 //! Also exercises the real-window interactive paths (`T` tracking, `G` measurement disk,
 //! `W` weight dump, `C`/`[`/`]` field mappings) that previously ran only offscreen.
 //!
+//! Every case fails below 98% of the configuration's paced frame rate (G6's 30 fps
+//! display) or above a `MoveLatencyBound` p95 of 100 ms.
+//!
+//! FL-034's profile cases (plan §19.5, §21.3) run when these name kept run directories:
+//! `FLIFE_G6_INTERACTIVE_RUN` (the evolved 25k Interactive world) and
+//! `FLIFE_G6_DESKTOP_RUN` (the evolved 100k Desktop ecology world). Each is resumed as
+//! `flife-studio --resume` resumes it, at its `[presentation]` size, with Metal
+//! controllers on 16 workers, for 20 s, and kept on there. Its digest is not compared
+//! (that is G4's), and `experiments/fl034/README.md` says how to make the worlds.
+//!
 //! Run in release for G6 measurements:
 //! ```text
 //! cargo test --release --locked -p flife-studio --features synthetic-input --test window_g6
@@ -26,6 +36,7 @@
 )]
 
 use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -39,6 +50,16 @@ use flife_studio::{
 use fmn_render::metal::{LogicalPoint, Modifiers, PointerButton, SyntheticInput};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
+
+/// FL-034's profile cases: each one's label and the variable naming its run directory.
+const PROFILE_RUNS: [(&str, &str); 2] = [
+    ("interactive-25k-metal16", "FLIFE_G6_INTERACTIVE_RUN"),
+    ("desktop-100k-metal16", "FLIFE_G6_DESKTOP_RUN"),
+];
+
+/// The least share of the paced frame rate a case must present (G6's 30 fps display): a
+/// frame that overruns its slot is not made up, so this lets one slot's time in fifty be lost.
+const PACED_SHARE: f64 = 0.98;
 
 struct Lcg(u64);
 
@@ -70,6 +91,8 @@ struct WindowG6Result {
     wall_seconds: f64,
     presented: u64,
     fps: f64,
+    /// The configuration's `[presentation] frames_per_second`, which the loop paces to.
+    paced_fps: f64,
     ticks: u64,
     ticks_per_second: f64,
     batched_evals: u64,
@@ -91,8 +114,15 @@ struct WindowG6Result {
     digest_hex: String,
 }
 
+/// One case on `config`'s world, founded, or with `resume` the run kept there, which must
+/// be `config`'s.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one case's settings, as main lists them"
+)]
 fn run_window_g6(
     config: &ValidatedConfig,
+    resume: Option<&Path>,
     label: &'static str,
     logical: [u32; 2],
     workers: usize,
@@ -100,8 +130,14 @@ fn run_window_g6(
     duration: Duration,
     verify_digest: bool,
 ) -> Result<WindowG6Result, String> {
+    if resume.is_some() && verify_digest {
+        return Err(format!(
+            "{label}: a resumed world has no founding to step directly"
+        ));
+    }
     let model = config.config();
-    let period = Duration::from_secs_f64(1.0 / f64::from(model.presentation.frames_per_second));
+    let paced_fps = f64::from(model.presentation.frames_per_second);
+    let period = Duration::from_secs_f64(1.0 / paced_fps);
     let options = StudioOptions {
         title: format!("FrankenLife G6 ({label})"),
         size: Some(logical),
@@ -114,7 +150,11 @@ fn run_window_g6(
         record: false,
         run: None,
     };
-    let mut studio = Studio::open(config, &options).map_err(|e| format!("{label} open: {e}"))?;
+    let mut studio = match resume {
+        Some(run) => Studio::resume(run, &options),
+        None => Studio::open(config, &options),
+    }
+    .map_err(|e| format!("{label} open: {e}"))?;
     let keys = legends(config).map_err(|e| format!("{label} legends: {e}"))?;
     let mut clocks = ClockMeter::new(config.report().timestep);
 
@@ -345,6 +385,7 @@ fn run_window_g6(
         wall_seconds,
         presented,
         fps: presented as f64 / wall_seconds,
+        paced_fps,
         ticks,
         ticks_per_second: ticks as f64 / wall_seconds,
         batched_evals,
@@ -598,8 +639,10 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    struct G6Case {
+    struct G6Case<'a> {
         label: &'static str,
+        config: &'a ValidatedConfig,
+        resume: Option<&'a Path>,
         logical: [u32; 2],
         workers: usize,
         controllers: ControllerChoice,
@@ -607,9 +650,33 @@ fn main() -> ExitCode {
         verify_digest: bool,
     }
 
-    let cases = [
+    // FL-034's evolved worlds, where their variables name them.
+    let mut profiles: Vec<(&'static str, PathBuf, ValidatedConfig)> = Vec::new();
+    for (label, variable) in PROFILE_RUNS {
+        let Some(run) = std::env::var_os(variable).map(PathBuf::from) else {
+            println!("window_g6: [{label}] skipped: {variable} is not set");
+            continue;
+        };
+        let loaded = std::fs::read_to_string(run.join("config.toml"))
+            .map_err(|e| e.to_string())
+            .and_then(|text| ValidatedConfig::from_toml(&text).map_err(|e| e.to_string()));
+        match loaded {
+            Ok(profile) => profiles.push((label, run, profile)),
+            Err(e) => {
+                eprintln!(
+                    "window_g6: [{label}] {variable}={}: no configuration: {e}",
+                    run.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let small = [
         G6Case {
             label: "1080p-retina-cpu16",
+            config: &config,
+            resume: None,
             logical: [960, 540],
             workers: 16,
             controllers: ControllerChoice::Cpu,
@@ -618,6 +685,8 @@ fn main() -> ExitCode {
         },
         G6Case {
             label: "1080p-retina-metal8",
+            config: &config,
+            resume: None,
             logical: [960, 540],
             workers: 8,
             controllers: ControllerChoice::Metal,
@@ -626,6 +695,8 @@ fn main() -> ExitCode {
         },
         G6Case {
             label: "4k-retina-cpu16",
+            config: &config,
+            resume: None,
             logical: [1920, 1080],
             workers: 16,
             controllers: ControllerChoice::Cpu,
@@ -633,11 +704,25 @@ fn main() -> ExitCode {
             verify_digest: false,
         },
     ];
+    let profile_cases = profiles.iter().map(|&(label, ref run, ref profile)| {
+        let presentation = &profile.config().presentation;
+        G6Case {
+            label,
+            config: profile,
+            resume: Some(run.as_path()),
+            logical: [presentation.width, presentation.height],
+            workers: 16,
+            controllers: ControllerChoice::Metal,
+            secs: 20,
+            verify_digest: false,
+        }
+    });
 
-    for case in cases {
+    for case in small.into_iter().chain(profile_cases) {
         let label = case.label;
         match run_window_g6(
-            &config,
+            case.config,
+            case.resume,
             case.label,
             case.logical,
             case.workers,
@@ -696,6 +781,15 @@ fn main() -> ExitCode {
                     eprintln!("window_g6: [{label}] moves_unmoved={}", r.moves_unmoved);
                     return ExitCode::FAILURE;
                 }
+                if r.fps < PACED_SHARE * r.paced_fps {
+                    eprintln!(
+                        "window_g6: [{label}] presented {:.2} fps < {:.0}% of the paced {:.0} fps G6 display",
+                        r.fps,
+                        100.0 * PACED_SHARE,
+                        r.paced_fps
+                    );
+                    return ExitCode::FAILURE;
+                }
                 if r.bound_p95_ms > 100.0 {
                     eprintln!(
                         "window_g6: [{label}] MoveLatencyBound p95 {:.1} ms > 100.0 ms G6 limit",
@@ -710,6 +804,10 @@ fn main() -> ExitCode {
             }
         }
     }
-    println!("window_g6: all real-window G6 profiles passed");
+    println!(
+        "window_g6: all real-window G6 cases passed ({} of FL-034's {} profiles run)",
+        profiles.len(),
+        PROFILE_RUNS.len()
+    );
     ExitCode::SUCCESS
 }

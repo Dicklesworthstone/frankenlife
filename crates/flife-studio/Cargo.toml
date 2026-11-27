@@ -61,7 +61,8 @@ harness = false
 required-features = ["synthetic-input"]
 
 # Real-window G6 interactive frame-rate, latency, and HUD/tracking/measure
-# qualification (FL-024):
+# qualification (FL-024), and FL-034's profile cases when FLIFE_G6_INTERACTIVE_RUN
+# and FLIFE_G6_DESKTOP_RUN name their run directories (experiments/fl034/README.md):
 # `cargo test --release -p flife-studio --features synthetic-input --test window_g6`.
 [[test]]
 name = "window_g6"

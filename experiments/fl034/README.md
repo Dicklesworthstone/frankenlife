@@ -300,7 +300,10 @@ The tick-8,941 checkpoint, branched and resumed headless with CPU controllers by
 So the Metal controllers keep parity while the renderer shares the GPU, and presentation leaves the world
 unchanged (plan §7.5).
 
-Engine commits after the builds above, commit:cdd7209 among them, are not covered.
+commit:cdd7209 (2026-11-27, which restructures the per-packet chemistry) came after these builds. It is checked at
+25k only. A release `flife` built at 17:23, after it, ends the Interactive world at the same `595e2d90…3167b`
+with CPU controllers on 16 workers, its tallies equal every 1,024 ticks. No simulation crate changed from
+cdd7209 to 3b53147. The 100k rows predate it.
 
 # FL-034 G6: the two profiles in a window (to run)
 

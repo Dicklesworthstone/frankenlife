@@ -37,7 +37,7 @@ use flife_core::memory::capacity_bytes;
 use flife_core::model::{MAXIMUM_HIDDEN_LAYERS, dense_parameter_count};
 use flife_core::numerics::{
     normalize_turns, shrink_to_left_fold_norm_limit, sigmoid, sin_cos_turns,
-    symplectic_rotate_channels, tanh_f32,
+    symplectic_rotate_channels, tanh_f32, tanh_f32_4,
 };
 use flife_core::{CoreError, ValidatedConfig};
 
@@ -983,6 +983,47 @@ impl<'a> ReferenceController<'a> {
         }
     }
 
+    /// Evaluate any topology on already-narrowed F32 inputs (`inputs.len() ==
+    /// topology.input_width()`), returning all `raw_output_width` linear raw
+    /// outputs. Bit-identical to [`ReferenceController::evaluate_raw`] when
+    /// `inputs` holds the F32-narrowed sensor values, without an intermediate
+    /// F32→F64→F32 widening round-trip.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] if `inputs.len() != topology.input_width()`;
+    /// [`CoreError::NumericalInvalid`] for any nonfinite input, hidden
+    /// pre-activation, or output; [`CoreError::AllocationFailed`] if `scratch`
+    /// must grow and cannot.
+    pub fn evaluate_raw_f32_inputs(
+        &self,
+        inputs: &[f32],
+        scratch: &mut ControllerScratch,
+    ) -> Result<RawOutputs, CoreError> {
+        let expected = self.topology.input_width();
+        if inputs.len() != expected {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "controller inputs",
+                detail: format!("expected {expected} inputs, got {}", inputs.len()),
+            });
+        }
+        // Fast branchless 4-lane finiteness check; scan in ascending index
+        // order only on the cold nonfinite path to preserve exact first error.
+        if !all_f32_finite(inputs) {
+            for (index, &value) in inputs.iter().enumerate() {
+                if !value.is_finite() {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "controller input",
+                        detail: format!("input {index} is {value}, not finite in F32"),
+                    });
+                }
+            }
+        }
+        match self.parameters {
+            Weights::F32(parameters) => self.evaluate_raw_f32(parameters, inputs, scratch),
+            Weights::F16(parameters) => self.evaluate_raw_f32(parameters, inputs, scratch),
+        }
+    }
+
     /// Evaluate a stateless baseline (`104 → … → 36`) controller on one
     /// observation's inputs, giving the 36 raw outputs of its linear final
     /// layer.
@@ -1215,34 +1256,25 @@ impl<'a> ReferenceController<'a> {
 
         let mut source: &[f32] = inputs;
         for (layer, activations) in hidden_layers.iter().zip([first, second]) {
-            affine(parameters, layer, source, |_, z| {
-                // `tanh_f32` is `tanh` in F64 rounded once to F32, the
-                // declared arithmetic, bit for bit.
-                let activated = tanh_f32(z).ok_or_else(|| CoreError::NumericalInvalid {
-                    quantity: "controller pre-activation",
-                    detail: format!("{z} overflowed"),
-                })?;
-                // The push never allocates: `reserve` sized it.
-                activations.push(activated);
-                Ok(())
-            })?;
+            activations.resize(layer.outputs, 0.0);
+            affine_into(parameters, layer, source, activations.as_mut_slice())?;
+            activate_hidden_in_place(activations.as_mut_slice())?;
             source = activations.as_slice();
         }
 
         let mut raw = RawOutputs::zeroed(output_layer.outputs)?;
         let out_slice = raw.as_mut_slice();
-        affine(parameters, output_layer, source, |output, z| {
-            if !z.is_finite() {
-                return Err(CoreError::NumericalInvalid {
-                    quantity: "controller output",
-                    detail: format!("output {output} is {z}"),
-                });
+        affine_into(parameters, output_layer, source, out_slice)?;
+        if !all_f32_finite(out_slice) {
+            for (output, &z) in out_slice.iter().enumerate() {
+                if !z.is_finite() {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "controller output",
+                        detail: format!("output {output} is {z}"),
+                    });
+                }
             }
-            if let Some(slot) = out_slice.get_mut(output) {
-                *slot = z;
-            }
-            Ok(())
-        })?;
+        }
         Ok(raw)
     }
 
@@ -1363,25 +1395,91 @@ pub fn widen_slice(raw: &[f32], out: &mut [f64]) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// One affine layer in the declared order: for each output neuron, the
-/// bias, then each input's product in ascending index, all in F32 with each
-/// weight read as [`Weight::widen`] gives it. `emit` receives each neuron's
-/// `z` in output order.
-fn affine<W: Weight>(
+/// Branchless IEEE-754 finiteness check over an F32 slice (`v.is_finite()`
+/// iff exponent bits `0x7F80_0000` are not all 1).
+#[inline(always)]
+fn all_f32_finite(values: &[f32]) -> bool {
+    const EXP_MASK: u32 = 0x7F80_0000;
+    let mut bad = [0_u32; 4];
+    let (chunks, rem) = values.as_chunks::<4>();
+    for c in chunks {
+        bad[0] |= u32::from((c[0].to_bits() & EXP_MASK) == EXP_MASK);
+        bad[1] |= u32::from((c[1].to_bits() & EXP_MASK) == EXP_MASK);
+        bad[2] |= u32::from((c[2].to_bits() & EXP_MASK) == EXP_MASK);
+        bad[3] |= u32::from((c[3].to_bits() & EXP_MASK) == EXP_MASK);
+    }
+    let mut any_bad = (bad[0] | bad[1]) | (bad[2] | bad[3]);
+    for &v in rem {
+        any_bad |= u32::from((v.to_bits() & EXP_MASK) == EXP_MASK);
+    }
+    any_bad == 0
+}
+
+/// Apply `tanh_f32` in place across a hidden layer using 4-lane [`tanh_f32_4`]
+/// (0-ULP bit-identical to scalar [`tanh_f32`]), scanning in ascending neuron
+/// order on any nonfinite chunk so the first failing pre-activation is
+/// reported identically to scalar evaluation.
+#[inline]
+fn activate_hidden_in_place(values: &mut [f32]) -> Result<(), CoreError> {
+    let (chunks, tail) = values.as_chunks_mut::<4>();
+    for chunk in chunks {
+        if let Some(activated) = tanh_f32_4(*chunk) {
+            *chunk = activated;
+        } else {
+            for slot in chunk.iter_mut() {
+                let z = *slot;
+                *slot = tanh_f32(z).ok_or_else(|| CoreError::NumericalInvalid {
+                    quantity: "controller pre-activation",
+                    detail: format!("{z} overflowed"),
+                })?;
+            }
+        }
+    }
+    for slot in tail {
+        let z = *slot;
+        *slot = tanh_f32(z).ok_or_else(|| CoreError::NumericalInvalid {
+            quantity: "controller pre-activation",
+            detail: format!("{z} overflowed"),
+        })?;
+    }
+    Ok(())
+}
+
+/// One affine layer in the declared order: for each output neuron `o`, the
+/// bias first, then each input's product `w_{o,k} * x_k` added in strictly
+/// ascending index `k = 0..layer.inputs`, in F32 with separate multiply and
+/// add (no FMA).
+///
+/// Register-blocks 8 output rows at a time (two independent 4-lane vector
+/// accumulators, with a 4-row block and scalar tail) over 4-input chunks so
+/// FADD latency is hidden on ARM64 NEON and x86_64 SSE/AVX while preserving
+/// exact 0-ULP left-to-right IEEE-754 summation per row.
+#[expect(
+    clippy::too_many_lines,
+    reason = "8-row, 4-row, and 1-row register-blocked 0-ULP affine kernels over generic Weight"
+)]
+fn affine_into<W: Weight>(
     parameters: &[W],
     layer: &LayerShape,
     input: &[f32],
-    mut emit: impl FnMut(usize, f32) -> Result<(), CoreError>,
+    out: &mut [f32],
 ) -> Result<(), CoreError> {
     let mismatch = |detail: String| CoreError::LayoutMismatch {
         buffer: "controller parameters",
         detail,
     };
-    if input.len() != layer.inputs || layer.inputs == 0 {
+    let n = layer.inputs;
+    if input.len() != n || n == 0 {
         return Err(mismatch(format!(
-            "a layer of fan-in {} read {} activations",
-            layer.inputs,
+            "a layer of fan-in {n} read {} activations",
             input.len()
+        )));
+    }
+    if out.len() != layer.outputs {
+        return Err(mismatch(format!(
+            "a layer of {} outputs wrote into {} slots",
+            layer.outputs,
+            out.len()
         )));
     }
     let weights = parameters
@@ -1390,12 +1488,172 @@ fn affine<W: Weight>(
     let biases = parameters
         .get(layer.biases..layer.end())
         .ok_or_else(|| mismatch(format!("biases {}..{}", layer.biases, layer.end())))?;
-    for (output, (row, &bias)) in weights.chunks_exact(layer.inputs).zip(biases).enumerate() {
-        let mut z = bias.widen();
+    let expected_weights = layer
+        .outputs
+        .checked_mul(n)
+        .ok_or_else(|| mismatch("layer weight count overflow".into()))?;
+    if weights.len() != expected_weights || biases.len() != layer.outputs {
+        return Err(mismatch(format!(
+            "layer shape {}x{} does not match {} weights and {} biases",
+            layer.outputs,
+            n,
+            weights.len(),
+            biases.len()
+        )));
+    }
+
+    let (in_q, in_r) = input.as_chunks::<4>();
+    let mut o = 0_usize;
+    let block8_stride = 8 * n;
+    for ((w_block, b_block), o_block) in weights
+        .chunks_exact(block8_stride)
+        .zip(biases.as_chunks::<8>().0)
+        .zip(out.as_chunks_mut::<8>().0)
+    {
+        let mut z0 = [
+            b_block[0].widen(),
+            b_block[1].widen(),
+            b_block[2].widen(),
+            b_block[3].widen(),
+        ];
+        let mut z1 = [
+            b_block[4].widen(),
+            b_block[5].widen(),
+            b_block[6].widen(),
+            b_block[7].widen(),
+        ];
+        let (r0_q, r0_r) = w_block[0..n].as_chunks::<4>();
+        let (r1_q, r1_r) = w_block[n..2 * n].as_chunks::<4>();
+        let (r2_q, r2_r) = w_block[2 * n..3 * n].as_chunks::<4>();
+        let (r3_q, r3_r) = w_block[3 * n..4 * n].as_chunks::<4>();
+        let (r4_q, r4_r) = w_block[4 * n..5 * n].as_chunks::<4>();
+        let (r5_q, r5_r) = w_block[5 * n..6 * n].as_chunks::<4>();
+        let (r6_q, r6_r) = w_block[6 * n..7 * n].as_chunks::<4>();
+        let (r7_q, r7_r) = w_block[7 * n..8 * n].as_chunks::<4>();
+
+        for ((((((((&x, w0), w1), w2), w3), w4), w5), w6), w7) in in_q
+            .iter()
+            .zip(r0_q)
+            .zip(r1_q)
+            .zip(r2_q)
+            .zip(r3_q)
+            .zip(r4_q)
+            .zip(r5_q)
+            .zip(r6_q)
+            .zip(r7_q)
+        {
+            let a0 = W::widen_4(*w0);
+            let a1 = W::widen_4(*w1);
+            let a2 = W::widen_4(*w2);
+            let a3 = W::widen_4(*w3);
+            let p0 = [a0[0] * x[0], a0[1] * x[1], a0[2] * x[2], a0[3] * x[3]];
+            let p1 = [a1[0] * x[0], a1[1] * x[1], a1[2] * x[2], a1[3] * x[3]];
+            let p2 = [a2[0] * x[0], a2[1] * x[1], a2[2] * x[2], a2[3] * x[3]];
+            let p3 = [a3[0] * x[0], a3[1] * x[1], a3[2] * x[2], a3[3] * x[3]];
+            for k in 0..4 {
+                z0 = [
+                    z0[0] + p0[k],
+                    z0[1] + p1[k],
+                    z0[2] + p2[k],
+                    z0[3] + p3[k],
+                ];
+            }
+            let a4 = W::widen_4(*w4);
+            let a5 = W::widen_4(*w5);
+            let a6 = W::widen_4(*w6);
+            let a7 = W::widen_4(*w7);
+            let p4 = [a4[0] * x[0], a4[1] * x[1], a4[2] * x[2], a4[3] * x[3]];
+            let p5 = [a5[0] * x[0], a5[1] * x[1], a5[2] * x[2], a5[3] * x[3]];
+            let p6 = [a6[0] * x[0], a6[1] * x[1], a6[2] * x[2], a6[3] * x[3]];
+            let p7 = [a7[0] * x[0], a7[1] * x[1], a7[2] * x[2], a7[3] * x[3]];
+            for k in 0..4 {
+                z1 = [
+                    z1[0] + p4[k],
+                    z1[1] + p5[k],
+                    z1[2] + p6[k],
+                    z1[3] + p7[k],
+                ];
+            }
+        }
+        for ((((((((&x, &w0), &w1), &w2), &w3), &w4), &w5), &w6), &w7) in in_r
+            .iter()
+            .zip(r0_r)
+            .zip(r1_r)
+            .zip(r2_r)
+            .zip(r3_r)
+            .zip(r4_r)
+            .zip(r5_r)
+            .zip(r6_r)
+            .zip(r7_r)
+        {
+            z0 = [
+                z0[0] + w0.widen() * x,
+                z0[1] + w1.widen() * x,
+                z0[2] + w2.widen() * x,
+                z0[3] + w3.widen() * x,
+            ];
+            z1 = [
+                z1[0] + w4.widen() * x,
+                z1[1] + w5.widen() * x,
+                z1[2] + w6.widen() * x,
+                z1[3] + w7.widen() * x,
+            ];
+        }
+        o_block[0..4].copy_from_slice(&z0);
+        o_block[4..8].copy_from_slice(&z1);
+        o += 8;
+    }
+
+    while o + 4 <= layer.outputs {
+        let w_block = &weights[o * n..(o + 4) * n];
+        let mut z0 = [
+            biases[o].widen(),
+            biases[o + 1].widen(),
+            biases[o + 2].widen(),
+            biases[o + 3].widen(),
+        ];
+        let (r0_q, r0_r) = w_block[0..n].as_chunks::<4>();
+        let (r1_q, r1_r) = w_block[n..2 * n].as_chunks::<4>();
+        let (r2_q, r2_r) = w_block[2 * n..3 * n].as_chunks::<4>();
+        let (r3_q, r3_r) = w_block[3 * n..4 * n].as_chunks::<4>();
+        for ((((&x, w0), w1), w2), w3) in in_q.iter().zip(r0_q).zip(r1_q).zip(r2_q).zip(r3_q) {
+            let a0 = W::widen_4(*w0);
+            let a1 = W::widen_4(*w1);
+            let a2 = W::widen_4(*w2);
+            let a3 = W::widen_4(*w3);
+            let p0 = [a0[0] * x[0], a0[1] * x[1], a0[2] * x[2], a0[3] * x[3]];
+            let p1 = [a1[0] * x[0], a1[1] * x[1], a1[2] * x[2], a1[3] * x[3]];
+            let p2 = [a2[0] * x[0], a2[1] * x[1], a2[2] * x[2], a2[3] * x[3]];
+            let p3 = [a3[0] * x[0], a3[1] * x[1], a3[2] * x[2], a3[3] * x[3]];
+            for k in 0..4 {
+                z0 = [
+                    z0[0] + p0[k],
+                    z0[1] + p1[k],
+                    z0[2] + p2[k],
+                    z0[3] + p3[k],
+                ];
+            }
+        }
+        for ((((&x, &w0), &w1), &w2), &w3) in in_r.iter().zip(r0_r).zip(r1_r).zip(r2_r).zip(r3_r) {
+            z0 = [
+                z0[0] + w0.widen() * x,
+                z0[1] + w1.widen() * x,
+                z0[2] + w2.widen() * x,
+                z0[3] + w3.widen() * x,
+            ];
+        }
+        out[o..o + 4].copy_from_slice(&z0);
+        o += 4;
+    }
+
+    while o < layer.outputs {
+        let mut z = biases[o].widen();
+        let row = &weights[o * n..(o + 1) * n];
         for (&weight, &value) in row.iter().zip(input) {
             z += weight.widen() * value;
         }
-        emit(output, z)?;
+        out[o] = z;
+        o += 1;
     }
     Ok(())
 }

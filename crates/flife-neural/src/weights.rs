@@ -69,6 +69,17 @@ pub trait Weight: Copy + Send + Sync + std::fmt::Debug + 'static {
     /// The weight as the F32 the reference arithmetic reads. Exact.
     fn widen(self) -> f32;
 
+    /// Four weights widened to F32 in lockstep. Exact.
+    #[inline(always)]
+    fn widen_4(values: [Self; 4]) -> [f32; 4] {
+        [
+            values[0].widen(),
+            values[1].widen(),
+            values[2].widen(),
+            values[3].widen(),
+        ]
+    }
+
     /// `value` rounded once to this dtype, to nearest with ties to even.
     fn round_from_f64(value: f64) -> Self;
 
@@ -80,9 +91,14 @@ pub trait Weight: Copy + Send + Sync + std::fmt::Debug + 'static {
 impl Weight for f32 {
     const DTYPE: WeightDtype = WeightDtype::F32;
 
-    #[inline]
+    #[inline(always)]
     fn widen(self) -> f32 {
         self
+    }
+
+    #[inline(always)]
+    fn widen_4(values: [Self; 4]) -> [f32; 4] {
+        values
     }
 
     #[inline]
@@ -103,9 +119,14 @@ impl Weight for f32 {
 impl Weight for F16 {
     const DTYPE: WeightDtype = WeightDtype::F16;
 
-    #[inline]
+    #[inline(always)]
     fn widen(self) -> f32 {
         self.to_f32()
+    }
+
+    #[inline(always)]
+    fn widen_4(values: [Self; 4]) -> [f32; 4] {
+        Self::to_f32_4(values)
     }
 
     #[inline]

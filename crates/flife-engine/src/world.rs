@@ -6373,30 +6373,29 @@ fn evaluate_reference_held_from_f32(
     let sensors = rules.v2.sensors();
     let obs_width = sensors.observation_width();
     let state_width = rules.recurrent_state_width;
+    if state_width == 0 {
+        let raw = eval.evaluate_raw_f32_inputs(&inputs_f32[..obs_width], controller)?;
+        return HeldOutput::evaluated_slice(to, raw.as_slice());
+    }
     let mut wide_obs = [0.0_f64; MAX_SENSOR_WIDTH];
     for (dst, &src) in wide_obs[..obs_width].iter_mut().zip(inputs_f32) {
         *dst = f64::from(src);
     }
-    if state_width > 0 {
-        let prev_state = organism.held.recurrent_state_array();
-        let mut next_state = [0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
-        let raw = eval.evaluate_recurrent_slice(
-            &wide_obs[..obs_width],
-            &prev_state[..state_width],
-            rules.v2.epigenetic_gate_bias(),
-            controller,
-            &mut next_state[..state_width],
-        )?;
-        apply_notch_delta_inhibition(
-            &rules.v2,
-            organism.last_neighbor_h0,
-            &mut next_state[..state_width],
-        );
-        HeldOutput::evaluated_recurrent_slice(to, raw.as_slice(), &next_state[..state_width])
-    } else {
-        let raw = eval.evaluate_raw(&wide_obs[..obs_width], controller)?;
-        HeldOutput::evaluated_slice(to, raw.as_slice())
-    }
+    let prev_state = organism.held.recurrent_state_array();
+    let mut next_state = [0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
+    let raw = eval.evaluate_recurrent_slice(
+        &wide_obs[..obs_width],
+        &prev_state[..state_width],
+        rules.v2.epigenetic_gate_bias(),
+        controller,
+        &mut next_state[..state_width],
+    )?;
+    apply_notch_delta_inhibition(
+        &rules.v2,
+        organism.last_neighbor_h0,
+        &mut next_state[..state_width],
+    );
+    HeldOutput::evaluated_recurrent_slice(to, raw.as_slice(), &next_state[..state_width])
 }
 
 /// Write one backend's raw F32 slice directly into `out`, avoiding a 280-byte
@@ -6471,11 +6470,14 @@ fn held_from_raw(
     held_from_raw_slice(rules, organism, to, raw.as_slice())
 }
 
-/// Phases 3 and 4 for one organism (§8.1): its already-sampled raw observation,
-/// encoded for the controller, then its due or forced evaluation, decoded.
-/// Skips all 69 controller-input `tanh` saturations when the organism is not
-/// due this tick while keeping identical gradients and validation errors.
-fn decide_from_raw(
+/// Phases 3 and 4 for one organism (§8.1) written directly into `out` without
+/// intermediate 1,360-byte `Observation` or 1,100-byte `Decision` copies or
+/// F32→F64→F32 sensor widening/narrowing round-trips.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "in-place Phase 3-4 reference evaluation avoiding per-organism Observation and Decision copies"
+)]
+fn decide_from_raw_into(
     rules: &Rules,
     genome: &Genome,
     organism: &Organism,
@@ -6483,11 +6485,32 @@ fn decide_from_raw(
     local_crowding: Option<u32>,
     [from, to]: [Tick; 2],
     controller: &mut ControllerScratch,
-) -> Result<Decision, CoreError> {
+    out: &mut Decision,
+) -> Result<(), CoreError> {
     if !due(rules, organism, to) {
-        let mut gradients = [[0.0; 2]; RESPONSE_TERMS];
-        encode_gradients_only_into(rules, organism, raw, from, &mut gradients)?;
-        return finish_from_gradients(rules, organism, organism.held, false, gradients);
+        encode_gradients_only_into(rules, organism, raw, from, &mut out.gradients)?;
+        out.held.copy_active_from(&organism.held);
+        out.evaluated = false;
+        return decode_held_into(rules, organism, &organism.held, &mut out.actions);
+    }
+    let sensors = rules.v2.sensors();
+    let obs_width = sensors.observation_width();
+    let state_width = rules.recurrent_state_width;
+    if obs_width == SENSOR_WIDTH && state_width == 0 {
+        let mut inputs_f32 = [0.0_f32; SENSOR_WIDTH];
+        encode_for_controller_f32_into(
+            rules,
+            organism,
+            raw,
+            from,
+            &mut inputs_f32,
+            &mut out.gradients,
+        )?;
+        let eval = genome.controller(&rules.catalog, &rules.limits)?;
+        let raw_out = eval.evaluate_raw_f32_inputs(&inputs_f32, controller)?;
+        held_from_raw_slice_into(rules, organism, to, raw_out.as_slice(), &mut out.held)?;
+        out.evaluated = true;
+        return decode_held_into(rules, organism, &out.held, &mut out.actions);
     }
     let observation = encode_for_controller(rules, organism, raw, from)?;
     let held = evaluate_reference_held(
@@ -6500,7 +6523,10 @@ fn decide_from_raw(
         to,
         controller,
     )?;
-    finish(rules, organism, held, true, &observation)
+    out.held.copy_active_from(&held);
+    out.evaluated = true;
+    out.gradients = observation.gradients;
+    decode_held_into(rules, organism, &out.held, &mut out.actions)
 }
 
 /// Phases 3 and 4 for one organism on a 34-plane dual-carrier field (`V2-15`).
@@ -8206,7 +8232,7 @@ fn decide_all(
                         Some(raw) => *raw,
                         None => view.sample(organism.position, genome.traits().sensing_scale())?,
                     };
-                    *slot = decide_from_raw(
+                    decide_from_raw_into(
                         rules,
                         genome,
                         organism,
@@ -8214,6 +8240,7 @@ fn decide_all(
                         crowding_counts.get(start + index).copied(),
                         ticks,
                         controller,
+                        slot,
                     )?;
                     local_eval += usize::from(slot.evaluated);
                 }
@@ -8251,7 +8278,7 @@ fn decide_all(
                     let Some(genome) = batch_genomes[i] else {
                         return Ok(());
                     };
-                    let dec = decide_from_raw(
+                    decide_from_raw_into(
                         rules,
                         genome,
                         &chunk[i],
@@ -8259,9 +8286,9 @@ fn decide_all(
                         crowding_counts.get(base + i).copied(),
                         ticks,
                         controller,
+                        &mut dec_chunk[i],
                     )?;
-                    local_eval += usize::from(dec.evaluated);
-                    dec_chunk[i] = dec;
+                    local_eval += usize::from(dec_chunk[i].evaluated);
                     Ok(())
                 })?;
             }

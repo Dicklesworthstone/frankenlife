@@ -767,3 +767,131 @@ fn default_network_outputs_are_identical_on_every_host() {
     }
     assert_eq!(digest, 0x821a_1b48_e19f_12ec);
 }
+
+#[test]
+fn register_blocked_gemv_and_f32_inputs_match_independent_scalar_oracle_bit_for_bit() {
+    use flife_core::binary16::F16;
+    use flife_core::numerics::tanh_f32;
+    use flife_neural::Weights;
+
+    // Independent 1-row scalar reference oracle directly from the plan §6.2 equation.
+    fn scalar_oracle(
+        topo: &DenseTopology,
+        params: &[f32],
+        inputs: &[f32],
+    ) -> Result<Vec<f32>, CoreError> {
+        let mut current = inputs.to_vec();
+        let (last, hidden) = topo.layers().split_last().expect("output layer");
+        for layer in hidden {
+            let w = &params[layer.weights..layer.biases];
+            let b = &params[layer.biases..layer.end()];
+            let mut next = Vec::with_capacity(layer.outputs);
+            for o in 0..layer.outputs {
+                let mut z = b[o];
+                for k in 0..layer.inputs {
+                    z += w[o * layer.inputs + k] * current[k];
+                }
+                let act = tanh_f32(z).ok_or_else(|| CoreError::NumericalInvalid {
+                    quantity: "controller pre-activation",
+                    detail: format!("{z} overflowed"),
+                })?;
+                next.push(act);
+            }
+            current = next;
+        }
+        let w = &params[last.weights..last.biases];
+        let b = &params[last.biases..last.end()];
+        let mut out = Vec::with_capacity(last.outputs);
+        for o in 0..last.outputs {
+            let mut z = b[o];
+            for k in 0..last.inputs {
+                z += w[o * last.inputs + k] * current[k];
+            }
+            if !z.is_finite() {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "controller output",
+                    detail: format!("output {o} is {z}"),
+                });
+            }
+            out.push(z);
+        }
+        Ok(out)
+    }
+
+    let mut state = 0x51A7_C0DE_u64;
+    for widths in [&[1][..], &[3], &[5], &[8], &[13, 7], &[48, 24], &[64, 32]] {
+        let topo = topology(widths);
+        let params_f32 = random_parameters(&topo, 0xA11C_0000 ^ (widths.len() as u64));
+        let params_f16: Vec<F16> = params_f32
+            .iter()
+            .map(|&v| F16::from_f64(f64::from(v)))
+            .collect();
+        let params_f16_wide: Vec<f32> = params_f16.iter().map(|v| v.to_f32()).collect();
+
+        let ctrl_f32 = ReferenceController::new(&topo, &params_f32, BOUND).expect("f32 ctrl");
+        let ctrl_f16 =
+            ReferenceController::new(&topo, Weights::F16(&params_f16), BOUND).expect("f16 ctrl");
+        let mut scratch = ControllerScratch::new(&topo).expect("scratch");
+
+        for trial in 0..8 {
+            let inputs_f64 = random_inputs(&mut state);
+            let inputs_f32: Vec<f32> = inputs_f64.iter().map(|&v| v as f32).collect();
+
+            // F32 weights: evaluate_raw AND evaluate_raw_f32_inputs match scalar oracle bit-for-bit.
+            let expected_f32 = scalar_oracle(&topo, &params_f32, &inputs_f32).expect("oracle f32");
+            let got_f64 = ctrl_f32
+                .evaluate_raw(&inputs_f64, &mut scratch)
+                .expect("eval f64");
+            let got_f32 = ctrl_f32
+                .evaluate_raw_f32_inputs(&inputs_f32, &mut scratch)
+                .expect("eval f32");
+            let exp_bits: Vec<u32> = expected_f32.iter().map(|v| v.to_bits()).collect();
+            let got_f64_bits: Vec<u32> = got_f64.as_slice().iter().map(|v| v.to_bits()).collect();
+            let got_f32_bits: Vec<u32> = got_f32.as_slice().iter().map(|v| v.to_bits()).collect();
+            assert_eq!(got_f64_bits, exp_bits, "f32 widths={widths:?} trial={trial}");
+            assert_eq!(got_f32_bits, exp_bits, "f32_in widths={widths:?} trial={trial}");
+
+            // F16 weights: evaluate_raw AND evaluate_raw_f32_inputs match scalar oracle bit-for-bit.
+            let expected_f16 =
+                scalar_oracle(&topo, &params_f16_wide, &inputs_f32).expect("oracle f16");
+            let got_h64 = ctrl_f16
+                .evaluate_raw(&inputs_f64, &mut scratch)
+                .expect("eval h64");
+            let got_h32 = ctrl_f16
+                .evaluate_raw_f32_inputs(&inputs_f32, &mut scratch)
+                .expect("eval h32");
+            let exp_h_bits: Vec<u32> = expected_f16.iter().map(|v| v.to_bits()).collect();
+            let got_h64_bits: Vec<u32> = got_h64.as_slice().iter().map(|v| v.to_bits()).collect();
+            let got_h32_bits: Vec<u32> = got_h32.as_slice().iter().map(|v| v.to_bits()).collect();
+            assert_eq!(got_h64_bits, exp_h_bits, "f16 widths={widths:?} trial={trial}");
+            assert_eq!(got_h32_bits, exp_h_bits, "f16_in widths={widths:?} trial={trial}");
+        }
+    }
+
+    // Verify ascending first-error reporting for nonfinite input and hidden/output overflow.
+    let topo = topology(&[12]);
+    let mut params = vec![0.0_f32; topo.parameter_count()];
+    set_weight(&mut params, &topo, 0, 5, 0, 4.0);
+    set_weight(&mut params, &topo, 0, 7, 0, -4.0);
+    let ctrl = ReferenceController::new(&topo, &params, BOUND).expect("ctrl");
+    let mut scratch = ControllerScratch::new(&topo).expect("scratch");
+    let mut bad_in = [0.0_f32; SENSOR_WIDTH];
+    bad_in[9] = f32::NAN;
+    bad_in[11] = f32::INFINITY;
+    let err = ctrl
+        .evaluate_raw_f32_inputs(&bad_in, &mut scratch)
+        .expect_err("nonfinite input must fail");
+    assert!(
+        matches!(err, CoreError::NumericalInvalid { ref detail, .. } if detail.contains("input 9")),
+        "must report first nonfinite input 9, got {err:?}"
+    );
+    let mut overflow_in = [0.0_f32; SENSOR_WIDTH];
+    overflow_in[0] = 3.0e38;
+    let err = ctrl
+        .evaluate_raw_f32_inputs(&overflow_in, &mut scratch)
+        .expect_err("hidden overflow must fail");
+    assert!(
+        matches!(err, CoreError::NumericalInvalid { ref detail, .. } if detail.contains("inf overflowed") && !detail.contains("-inf")),
+        "must report first overflowing hidden neuron (+inf at neuron 5, not -inf at neuron 7), got {err:?}"
+    );
+}

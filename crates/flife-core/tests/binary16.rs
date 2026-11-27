@@ -69,6 +69,46 @@ fn every_bit_pattern_widens_exactly_and_rounds_back_to_itself() {
     }
     // 2 signs × 1,023 nonzero payloads.
     assert_eq!(nans, 2046);
+
+    // Exhaustively check `F16::to_f32_4` across all 65,536 bit patterns (16,384 quads)
+    // including exact NaN payload & sign preservation.
+    for base in (0_u32..=u32::from(u16::MAX)).step_by(4) {
+        let quad = [
+            F16::from_bits(base as u16),
+            F16::from_bits((base + 1) as u16),
+            F16::from_bits((base + 2) as u16),
+            F16::from_bits((base + 3) as u16),
+        ];
+        let got = F16::to_f32_4(quad);
+        for (lane, (&h, &g)) in quad.iter().zip(&got).enumerate() {
+            let bits = h.to_bits();
+            let expected_bits = match (bits & 0x7C00) >> 10 {
+                0 => {
+                    let sign = u32::from(bits & 0x8000) << 16;
+                    let frac = bits & 0x03FF;
+                    sign | (f32::from(frac) * f32::from_bits(0x3380_0000)).to_bits()
+                }
+                0x1F => {
+                    let sign = u32::from(bits & 0x8000) << 16;
+                    sign | 0x7F80_0000 | (u32::from(bits & 0x03FF) << 13)
+                }
+                exp => {
+                    let sign = u32::from(bits & 0x8000) << 16;
+                    sign | ((u32::from(exp) + 112) << 23) | (u32::from(bits & 0x03FF) << 13)
+                }
+            };
+            assert_eq!(
+                g.to_bits(),
+                expected_bits,
+                "to_f32_4 lane={lane} bits={bits:#06x}"
+            );
+            assert_eq!(
+                h.to_f32().to_bits(),
+                expected_bits,
+                "to_f32 bits={bits:#06x}"
+            );
+        }
+    }
 }
 
 #[test]

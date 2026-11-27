@@ -22,16 +22,18 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct F16(u16);
 
-/// The sign bit.
-const SIGN: u16 = 0x8000;
 /// Every exponent bit set: infinity or NaN.
 const EXPONENT_MASK: u16 = 0x7C00;
 /// The fraction bits.
 const FRACTION_MASK: u16 = 0x03FF;
 /// The canonical quiet NaN's magnitude bits.
 const QUIET_NAN: u16 = 0x7E00;
-/// 2^-24, the smallest subnormal binary16 value, as F32 bits.
-const SMALLEST_SUBNORMAL_F32: u32 = 0x3380_0000;
+/// `2^-14` in F32 bits (`biased_exp = 113 = 127 - 14`), used for exact
+/// branchless subnormal widening via Sterbenz subtraction:
+/// `f32::from_bits(0x3880_0000 | (frac << 13)) - 2^-14 == frac * 2^-24`.
+const SUBNORMAL_BIAS_F32: u32 = 0x3880_0000;
+/// Exponent rebias delta `(127 - 15) << 23 = 112 << 23` for normal F16 -> F32.
+const NORMAL_BIAS_DELTA_F32: u32 = 0x3800_0000;
 
 impl F16 {
     /// Positive zero.
@@ -55,25 +57,45 @@ impl F16 {
         self.0 & EXPONENT_MASK == EXPONENT_MASK && self.0 & FRACTION_MASK != 0
     }
 
-    /// The value as F32, exactly. A NaN keeps its sign and payload.
+    /// The value as F32, exactly, via branchless IEEE-754 bit arithmetic across
+    /// all 65,536 bit patterns (normals, zero, subnormals, infinities, and NaN
+    /// payloads with sign preserved).
+    #[inline(always)]
     #[must_use]
     pub fn to_f32(self) -> f32 {
-        let sign = u32::from(self.0 & SIGN) << 16;
-        let exponent = (self.0 & EXPONENT_MASK) >> 10;
-        let fraction = self.0 & FRACTION_MASK;
-        let magnitude = match exponent {
-            // Zero or subnormal: fraction × 2^-24, exact in F32 (a 10-bit
-            // integer scaled by a power of two well inside F32's normal
-            // range).
-            0 => (f32::from(fraction) * f32::from_bits(SMALLEST_SUBNORMAL_F32)).to_bits(),
-            // Infinity, or NaN with the payload moved to F32's high
-            // fraction bits.
-            0x1F => 0x7F80_0000 | (u32::from(fraction) << 13),
-            // Normal: rebias the exponent from 15 to 127 and widen the
-            // fraction from 10 to 23 bits.
-            _ => ((u32::from(exponent) + 112) << 23) | (u32::from(fraction) << 13),
+        let b = u32::from(self.0);
+        let sign = (b & 0x8000) << 16;
+        let mag = b & 0x7FFF;
+        let shifted = mag << 13;
+        let extra_inf_bias = if mag >= 0x7C00 {
+            NORMAL_BIAS_DELTA_F32
+        } else {
+            0
         };
+        let norm_or_inf = shifted
+            .wrapping_add(NORMAL_BIAS_DELTA_F32)
+            .wrapping_add(extra_inf_bias);
+        // Zero and subnormals (`mag < 0x0400`): `(2^-14 + frac * 2^-24) - 2^-14`
+        // is exact in F32 for every 10-bit fraction (`0..=1023`), returning +0.0
+        // for `mag == 0` so `sign | sub` preserves `-0.0` bit-for-bit.
+        let sub = (f32::from_bits(shifted | SUBNORMAL_BIAS_F32)
+            - f32::from_bits(SUBNORMAL_BIAS_F32))
+        .to_bits();
+        let magnitude = if mag < 0x0400 { sub } else { norm_or_inf };
         f32::from_bits(sign | magnitude)
+    }
+
+    /// Four-lane lockstep [`F16::to_f32`], bit-identical per lane across all
+    /// 65,536 binary16 patterns and auto-vectorizing to branchless SIMD.
+    #[inline(always)]
+    #[must_use]
+    pub fn to_f32_4(xs: [Self; 4]) -> [f32; 4] {
+        [
+            xs[0].to_f32(),
+            xs[1].to_f32(),
+            xs[2].to_f32(),
+            xs[3].to_f32(),
+        ]
     }
 
     /// The value as F64, exactly.

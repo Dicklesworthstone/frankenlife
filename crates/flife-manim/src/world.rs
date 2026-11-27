@@ -162,7 +162,9 @@ pub struct WorldView {
     preparation_threads: NonZeroUsize,
     /// The viewport `cloud`'s current dot positions and radii were lowered for.
     /// When equal to `viewport` at `zoom > 1`, [`WorldView::draws`] culls dots
-    /// whose 3D billboards lie strictly outside the camera frustum.
+    /// whose 3D billboards lie strictly outside the camera frustum, drawing
+    /// the rest as true dots, when at most a quarter of the clouds' dots are
+    /// left.
     placed_viewport: Option<Viewport>,
     /// The shown epoch's optional quantized apical polarities (`V2-16`), kept
     /// `None` (zero extra bytes) until an epoch carrying polarities is shown.
@@ -1163,20 +1165,35 @@ impl WorldView {
         let halos = self.cloud.halos();
         let dots = self.cloud.draws();
         let ticks_draw = (!density).then(|| self.apical_ticks_draw()).flatten();
-        let cull =
+        let placed_zoom =
             !density && self.placed_viewport == Some(self.viewport) && self.viewport.zoom() > 1.0;
         let [fw, fh] = self.viewport.frame_shape();
         let (half_fw, half_fh) = (0.5 * fw, 0.5 * fh);
         let focal = self.camera.camera().frame().focal_distance();
         let visible = |dot: &CloudDot| dot_possibly_visible(dot, half_fw, half_fh, focal);
         let clouds = [halos, dots];
-        let particle_draws = if density {
-            0
-        } else if cull {
+        let kept: usize = if placed_zoom {
             clouds
                 .iter()
                 .map(|cloud| cloud.dots.iter().filter(|dot| visible(dot)).count())
                 .sum()
+        } else {
+            0
+        };
+        // Cull to true dots only when that keeps at most a quarter of the
+        // clouds' dots; otherwise draw the clouds. Both draw the same frame.
+        // A true dot is a draw of its own, compiled in the job and laid out
+        // draw by draw where a route derives the frame, so it costs more than
+        // a cloud's dot, which a route compiles on its threads and rejects
+        // early when it is off screen. Drawn as clouds, a zoomed frame costs
+        // about what the unzoomed one does; culling pays only when few dots
+        // are left. The quarter is a judgment, not a measured crossover.
+        let all = clouds.iter().map(|cloud| cloud.dots.len()).sum::<usize>();
+        let cull = placed_zoom && kept.saturating_mul(4) <= all;
+        let particle_draws = if density {
+            0
+        } else if cull {
+            kept
         } else {
             clouds.len()
         };

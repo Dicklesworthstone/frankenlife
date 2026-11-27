@@ -272,9 +272,10 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     none. It returns whether the region changed, rebuilds the outline for every view change and density, and
     leaves the view as it was when the region is refused; `region()` and `region_draw()`;
   - `draws()` is the frame in painter order: the field (when `Style::field_drawn`, in the style's field mapping),
-    then the density layer, or every halo and then every dot (at zoom > 1 for a placed viewport, `WorldView::draws`
-    conservatively culls dots and halos whose 3D billboards lie strictly outside the camera frustum, preserving
-    bit-exact rendered pixels while `ParticleCloud::draws` keeps every row), then the optional bulk apical
+    then the density layer, or every halo and then every dot, as two dot clouds (at zoom > 1 for a placed viewport,
+    when at most a quarter of the clouds' dots lie possibly inside the camera frustum, `WorldView::draws` draws
+    those as true dots and culls the rest, whose 3D billboards lie strictly outside it, preserving bit-exact
+    rendered pixels while `ParticleCloud::draws` keeps every row), then the optional bulk apical
     orientation ticks draw (`apical_ticks_draw()`, present strictly in `ColorMapping::Polarity` + `Look::Sphere` +
     `Particles::Points` when the epoch carries `Epoch::polarities()`, frustum-culled at `zoom > 1`, rebuilt
     transactionally across view/style/radius updates), then the brush's region, then the selection ring, then the

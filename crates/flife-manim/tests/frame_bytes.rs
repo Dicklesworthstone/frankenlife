@@ -296,7 +296,8 @@ fn a_frame_prepared_on_threads_is_the_frame_prepared_on_one() {
 /// drops offscreen dots and halos without changing a single byte of the
 /// rendered frame (including bloom, halos straddling the viewport edge, seam
 /// views, and all three looks), while unplaced `set_view` leaves the draw list
-/// intact.
+/// intact. It culls only when at most a quarter of the dots are left: at zoom
+/// 1.25 the view draws its two clouds whole, at 4 and 16 the few true dots.
 #[test]
 fn zoomed_offscreen_culling_is_bit_identical_to_unculled_rendering() {
     let config = common::config(&[
@@ -319,6 +320,7 @@ fn zoomed_offscreen_culling_is_bit_identical_to_unculled_rendering() {
             ..Style::default()
         };
         for (center, zoom) in [
+            ([64.0, 64.0], 1.25),
             ([12.0, 20.0], 2.0),
             ([0.1, 127.9], 4.0),
             ([64.0, 64.0], 16.0),
@@ -346,7 +348,24 @@ fn zoomed_offscreen_culling_is_bit_identical_to_unculled_rendering() {
             let culled_draws = view.draws().expect("culled draws");
             let full_particles = view.cloud().halos().dots.len() + view.cloud().draws().dots.len();
             let culled_particles = particles(&culled_draws);
+            let drawn_clouds = culled_draws
+                .iter()
+                .filter(|draw| matches!(draw, ThreeDDraw::DotCloud(_)))
+                .count();
+            if zoom < 1.5 {
+                // Most dots are on screen: culling would keep more than a
+                // quarter of them, so the view draws its clouds whole (the
+                // raw look's halos are none, and an empty cloud is not drawn).
+                let clouds = usize::from(!view.cloud().halos().dots.is_empty())
+                    + usize::from(!view.cloud().draws().dots.is_empty());
+                assert_eq!(
+                    (drawn_clouds, culled_particles),
+                    (clouds, full_particles),
+                    "{look:?} zoom {zoom}: the clouds, not true dots"
+                );
+            }
             if zoom >= 4.0 {
+                assert_eq!(drawn_clouds, 0, "{look:?} zoom {zoom}: true dots");
                 assert!(
                     culled_particles * 4 < full_particles,
                     "{look:?} zoom {zoom}: expected >75% culled, kept {culled_particles}/{full_particles}"

@@ -178,6 +178,7 @@ impl F16 {
 
     /// `x` rounded once to the nearest binary16 value, ties to even
     /// (the declared rounding; see the [module documentation](self)).
+    #[inline]
     #[must_use]
     pub const fn from_f64(x: f64) -> Self {
         let bits = x.to_bits();
@@ -232,6 +233,7 @@ impl F16 {
 }
 
 /// `value >> shift` rounded to nearest, ties to even (`1 ≤ shift ≤ 53`).
+#[inline(always)]
 const fn round_shift(value: u64, shift: u32) -> u64 {
     let kept = value >> shift;
     let rest = value & ((1 << shift) - 1);

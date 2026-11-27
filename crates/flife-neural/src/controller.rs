@@ -876,9 +876,11 @@ impl<'a> ReferenceController<'a> {
                 ),
             });
         }
-        if let Some((index, value)) = parameters.iter().enumerate().find(|&(_, value)| {
-            !value.is_finite() || f64::from(value.abs()) > maximum_absolute_parameter
-        }) {
+        if !all_parameters_within_bound(parameters, maximum_absolute_parameter)
+            && let Some((index, value)) = parameters.iter().enumerate().find(|&(_, value)| {
+                !value.is_finite() || f64::from(value.abs()) > maximum_absolute_parameter
+            })
+        {
             return Err(CoreError::NumericalInvalid {
                 quantity: "controller parameter",
                 detail: format!(
@@ -1410,6 +1412,79 @@ pub fn widen_slice(raw: &[f32], out: &mut [f64]) -> Result<(), CoreError> {
 
 /// Branchless IEEE-754 finiteness check over an F32 slice (`v.is_finite()`
 /// iff exponent bits `0x7F80_0000` are not all 1).
+/// Exact SIMD-friendly bound check for [`ReferenceController::new`]:
+/// returns `true` iff every parameter in `parameters` is finite and has
+/// `|value| <= maximum_absolute_parameter` (for finite positive `max_abs`).
+///
+/// Exploits IEEE-754 monotonic magnitude bit order (`0x0000..=0x7BFF` for F16,
+/// `0x0000_0000..=0x7F7F_FFFF` for F32; Inf and NaN always exceed finite
+/// magnitude thresholds), reducing F16 parameter validation from per-element
+/// Sterbenz F32 widening to an 8-lane `u16` maximum reduction.
+#[inline]
+fn all_parameters_within_bound(parameters: Weights<'_>, max_abs: f64) -> bool {
+    match parameters {
+        Weights::F16(values) => {
+            let max_mag: u16 = if max_abs >= 65_504.0 {
+                0x7BFF
+            } else {
+                let mut m = flife_core::binary16::F16::from_f64(max_abs).to_bits() & 0x7FFF;
+                if m > 0x7BFF {
+                    m = 0x7BFF;
+                }
+                if flife_core::binary16::F16::from_bits(m).to_f64() > max_abs {
+                    m = m.saturating_sub(1);
+                }
+                m
+            };
+            let mut worst = [0_u16; 8];
+            let (chunks, rem) = values.as_chunks::<8>();
+            for chunk in chunks {
+                for (slot, &h) in worst.iter_mut().zip(chunk) {
+                    *slot = (*slot).max(h.to_bits() & 0x7FFF);
+                }
+            }
+            let mut max_seen = worst[0]
+                .max(worst[1])
+                .max(worst[2].max(worst[3]))
+                .max(worst[4].max(worst[5]).max(worst[6].max(worst[7])));
+            for &h in rem {
+                max_seen = max_seen.max(h.to_bits() & 0x7FFF);
+            }
+            max_seen <= max_mag
+        }
+        Weights::F32(values) => {
+            let max_mag: u32 = if max_abs >= f64::from(f32::MAX) {
+                0x7F7F_FFFF
+            } else {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "clamped below f32::MAX; stepped down if rounded above max_abs"
+                )]
+                let mut m = (max_abs as f32).to_bits() & 0x7FFF_FFFF;
+                if m > 0x7F7F_FFFF {
+                    m = 0x7F7F_FFFF;
+                }
+                if f64::from(f32::from_bits(m)) > max_abs {
+                    m = m.saturating_sub(1);
+                }
+                m
+            };
+            let mut worst = [0_u32; 4];
+            let (chunks, rem) = values.as_chunks::<4>();
+            for chunk in chunks {
+                for (slot, &v) in worst.iter_mut().zip(chunk) {
+                    *slot = (*slot).max(v.to_bits() & 0x7FFF_FFFF);
+                }
+            }
+            let mut max_seen = worst[0].max(worst[1]).max(worst[2].max(worst[3]));
+            for &v in rem {
+                max_seen = max_seen.max(v.to_bits() & 0x7FFF_FFFF);
+            }
+            max_seen <= max_mag
+        }
+    }
+}
+
 #[inline(always)]
 fn all_f32_finite(values: &[f32]) -> bool {
     const EXP_MASK: u32 = 0x7F80_0000;

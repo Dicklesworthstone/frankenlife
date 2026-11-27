@@ -197,6 +197,8 @@ fn semantic_blocks_match_numpy() {
     ];
     for (rng, at, expected) in cases {
         assert_eq!(rng.block(at), expected, "{at:?}");
+        assert_eq!(rng.block_via_fnp(at), expected, "{at:?}");
+        assert_eq!(rng.word0(at), expected[0], "{at:?}");
     }
     // The oracle packed these lanes independently.
     assert_eq!(weight.get(), 0x0302_0001_0005_0011);
@@ -486,4 +488,37 @@ fn the_rng_family_and_seed_come_from_the_configuration() {
     // `from_config` refuses it again for a configuration built otherwise.
     assert_ne!(renamed, appendix_a_toml());
     assert!(ValidatedConfig::from_toml(&renamed).is_err());
+}
+
+#[test]
+fn direct_philox_block_word0_and_lanes4_match_fnp_philox_bit_for_bit() {
+    for seed in [0_u64, 1, 42, 0xDEAD_BEEF_CAFE_BABE, MAX] {
+        let rng = SemanticRng::new(seed);
+        for stream in Stream::ALL {
+            for entity in [0_u64, 1, 99_999, MAX - 1, MAX] {
+                for ordinal in [0_u64, 1, 1234, MAX] {
+                    for draw in [0_u64, 1, MAX] {
+                        let base_idx = neuron(2, 17, 0);
+                        let lanes = [
+                            lane(0, LaneKind::Weight, base_idx),
+                            lane(0, LaneKind::Weight, base_idx + 1),
+                            lane(0, LaneKind::Weight, base_idx + 2),
+                            lane(0, LaneKind::Weight, base_idx + 3),
+                        ];
+                        let got4 = rng.word0_lanes4(stream, entity, ordinal, lanes, draw);
+                        for (i, &ln) in lanes.iter().enumerate() {
+                            let at = address(stream, entity, ordinal, ln, draw);
+                            let expected = rng.block_via_fnp(at);
+                            assert_eq!(rng.block(at), expected, "block mismatch at {at:?}");
+                            assert_eq!(rng.word0(at), expected[0], "word0 mismatch at {at:?}");
+                            assert_eq!(
+                                got4[i], expected[0],
+                                "word0_lanes4[{i}] mismatch at {at:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

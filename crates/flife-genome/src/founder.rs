@@ -25,7 +25,7 @@ use crate::genome::{
     AFFINITY_TERMS, CADHERIN_TERMS, CadherinTraits, Genome, MOTION_RESPONSE_TERMS, PolarityTraits,
     TraitLimits, Traits, Unsealed, check_maximum_wedge_curvature, rescale,
 };
-use crate::init::{WeightAddress, initialize};
+use crate::init::initialize_from_rng;
 use crate::quota::{GenomeQuota, ParameterBuffer, WeightsMut};
 
 /// Index on [`LaneKind::Direction`] (`0x0800`) for initializing and mutating
@@ -113,22 +113,29 @@ pub fn grow_founder(
             buffer,
         });
     };
-    let mut lane_error = None;
-    let word =
-        |weight: WeightAddress| match Lane::neuron_index(weight.layer, weight.output, weight.input)
-            .and_then(|index| Lane::new(0, LaneKind::Weight, index))
-        {
-            Ok(lane) => rng.block(address(organism, lane))[0],
-            Err(error) => {
-                lane_error.get_or_insert(error);
-                0
-            }
-        };
     let filled = match buffer.values_mut() {
-        WeightsMut::F32(values) => initialize(topology, values, word),
-        WeightsMut::F16(values) => initialize(topology, values, word),
+        WeightsMut::F32(values) => initialize_from_rng(
+            topology,
+            values,
+            rng,
+            Stream::Founders,
+            organism.get(),
+            0,
+            0,
+            LaneKind::Weight,
+        ),
+        WeightsMut::F16(values) => initialize_from_rng(
+            topology,
+            values,
+            rng,
+            Stream::Founders,
+            organism.get(),
+            0,
+            0,
+            LaneKind::Weight,
+        ),
     };
-    if let Some(error) = lane_error.or_else(|| filled.err()) {
+    if let Some(error) = filled.err() {
         return Err(Unsealed { error, buffer });
     }
     Genome::seal(buffer, id, catalog, traits, None, limits)

@@ -15,7 +15,7 @@
 //! ([`crate::mutation`]).
 
 use flife_core::CoreError;
-use flife_core::rng::half_open_unit;
+use flife_core::rng::{Address, Lane, LaneKind, SemanticRng, Stream, half_open_unit};
 use flife_neural::{DenseTopology, Weight};
 
 /// The initializer this module implements.
@@ -91,6 +91,7 @@ pub fn initialize<W: Weight>(
                 detail: format!("layer {layer} has no inputs"),
             });
         }
+        let limit = (3.0 / shape.inputs as f64).sqrt();
         let (weights, biases) = parameters
             .get_mut(shape.weights..shape.end())
             .ok_or_else(|| CoreError::LayoutMismatch {
@@ -100,14 +101,102 @@ pub fn initialize<W: Weight>(
             .split_at_mut(shape.biases - shape.weights);
         for (output, row) in weights.chunks_exact_mut(shape.inputs).enumerate() {
             for (input, slot) in row.iter_mut().enumerate() {
-                *slot = fan_in_draw(
-                    word(WeightAddress {
-                        layer,
-                        output,
-                        input,
-                    }),
-                    shape.inputs,
-                )?;
+                let raw = word(WeightAddress {
+                    layer,
+                    output,
+                    input,
+                });
+                *slot = W::round_from_f64((2.0 * half_open_unit(raw) - 1.0) * limit);
+            }
+        }
+        biases.fill(W::round_from_f64(0.0));
+    }
+    Ok(())
+}
+
+/// Specialized [`initialize`] drawing directly from `rng` at
+/// `(stream, entity, ordinal, Lane(candidate, kind, neuron_index(l, o, i)), 0)`.
+///
+/// Hoists the per-layer scale `√(3 / fan_in)` and neuron-index range checks
+/// out of the per-weight inner loop and evaluates 4 consecutive Philox4x64-10
+/// weight lanes in parallel via [`SemanticRng::word0_lanes4`], producing
+/// weights bit-identical to [`initialize`] with `rng.block(address)[0]`.
+///
+/// # Errors
+/// [`CoreError::LayoutMismatch`] for a mismatched parameter length or zero
+/// fan-in; [`CoreError::Overflow`] if any `(layer, output, input)` exceeds
+/// [`Lane::neuron_index`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors SemanticRng::Address coordinates directly without an extra wrapper struct"
+)]
+pub fn initialize_from_rng<W: Weight>(
+    topology: &DenseTopology,
+    parameters: &mut [W],
+    rng: &SemanticRng,
+    stream: Stream,
+    entity: u64,
+    ordinal: u64,
+    candidate: u8,
+    kind: LaneKind,
+) -> Result<(), CoreError> {
+    if parameters.len() != topology.parameter_count() {
+        return Err(CoreError::LayoutMismatch {
+            buffer: "genome parameters",
+            detail: format!(
+                "{} values for a topology of {} parameters",
+                parameters.len(),
+                topology.parameter_count()
+            ),
+        });
+    }
+    for (layer, shape) in topology.layers().iter().enumerate() {
+        if shape.inputs == 0 {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "genome parameters",
+                detail: format!("layer {layer} has no inputs"),
+            });
+        }
+        if shape.outputs > 0 {
+            let _ = Lane::neuron_index(layer, shape.outputs - 1, shape.inputs - 1)
+                .and_then(|idx| Lane::new(candidate, kind, idx))?;
+        }
+        let limit = (3.0 / shape.inputs as f64).sqrt();
+        let (weights, biases) = parameters
+            .get_mut(shape.weights..shape.end())
+            .ok_or_else(|| CoreError::LayoutMismatch {
+                buffer: "genome parameters",
+                detail: format!("layer {layer} ends past the buffer"),
+            })?
+            .split_at_mut(shape.biases - shape.weights);
+        for (output, row) in weights.chunks_exact_mut(shape.inputs).enumerate() {
+            let base_idx = Lane::neuron_index(layer, output, 0)?;
+            let (chunks, rem) = row.as_chunks_mut::<4>();
+            for (chunk_idx, dst) in chunks.iter_mut().enumerate() {
+                let input = (chunk_idx * 4) as u64;
+                let lanes = [
+                    Lane::new(candidate, kind, base_idx | input)?,
+                    Lane::new(candidate, kind, base_idx | (input + 1))?,
+                    Lane::new(candidate, kind, base_idx | (input + 2))?,
+                    Lane::new(candidate, kind, base_idx | (input + 3))?,
+                ];
+                let words = rng.word0_lanes4(stream, entity, ordinal, lanes, 0);
+                dst[0] = W::round_from_f64((2.0 * half_open_unit(words[0]) - 1.0) * limit);
+                dst[1] = W::round_from_f64((2.0 * half_open_unit(words[1]) - 1.0) * limit);
+                dst[2] = W::round_from_f64((2.0 * half_open_unit(words[2]) - 1.0) * limit);
+                dst[3] = W::round_from_f64((2.0 * half_open_unit(words[3]) - 1.0) * limit);
+            }
+            let tail_start = chunks.len() * 4;
+            for (offset, slot) in rem.iter_mut().enumerate() {
+                let lane = Lane::new(candidate, kind, base_idx | (tail_start + offset) as u64)?;
+                let raw = rng.word0(Address {
+                    stream,
+                    entity,
+                    ordinal,
+                    lane,
+                    draw: 0,
+                });
+                *slot = W::round_from_f64((2.0 * half_open_unit(raw) - 1.0) * limit);
             }
         }
         biases.fill(W::round_from_f64(0.0));

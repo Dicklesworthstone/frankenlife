@@ -907,3 +907,97 @@ fn register_blocked_gemv_and_f32_inputs_match_independent_scalar_oracle_bit_for_
         "must report first overflowing hidden neuron (+inf at neuron 5, not -inf at neuron 7), got {err:?}"
     );
 }
+
+#[test]
+fn reference_controller_fast_bound_check_matches_scalar_oracle_on_boundaries() {
+    use flife_core::binary16::F16;
+    let topo = DenseTopology::with_io(3, &[4], 2).expect("small topology");
+    let count = topo.parameter_count();
+    let f16_bounds = [
+        1.0e-12_f64,
+        f64::from(F16::from_bits(0x0001).to_f32()), // smallest subnormal
+        0.5 * (f64::from(F16::from_bits(0x0001).to_f32())
+            + f64::from(F16::from_bits(0x0002).to_f32())),
+        1.0,
+        4.0,
+        4.001,
+        65_504.0,
+        1.0e9,
+    ];
+    let f16_probes = [
+        0x0000_u16, 0x8000, 0x0001, 0x8001, 0x0002, 0x3C00, 0xBC00, 0x4400, 0xC400, 0x4401, 0xC401,
+        0x7BFF, 0xFBFF, 0x7C00, 0xFC00, 0x7E00, 0xFFFF,
+    ];
+    for &bound in &f16_bounds {
+        for &bits in &f16_probes {
+            let h = F16::from_bits(bits);
+            let scalar_ok = {
+                let v = h.to_f32();
+                v.is_finite() && f64::from(v.abs()) <= bound
+            };
+            for pos in [0, 1, 7, 8, count - 1] {
+                let mut params = vec![F16::ZERO; count];
+                params[pos] = h;
+                let res = ReferenceController::new(&topo, &params, bound);
+                assert_eq!(
+                    res.is_ok(),
+                    scalar_ok,
+                    "F16 bound={bound:e} bits={bits:#06x} pos={pos}"
+                );
+                if let Err(CoreError::NumericalInvalid { detail, .. }) = res {
+                    assert!(
+                        detail.contains(&format!("parameter {pos} ")),
+                        "expected index {pos}, got {detail}"
+                    );
+                }
+            }
+        }
+    }
+
+    let f32_bounds = [
+        1.0e-46_f64,
+        1.0e-38,
+        1.0,
+        4.0,
+        4.0 + 1.0e-12,
+        f64::from(f32::MAX),
+        1.0e100,
+    ];
+    let f32_probes = [
+        0.0_f32,
+        -0.0,
+        f32::from_bits(1),
+        -f32::from_bits(1),
+        1.0,
+        -1.0,
+        4.0,
+        -4.0,
+        f32::from_bits(4.0_f32.to_bits() + 1),
+        f32::MAX,
+        -f32::MAX,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+    ];
+    for &bound in &f32_bounds {
+        for &val in &f32_probes {
+            let scalar_ok = val.is_finite() && f64::from(val.abs()) <= bound;
+            for pos in [0, 3, 4, count - 1] {
+                let mut params = vec![0.0_f32; count];
+                params[pos] = val;
+                let res = ReferenceController::new(&topo, &params, bound);
+                assert_eq!(
+                    res.is_ok(),
+                    scalar_ok,
+                    "F32 bound={bound:e} val={val:?} pos={pos}"
+                );
+                if let Err(CoreError::NumericalInvalid { detail, .. }) = res {
+                    assert!(
+                        detail.contains(&format!("parameter {pos} ")),
+                        "expected index {pos}, got {detail}"
+                    );
+                }
+            }
+        }
+    }
+}

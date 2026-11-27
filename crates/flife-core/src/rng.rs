@@ -218,6 +218,114 @@ pub struct SemanticRng {
     seed: u64,
 }
 
+/// Philox4x64-10 multipliers and Weyl key increments matching NumPy /
+/// `fnp_random::PhiloxRng` bit for bit.
+const PHILOX_M0: u64 = 0xD2E7_470E_E14C_6C93;
+const PHILOX_M1: u64 = 0xCA5A_8263_9512_1157;
+const PHILOX_W0: u64 = 0x9E37_79B9_7F4A_7C15;
+const PHILOX_W1: u64 = 0xBB67_AE85_84CA_A73B;
+
+/// Full 64×64 -> (hi, lo) multiply for one Philox4x64 round.
+#[inline(always)]
+const fn mulhilo64(a: u64, b: u64) -> (u64, u64) {
+    let product = (a as u128) * (b as u128);
+    ((product >> 64) as u64, product as u64)
+}
+
+/// Increment a little-endian 256-bit Philox counter by 1 (mod `2^256`),
+/// matching NumPy / `fnp_random::PhiloxRng`'s pre-block increment.
+#[inline(always)]
+const fn inc_counter(mut ctr: [u64; 4]) -> [u64; 4] {
+    ctr[0] = ctr[0].wrapping_add(1);
+    if ctr[0] == 0 {
+        ctr[1] = ctr[1].wrapping_add(1);
+        if ctr[1] == 0 {
+            ctr[2] = ctr[2].wrapping_add(1);
+            if ctr[2] == 0 {
+                ctr[3] = ctr[3].wrapping_add(1);
+            }
+        }
+    }
+    ctr
+}
+
+/// One Philox4x64-10 block of `counter + 1 (mod 2^256)` under `key`,
+/// bit-identical to `fnp_random::PhiloxRng::new(key, counter)`.
+#[inline]
+const fn philox4x64_10_block(mut key: [u64; 2], counter: [u64; 4]) -> Block {
+    let mut ctr = inc_counter(counter);
+    let mut round = 0;
+    while round < 10 {
+        let (hi0, lo0) = mulhilo64(PHILOX_M0, ctr[0]);
+        let (hi1, lo1) = mulhilo64(PHILOX_M1, ctr[2]);
+        ctr = [hi1 ^ ctr[1] ^ key[0], lo1, hi0 ^ ctr[3] ^ key[1], lo0];
+        key[0] = key[0].wrapping_add(PHILOX_W0);
+        key[1] = key[1].wrapping_add(PHILOX_W1);
+        round += 1;
+    }
+    ctr
+}
+
+/// Word 0 of one Philox4x64-10 block of `counter + 1 (mod 2^256)` under `key`.
+/// Skips the unused `M0` multiply on round 10.
+#[inline]
+const fn philox4x64_10_word0(mut key: [u64; 2], counter: [u64; 4]) -> u64 {
+    let mut ctr = inc_counter(counter);
+    let mut round = 0;
+    while round < 9 {
+        let (hi0, lo0) = mulhilo64(PHILOX_M0, ctr[0]);
+        let (hi1, lo1) = mulhilo64(PHILOX_M1, ctr[2]);
+        ctr = [hi1 ^ ctr[1] ^ key[0], lo1, hi0 ^ ctr[3] ^ key[1], lo0];
+        key[0] = key[0].wrapping_add(PHILOX_W0);
+        key[1] = key[1].wrapping_add(PHILOX_W1);
+        round += 1;
+    }
+    let (hi1, _) = mulhilo64(PHILOX_M1, ctr[2]);
+    hi1 ^ ctr[1] ^ key[0]
+}
+
+/// Four independent Philox4x64-10 word-0 outputs computed in lockstep across
+/// the same 10 rounds under a shared `key` (`[seed, stream.code()]`), exposing
+/// 4-way instruction-level parallelism across wide integer multiply pipes.
+#[inline]
+const fn philox4x64_10_word0_4(mut key: [u64; 2], counters: [[u64; 4]; 4]) -> [u64; 4] {
+    let mut c0 = inc_counter(counters[0]);
+    let mut c1 = inc_counter(counters[1]);
+    let mut c2 = inc_counter(counters[2]);
+    let mut c3 = inc_counter(counters[3]);
+    let mut round = 0;
+    while round < 9 {
+        let k0 = key[0];
+        let k1 = key[1];
+        let (a_hi0, a_lo0) = mulhilo64(PHILOX_M0, c0[0]);
+        let (a_hi1, a_lo1) = mulhilo64(PHILOX_M1, c0[2]);
+        let (b_hi0, b_lo0) = mulhilo64(PHILOX_M0, c1[0]);
+        let (b_hi1, b_lo1) = mulhilo64(PHILOX_M1, c1[2]);
+        let (c_hi0, c_lo0) = mulhilo64(PHILOX_M0, c2[0]);
+        let (c_hi1, c_lo1) = mulhilo64(PHILOX_M1, c2[2]);
+        let (d_hi0, d_lo0) = mulhilo64(PHILOX_M0, c3[0]);
+        let (d_hi1, d_lo1) = mulhilo64(PHILOX_M1, c3[2]);
+        c0 = [a_hi1 ^ c0[1] ^ k0, a_lo1, a_hi0 ^ c0[3] ^ k1, a_lo0];
+        c1 = [b_hi1 ^ c1[1] ^ k0, b_lo1, b_hi0 ^ c1[3] ^ k1, b_lo0];
+        c2 = [c_hi1 ^ c2[1] ^ k0, c_lo1, c_hi0 ^ c2[3] ^ k1, c_lo0];
+        c3 = [d_hi1 ^ c3[1] ^ k0, d_lo1, d_hi0 ^ c3[3] ^ k1, d_lo0];
+        key[0] = k0.wrapping_add(PHILOX_W0);
+        key[1] = k1.wrapping_add(PHILOX_W1);
+        round += 1;
+    }
+    let k0 = key[0];
+    let (a_hi1, _) = mulhilo64(PHILOX_M1, c0[2]);
+    let (b_hi1, _) = mulhilo64(PHILOX_M1, c1[2]);
+    let (c_hi1, _) = mulhilo64(PHILOX_M1, c2[2]);
+    let (d_hi1, _) = mulhilo64(PHILOX_M1, c3[2]);
+    [
+        a_hi1 ^ c0[1] ^ k0,
+        b_hi1 ^ c1[1] ^ k0,
+        c_hi1 ^ c2[1] ^ k0,
+        d_hi1 ^ c3[1] ^ k0,
+    ]
+}
+
 impl SemanticRng {
     /// The source for `seed`.
     #[must_use]
@@ -248,8 +356,64 @@ impl SemanticRng {
     }
 
     /// The block at `address`.
+    #[inline]
     #[must_use]
     pub fn block(&self, address: Address) -> Block {
+        philox4x64_10_block(
+            [self.seed, address.stream.code()],
+            [
+                address.entity,
+                address.ordinal,
+                address.lane.get(),
+                address.draw,
+            ],
+        )
+    }
+
+    /// Word 0 of [`SemanticRng::block`] at `address`, bit-identical to
+    /// `self.block(address)[0]`.
+    #[inline]
+    #[must_use]
+    pub fn word0(&self, address: Address) -> u64 {
+        philox4x64_10_word0(
+            [self.seed, address.stream.code()],
+            [
+                address.entity,
+                address.ordinal,
+                address.lane.get(),
+                address.draw,
+            ],
+        )
+    }
+
+    /// Word 0 of [`SemanticRng::block`] for four consecutive lanes
+    /// `lanes[0..4]` sharing `(stream, entity, ordinal, draw)`, bit-identical
+    /// per lane to `self.block(Address { stream, entity, ordinal, lane: lanes[i], draw })[0]`.
+    #[inline]
+    #[must_use]
+    pub fn word0_lanes4(
+        &self,
+        stream: Stream,
+        entity: u64,
+        ordinal: u64,
+        lanes: [Lane; 4],
+        draw: u64,
+    ) -> [u64; 4] {
+        philox4x64_10_word0_4(
+            [self.seed, stream.code()],
+            [
+                [entity, ordinal, lanes[0].get(), draw],
+                [entity, ordinal, lanes[1].get(), draw],
+                [entity, ordinal, lanes[2].get(), draw],
+                [entity, ordinal, lanes[3].get(), draw],
+            ],
+        )
+    }
+
+    /// Reference path through upstream `fnp_random::PhiloxRng` for conformance
+    /// checking against [`SemanticRng::block`].
+    #[must_use]
+    pub fn block_via_fnp(&self, address: Address) -> Block {
         let mut philox = PhiloxRng::new(
             [self.seed, address.stream.code()],
             [

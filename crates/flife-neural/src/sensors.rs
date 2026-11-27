@@ -544,10 +544,10 @@ fn err_tanh_undef(value: f64) -> CoreError {
 
 #[cold]
 #[inline(never)]
-fn err_tanh4_undef(xs: [f64; 4]) -> CoreError {
+fn err_tanh4_undef(x0: f64, x1: f64, x2: f64, x3: f64) -> CoreError {
     CoreError::NumericalInvalid {
         quantity: "sensor input",
-        detail: format!("tanh({xs:?}) is undefined"),
+        detail: format!("tanh({:?}) is undefined", [x0, x1, x2, x3]),
     }
 }
 
@@ -641,39 +641,36 @@ fn normalize_single_to_f32(
         *slot = q0 as f32;
     }
     out_gradients[0] = [gx0, gy0];
-    let mut z_buf = [0.0_f64; PLANES - 1];
-    // Separate unit-stride normalization from finiteness reduction so LLVM
-    // emits contiguous ldp/fdiv.2d/fcvtn/st2.2d without 4-way ld4.2d/st4.4s
-    // deinterleaving loads and stores.
-    for ((dst_f32, dst_z), &moment) in value_slots[1..].iter_mut().zip(&mut z_buf).zip(moments) {
-        let z = moment / regularized;
-        *dst_z = z;
-        *dst_f32 = z as f32;
-    }
-    for (((gc, &z), &mx), &my) in out_gradients[1..]
+    let mut val_acc = [q0 + (gx0 + gy0), 0.0];
+    // Process two chemical channels per iteration without an intermediate
+    // `z_buf: [f64; 32]` stack buffer so LLVM keeps live values in registers
+    // with zero `stp q [sp, ...]` spills and emits clean `fdiv.2d` + `st2.2d`.
+    let val_pairs = value_slots[1..].as_chunks_mut::<2>().0;
+    let grad_pairs = out_gradients[1..].as_chunks_mut::<2>().0;
+    let m_pairs = moments.as_chunks::<2>().0;
+    let mx_pairs = moments_x.as_chunks::<2>().0;
+    let my_pairs = moments_y.as_chunks::<2>().0;
+    for ((((dst_f32, gc), &m), &mx), &my) in val_pairs
         .iter_mut()
-        .zip(&z_buf)
-        .zip(moments_x)
-        .zip(moments_y)
+        .zip(grad_pairs)
+        .zip(m_pairs)
+        .zip(mx_pairs)
+        .zip(my_pairs)
     {
-        *gc = [
-            (mx - z * density_x) / regularized,
-            (my - z * density_y) / regularized,
+        let z0 = m[0] / regularized;
+        let z1 = m[1] / regularized;
+        *dst_f32 = [z0 as f32, z1 as f32];
+        gc[0] = [
+            (mx[0] - z0 * density_x) / regularized,
+            (my[0] - z0 * density_y) / regularized,
         ];
-    }
-    let mut val_acc = [q0 + (gx0 + gy0), 0.0, 0.0, 0.0];
-    for chunk in z_buf.as_chunks::<4>().0 {
-        val_acc = [
-            val_acc[0] + chunk[0],
-            val_acc[1] + chunk[1],
-            val_acc[2] + chunk[2],
-            val_acc[3] + chunk[3],
+        gc[1] = [
+            (mx[1] - z1 * density_x) / regularized,
+            (my[1] - z1 * density_y) / regularized,
         ];
+        val_acc = [val_acc[0] + z0, val_acc[1] + z1];
     }
-    let val_finite_ok = val_acc[0].is_finite()
-        & val_acc[1].is_finite()
-        & val_acc[2].is_finite()
-        & val_acc[3].is_finite();
+    let val_finite_ok = val_acc[0].is_finite() & val_acc[1].is_finite();
     Ok((
         intrinsic.energy / energy_denom,
         intrinsic.age_seconds / age_denom,
@@ -795,7 +792,7 @@ fn check_finite_single_from_raw_slow(
 
 #[inline]
 fn saturate_4(xs: [f64; 4]) -> Result<[f32; 4], CoreError> {
-    tanh_f64_as_f32_4(xs).ok_or_else(|| err_tanh4_undef(xs))
+    tanh_f64_as_f32_4(xs).ok_or_else(|| err_tanh4_undef(xs[0], xs[1], xs[2], xs[3]))
 }
 
 type NormalizedSingle = ([f64; PLANES], [[f64; 2]; PLANES], f64, f64);

@@ -1364,3 +1364,90 @@ fn tanh_4_homogeneous_and_mixed_regimes_match_scalar_bit_for_bit() {
         check(c);
     }
 }
+
+#[test]
+fn tanh_poly17_boundary_and_timestep_seconds_power_of_two_bit_exact() {
+    use flife_core::clock::age_seconds;
+    use flife_core::{Tick, TickSpan, TimeStep};
+
+    // Dense ULP walk across the `TANH_POLY_MAX = 0.75` and `TANH_PADE_MAX = 2.25`
+    // boundaries, plus mixed 4-lane quads straddling every regime and F32 midpoint
+    // ties inside `[0, 0.75]`.
+    let mut xs = vec![
+        0.0,
+        -0.0,
+        f64::from_bits(1),
+        -f64::from_bits(1),
+        f64::from(f32::MIN_POSITIVE) * 0.5,
+        f64::from(f32::MIN_POSITIVE) * 2.0,
+        0.75_f64.next_down(),
+        0.75,
+        0.75_f64.next_up(),
+        -0.75_f64.next_down(),
+        -0.75,
+        -0.75_f64.next_up(),
+        2.25_f64.next_down(),
+        2.25,
+        2.25_f64.next_up(),
+        20.0,
+        -20.0,
+    ];
+    for step in 0..4_000_u32 {
+        let v = 0.75 * f64::from(step) / 4_000.0;
+        xs.push(v);
+        xs.push(-v);
+    }
+    // Check scalar and 4-lane against canonical `tanh(x) as f32` bit-for-bit.
+    for &x in &xs {
+        let want = (tanh(x).expect("tanh") as f32).to_bits();
+        let got_scalar = tanh_f64_as_f32(x).expect("scalar").to_bits();
+        assert_eq!(got_scalar, want, "tanh_f64_as_f32 mismatch at x={x:?}");
+    }
+    for &quad in xs.as_chunks::<4>().0 {
+        let got = tanh_f64_as_f32_4(quad).expect("batch");
+        for (lane, &x) in quad.iter().enumerate() {
+            let want = (tanh(x).expect("tanh") as f32).to_bits();
+            assert_eq!(
+                got[lane].to_bits(),
+                want,
+                "tanh_f64_as_f32_4 mismatch at lane {lane} x={x:?} in {quad:?}"
+            );
+        }
+    }
+    for mixed in [
+        [0.1, -0.749_999, 0.75, -0.0],
+        [0.1, 0.75_f64.next_up(), -0.5, 0.2],
+        [0.75, 2.25, -0.75, -2.25],
+        [0.75, 2.25_f64.next_up(), 0.0, -30.0],
+    ] {
+        let got = tanh_f64_as_f32_4(mixed).expect("mixed");
+        for (lane, &x) in mixed.iter().enumerate() {
+            let want = (tanh(x).expect("tanh") as f32).to_bits();
+            assert_eq!(got[lane].to_bits(), want, "mixed mismatch {mixed:?}[{lane}]");
+        }
+    }
+
+    // TimeStep::seconds and age_seconds exact bit parity with rational `(span * num) / den`
+    // across power-of-two and non-power-of-two denominators, including `u64` overflow into `u128`.
+    for &(num, den) in &[(1_u32, 128), (1, 1), (1, 64), (3, 128), (1, 60), (7, 100)] {
+        let step = TimeStep::new(num, den).expect("step");
+        for &ticks in &[0_u64, 1, 2, 127, 128, 129, 1_000_000, u64::MAX / 2, u64::MAX] {
+            let oracle =
+                ((u128::from(ticks) * u128::from(step.numerator())) as f64)
+                    / f64::from(step.denominator());
+            let got = step.seconds(TickSpan::new(ticks));
+            assert_eq!(
+                got.to_bits(),
+                oracle.to_bits(),
+                "TimeStep({num}/{den}).seconds({ticks}) mismatch"
+            );
+        }
+        assert_eq!(
+            age_seconds(Tick::new(10), Tick::new(138), step)
+                .expect("age")
+                .to_bits(),
+            step.seconds(TickSpan::new(128)).to_bits()
+        );
+        assert!(age_seconds(Tick::new(20), Tick::new(10), step).is_err());
+    }
+}

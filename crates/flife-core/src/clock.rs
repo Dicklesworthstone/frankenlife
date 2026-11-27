@@ -74,13 +74,26 @@ impl TimeStep {
     #[inline]
     #[must_use]
     pub fn seconds(self, span: TickSpan) -> f64 {
-        let num = u64::from(self.numerator);
-        let scaled = if let Some(product) = span.get().checked_mul(num) {
-            product as f64
+        let ticks = span.get();
+        let scaled = if self.numerator == 1 {
+            ticks as f64
         } else {
-            (u128::from(span.get()) * u128::from(num)) as f64
+            let num = u64::from(self.numerator);
+            if let Some(product) = ticks.checked_mul(num) {
+                product as f64
+            } else {
+                (u128::from(ticks) * u128::from(num)) as f64
+            }
         };
-        scaled / f64::from(self.denominator)
+        if self.denominator.is_power_of_two() {
+            // For any power-of-two `u32` denominator `2^k` (`0 <= k <= 31`),
+            // `1.0 / 2^k` is an exact normal f64 and `scaled >= 0` is an
+            // integer so `scaled * 2^(-k)` is never subnormal when nonzero,
+            // making multiplication 0-ulp bit-identical to division.
+            scaled * (1.0 / f64::from(self.denominator))
+        } else {
+            scaled / f64::from(self.denominator)
+        }
     }
 
     /// Ticks in exactly `seconds`, which must be a whole number of ticks
@@ -217,6 +230,7 @@ impl Tick {
     ///
     /// # Errors
     /// [`CoreError::Overflow`] when `earlier` is after this tick.
+    #[inline]
     pub fn since(self, earlier: Self) -> Result<TickSpan, CoreError> {
         self.0
             .checked_sub(earlier.0)

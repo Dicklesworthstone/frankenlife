@@ -44,7 +44,9 @@ use flife_cli::{
 };
 use flife_core::ids::OrganismId;
 use flife_core::{CoreError, ValidatedConfig};
-use flife_engine::{Arrangement, Disposition, Intervention, NumericalProfile, Stepped, World};
+use flife_engine::{
+    Arrangement, Disposition, Intervention, NumericalProfile, STOP_AND_PRESERVE, Stepped, World,
+};
 
 const REFERENCE: &str = include_str!("../../../presets/reference-small-world.toml");
 
@@ -216,10 +218,15 @@ fn controlled_churn_endurance_turnover_bounded_memory_and_inv07() {
         post_warmup_footprint_max <= max_budget,
         "footprint {post_warmup_footprint_max} exceeded budget {max_budget}"
     );
-    // Repeated reclamation must keep footprint strictly bounded (no monotonic leak > 2x).
+    // Repeated reclamation must keep post-warmup footprint strictly bounded
+    // (within +2 MiB of the post-warmup floor, catching leaks well below budget).
     assert!(
-        post_warmup_footprint_max <= post_warmup_footprint_min.saturating_mul(2).max(16 << 20),
-        "post-warmup footprint grew suspiciously: min={post_warmup_footprint_min} max={post_warmup_footprint_max}"
+        post_warmup_footprint_min > 0 && post_warmup_footprint_max >= post_warmup_footprint_min,
+        "invalid post-warmup footprint range [{post_warmup_footprint_min}, {post_warmup_footprint_max}]"
+    );
+    assert!(
+        post_warmup_footprint_max <= post_warmup_footprint_min.saturating_add(2 << 20),
+        "post-warmup footprint grew beyond 2 MiB bound: min={post_warmup_footprint_min} max={post_warmup_footprint_max}"
     );
 }
 
@@ -302,41 +309,29 @@ fn multi_stage_checkpoint_restart_and_corrupted_chunk_recovery() {
         "restarted run must match uninterrupted control bit-for-bit"
     );
 
-    // 4. Fault injection: corrupt the newest checkpoint's sealed file in store/
-    //    and confirm `resume` detects the corruption, skips the damaged checkpoint,
-    //    and recovers to the exact uninterrupted digest!
-    let store_dir = run_dir.join("store");
-    let mut entries: Vec<PathBuf> = fs::read_dir(&store_dir)
-        .expect("read store dir")
+    // 4. Fault injection: corrupt the highest-sequence checkpoint manifest under
+    //    `store/checkpoints/<sequence>.manifest` (sorting numerically, never
+    //    lexicographically so `10.manifest` > `2.manifest`) and confirm `resume`
+    //    detects the corruption, skips the damaged checkpoint, and recovers to
+    //    the exact uninterrupted digest!
+    let ckpt_dir = run_dir.join("store").join("checkpoints");
+    let mut sequenced: Vec<(u64, PathBuf)> = fs::read_dir(&ckpt_dir)
+        .expect("read checkpoints dir")
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.ends_with(".flchk") || n.starts_with("ckpt-"))
+        .filter(|p| p.is_file())
+        .filter_map(|p| {
+            let seq = p.file_stem()?.to_str()?.parse::<u64>().ok()?;
+            Some((seq, p))
         })
         .collect();
-    entries.sort();
-    // Chunk store writes checkpoint manifests under store/checkpoints/ or store/chunks/.
-    if entries.is_empty() {
-        let ckpt_dir = store_dir.join("checkpoints");
-        if ckpt_dir.is_dir() {
-            entries = fs::read_dir(&ckpt_dir)
-                .expect("read checkpoints dir")
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| p.is_file())
-                .collect();
-            entries.sort();
-        }
-    }
+    sequenced.sort_by_key(|(seq, _)| *seq);
     assert!(
-        !entries.is_empty(),
-        "expected at least one persisted checkpoint file under {}",
-        store_dir.display()
+        sequenced.len() >= 2,
+        "expected at least two persisted checkpoint manifests under {}",
+        ckpt_dir.display()
     );
-    let newest_chunk = entries.last().expect("at least one checkpoint file");
+    let (_, newest_chunk) = sequenced.last().expect("at least one checkpoint manifest");
     let mut bytes = fs::read(newest_chunk).expect("read newest checkpoint file");
     assert!(bytes.len() > 32, "checkpoint file non-trivial");
     let mid = bytes.len() / 2;
@@ -439,8 +434,9 @@ fn capacity_pause_and_numerical_fault_subruns_preserve_committed_state() {
         Stepped::Paused(s) => panic!("unexpected pause after removal: {s:?}"),
     }
 
-    // 3. Numerical fault subrun: NaN energy injection must be rejected cleanly and NEVER
-    //    masquerade as organism death or corrupt the committed world!
+    // 3. Pre-prepare invalid intervention refusal: NaN energy injection must be
+    //    rejected cleanly before `prepare()` without latching `world.fault()` or
+    //    killing organisms, leaving the world intact and steppable.
     let digest_pre_nan = world.digest();
     let live_pre_nan = world.population().len();
     let tick_pre_nan = world.tick();
@@ -454,6 +450,10 @@ fn capacity_pause_and_numerical_fault_subruns_preserve_committed_state() {
         matches!(err, CoreError::NumericalInvalid { .. }),
         "expected NumericalInvalid for NaN intervention, got {err:?}"
     );
+    assert!(
+        world.fault().is_none(),
+        "pre-prepare invalid command must not latch a stop-and-preserve run fault"
+    );
     assert_eq!(
         world.digest(),
         digest_pre_nan,
@@ -462,7 +462,74 @@ fn capacity_pause_and_numerical_fault_subruns_preserve_committed_state() {
     assert_eq!(
         world.population().len(),
         live_pre_nan,
-        "numerical fault must never kill organisms"
+        "invalid command must never kill organisms"
     );
     assert_eq!(world.tick(), tick_pre_nan);
+
+    // 4. True mid-step `stop-and-preserve` numerical fault (plan §7.6): found a
+    //    world whose enormous narrow source (`power_per_source = 1.0e40`,
+    //    `sigma = 0.5`) overflows the F32 field during `World::prepare()` after
+    //    publishing valid ticks, proving:
+    //    - `CoreError::NumericalInvalid` is returned;
+    //    - `world.fault()` latches with the exact input tick and error;
+    //    - committed digest, live organism count, and tick are preserved bit-for-bit
+    //      (numerical fault NEVER masquerades as organism death);
+    //    - subsequent `world.step()` is refused with `StateConflict` naming
+    //      `stop-and-preserve`.
+    let overflow_toml = high_churn_ecology_toml(512)
+        .replacen("count = 4\n", "count = 1\n", 1)
+        .replacen(
+            "power_per_source = 190.0\n",
+            "power_per_source = 1.0e40\n",
+            1,
+        )
+        .replacen("sigma_world_units = 3.2\n", "sigma_world_units = 0.5\n", 1);
+    let overflow_config =
+        ValidatedConfig::from_toml(&overflow_toml).expect("valid overflow config");
+    let mut overflow_world =
+        World::found_on(&overflow_config, Arrangement::FreeList, profile, workers)
+            .expect("found overflow world");
+    let (overflow_err, digest_pre_fault, live_pre_fault, tick_pre_fault) = loop {
+        assert!(
+            overflow_world.tick().get() < 64,
+            "expected F32 field overflow within 64 ticks"
+        );
+        let d_before = overflow_world.digest();
+        let l_before = overflow_world.population().len();
+        let t_before = overflow_world.tick();
+        match overflow_world.step() {
+            Ok(Stepped::Published(_)) => {}
+            Ok(Stepped::Paused(s)) => panic!("unexpected pause before overflow: {s:?}"),
+            Err(err) => break (err, d_before, l_before, t_before),
+        }
+    };
+    assert!(
+        matches!(overflow_err, CoreError::NumericalInvalid { .. }),
+        "expected NumericalInvalid on F32 field overflow, got {overflow_err:?}"
+    );
+    let fault = overflow_world
+        .fault()
+        .expect("mid-step NumericalInvalid must latch stop-and-preserve fault");
+    assert_eq!(fault.tick, tick_pre_fault);
+    assert_eq!(fault.error, overflow_err);
+    assert_eq!(
+        overflow_world.digest(),
+        digest_pre_fault,
+        "stop-and-preserve must preserve committed world bit-for-bit"
+    );
+    assert_eq!(
+        overflow_world.population().len(),
+        live_pre_fault,
+        "mid-step numerical fault must never masquerade as organism death"
+    );
+    assert_eq!(overflow_world.tick(), tick_pre_fault);
+
+    let after_fault = overflow_world
+        .step()
+        .expect_err("stopped world must refuse subsequent steps");
+    assert!(
+        matches!(&after_fault, CoreError::StateConflict { detail, .. } if detail.contains(STOP_AND_PRESERVE)),
+        "expected StateConflict naming {STOP_AND_PRESERVE}, got {after_fault:?}"
+    );
+    assert_eq!(overflow_world.digest(), digest_pre_fault);
 }

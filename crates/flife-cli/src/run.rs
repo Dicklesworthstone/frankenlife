@@ -19,6 +19,8 @@
 //! ticks remain ([`crate::metrics`], FL-040).
 
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use asupersync::Cx;
@@ -506,6 +508,30 @@ pub fn run_with(
     persistence: Option<&Persistence>,
     emit: impl FnMut(&Record) + Send + 'static,
 ) -> Result<Finished, CoreError> {
+    run_with_cancel(config, options, scheduled, persistence, None, emit)
+}
+
+/// [`run_with`] with an optional cooperative cancellation flag checked at
+/// every tick boundary before stepping (FL-057, plan §20.4).
+///
+/// When cancelled, the session owner is closed cleanly and
+/// [`CoreError::Cancelled`] is returned without emitting a [`Record::End`].
+pub(crate) fn run_with_cancel(
+    config: &ValidatedConfig,
+    options: RunOptions,
+    scheduled: &[ScheduledCommand],
+    persistence: Option<&Persistence>,
+    cancel: Option<Arc<AtomicBool>>,
+    emit: impl FnMut(&Record) + Send + 'static,
+) -> Result<Finished, CoreError> {
+    if cancel
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        return Err(CoreError::Cancelled {
+            reason: "run cancelled before founding".to_owned(),
+        });
+    }
     // The session's limits are checked before the world is founded, so an
     // unadmitted durability is refused without founding 4,096 organisms.
     let limits = SessionConfig::from_config(RUN_SESSION, config)?;
@@ -526,6 +552,14 @@ pub fn run_with(
         })
         .transpose()?;
     let mut world = found_on(config, options.cpu_workers)?;
+    if cancel
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        return Err(CoreError::Cancelled {
+            reason: "run cancelled after founding".to_owned(),
+        });
+    }
     let extra_lineages = scheduled
         .iter()
         .map(|command| match command {
@@ -583,6 +617,7 @@ pub fn run_with(
         commands,
         resumed: None,
         metrics,
+        cancel,
     };
     let driven = drive(owner, handle, plan, checkpoints, emit, clock)?;
     finish(
@@ -672,6 +707,8 @@ pub(crate) struct Plan {
     pub resumed: Option<(Option<CheckpointAt>, Vec<SkippedCheckpoint>)>,
     /// The metrics tracker, from the world the session was opened with.
     pub metrics: Option<Tracker>,
+    /// Optional cooperative cancellation flag polled at every tick boundary.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 /// What driving a session returned.
@@ -823,9 +860,19 @@ where
                     }
                 }
                 let mut tally = Tally::default();
+                let cancel = plan.cancel;
                 let stop = loop {
                     if committed >= until {
                         break Stop::Reached;
+                    }
+                    if cancel
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::Acquire))
+                    {
+                        handle.close(&cx).await?;
+                        return Err(CoreError::Cancelled {
+                            reason: format!("run cancelled at committed tick {committed}"),
+                        });
                     }
                     let next_tick = committed.saturating_add(1);
                     let need_render = metrics

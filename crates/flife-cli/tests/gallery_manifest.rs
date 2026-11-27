@@ -25,11 +25,12 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use flife_cli::{
     CameraPath, ColorMapping, ControllerChoice, FieldMapping, Look, Particles, RenderOptions,
-    RenderRecord, Style, render,
+    RenderRecord, Style, render, validate_v2_visual_style,
 };
 use flife_core::ValidatedConfig;
 use flife_core::canonical::Sha256Digest;
@@ -142,8 +143,31 @@ fn gallery_manifest_covers_all_six_categories_with_valid_provenance() {
             .unwrap_or_else(|e| panic!("gallery preset {preset_rel} failed validation: {e}"));
         assert_eq!(validated.config().model, model);
         assert_eq!(validated.config().seed, seed);
+        let tick = entry
+            .get("checkpoint_or_tick")
+            .and_then(Value::as_u64)
+            .expect("entry checkpoint_or_tick");
+        assert!(tick > 0, "gallery entry {id} must specify tick > 0");
+        let eco_rel = entry
+            .get("ecological_reference")
+            .and_then(Value::as_str)
+            .expect("entry ecological_reference");
+        assert!(
+            root.join(eco_rel).is_file(),
+            "gallery entry {id} missing ecological_reference {eco_rel}"
+        );
+        if cat == "perturbed-colony" {
+            assert!(
+                entry
+                    .get("interventions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| !arr.is_empty()),
+                "perturbed-colony gallery entry {id} must list its declared interventions"
+            );
+        }
 
-        // Both aesthetic and raw G5 views must be present and explicitly mapped.
+        // Both aesthetic and raw G5 views must be present and parse through the
+        // real CLI/Manim mapping parsers + V2 visual compatibility validator.
         let aesthetic = entry.get("aesthetic_view").expect("aesthetic_view");
         let raw = entry.get("raw_view").expect("raw_view");
         assert_eq!(
@@ -152,12 +176,28 @@ fn gallery_manifest_covers_all_six_categories_with_valid_provenance() {
             "gallery entry {id} must pair an honest raw G5 view"
         );
         for view in [aesthetic, raw] {
-            assert!(
-                view.get("color_mapping")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty()),
-                "gallery entry {id} missing color_mapping"
-            );
+            let look_str = view.get("look").and_then(Value::as_str).expect("view look");
+            Look::from_str(look_str)
+                .unwrap_or_else(|e| panic!("gallery entry {id} invalid look {look_str:?}: {e}"));
+            let color_str = view
+                .get("color_mapping")
+                .and_then(Value::as_str)
+                .expect("view color_mapping");
+            let color = ColorMapping::from_str(color_str).unwrap_or_else(|e| {
+                panic!("gallery entry {id} invalid color_mapping {color_str:?}: {e}")
+            });
+            let field_str = view
+                .get("field_mapping")
+                .and_then(Value::as_str)
+                .expect("view field_mapping");
+            let field = FieldMapping::from_str(field_str).unwrap_or_else(|e| {
+                panic!("gallery entry {id} invalid field_mapping {field_str:?}: {e}")
+            });
+            validate_v2_visual_style(&validated, color, field).unwrap_or_else(|e| {
+                panic!(
+                    "gallery entry {id} incompatible style ({color_str}, {field_str}) for {preset_rel}: {e}"
+                )
+            });
             assert!(
                 view.get("command")
                     .and_then(Value::as_str)

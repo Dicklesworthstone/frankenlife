@@ -77,8 +77,9 @@ pub struct FlifeMetalVtable {
     pub recommended_working_set_bytes: u64,
     pub device_name: *const c_char,
 
-    pub alloc_shard:
-        Option<unsafe extern "C" fn(ctx: *mut c_void, bytes: u64, out_contents: *mut *mut u8) -> u64>,
+    pub alloc_shard: Option<
+        unsafe extern "C" fn(ctx: *mut c_void, bytes: u64, out_contents: *mut *mut u8) -> u64,
+    >,
     pub free_shard: Option<unsafe extern "C" fn(ctx: *mut c_void, handle: u64)>,
     pub write_shard: Option<
         unsafe extern "C" fn(
@@ -394,31 +395,29 @@ fn pack_f16_for_metal_into(
     }
     let mut cursor = 0_usize;
     let mut pending_lo: Option<u16> = None;
-    let write_slice = |slice: &[F16],
-                       pending: &mut Option<u16>,
-                       out_dst: &mut [u32],
-                       out_cursor: &mut usize| {
-        let mut iter = slice.iter();
-        if let Some(lo) = pending.take() {
-            if let Some(&hi) = iter.next() {
-                out_dst[*out_cursor] = u32::from(lo) | (u32::from(hi.to_bits()) << 16);
-                *out_cursor += 1;
-            } else {
-                *pending = Some(lo);
-                return;
+    let write_slice =
+        |slice: &[F16], pending: &mut Option<u16>, out_dst: &mut [u32], out_cursor: &mut usize| {
+            let mut iter = slice.iter();
+            if let Some(lo) = pending.take() {
+                if let Some(&hi) = iter.next() {
+                    out_dst[*out_cursor] = u32::from(lo) | (u32::from(hi.to_bits()) << 16);
+                    *out_cursor += 1;
+                } else {
+                    *pending = Some(lo);
+                    return;
+                }
             }
-        }
-        let rem = iter.as_slice();
-        let (pairs, tail) = rem.as_chunks::<2>();
-        let next = *out_cursor + pairs.len();
-        for (dst_word, [low, high]) in out_dst[*out_cursor..next].iter_mut().zip(pairs) {
-            *dst_word = u32::from(low.to_bits()) | (u32::from(high.to_bits()) << 16);
-        }
-        *out_cursor = next;
-        if let Some(&last) = tail.first() {
-            *pending = Some(last.to_bits());
-        }
-    };
+            let rem = iter.as_slice();
+            let (pairs, tail) = rem.as_chunks::<2>();
+            let next = *out_cursor + pairs.len();
+            for (dst_word, [low, high]) in out_dst[*out_cursor..next].iter_mut().zip(pairs) {
+                *dst_word = u32::from(low.to_bits()) | (u32::from(high.to_bits()) << 16);
+            }
+            *out_cursor = next;
+            if let Some(&last) = tail.first() {
+                *pending = Some(last.to_bits());
+            }
+        };
 
     let mut layer_offset = 0_usize;
     for layer in topology.layers() {
@@ -725,12 +724,8 @@ impl IosMetalControllerBackend {
         let bucket = self.buckets[topo_idx].get_or_insert_with(|| {
             let elem_limit = (max_buf / dtype.bytes()).min(u64::from(u32::MAX));
             let shape_words = validate_shape_words(topology, length);
-            let widest_hidden = topology
-                .hidden_widths()
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(0) as usize;
+            let widest_hidden =
+                topology.hidden_widths().iter().copied().max().unwrap_or(0) as usize;
             let geometry = shape_words.and_then(|_| {
                 ShardGeometry::fitting_for_dtype(
                     length as u64,
@@ -782,10 +777,7 @@ impl IosMetalControllerBackend {
                     pack_f16_for_metal_into(topology, values, &mut self.packed_f16[..word_count])?;
                 let byte_offset = offset_elems * 2;
                 let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        self.packed_f16.as_ptr().cast::<u8>(),
-                        written * 4,
-                    )
+                    std::slice::from_raw_parts(self.packed_f16.as_ptr().cast::<u8>(), written * 4)
                 };
                 self.write_device_shard(handle, byte_offset, bytes)?;
             }
@@ -853,8 +845,9 @@ impl IosMetalControllerBackend {
                 }
                 let dst_ptr = unsafe { shard_contents.add(byte_offset as usize) };
                 if (dst_ptr as usize).is_multiple_of(align_of::<u32>()) {
-                    let dst_words =
-                        unsafe { std::slice::from_raw_parts_mut(dst_ptr.cast::<u32>(), word_count) };
+                    let dst_words = unsafe {
+                        std::slice::from_raw_parts_mut(dst_ptr.cast::<u32>(), word_count)
+                    };
                     pack_f16_for_metal_into(topology, values, dst_words)?;
                 } else {
                     if scratch.len() < word_count {
@@ -903,6 +896,12 @@ impl IosMetalControllerBackend {
             true
         });
 
+        // When called via `World::step()` with `prefers_cpu_overlap() == true`,
+        // `flife_core::pool::overlap_off_cpu` runs `evaluate_flat_f32` on a pool
+        // worker thread (`ON_POOL_THREAD == true`), so `pool::parallel_for_each_mut`
+        // executes serially on that overlap thread alongside `cpu_workers - 1`
+        // chemistry threads (preserving the single-worker budget). Standalone
+        // callers outside `overlap_off_cpu` parallelize across `self.cpu_workers`.
         let all_direct = live_uploads.iter().all(|u| u.shard_contents != 0);
         let result = if all_direct && live_uploads.len() >= 16 && self.cpu_workers > 1 {
             let workers = self.cpu_workers.min(live_uploads.len());
@@ -1072,7 +1071,8 @@ impl IosMetalControllerBackend {
                 // find the max slot for this (topology, shard) across remaining jobs so each shard
                 // allocates ONCE at its final power-of-two capacity.
                 let mut target_local = local;
-                for (later_job, &later_fin) in jobs[index + 1..].iter().zip(&inputs_finite[index + 1..])
+                for (later_job, &later_fin) in
+                    jobs[index + 1..].iter().zip(&inputs_finite[index + 1..])
                 {
                     if later_fin == 0 {
                         continue;
@@ -1200,9 +1200,14 @@ impl IosMetalControllerBackend {
             }
         }
 
-        // Flush all newborn / mutated controller weights in parallel directly into
-        // Apple Silicon unified memory (`MTLBuffer.contents()`), zero FFI hops!
-        self.flush_pending_uploads(jobs)?;
+        // Flush all newborn / mutated controller weights directly into Apple
+        // Silicon unified memory (`MTLBuffer.contents()`), zero FFI hops!
+        // If any upload fails, invalidate all resident shards so `occupants`
+        // never falsely marks unwritten slots as resident on a subsequent call.
+        if let Err(err) = self.flush_pending_uploads(jobs) {
+            self.clear_all_shards();
+            return Err(err);
+        }
 
         if overwrote_existing {
             // Rebuild staged lists cleanly dropping any evicted earlier duplicate slot.
@@ -1558,7 +1563,10 @@ fn fill_organism_info(snap: &OrganismSnapshot, out: &mut FlifeOrganismInfo) {
     out.topology_index = snap.topology as u32;
     let hl = snap.hidden_widths.len().min(4);
     out.hidden_layer_count = hl as u32;
-    for (dst, &w) in out.hidden_widths[..hl].iter_mut().zip(&snap.hidden_widths[..hl]) {
+    for (dst, &w) in out.hidden_widths[..hl]
+        .iter_mut()
+        .zip(&snap.hidden_widths[..hl])
+    {
         *dst = w;
     }
     out.parameter_count = snap.parameters as u64;
@@ -1687,7 +1695,14 @@ fn worker_loop(
             let watch_upd = guard.watch_update.take();
             let follow_upd = guard.follow_update.take();
             let queries = std::mem::take(&mut guard.queries);
-            (do_step, target_tps, interventions, watch_upd, follow_upd, queries)
+            (
+                do_step,
+                target_tps,
+                interventions,
+                watch_upd,
+                follow_upd,
+                queries,
+            )
         };
 
         if let Some(w) = watch_upd {
@@ -1733,7 +1748,11 @@ fn worker_loop(
             let ctrl = world.controller_report();
             let delta_gpu_ns = ctrl.device_nanoseconds.saturating_sub(prev_device_ns);
             prev_device_ns = ctrl.device_nanoseconds;
-            let inst_tps = if wall_ms > 0.001 { 1000.0 / wall_ms } else { 0.0 };
+            let inst_tps = if wall_ms > 0.001 {
+                1000.0 / wall_ms
+            } else {
+                0.0
+            };
             ema_tps = if ema_tps == 0.0 {
                 inst_tps
             } else {
@@ -2011,10 +2030,7 @@ pub unsafe extern "C" fn flife_session_step_once(session: *mut FlifeSession) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn flife_session_set_target_tps(
-    session: *mut FlifeSession,
-    target_tps: f64,
-) {
+pub unsafe extern "C" fn flife_session_set_target_tps(session: *mut FlifeSession, target_tps: f64) {
     if session.is_null() {
         return;
     }
@@ -2084,13 +2100,7 @@ pub unsafe extern "C" fn flife_session_acquire_latest_epoch(
                 None => (false, 0, 0, 0, 0, 0, 0, 0.0),
             };
         let (has_fol, f_orig, f_org, f_hand, f_alive) = match lease.followed() {
-            Some(f) => (
-                true,
-                f.origin.get(),
-                f.organism.get(),
-                f.handoffs,
-                f.alive,
-            ),
+            Some(f) => (true, f.origin.get(), f.organism.get(), f.handoffs, f.alive),
             None => (false, 0, 0, 0, false),
         };
 
@@ -2117,9 +2127,7 @@ pub unsafe extern "C" fn flife_session_acquire_latest_epoch(
             generations: lease.generations().as_ptr(),
             topologies: lease.topologies().as_ptr(),
             affinities: lease.affinities().as_ptr().cast::<f32>(),
-            cell_states: lease
-                .cell_states()
-                .map_or(ptr::null(), |sl| sl.as_ptr()),
+            cell_states: lease.cell_states().map_or(ptr::null(), |sl| sl.as_ptr()),
             polarities: lease.polarities().map_or(ptr::null(), |sl| sl.as_ptr()),
 
             field_cells_x: cells_x,
@@ -2129,9 +2137,7 @@ pub unsafe extern "C" fn flife_session_acquire_latest_epoch(
             field_energy: field.values().as_ptr(),
             field_composition: field.composition().as_ptr().cast::<f32>(),
             field_components: field.components().as_ptr().cast::<i8>(),
-            field_trail_energy: field
-                .trail_energy()
-                .map_or(ptr::null(), |sl| sl.as_ptr()),
+            field_trail_energy: field.trail_energy().map_or(ptr::null(), |sl| sl.as_ptr()),
             field_vascular: field
                 .vascular_conductance()
                 .map_or(ptr::null(), |sl| sl.as_ptr()),
@@ -2362,8 +2368,10 @@ pub unsafe extern "C" fn flife_session_inspect_organism(
             let Ok(mut g) = lock.lock() else {
                 return false;
             };
-            g.queries
-                .push(SyncQuery::Inspect(OrganismId::new(organism_id), Arc::clone(&reply)));
+            g.queries.push(SyncQuery::Inspect(
+                OrganismId::new(organism_id),
+                Arc::clone(&reply),
+            ));
             cvar.notify_all();
         }
         let (rlock, rcvar) = &*reply;
@@ -2562,7 +2570,10 @@ pub unsafe extern "C" fn flife_inspect_preset(
         write_c_array(&mut out.name, &cfg.name);
         write_c_array(&mut out.model, &cfg.model);
         write_c_array(&mut out.color_mapping, &cfg.presentation.color_mapping);
-        write_c_array(&mut out.weight_dtype, &cfg.controller.canonical_weight_dtype);
+        write_c_array(
+            &mut out.weight_dtype,
+            &cfg.controller.canonical_weight_dtype,
+        );
         out.world_width = cfg.world.width;
         out.world_height = cfg.world.height;
         out.grid_width = cfg.world.grid_width;
@@ -2577,8 +2588,7 @@ pub unsafe extern "C" fn flife_inspect_preset(
         out.has_contact = cfg.contact.is_some();
         let v2_vis = cfg.is_v2_feature_enabled(V2Feature::V2VisualMappings);
         out.has_v2_visuals = v2_vis;
-        out.has_trail_carrier =
-            v2_vis && cfg.is_v2_feature_enabled(V2Feature::DualCarrierTrails);
+        out.has_trail_carrier = v2_vis && cfg.is_v2_feature_enabled(V2Feature::DualCarrierTrails);
         out.has_vascular_field = v2_vis && cfg.is_v2_feature_enabled(V2Feature::VascularField);
         out.has_cell_state = v2_vis
             && (cfg.is_v2_feature_enabled(V2Feature::EpigeneticRecurrence)
@@ -2625,27 +2635,27 @@ pub unsafe extern "C" fn flife_verify_metal_parity(
         let vtable = unsafe { *metal };
         let raw = RunConfig::from_toml(toml_text).map_err(|e| e.to_string())?;
         let validated = validate(raw).map_err(|e| e.to_string())?;
-        let workers = NonZeroUsize::new((cpu_workers as usize).clamp(1, 8))
-            .unwrap_or(NonZeroUsize::MIN);
+        let workers =
+            NonZeroUsize::new((cpu_workers as usize).clamp(1, 8)).unwrap_or(NonZeroUsize::MIN);
         let profile = NumericalProfile::reference_f32().map_err(|e| e.to_string())?;
 
-        let mut world_metal =
-            World::found_on(&validated, Arrangement::Compact, profile, workers)
-                .map_err(|e| e.to_string())?;
+        let mut world_metal = World::found_on(&validated, Arrangement::Compact, profile, workers)
+            .map_err(|e| e.to_string())?;
         let backend =
             IosMetalControllerBackend::new(vtable, workers.get()).map_err(|e| e.to_string())?;
         world_metal.set_controller_backend(Some(Box::new(backend)));
 
-        let mut world_cpu =
-            World::found_on(&validated, Arrangement::Compact, profile, workers)
-                .map_err(|e| e.to_string())?;
+        let mut world_cpu = World::found_on(&validated, Arrangement::Compact, profile, workers)
+            .map_err(|e| e.to_string())?;
 
         let mut metal_wall_ns = 0_u64;
         let mut cpu_wall_ns = 0_u64;
 
         for t in 1..=ticks {
             let tm0 = Instant::now();
-            world_metal.step().map_err(|e| format!("metal tick {t}: {e}"))?;
+            world_metal
+                .step()
+                .map_err(|e| format!("metal tick {t}: {e}"))?;
             metal_wall_ns = metal_wall_ns.saturating_add(tm0.elapsed().as_nanos() as u64);
 
             let tc0 = Instant::now();

@@ -16,10 +16,10 @@ use std::process::ExitCode;
 use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use flife_cli::{
     BranchOptions, CheckpointMode, ColorMapping, ControllerChoice, DiscoverOptions, Discovery,
-    ERROR_SCHEMA, Experiment, ExperimentOptions, FieldMapping, Injection, InspectOptions,
-    Introduction, Look, Material, Particles, Persistence, Removal, ResumeOptions, RunOptions,
-    ScheduledCommand, Selection, Stop, StoreDurability, Style, TransplantOptions, Until,
-    Validation,
+    ERROR_SCHEMA, EnsembleOptions, EnsembleOutcome, EnsembleStage, Experiment, FieldMapping,
+    Injection, InspectOptions, Introduction, Look, Material, Particles, Persistence, Removal,
+    ResumeOptions, RunOptions, ScheduledCommand, Selection, ShardSpec, Stop, StoreDurability,
+    Style, TransplantOptions, Until, Validation,
 };
 
 /// `flife discover`'s one record: the [`Discovery`] its bundle's
@@ -325,6 +325,27 @@ enum Command {
         /// No result depends on it.
         #[arg(long, default_value = "auto")]
         controllers: ControllerChoice,
+        /// Concurrent independent worlds supervised under Asupersync (FL-057,
+        /// plan §20.4). Default `1`. No scientific result depends on it.
+        #[arg(long, default_value = "1")]
+        parallel: NonZeroUsize,
+        /// Run only deterministic shard `K/N` (`1 <= K <= N`) of the planned
+        /// jobs so independent machines execute disjoint slices (FL-057).
+        #[arg(long)]
+        shard: Option<ShardSpec>,
+        /// Which ensemble stage to run: `all` (default), `discovery`, or
+        /// `held-out` (for two-stage `[select]` multi-machine sharding).
+        #[arg(long, default_value = "all")]
+        stage: EnsembleStage,
+        /// Verify and import completed shard directories before running or
+        /// reporting (repeatable; refuses mismatched experiments or tampered
+        /// records).
+        #[arg(long = "import", value_name = "DIR")]
+        imports: Vec<PathBuf>,
+        /// Assemble `report.json` strictly from already-cataloged and imported
+        /// runs without executing missing jobs (refuses if any run is missing).
+        #[arg(long)]
+        report_only: bool,
         #[command(flatten)]
         features: FeatureFlags,
     },
@@ -943,22 +964,36 @@ fn main() -> ExitCode {
             out,
             cpu_workers,
             controllers,
+            parallel,
+            shard,
+            stage,
+            imports,
+            report_only,
             features: _,
         } => {
             let experiment = match Experiment::load_with_overrides(&spec, &overrides) {
                 Ok(experiment) => experiment,
                 Err(error) => return fail(error.kind(), error.to_string()),
             };
-            match flife_cli::experiment(
+            match flife_cli::run_ensemble(
                 &experiment,
                 &out,
-                ExperimentOptions {
+                &EnsembleOptions {
                     cpu_workers,
                     controllers,
+                    parallel,
+                    shard,
+                    stage,
+                    imports,
+                    report_only,
+                    cancel: None,
                 },
                 print,
             ) {
-                Ok(_) => ExitCode::SUCCESS,
+                Ok(EnsembleOutcome::Complete(_) | EnsembleOutcome::Partial { .. }) => {
+                    ExitCode::SUCCESS
+                }
+                Ok(EnsembleOutcome::Cancelled { .. }) => ExitCode::from(1),
                 Err(error) => fail(error.kind(), error.to_string()),
             }
         }

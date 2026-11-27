@@ -113,9 +113,11 @@ pub use discovery::{
     THUMBNAIL_FILE, THUMBNAIL_MAX_PIXELS, Thumbnail, WORLD_DIR, discover, discovery_id,
 };
 pub use experiment::{
-    ABLATIONS, Ablation, Condition, EXPERIMENT_CATALOG_FILE, EXPERIMENT_SCHEMA, Experiment,
-    ExperimentOptions, ExperimentRecord, LastRecord, MANIFEST_SCHEMA, MEASURES, Measure, Measures,
-    REPORT_FILE, REPORT_SCHEMA, Report, RunResult, Spec, V2Measures, experiment,
+    ABLATIONS, Ablation, CancelToken, Condition, EXPERIMENT_CATALOG_FILE, EXPERIMENT_SCHEMA,
+    EnsembleOptions, EnsembleOutcome, EnsembleStage, Experiment, ExperimentOptions,
+    ExperimentRecord, ImportSummary, JOB_IDENTITY_SCHEMA, LastRecord, MANIFEST_SCHEMA, MEASURES,
+    Measure, Measures, REPORT_FILE, REPORT_SCHEMA, Report, RunResult, ShardSpec, Spec, V2Measures,
+    experiment, import_shards, run_ensemble,
 };
 pub use features::{FEATURES_SCHEMA, FeatureInfo, FeatureListing, list_features};
 pub use flife_backend_metal::{BackendBudget, ControllerChoice};

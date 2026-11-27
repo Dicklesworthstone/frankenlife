@@ -164,15 +164,24 @@ fn screenshot_world_full_evaluation_compact_parity_and_invariants() {
     let mut world_cpu =
         World::found_on(&config, Arrangement::Compact, profile, workers).expect("cpu found");
     let mut total_evals_cpu = 0_u64;
+    let mut expected_total_evals = 0_u64;
     for _ in 0..ticks {
+        let live_before = u64::try_from(world_cpu.population().len()).expect("u64");
         let report = match world_cpu.step().expect("cpu step") {
             Stepped::Published(r) => *r,
             Stepped::Paused(shortfall) => panic!("unexpected capacity pause: {shortfall:?}"),
         };
         let evals = u64::try_from(report.evaluated).expect("u64");
         total_evals_cpu += evals;
-        // Full-evaluation contract (K = 1): every organism alive at phase 5 was evaluated.
-        assert!(evals > 0);
+        expected_total_evals += live_before;
+        // Full-evaluation contract (K = 1): EVERY organism alive entering phase 4
+        // must be evaluated on every tick (no reduced cadence shortcut).
+        assert_eq!(
+            evals,
+            live_before,
+            "K=1 full-evaluation violation at tick {}: evaluated {evals} != live_before {live_before}",
+            report.tick.get()
+        );
         let norm_res = report.ledger.normalized.unwrap_or(0.0).abs();
         assert!(
             norm_res <= 1.0e-5,
@@ -181,7 +190,8 @@ fn screenshot_world_full_evaluation_compact_parity_and_invariants() {
         );
     }
     let cpu_digest = world_cpu.digest();
-    assert!(total_evals_cpu >= 512);
+    assert_eq!(total_evals_cpu, expected_total_evals);
+    assert!(total_evals_cpu >= 512 * ticks);
 
     // If Metal is available on this host, require 0-ULP bit-exact parity and zero deferrals.
     if MetalControllers::open().is_ok() {
@@ -195,7 +205,15 @@ fn screenshot_world_full_evaluation_compact_parity_and_invariants() {
         )
         .expect("configure metal");
         for _ in 0..ticks {
-            let _ = world_metal.step().expect("metal step");
+            let live_before = world_metal.population().len();
+            match world_metal.step().expect("metal step") {
+                Stepped::Published(r) => {
+                    assert_eq!(r.evaluated, live_before, "Metal K=1 evaluation mismatch");
+                }
+                Stepped::Paused(shortfall) => {
+                    panic!("unexpected Metal capacity pause: {shortfall:?}")
+                }
+            }
         }
         assert_eq!(
             world_metal.digest(),
@@ -204,9 +222,18 @@ fn screenshot_world_full_evaluation_compact_parity_and_invariants() {
         );
         let ctrl = world_metal.controller_report();
         assert_eq!(ctrl.deferred, 0, "expected 0 Metal deferrals");
+        assert_eq!(
+            ctrl.reference_ticks, 0,
+            "expected 0 fallback reference ticks"
+        );
         assert!(
-            ctrl.batched >= total_evals_cpu,
-            "expected Metal to batch all evals"
+            ctrl.failure.is_none(),
+            "unexpected Metal failure: {:?}",
+            ctrl.failure
+        );
+        assert_eq!(
+            ctrl.batched, total_evals_cpu,
+            "expected Metal to batch every K=1 evaluation without drops or extras"
         );
     }
 }

@@ -1807,6 +1807,7 @@ pub fn resume(
         commands: Vec::new(),
         resumed: Some((from, skipped)),
         metrics,
+        cancel: None,
     };
     let driven = drive(owner, handle, plan, Some(checkpoints), emit, clock)?;
     let kind = match options.until {

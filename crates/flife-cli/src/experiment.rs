@@ -33,13 +33,19 @@
 //! undefined (no organism left to clump); its effect names the paired
 //! seeds it leaves out.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 use std::io::Write as _;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use asupersync::Cx;
+use asupersync::channel::mpsc;
+use asupersync::runtime::RuntimeBuilder;
 use flife_backend_metal::ControllerChoice;
 use flife_core::config::CONFIG_SCHEMA;
 use flife_core::model::is_v2_model;
@@ -65,6 +71,9 @@ pub const REPORT_SCHEMA: &str = "frankenlife.experiment-report.v1";
 
 /// The schema of a run manifest (Appendix B.1).
 pub const MANIFEST_SCHEMA: &str = "frankenlife.run-manifest.v1";
+
+/// The domain tag for deterministic per-job identities (FL-057, plan §20.4).
+pub const JOB_IDENTITY_SCHEMA: &str = "frankenlife.experiment-job.v1";
 
 /// The experiment catalog's file in an experiment directory.
 pub const EXPERIMENT_CATALOG_FILE: &str = "experiment.sqlite";
@@ -782,6 +791,33 @@ impl Experiment {
     pub const fn base_hash(&self) -> Sha256Digest {
         self.base_hash
     }
+
+    /// Reproducible, host-independent SHA-256 identity for one planned
+    /// experiment job (FL-057, plan §20.4). Depends solely on the experiment
+    /// design hash, ordinal, condition name, split, and seed — never on host,
+    /// worker count, shard assignment, or wall clock.
+    #[must_use]
+    pub fn job_id(&self, ordinal: u64, condition: &str, split: &str, seed: u64) -> Sha256Digest {
+        let exp_hex = self.identity.to_hex();
+        let mut bytes = Vec::with_capacity(
+            JOB_IDENTITY_SCHEMA.len()
+                + exp_hex.len()
+                + condition.len()
+                + split.len()
+                + 4 * size_of::<u64>()
+                + 1,
+        );
+        bytes.extend_from_slice(JOB_IDENTITY_SCHEMA.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(exp_hex.as_bytes());
+        bytes.extend_from_slice(&ordinal.to_le_bytes());
+        bytes.extend_from_slice(&wide(condition.len()).to_le_bytes());
+        bytes.extend_from_slice(condition.as_bytes());
+        bytes.extend_from_slice(&wide(split.len()).to_le_bytes());
+        bytes.extend_from_slice(split.as_bytes());
+        bytes.extend_from_slice(&seed.to_le_bytes());
+        Sha256Digest::of(&bytes)
+    }
 }
 
 /// What an experiment's identity hashes: everything that decides its runs
@@ -1396,10 +1432,12 @@ fn manifest(
     let model = config.map(|config| config_groups(config, experiment.spec.ticks, 0));
     let ticks_per_second = (execution.wall_seconds > 0.0 && result.tick > 0)
         .then(|| real(result.tick) / execution.wall_seconds);
+    let job_id = experiment.job_id(ordinal, &condition.name, split, seed);
     let mut manifest = serde_json::json!({
         "schema": MANIFEST_SCHEMA,
         "identity": {
             "run": format!("{}/{ordinal}", experiment.spec.name),
+            "job_id": job_id.to_hex(),
             "experiment": experiment.spec.name,
             "experiment_identity": experiment.identity.to_hex(),
             "ordinal": ordinal,
@@ -1445,6 +1483,224 @@ pub struct ExperimentOptions {
     pub controllers: ControllerChoice,
 }
 
+/// Cooperative cancellation signal for supervised ensemble runs (FL-057,
+/// plan §20.4). Triggering [`CancelToken::cancel`] halts queued jobs before
+/// start and interrupts in-flight jobs cleanly at their next tick boundary
+/// without cataloging partial runs.
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken {
+    flag: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    /// A fresh, uncancelled token.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cooperative cancellation across all workers sharing this token.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::Release);
+    }
+
+    /// Whether cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    fn as_arc(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.flag)
+    }
+}
+
+/// Deterministic shard assignment `K/N` (`1 <= K <= N`, stored 0-based as
+/// `index < total`) so independent workers or machines execute disjoint slices
+/// of an experiment ensemble (FL-057, plan §20.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardSpec {
+    /// Zero-based shard index (`0..total`).
+    pub index: u32,
+    /// Total shard count (`>= 1`).
+    pub total: u32,
+}
+
+impl ShardSpec {
+    /// Construct a shard from 1-based `one_based` in `1..=total`.
+    ///
+    /// # Errors
+    /// Returns an error message when `total == 0`, `one_based == 0`, or
+    /// `one_based > total`.
+    pub fn from_one_based(one_based: u32, total: u32) -> Result<Self, String> {
+        if total == 0 {
+            return Err("shard total must be at least 1".to_owned());
+        }
+        if one_based == 0 || one_based > total {
+            return Err(format!("shard index {one_based} must lie in 1..={total}"));
+        }
+        Ok(Self {
+            index: one_based - 1,
+            total,
+        })
+    }
+
+    /// Whether this shard owns planned run `ordinal` (1-based). Every positive
+    /// ordinal belongs to exactly one shard in `0..self.total`.
+    #[must_use]
+    pub const fn owns(self, ordinal: u64) -> bool {
+        ordinal > 0 && ((ordinal - 1) % (self.total as u64)) == (self.index as u64)
+    }
+}
+
+impl fmt::Display for ShardSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.index + 1, self.total)
+    }
+}
+
+impl FromStr for ShardSpec {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let Some((lhs, rhs)) = text.split_once('/') else {
+            return Err(format!("`{text}` is not `K/N` (e.g. `1/4`)"));
+        };
+        let one_based: u32 = lhs
+            .parse()
+            .map_err(|_| format!("invalid shard index `{lhs}` in `{text}`"))?;
+        let total: u32 = rhs
+            .parse()
+            .map_err(|_| format!("invalid shard total `{rhs}` in `{text}`"))?;
+        Self::from_one_based(one_based, total)
+    }
+}
+
+/// Which split stage(s) of an experiment ensemble to execute (FL-057).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EnsembleStage {
+    /// Run discovery, selection (if configured), held-out, and report.
+    #[default]
+    All,
+    /// Run only discovery jobs (required before two-stage `[select]` sharding).
+    DiscoveryOnly,
+    /// Run only held-out jobs (requires completed discovery catalog).
+    HeldOutOnly,
+}
+
+impl EnsembleStage {
+    /// Canonical kebab-case stage label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::DiscoveryOnly => "discovery",
+            Self::HeldOutOnly => "held-out",
+        }
+    }
+}
+
+impl fmt::Display for EnsembleStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for EnsembleStage {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "all" => Ok(Self::All),
+            "discovery" => Ok(Self::DiscoveryOnly),
+            "held-out" => Ok(Self::HeldOutOnly),
+            _ => Err(format!(
+                "`{text}` is not a stage: expected `all`, `discovery`, or `held-out`"
+            )),
+        }
+    }
+}
+
+/// Execution options for [`run_ensemble`] (FL-057, plan §20.4).
+#[derive(Debug, Clone)]
+pub struct EnsembleOptions {
+    /// Threads for each run's organism phases (`None` divides `auto_workers`
+    /// evenly across `parallel` concurrent jobs to honor the worker budget).
+    pub cpu_workers: Option<NonZeroUsize>,
+    /// Where due controllers are evaluated.
+    pub controllers: ControllerChoice,
+    /// Concurrent independent jobs supervised under Asupersync (default `1`).
+    pub parallel: NonZeroUsize,
+    /// Optional deterministic `K/N` shard filter.
+    pub shard: Option<ShardSpec>,
+    /// Which ensemble stage(s) to execute.
+    pub stage: EnsembleStage,
+    /// Optional shard directories to verify and import before running/reporting.
+    pub imports: Vec<PathBuf>,
+    /// Assemble `report.json` strictly from cataloged/imported runs without
+    /// executing missing jobs (refuses if any planned run is missing).
+    pub report_only: bool,
+    /// Optional cooperative cancellation signal.
+    pub cancel: Option<CancelToken>,
+}
+
+impl Default for EnsembleOptions {
+    fn default() -> Self {
+        Self {
+            cpu_workers: None,
+            controllers: ControllerChoice::Auto,
+            parallel: NonZeroUsize::MIN,
+            shard: None,
+            stage: EnsembleStage::All,
+            imports: Vec::new(),
+            report_only: false,
+            cancel: None,
+        }
+    }
+}
+
+/// Summary of verified durable shard imports (FL-057).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImportSummary {
+    /// Number of shard directories inspected.
+    pub shards: usize,
+    /// New runs verified and imported into the destination catalog.
+    pub imported: usize,
+    /// Runs already cataloged with matching identity and SHA-256 (idempotent).
+    pub skipped_existing: usize,
+}
+
+/// Terminal outcome of [`run_ensemble`] (FL-057).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EnsembleOutcome {
+    /// All planned runs are durably cataloged and `report.json` was written.
+    Complete(Box<Report>),
+    /// A partial slice (`--shard` or `--stage`) finished durably; no premature
+    /// `report.json` was written.
+    Partial {
+        /// Shard filter applied, if any.
+        shard: Option<ShardSpec>,
+        /// Stage executed.
+        stage: EnsembleStage,
+        /// Total runs durably cataloged in this directory.
+        cataloged: usize,
+        /// Runs executed during this invocation.
+        executed: usize,
+        /// Assigned runs already cataloged and skipped.
+        skipped: usize,
+    },
+    /// Cooperative cancellation stopped execution cleanly; all completed runs
+    /// remain durable and resumable, and cancelled runs were not cataloged.
+    Cancelled {
+        /// Total runs durably cataloged in this directory.
+        cataloged: usize,
+        /// Runs completed and cataloged before cancellation.
+        executed: usize,
+        /// In-flight jobs interrupted cleanly at a tick boundary.
+        cancelled: usize,
+    },
+}
+
 /// One line of `flife experiment`'s output.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "record")]
@@ -1462,12 +1718,21 @@ pub enum ExperimentRecord {
         /// Runs already cataloged, which will not run again.
         cataloged: usize,
     },
+    /// Verified shard directories imported into this experiment directory.
+    ExperimentImport {
+        /// [`EXPERIMENT_SCHEMA`].
+        schema: &'static str,
+        /// Counts of shards, newly imported runs, and idempotent skips.
+        summary: ImportSummary,
+    },
     /// A run ended and was cataloged.
     ExperimentRun {
         /// [`EXPERIMENT_SCHEMA`].
         schema: &'static str,
         /// Its ordinal.
         ordinal: u64,
+        /// Its deterministic content-addressed job identity (FL-057).
+        job_id: String,
         /// Its condition.
         condition: String,
         /// `discovery` or `held-out`.
@@ -1485,6 +1750,33 @@ pub enum ExperimentRecord {
         schema: &'static str,
         /// What was picked, and from what.
         selection: Selection,
+    },
+    /// A shard or single-stage slice finished durably without writing a final report.
+    ExperimentPartial {
+        /// [`EXPERIMENT_SCHEMA`].
+        schema: &'static str,
+        /// Shard specification, if any (`K/N`).
+        shard: Option<String>,
+        /// Stage executed (`all`, `discovery`, `held-out`).
+        stage: &'static str,
+        /// Total runs durably cataloged in this directory.
+        cataloged: usize,
+        /// Runs executed during this invocation.
+        executed: usize,
+        /// Assigned runs already cataloged and skipped.
+        skipped: usize,
+    },
+    /// Execution stopped early under cooperative cancellation; durable progress
+    /// is preserved for clean resumption.
+    ExperimentCancelled {
+        /// [`EXPERIMENT_SCHEMA`].
+        schema: &'static str,
+        /// Total runs durably cataloged in this directory.
+        cataloged: usize,
+        /// Runs completed before cancellation.
+        executed: usize,
+        /// In-flight jobs interrupted cleanly.
+        cancelled: usize,
     },
     /// The experiment's report was written.
     ExperimentEnd {
@@ -1543,8 +1835,30 @@ pub fn experiment(
     experiment: &Experiment,
     directory: &Path,
     options: ExperimentOptions,
-    mut emit: impl FnMut(&ExperimentRecord),
+    emit: impl FnMut(&ExperimentRecord),
 ) -> Result<Report, CoreError> {
+    let ensemble = EnsembleOptions {
+        cpu_workers: options.cpu_workers,
+        controllers: options.controllers,
+        ..EnsembleOptions::default()
+    };
+    match run_ensemble(experiment, directory, &ensemble, emit)? {
+        EnsembleOutcome::Complete(report) => Ok(*report),
+        EnsembleOutcome::Partial { .. } | EnsembleOutcome::Cancelled { .. } => {
+            Err(CoreError::StateConflict {
+                operation: "run experiment",
+                detail: "unsharded non-cancellable experiment did not complete".to_owned(),
+            })
+        }
+    }
+}
+
+/// Prepare `directory` and open its experiment catalog, refusing any non-empty
+/// directory that does not already hold an `experiment.sqlite` for `experiment`.
+fn open_experiment_dir(
+    experiment: &Experiment,
+    directory: &Path,
+) -> Result<(PathBuf, ExperimentCatalog), CoreError> {
     let catalog_path = directory.join(EXPERIMENT_CATALOG_FILE);
     if directory.exists() && !catalog_path.exists() {
         let mut entries =
@@ -1569,48 +1883,402 @@ pub fn experiment(
         path: runs_dir.display().to_string(),
         reason: error.to_string(),
     })?;
-    let mut catalog = ExperimentCatalog::open(
+    let catalog = ExperimentCatalog::open(
         &catalog_path,
         &experiment.identity.to_hex(),
         &experiment.design,
     )?;
-    emit(&ExperimentRecord::ExperimentStart {
-        schema: EXPERIMENT_SCHEMA,
-        name: experiment.spec.name.clone(),
-        experiment: experiment.identity.to_hex(),
-        conditions: experiment
-            .conditions
-            .iter()
-            .map(|condition| condition.name.clone())
-            .collect(),
-        cataloged: catalog.runs()?.len(),
-    });
-    let host = Host::current();
+    Ok((runs_dir, catalog))
+}
 
-    let discovery: Vec<Planned> = plan(
+/// Verify and durably import completed runs from one or more independent shard
+/// experiment directories into `directory` (FL-057, plan §20.4).
+///
+/// Every imported shard must match `experiment.identity()` and
+/// `experiment.design()` verbatim, and every imported run's `(ordinal,
+/// condition, split, seed, config_hash, job_id)` and `runs/run-NNNNNN.ndjson`
+/// SHA-256 are verified before committing durably to `directory`. Re-importing
+/// an already-present identical run is idempotent; any conflicting row or
+/// tampered/missing record file is refused with [`CoreError::StateConflict`].
+///
+/// # Errors
+/// [`CoreError::StateConflict`] for experiment identity mismatch, tampered or
+/// missing records, unexpected ordinals/conditions, or conflicting duplicates;
+/// [`CoreError::StorageFailed`] for I/O errors.
+pub fn import_shards(
+    experiment: &Experiment,
+    directory: &Path,
+    shard_dirs: &[PathBuf],
+) -> Result<ImportSummary, CoreError> {
+    let (runs_dir, mut catalog) = open_experiment_dir(experiment, directory)?;
+    import_shards_into(experiment, directory, &runs_dir, &mut catalog, shard_dirs)
+}
+
+fn verify_and_import_row(
+    experiment: &Experiment,
+    planned: &Planned,
+    shard_dir: &Path,
+    dest_runs_dir: &Path,
+    catalog: &mut ExperimentCatalog,
+    existing_by_ordinal: &mut BTreeMap<u64, CatalogedRun>,
+    row: &CatalogedRun,
+) -> Result<bool, CoreError> {
+    let condition = experiment
+        .conditions
+        .get(planned.condition)
+        .ok_or_else(|| spec_error("conditions", format!("no condition {}", planned.condition)))?;
+    if row.condition != condition.name || row.split != planned.split || row.seed != planned.seed {
+        return Err(CoreError::StateConflict {
+            operation: "import experiment shard",
+            detail: format!(
+                "shard {} run {} claims ({}, {}, seed {}), expected ({}, {}, seed {})",
+                shard_dir.display(),
+                row.ordinal,
+                row.condition,
+                row.split,
+                row.seed,
+                condition.name,
+                planned.split,
+                planned.seed
+            ),
+        });
+    }
+    let expected_config_hash = experiment
+        .configuration(planned.condition, planned.seed)
+        .map_or_else(|_| String::new(), |cfg| cfg.config_hash().to_hex());
+    if row.config_hash != expected_config_hash {
+        return Err(CoreError::StateConflict {
+            operation: "import experiment shard",
+            detail: format!(
+                "shard {} run {} config_hash {} does not match specification {}",
+                shard_dir.display(),
+                row.ordinal,
+                row.config_hash,
+                expected_config_hash
+            ),
+        });
+    }
+    let expected_job_id = experiment
+        .job_id(
+            planned.ordinal,
+            &condition.name,
+            planned.split,
+            planned.seed,
+        )
+        .to_hex();
+    let manifest_val: serde_json::Value =
+        serde_json::from_str(&row.manifest).map_err(|error| CoreError::StateConflict {
+            operation: "import experiment shard",
+            detail: format!(
+                "shard {} run {} manifest is invalid JSON: {error}",
+                shard_dir.display(),
+                row.ordinal
+            ),
+        })?;
+    if let Some(found_job_id) = manifest_val
+        .get("identity")
+        .and_then(|id| id.get("job_id"))
+        .and_then(serde_json::Value::as_str)
+        && found_job_id != expected_job_id
+    {
+        return Err(CoreError::StateConflict {
+            operation: "import experiment shard",
+            detail: format!(
+                "shard {} run {} job_id {found_job_id} does not match expected {expected_job_id}",
+                shard_dir.display(),
+                row.ordinal
+            ),
+        });
+    }
+    if let Some(artifact_sha) = manifest_val
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|a| a.get("sha256"))
+        .and_then(serde_json::Value::as_str)
+        && artifact_sha != row.records_sha256
+    {
+        return Err(CoreError::StateConflict {
+            operation: "import experiment shard",
+            detail: format!(
+                "shard {} run {} manifest artifact SHA-256 {artifact_sha} differs from catalog {}",
+                shard_dir.display(),
+                row.ordinal,
+                row.records_sha256
+            ),
+        });
+    }
+
+    let file_name = format!("run-{:06}.ndjson", row.ordinal);
+    let src_records = shard_dir.join(RUNS_DIR).join(&file_name);
+    let src_bytes = std::fs::read(&src_records).map_err(|error| CoreError::StateConflict {
+        operation: "import experiment shard",
+        detail: format!(
+            "shard {} missing or unreadable records {}: {error}",
+            shard_dir.display(),
+            src_records.display()
+        ),
+    })?;
+    let actual_sha = Sha256Digest::of(&src_bytes).to_hex();
+    if actual_sha != row.records_sha256 {
+        return Err(CoreError::StateConflict {
+            operation: "import experiment shard",
+            detail: format!(
+                "shard {} run {} records SHA-256 mismatch: catalog has {}, file has {actual_sha}",
+                shard_dir.display(),
+                row.ordinal,
+                row.records_sha256
+            ),
+        });
+    }
+
+    if let Some(existing) = existing_by_ordinal.get(&row.ordinal) {
+        if existing == row {
+            let dest_records = dest_runs_dir.join(&file_name);
+            if dest_records.exists() {
+                let dest_bytes =
+                    std::fs::read(&dest_records).map_err(|error| CoreError::StorageFailed {
+                        operation: "read destination run records",
+                        path: dest_records.display().to_string(),
+                        reason: error.to_string(),
+                    })?;
+                if Sha256Digest::of(&dest_bytes).to_hex() != row.records_sha256 {
+                    return Err(CoreError::StateConflict {
+                        operation: "import experiment shard",
+                        detail: format!(
+                            "destination {} SHA-256 differs from cataloged run {}",
+                            dest_records.display(),
+                            row.ordinal
+                        ),
+                    });
+                }
+            } else {
+                write_durably(&dest_records, &src_bytes)?;
+            }
+            return Ok(false);
+        }
+        return Err(CoreError::StateConflict {
+            operation: "import experiment shard",
+            detail: format!(
+                "shard {} run {} conflicts with an existing cataloged run",
+                shard_dir.display(),
+                row.ordinal
+            ),
+        });
+    }
+
+    let dest_records = dest_runs_dir.join(&file_name);
+    if dest_records.exists() {
+        let dest_bytes =
+            std::fs::read(&dest_records).map_err(|error| CoreError::StorageFailed {
+                operation: "read destination run records",
+                path: dest_records.display().to_string(),
+                reason: error.to_string(),
+            })?;
+        if Sha256Digest::of(&dest_bytes).to_hex() != row.records_sha256 {
+            return Err(CoreError::StateConflict {
+                operation: "import experiment shard",
+                detail: format!(
+                    "destination {} exists with mismatched SHA-256 before importing run {}",
+                    dest_records.display(),
+                    row.ordinal
+                ),
+            });
+        }
+    } else {
+        write_durably(&dest_records, &src_bytes)?;
+    }
+
+    catalog.record(row)?;
+    existing_by_ordinal.insert(row.ordinal, row.clone());
+    Ok(true)
+}
+
+fn import_shards_into(
+    experiment: &Experiment,
+    dest_dir: &Path,
+    dest_runs_dir: &Path,
+    catalog: &mut ExperimentCatalog,
+    shard_dirs: &[PathBuf],
+) -> Result<ImportSummary, CoreError> {
+    if shard_dirs.is_empty() {
+        return Ok(ImportSummary {
+            shards: 0,
+            imported: 0,
+            skipped_existing: 0,
+        });
+    }
+    let expected_identity = experiment.identity.to_hex();
+    let dest_canon = std::fs::canonicalize(dest_dir).ok();
+
+    let mut shard_rows: Vec<(PathBuf, Vec<CatalogedRun>)> = Vec::with_capacity(shard_dirs.len());
+    for shard_dir in shard_dirs {
+        if let (Some(dc), Ok(sc)) = (&dest_canon, std::fs::canonicalize(shard_dir))
+            && *dc == sc
+        {
+            continue;
+        }
+        let shard_catalog = ExperimentCatalog::read(&shard_dir.join(EXPERIMENT_CATALOG_FILE))?;
+        let found_id = shard_catalog.experiment_id()?.unwrap_or_default();
+        if found_id != expected_identity {
+            return Err(CoreError::StateConflict {
+                operation: "import experiment shard",
+                detail: format!(
+                    "shard {} belongs to experiment {found_id}, not {expected_identity}",
+                    shard_dir.display()
+                ),
+            });
+        }
+        let found_design = shard_catalog.design()?.unwrap_or_default();
+        if found_design != experiment.design {
+            return Err(CoreError::StateConflict {
+                operation: "import experiment shard",
+                detail: format!(
+                    "shard {} design differs from this experiment specification",
+                    shard_dir.display()
+                ),
+            });
+        }
+        let runs = shard_catalog.runs()?;
+        shard_rows.push((shard_dir.clone(), runs));
+    }
+
+    let discovery = plan(
         0,
         &(0..experiment.conditions.len()).collect::<Vec<_>>(),
         DISCOVERY,
         &experiment.spec.seeds.discovery,
     );
-    run_all(
-        experiment,
-        &mut catalog,
-        &discovery,
-        &runs_dir,
-        options,
-        &host,
-        &mut emit,
-    )?;
+    let discovery_by_ord: BTreeMap<u64, Planned> =
+        discovery.iter().map(|&p| (p.ordinal, p)).collect();
 
-    let selection = select(experiment, &catalog.runs()?)?;
-    if let Some(selection) = &selection {
-        emit(&ExperimentRecord::ExperimentSelect {
-            schema: EXPERIMENT_SCHEMA,
-            selection: selection.clone(),
-        });
+    let mut existing_by_ordinal: BTreeMap<u64, CatalogedRun> = catalog
+        .runs()?
+        .into_iter()
+        .map(|run| (run.ordinal, run))
+        .collect();
+    let mut imported = 0_usize;
+    let mut skipped_existing = 0_usize;
+
+    // Pass 1: verify and import all discovery runs first so `[select]`
+    // resolution is deterministic before validating held-out runs.
+    for (shard_dir, runs) in &shard_rows {
+        for row in runs {
+            if row.split == DISCOVERY {
+                let planned =
+                    discovery_by_ord
+                        .get(&row.ordinal)
+                        .ok_or_else(|| CoreError::StateConflict {
+                            operation: "import experiment shard",
+                            detail: format!(
+                                "shard {} has unexpected discovery ordinal {}",
+                                shard_dir.display(),
+                                row.ordinal
+                            ),
+                        })?;
+                if verify_and_import_row(
+                    experiment,
+                    planned,
+                    shard_dir,
+                    dest_runs_dir,
+                    catalog,
+                    &mut existing_by_ordinal,
+                    row,
+                )? {
+                    imported += 1;
+                } else {
+                    skipped_existing += 1;
+                }
+            } else if row.split != HELD_OUT {
+                return Err(CoreError::StateConflict {
+                    operation: "import experiment shard",
+                    detail: format!(
+                        "shard {} run {} has unknown split `{}`",
+                        shard_dir.display(),
+                        row.ordinal,
+                        row.split
+                    ),
+                });
+            }
+        }
     }
-    let held_out_conditions: Vec<usize> = match &selection {
+
+    // Pass 2: verify and import held-out runs once discovery is in place.
+    let any_held_out = shard_rows
+        .iter()
+        .any(|(_, runs)| runs.iter().any(|row| row.split == HELD_OUT));
+    if any_held_out {
+        let all_discovery_present = discovery
+            .iter()
+            .all(|p| existing_by_ordinal.contains_key(&p.ordinal));
+        if experiment.spec.select.is_some() && !all_discovery_present {
+            return Err(CoreError::StateConflict {
+                operation: "import experiment shard",
+                detail: "cannot import held-out runs for a `[select]` experiment before all \
+                         discovery runs are present"
+                    .to_owned(),
+            });
+        }
+        let current_runs = catalog.runs()?;
+        let selection = if experiment.spec.select.is_some() {
+            select(experiment, &current_runs)?
+        } else {
+            None
+        };
+        let held_out_conditions = resolved_held_out_conditions(experiment, selection.as_ref());
+        let held_out = plan(
+            wide(discovery.len()),
+            &held_out_conditions,
+            HELD_OUT,
+            &experiment.spec.seeds.held_out,
+        );
+        let held_out_by_ord: BTreeMap<u64, Planned> =
+            held_out.iter().map(|&p| (p.ordinal, p)).collect();
+        for (shard_dir, runs) in &shard_rows {
+            for row in runs {
+                if row.split != HELD_OUT {
+                    continue;
+                }
+                let planned =
+                    held_out_by_ord
+                        .get(&row.ordinal)
+                        .ok_or_else(|| CoreError::StateConflict {
+                            operation: "import experiment shard",
+                            detail: format!(
+                                "shard {} has unexpected held-out ordinal {}",
+                                shard_dir.display(),
+                                row.ordinal
+                            ),
+                        })?;
+                if verify_and_import_row(
+                    experiment,
+                    planned,
+                    shard_dir,
+                    dest_runs_dir,
+                    catalog,
+                    &mut existing_by_ordinal,
+                    row,
+                )? {
+                    imported += 1;
+                } else {
+                    skipped_existing += 1;
+                }
+            }
+        }
+    }
+
+    Ok(ImportSummary {
+        shards: shard_rows.len(),
+        imported,
+        skipped_existing,
+    })
+}
+
+fn resolved_held_out_conditions(
+    experiment: &Experiment,
+    selection: Option<&Selection>,
+) -> Vec<usize> {
+    match selection {
         Some(selection) => {
             let mut chosen = vec![experiment.control];
             if let Some(index) = experiment
@@ -1624,24 +2292,257 @@ pub fn experiment(
             chosen
         }
         None => (0..experiment.conditions.len()).collect(),
+    }
+}
+
+/// Run, shard, import, or assemble an experiment ensemble under Asupersync
+/// supervision with reproducible job identity, cooperative cancellation, and
+/// durable per-run results (FL-057, plan §20.4).
+///
+/// # Errors
+/// [`CoreError::StateConflict`] for incompatible option combinations, directory
+/// conflicts, tampered/mismatched shard imports, or incomplete `--report-only`
+/// ensembles; [`CoreError::StorageFailed`] for catalog or record I/O failures.
+#[expect(
+    clippy::too_many_lines,
+    reason = "orchestrates import, discovery, selection, held-out, cancellation, and durable report assembly"
+)]
+pub fn run_ensemble(
+    experiment: &Experiment,
+    directory: &Path,
+    options: &EnsembleOptions,
+    mut emit: impl FnMut(&ExperimentRecord),
+) -> Result<EnsembleOutcome, CoreError> {
+    if options.report_only && (options.shard.is_some() || options.stage != EnsembleStage::All) {
+        return Err(CoreError::StateConflict {
+            operation: "assemble experiment report",
+            detail: "`--report-only` requires `--stage all` without `--shard`".to_owned(),
+        });
+    }
+    let (runs_dir, mut catalog) = open_experiment_dir(experiment, directory)?;
+
+    let mut import_summary: Option<ImportSummary> = None;
+    if !options.imports.is_empty() {
+        let summary = import_shards_into(
+            experiment,
+            directory,
+            &runs_dir,
+            &mut catalog,
+            &options.imports,
+        )?;
+        import_summary = Some(summary);
+    }
+
+    emit(&ExperimentRecord::ExperimentStart {
+        schema: EXPERIMENT_SCHEMA,
+        name: experiment.spec.name.clone(),
+        experiment: experiment.identity.to_hex(),
+        conditions: experiment
+            .conditions
+            .iter()
+            .map(|condition| condition.name.clone())
+            .collect(),
+        cataloged: catalog.runs()?.len(),
+    });
+    if let Some(summary) = import_summary {
+        emit(&ExperimentRecord::ExperimentImport {
+            schema: EXPERIMENT_SCHEMA,
+            summary,
+        });
+    }
+
+    let host = Host::current();
+    let discovery: Vec<Planned> = plan(
+        0,
+        &(0..experiment.conditions.len()).collect::<Vec<_>>(),
+        DISCOVERY,
+        &experiment.spec.seeds.discovery,
+    );
+
+    // Fail fast BEFORE executing any discovery jobs when a partial shard
+    // (`total > 1`) requests `--stage all` on a `[select]` experiment with
+    // held-out seeds whose discovery runs are not yet complete in the catalog.
+    if let Some(shard) = options.shard
+        && shard.total > 1
+        && options.stage == EnsembleStage::All
+        && experiment.spec.select.is_some()
+        && !experiment.spec.seeds.held_out.is_empty()
+    {
+        let existing_ordinals: BTreeSet<u64> =
+            catalog.runs()?.iter().map(|run| run.ordinal).collect();
+        let all_discovery_already_in = discovery
+            .iter()
+            .all(|p| existing_ordinals.contains(&p.ordinal));
+        if !all_discovery_already_in {
+            return Err(CoreError::StateConflict {
+                operation: "select held-out conditions",
+                detail: "cannot run `--stage all` on a partial `--shard` of a `[select]` \
+                         experiment before all discovery runs are cataloged; run `--stage \
+                         discovery --shard K/N`, import all discovery shards, then run \
+                         `--stage held-out --shard K/N`"
+                    .to_owned(),
+            });
+        }
+    }
+
+    let mut total_executed = 0_usize;
+    let mut total_skipped = 0_usize;
+    let mut total_cancelled = 0_usize;
+
+    if !options.report_only && options.stage != EnsembleStage::HeldOutOnly {
+        let stats = run_stage_supervised(
+            experiment,
+            &mut catalog,
+            &discovery,
+            &runs_dir,
+            options,
+            &host,
+            &mut emit,
+        )?;
+        total_executed += stats.executed;
+        total_skipped += stats.skipped;
+        total_cancelled += stats.cancelled;
+        if stats.was_cancelled {
+            let cataloged = catalog.runs()?.len();
+            emit(&ExperimentRecord::ExperimentCancelled {
+                schema: EXPERIMENT_SCHEMA,
+                cataloged,
+                executed: total_executed,
+                cancelled: total_cancelled,
+            });
+            return Ok(EnsembleOutcome::Cancelled {
+                cataloged,
+                executed: total_executed,
+                cancelled: total_cancelled,
+            });
+        }
+    }
+
+    if options.stage == EnsembleStage::DiscoveryOnly {
+        let cataloged = catalog.runs()?.len();
+        emit(&ExperimentRecord::ExperimentPartial {
+            schema: EXPERIMENT_SCHEMA,
+            shard: options.shard.map(|s| s.to_string()),
+            stage: options.stage.as_str(),
+            cataloged,
+            executed: total_executed,
+            skipped: total_skipped,
+        });
+        return Ok(EnsembleOutcome::Partial {
+            shard: options.shard,
+            stage: options.stage,
+            cataloged,
+            executed: total_executed,
+            skipped: total_skipped,
+        });
+    }
+
+    let current_runs = catalog.runs()?;
+    let cataloged_ordinals: BTreeSet<u64> = current_runs.iter().map(|run| run.ordinal).collect();
+    let all_discovery_complete = discovery
+        .iter()
+        .all(|p| cataloged_ordinals.contains(&p.ordinal));
+
+    if experiment.spec.select.is_some()
+        && !experiment.spec.seeds.held_out.is_empty()
+        && !all_discovery_complete
+    {
+        return Err(CoreError::StateConflict {
+            operation: "select held-out conditions",
+            detail: "cannot run or assemble held-out seeds for a `[select]` experiment before \
+                     all discovery runs are cataloged; run `--stage discovery --shard K/N`, \
+                     import all discovery shards, then run `--stage held-out --shard K/N`"
+                .to_owned(),
+        });
+    }
+
+    let selection = if all_discovery_complete {
+        select(experiment, &current_runs)?
+    } else {
+        None
     };
+    if let Some(selection) = &selection {
+        emit(&ExperimentRecord::ExperimentSelect {
+            schema: EXPERIMENT_SCHEMA,
+            selection: selection.clone(),
+        });
+    }
+
+    let held_out_conditions = resolved_held_out_conditions(experiment, selection.as_ref());
     let held_out = plan(
         wide(discovery.len()),
         &held_out_conditions,
         HELD_OUT,
         &experiment.spec.seeds.held_out,
     );
-    run_all(
-        experiment,
-        &mut catalog,
-        &held_out,
-        &runs_dir,
-        options,
-        &host,
-        &mut emit,
-    )?;
+
+    if !options.report_only {
+        let stats = run_stage_supervised(
+            experiment,
+            &mut catalog,
+            &held_out,
+            &runs_dir,
+            options,
+            &host,
+            &mut emit,
+        )?;
+        total_executed += stats.executed;
+        total_skipped += stats.skipped;
+        total_cancelled += stats.cancelled;
+        if stats.was_cancelled {
+            let cataloged = catalog.runs()?.len();
+            emit(&ExperimentRecord::ExperimentCancelled {
+                schema: EXPERIMENT_SCHEMA,
+                cataloged,
+                executed: total_executed,
+                cancelled: total_cancelled,
+            });
+            return Ok(EnsembleOutcome::Cancelled {
+                cataloged,
+                executed: total_executed,
+                cancelled: total_cancelled,
+            });
+        }
+    }
+
+    if options.shard.is_some() || options.stage != EnsembleStage::All {
+        let cataloged = catalog.runs()?.len();
+        emit(&ExperimentRecord::ExperimentPartial {
+            schema: EXPERIMENT_SCHEMA,
+            shard: options.shard.map(|s| s.to_string()),
+            stage: options.stage.as_str(),
+            cataloged,
+            executed: total_executed,
+            skipped: total_skipped,
+        });
+        return Ok(EnsembleOutcome::Partial {
+            shard: options.shard,
+            stage: options.stage,
+            cataloged,
+            executed: total_executed,
+            skipped: total_skipped,
+        });
+    }
 
     let runs = catalog.runs()?;
+    let present: BTreeSet<u64> = runs.iter().map(|run| run.ordinal).collect();
+    let missing: Vec<u64> = discovery
+        .iter()
+        .chain(held_out.iter())
+        .map(|p| p.ordinal)
+        .filter(|ord| !present.contains(ord))
+        .collect();
+    if !missing.is_empty() {
+        return Err(CoreError::StateConflict {
+            operation: "assemble experiment report",
+            detail: format!(
+                "{} planned run(s) missing from catalog (first missing ordinal: {})",
+                missing.len(),
+                missing[0]
+            ),
+        });
+    }
+
     let report = Report::of(experiment, &runs, selection)?;
     let text = report.to_json()?;
     let report_path = directory.join(REPORT_FILE);
@@ -1659,7 +2560,7 @@ pub fn experiment(
         report: report_path.display().to_string(),
         report_sha256: Sha256Digest::of(text.as_bytes()).to_hex(),
     });
-    Ok(report)
+    Ok(EnsembleOutcome::Complete(Box::new(report)))
 }
 
 fn plan(first: u64, conditions: &[usize], split: &'static str, seeds: &[u64]) -> Vec<Planned> {
@@ -1677,53 +2578,298 @@ fn plan(first: u64, conditions: &[usize], split: &'static str, seeds: &[u64]) ->
     planned
 }
 
-fn run_all(
+struct StageStats {
+    executed: usize,
+    skipped: usize,
+    cancelled: usize,
+    was_cancelled: bool,
+}
+
+enum WorkerMsg {
+    Completed(Box<Ran>),
+    Cancelled,
+    Error(CoreError),
+}
+
+/// Effective per-job worker budget: honors explicit `cpu_workers`, or divides
+/// `auto_workers` evenly across `parallel` concurrent jobs so independent
+/// worlds share the host's single worker budget (plan §3.4, §12.5).
+fn per_job_workers(explicit: Option<NonZeroUsize>, parallel: NonZeroUsize) -> Option<NonZeroUsize> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    if parallel.get() <= 1 {
+        return None;
+    }
+    let budget = crate::run::auto_workers().get();
+    NonZeroUsize::new((budget / parallel).max(1))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Asupersync-supervised bounded parallel and serial ensemble execution with durable streaming commits"
+)]
+fn run_stage_supervised(
     experiment: &Experiment,
     catalog: &mut ExperimentCatalog,
     planned: &[Planned],
     runs_dir: &Path,
-    options: ExperimentOptions,
+    options: &EnsembleOptions,
     host: &Host,
     emit: &mut impl FnMut(&ExperimentRecord),
-) -> Result<(), CoreError> {
+) -> Result<StageStats, CoreError> {
     let cataloged: BTreeSet<u64> = catalog.runs()?.iter().map(|run| run.ordinal).collect();
+    let mut pending = Vec::new();
+    let mut skipped = 0_usize;
     for &run in planned {
-        if cataloged.contains(&run.ordinal) {
+        if let Some(shard) = options.shard
+            && !shard.owns(run.ordinal)
+        {
             continue;
         }
-        let cataloged = run_one(experiment, run, runs_dir, options, host)?;
-        catalog.record(&cataloged.row)?;
-        emit(&ExperimentRecord::ExperimentRun {
-            schema: EXPERIMENT_SCHEMA,
-            ordinal: run.ordinal,
-            condition: cataloged.row.condition.clone(),
-            split: run.split,
-            seed: run.seed,
-            result: Box::new(cataloged.result),
-            wall_seconds: cataloged.wall_seconds,
+        if cataloged.contains(&run.ordinal) {
+            skipped += 1;
+            continue;
+        }
+        pending.push(run);
+    }
+
+    let cancel_arc = options
+        .cancel
+        .as_ref()
+        .map_or_else(|| Arc::new(AtomicBool::new(false)), CancelToken::as_arc);
+    if cancel_arc.load(Ordering::Acquire) {
+        return Ok(StageStats {
+            executed: 0,
+            skipped,
+            cancelled: 0,
+            was_cancelled: true,
         });
     }
-    Ok(())
+    if pending.is_empty() {
+        return Ok(StageStats {
+            executed: 0,
+            skipped,
+            cancelled: 0,
+            was_cancelled: false,
+        });
+    }
+
+    let run_opts = ExperimentOptions {
+        cpu_workers: per_job_workers(options.cpu_workers, options.parallel),
+        controllers: options.controllers,
+    };
+
+    let worker_count = options.parallel.get().min(pending.len());
+    if worker_count <= 1 {
+        let mut executed = 0_usize;
+        let mut cancelled = 0_usize;
+        for run in pending {
+            if cancel_arc.load(Ordering::Acquire) {
+                return Ok(StageStats {
+                    executed,
+                    skipped,
+                    cancelled,
+                    was_cancelled: true,
+                });
+            }
+            match run_one_cancellable(
+                experiment,
+                run,
+                runs_dir,
+                run_opts,
+                host,
+                Some(Arc::clone(&cancel_arc)),
+            )? {
+                Some(ran) => {
+                    catalog.record(&ran.row)?;
+                    emit(&ExperimentRecord::ExperimentRun {
+                        schema: EXPERIMENT_SCHEMA,
+                        ordinal: run.ordinal,
+                        job_id: ran.job_id,
+                        condition: ran.row.condition,
+                        split: run.split,
+                        seed: run.seed,
+                        result: Box::new(ran.result),
+                        wall_seconds: ran.wall_seconds,
+                    });
+                    executed += 1;
+                }
+                None => {
+                    cancelled += 1;
+                    return Ok(StageStats {
+                        executed,
+                        skipped,
+                        cancelled,
+                        was_cancelled: true,
+                    });
+                }
+            }
+        }
+        return Ok(StageStats {
+            executed,
+            skipped,
+            cancelled,
+            was_cancelled: cancel_arc.load(Ordering::Acquire),
+        });
+    }
+
+    // Bounded Asupersync-supervised concurrent execution: one supervisor
+    // runtime owns the FrankenSQLite catalog and output emitter, draining
+    // durable completions live over an Asupersync mpsc channel while scoped
+    // workers execute disjoint independent worlds (zero detached threads).
+    let runtime =
+        RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|error| CoreError::MissingCapability {
+                capability: format!("an Asupersync ensemble supervisor runtime: {error}"),
+            })?;
+    let (tx, mut rx) = mpsc::channel::<WorkerMsg>(pending.len().max(1));
+    let queue = Arc::new(Mutex::new(VecDeque::from(pending)));
+    let mut executed = 0_usize;
+    let mut cancelled = 0_usize;
+    let mut fatal: Option<CoreError> = None;
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let tx_worker = tx.clone();
+            let queue_worker = Arc::clone(&queue);
+            let cancel_worker = Arc::clone(&cancel_arc);
+            scope.spawn(move || {
+                loop {
+                    if cancel_worker.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let next_job = queue_worker
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .pop_front();
+                    let Some(job) = next_job else {
+                        break;
+                    };
+                    if cancel_worker.load(Ordering::Acquire) {
+                        break;
+                    }
+                    match run_one_cancellable(
+                        experiment,
+                        job,
+                        runs_dir,
+                        run_opts,
+                        host,
+                        Some(Arc::clone(&cancel_worker)),
+                    ) {
+                        Ok(Some(ran)) => {
+                            let _ = tx_worker.try_send(WorkerMsg::Completed(Box::new(ran)));
+                        }
+                        Ok(None) => {
+                            let _ = tx_worker.try_send(WorkerMsg::Cancelled);
+                            break;
+                        }
+                        Err(error) => {
+                            cancel_worker.store(true, Ordering::Release);
+                            let _ = tx_worker.try_send(WorkerMsg::Error(error));
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        let supervisor_result = runtime.block_on(async {
+            let cx = Cx::detached_cancel_context();
+            while let Ok(msg) = rx.recv(&cx).await {
+                match msg {
+                    WorkerMsg::Completed(ran) => {
+                        if fatal.is_some() {
+                            continue;
+                        }
+                        if let Err(error) = catalog.record(&ran.row) {
+                            cancel_arc.store(true, Ordering::Release);
+                            fatal = Some(error);
+                            continue;
+                        }
+                        emit(&ExperimentRecord::ExperimentRun {
+                            schema: EXPERIMENT_SCHEMA,
+                            ordinal: ran.row.ordinal,
+                            job_id: ran.job_id,
+                            condition: ran.row.condition,
+                            split: ran.split,
+                            seed: ran.row.seed,
+                            result: Box::new(ran.result),
+                            wall_seconds: ran.wall_seconds,
+                        });
+                        executed += 1;
+                    }
+                    WorkerMsg::Cancelled => {
+                        cancelled += 1;
+                    }
+                    WorkerMsg::Error(error) => {
+                        cancel_arc.store(true, Ordering::Release);
+                        if fatal.is_none() {
+                            fatal = Some(error);
+                        }
+                    }
+                }
+            }
+            Ok::<_, CoreError>(())
+        });
+        if let Err(error) = supervisor_result
+            && fatal.is_none()
+        {
+            fatal = Some(error);
+        }
+    });
+
+    if let Some(error) = fatal {
+        return Err(error);
+    }
+
+    Ok(StageStats {
+        executed,
+        skipped,
+        cancelled,
+        was_cancelled: cancel_arc.load(Ordering::Acquire) || cancelled > 0,
+    })
 }
 
 struct Ran {
     row: CatalogedRun,
+    job_id: String,
+    split: &'static str,
     result: RunResult,
     wall_seconds: f64,
 }
 
 /// Run one planned run and write its records; the caller catalogs it.
-fn run_one(
+/// Returns `Ok(None)` when cooperatively cancelled without writing partial
+/// records or cataloging a bogus row.
+fn run_one_cancellable(
     experiment: &Experiment,
     planned: Planned,
     runs_dir: &Path,
     options: ExperimentOptions,
     host: &Host,
-) -> Result<Ran, CoreError> {
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<Option<Ran>, CoreError> {
+    if cancel
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        return Ok(None);
+    }
     let condition = experiment
         .conditions
         .get(planned.condition)
         .ok_or_else(|| spec_error("conditions", format!("no condition {}", planned.condition)))?;
+    let job_id = experiment
+        .job_id(
+            planned.ordinal,
+            &condition.name,
+            planned.split,
+            planned.seed,
+        )
+        .to_hex();
     let lines = Arc::new(Mutex::new(String::new()));
     let sink = Arc::clone(&lines);
     let last_metrics: Arc<Mutex<Option<Metrics>>> = Arc::new(Mutex::new(None));
@@ -1731,7 +2877,7 @@ fn run_one(
     let clock = Instant::now();
     let config = experiment.configuration(planned.condition, planned.seed);
     let finished = config.as_ref().map_err(Clone::clone).and_then(|config| {
-        crate::run::run_with(
+        crate::run::run_with_cancel(
             config,
             RunOptions {
                 ticks: experiment.spec.ticks,
@@ -1742,6 +2888,7 @@ fn run_one(
             },
             &[],
             None,
+            cancel,
             move |record| {
                 if let Record::Metrics(metrics) = record {
                     *last_sink.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -1755,6 +2902,9 @@ fn run_one(
             },
         )
     });
+    if matches!(&finished, Err(CoreError::Cancelled { .. })) {
+        return Ok(None);
+    }
     let wall_seconds = clock.elapsed().as_secs_f64();
     let result = match &finished {
         Ok(finished) => match RunResult::of(
@@ -1808,7 +2958,7 @@ fn run_one(
         },
         host,
     );
-    Ok(Ran {
+    Ok(Some(Ran {
         row: CatalogedRun {
             ordinal: planned.ordinal,
             condition: condition.name.clone(),
@@ -1822,9 +2972,11 @@ fn run_one(
             manifest: json(&manifest)?,
             records_sha256,
         },
+        job_id,
+        split: planned.split,
         result,
         wall_seconds,
-    })
+    }))
 }
 
 /// `value` as compact JSON.

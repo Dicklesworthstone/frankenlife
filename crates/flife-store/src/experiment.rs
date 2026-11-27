@@ -236,6 +236,14 @@ impl ExperimentCatalog {
         &self.path
     }
 
+    /// The experiment identity hash the catalog was created with.
+    ///
+    /// # Errors
+    /// [`CoreError::StorageFailed`] when it cannot be read.
+    pub fn experiment_id(&self) -> Result<Option<String>, CoreError> {
+        self.value("experiment")
+    }
+
     /// The design text the catalog was created with.
     ///
     /// # Errors

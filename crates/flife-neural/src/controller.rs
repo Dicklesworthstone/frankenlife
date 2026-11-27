@@ -1542,28 +1542,8 @@ fn affine_into<W: Weight>(
             .zip(r6_q)
             .zip(r7_q)
         {
-            let a0 = W::widen_4(*w0);
-            let a1 = W::widen_4(*w1);
-            let a2 = W::widen_4(*w2);
-            let a3 = W::widen_4(*w3);
-            let p0 = [a0[0] * x[0], a0[1] * x[1], a0[2] * x[2], a0[3] * x[3]];
-            let p1 = [a1[0] * x[0], a1[1] * x[1], a1[2] * x[2], a1[3] * x[3]];
-            let p2 = [a2[0] * x[0], a2[1] * x[1], a2[2] * x[2], a2[3] * x[3]];
-            let p3 = [a3[0] * x[0], a3[1] * x[1], a3[2] * x[2], a3[3] * x[3]];
-            for k in 0..4 {
-                z0 = [z0[0] + p0[k], z0[1] + p1[k], z0[2] + p2[k], z0[3] + p3[k]];
-            }
-            let a4 = W::widen_4(*w4);
-            let a5 = W::widen_4(*w5);
-            let a6 = W::widen_4(*w6);
-            let a7 = W::widen_4(*w7);
-            let p4 = [a4[0] * x[0], a4[1] * x[1], a4[2] * x[2], a4[3] * x[3]];
-            let p5 = [a5[0] * x[0], a5[1] * x[1], a5[2] * x[2], a5[3] * x[3]];
-            let p6 = [a6[0] * x[0], a6[1] * x[1], a6[2] * x[2], a6[3] * x[3]];
-            let p7 = [a7[0] * x[0], a7[1] * x[1], a7[2] * x[2], a7[3] * x[3]];
-            for k in 0..4 {
-                z1 = [z1[0] + p4[k], z1[1] + p5[k], z1[2] + p6[k], z1[3] + p7[k]];
-            }
+            z0 = W::mac_4x4(z0, [*w0, *w1, *w2, *w3], x);
+            z1 = W::mac_4x4(z1, [*w4, *w5, *w6, *w7], x);
         }
         for ((((((((&x, &w0), &w1), &w2), &w3), &w4), &w5), &w6), &w7) in in_r
             .iter()
@@ -1607,17 +1587,7 @@ fn affine_into<W: Weight>(
         let (r2_q, r2_r) = w_block[2 * n..3 * n].as_chunks::<4>();
         let (r3_q, r3_r) = w_block[3 * n..4 * n].as_chunks::<4>();
         for ((((&x, w0), w1), w2), w3) in in_q.iter().zip(r0_q).zip(r1_q).zip(r2_q).zip(r3_q) {
-            let a0 = W::widen_4(*w0);
-            let a1 = W::widen_4(*w1);
-            let a2 = W::widen_4(*w2);
-            let a3 = W::widen_4(*w3);
-            let p0 = [a0[0] * x[0], a0[1] * x[1], a0[2] * x[2], a0[3] * x[3]];
-            let p1 = [a1[0] * x[0], a1[1] * x[1], a1[2] * x[2], a1[3] * x[3]];
-            let p2 = [a2[0] * x[0], a2[1] * x[1], a2[2] * x[2], a2[3] * x[3]];
-            let p3 = [a3[0] * x[0], a3[1] * x[1], a3[2] * x[2], a3[3] * x[3]];
-            for k in 0..4 {
-                z0 = [z0[0] + p0[k], z0[1] + p1[k], z0[2] + p2[k], z0[3] + p3[k]];
-            }
+            z0 = W::mac_4x4(z0, [*w0, *w1, *w2, *w3], x);
         }
         for ((((&x, &w0), &w1), &w2), &w3) in in_r.iter().zip(r0_r).zip(r1_r).zip(r2_r).zip(r3_r) {
             z0 = [

@@ -98,6 +98,84 @@ impl F16 {
         ]
     }
 
+    /// Whether every element of a 4×4 binary16 tile is normal finite
+    /// (`1 <= exponent <= 30`, i.e. `0x0400 <= (bits & 0x7FFF) <= 0x7BFF`),
+    /// so widening is an exact exponent-rebias shift with no zero, subnormal,
+    /// infinity, or NaN special cases.
+    #[inline(always)]
+    #[must_use]
+    pub fn all_normal_4x4(rows: [[Self; 4]; 4]) -> bool {
+        let mut worst = [0_u16; 4];
+        for row in rows {
+            for (slot, h) in worst.iter_mut().zip(row) {
+                let u = (h.0 & 0x7FFF).wrapping_sub(0x0400);
+                if u > *slot {
+                    *slot = u;
+                }
+            }
+        }
+        worst[0].max(worst[1]).max(worst[2]).max(worst[3]) < 0x7800
+    }
+
+    /// Exact F32 widening for four binary16 values already proven normal finite
+    /// (`0x0400 <= (bits & 0x7FFF) <= 0x7BFF`). Private so callers cannot violate
+    /// the precondition.
+    #[inline(always)]
+    fn to_f32_4_assuming_normal(xs: [Self; 4]) -> [f32; 4] {
+        let mut out = [0.0_f32; 4];
+        for (dst, h) in out.iter_mut().zip(xs) {
+            let b = u32::from(h.0);
+            let sign = (b & 0x8000) << 16;
+            let mag = b & 0x7FFF;
+            *dst = f32::from_bits(sign | ((mag << 13).wrapping_add(NORMAL_BIAS_DELTA_F32)));
+        }
+        out
+    }
+
+    /// Cold exact fallback for [`F16::to_f32_4x4`] when at least one lane in
+    /// the 4×4 tile is zero, subnormal, infinity, or NaN.
+    #[cold]
+    #[inline(never)]
+    fn to_f32_4x4_slow(rows: [[Self; 4]; 4]) -> [[f32; 4]; 4] {
+        [
+            Self::to_f32_4(rows[0]),
+            Self::to_f32_4(rows[1]),
+            Self::to_f32_4(rows[2]),
+            Self::to_f32_4(rows[3]),
+        ]
+    }
+
+    /// Widen a 4×4 tile of binary16 values to F32 if and only if every element
+    /// is normal finite (`1 <= exponent <= 30`). Returns `None` if any lane is
+    /// zero, subnormal, infinity, or NaN so callers can dispatch to an
+    /// out-of-line exact fallback without repeating the tile scan.
+    #[inline(always)]
+    #[must_use]
+    pub fn to_f32_4x4_if_normal(rows: [[Self; 4]; 4]) -> Option<[[f32; 4]; 4]> {
+        if Self::all_normal_4x4(rows) {
+            Some([
+                Self::to_f32_4_assuming_normal(rows[0]),
+                Self::to_f32_4_assuming_normal(rows[1]),
+                Self::to_f32_4_assuming_normal(rows[2]),
+                Self::to_f32_4_assuming_normal(rows[3]),
+            ])
+        } else {
+            None
+        }
+    }
+
+    /// Widen a 4×4 tile of binary16 values to F32, bit-identical per element
+    /// to [`F16::to_f32`] across all 65,536 binary16 bit patterns.
+    ///
+    /// When all 16 values are normal finite binary16 values, widens via pure
+    /// exponent-rebias arithmetic with no Sterbenz subnormal FADD or Inf/NaN
+    /// masks; otherwise delegates to [`F16::to_f32_4`].
+    #[inline(always)]
+    #[must_use]
+    pub fn to_f32_4x4(rows: [[Self; 4]; 4]) -> [[f32; 4]; 4] {
+        Self::to_f32_4x4_if_normal(rows).unwrap_or_else(|| Self::to_f32_4x4_slow(rows))
+    }
+
     /// The value as F64, exactly.
     #[must_use]
     pub fn to_f64(self) -> f64 {

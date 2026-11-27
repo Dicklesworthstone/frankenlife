@@ -80,12 +80,77 @@ pub trait Weight: Copy + Send + Sync + std::fmt::Debug + 'static {
         ]
     }
 
+    /// Accumulate a 4-row × 4-column weight tile against 4 inputs `x` into
+    /// 4 row accumulators `z`, adding columns in strictly ascending order
+    /// `k = 0..4` (`z[r] = (((z[r] + w[r][0]*x[0]) + w[r][1]*x[1]) +
+    /// w[r][2]*x[2]) + w[r][3]*x[3]`), 0-ULP bit-identical to scalar F32
+    /// multiply-then-add (no FMA).
+    #[inline(always)]
+    fn mac_4x4(z: [f32; 4], rows: [[Self; 4]; 4], x: [f32; 4]) -> [f32; 4] {
+        mac_4x4_f32(
+            z,
+            [
+                Self::widen_4(rows[0]),
+                Self::widen_4(rows[1]),
+                Self::widen_4(rows[2]),
+                Self::widen_4(rows[3]),
+            ],
+            x,
+        )
+    }
+
     /// `value` rounded once to this dtype, to nearest with ties to even.
     fn round_from_f64(value: f64) -> Self;
 
     /// The weight's bits, widened to 32 (equality of bits, not of values:
     /// `-0` and `+0` differ).
     fn bits(self) -> u32;
+}
+
+/// Accumulate four widened F32 weight rows against `x` into `z` in strict
+/// ascending column order `k = 0..4`, using an explicit two-stage 4×4
+/// butterfly transpose (`trn1`/`trn2` on NEON, `unpcklps`/`unpckhps` +
+/// `movlhps`/`movhlps` on x86_64) so products are computed row-wise and summed
+/// column-wise with zero scalar lane insertions and 0-ULP exactness.
+#[inline(always)]
+fn mac_4x4_f32(z: [f32; 4], rows: [[f32; 4]; 4], x: [f32; 4]) -> [f32; 4] {
+    let [a0, a1, a2, a3] = rows;
+    let p0 = [a0[0] * x[0], a0[1] * x[1], a0[2] * x[2], a0[3] * x[3]];
+    let p1 = [a1[0] * x[0], a1[1] * x[1], a1[2] * x[2], a1[3] * x[3]];
+    let p2 = [a2[0] * x[0], a2[1] * x[1], a2[2] * x[2], a2[3] * x[3]];
+    let p3 = [a3[0] * x[0], a3[1] * x[1], a3[2] * x[2], a3[3] * x[3]];
+    // Stage 1: interleave 32-bit pairs within (p0, p1) and (p2, p3).
+    let t0 = [p0[0], p1[0], p0[2], p1[2]];
+    let t1 = [p0[1], p1[1], p0[3], p1[3]];
+    let t2 = [p2[0], p3[0], p2[2], p3[2]];
+    let t3 = [p2[1], p3[1], p2[3], p3[3]];
+    // Stage 2: interleave 64-bit halves to yield the 4 column vectors.
+    let c0 = [t0[0], t0[1], t2[0], t2[1]];
+    let c1 = [t1[0], t1[1], t3[0], t3[1]];
+    let c2 = [t0[2], t0[3], t2[2], t2[3]];
+    let c3 = [t1[2], t1[3], t3[2], t3[3]];
+    let z = [z[0] + c0[0], z[1] + c0[1], z[2] + c0[2], z[3] + c0[3]];
+    let z = [z[0] + c1[0], z[1] + c1[1], z[2] + c1[2], z[3] + c1[3]];
+    let z = [z[0] + c2[0], z[1] + c2[1], z[2] + c2[2], z[3] + c2[3]];
+    [z[0] + c3[0], z[1] + c3[1], z[2] + c3[2], z[3] + c3[3]]
+}
+
+/// Cold exact F16 4×4 MAC fallback invoked when a tile contains any zero,
+/// subnormal, infinity, or NaN weight. Keeping this out-of-line keeps the hot
+/// normal-only loop free of subnormal/Inf constants and merges only `[f32; 4]`.
+#[cold]
+#[inline(never)]
+fn mac_4x4_f16_slow(z: [f32; 4], rows: [[F16; 4]; 4], x: [f32; 4]) -> [f32; 4] {
+    mac_4x4_f32(
+        z,
+        [
+            F16::to_f32_4(rows[0]),
+            F16::to_f32_4(rows[1]),
+            F16::to_f32_4(rows[2]),
+            F16::to_f32_4(rows[3]),
+        ],
+        x,
+    )
 }
 
 impl Weight for f32 {
@@ -99,6 +164,11 @@ impl Weight for f32 {
     #[inline(always)]
     fn widen_4(values: [Self; 4]) -> [f32; 4] {
         values
+    }
+
+    #[inline(always)]
+    fn mac_4x4(z: [f32; 4], rows: [[Self; 4]; 4], x: [f32; 4]) -> [f32; 4] {
+        mac_4x4_f32(z, rows, x)
     }
 
     #[inline]
@@ -127,6 +197,15 @@ impl Weight for F16 {
     #[inline(always)]
     fn widen_4(values: [Self; 4]) -> [f32; 4] {
         Self::to_f32_4(values)
+    }
+
+    #[inline(always)]
+    fn mac_4x4(z: [f32; 4], rows: [[Self; 4]; 4], x: [f32; 4]) -> [f32; 4] {
+        if let Some(widened) = Self::to_f32_4x4_if_normal(rows) {
+            mac_4x4_f32(z, widened, x)
+        } else {
+            mac_4x4_f16_slow(z, rows, x)
+        }
     }
 
     #[inline]

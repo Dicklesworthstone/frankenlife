@@ -219,3 +219,100 @@ fn rounding_is_once_from_f64_not_through_f32() {
     let via_f32 = F16::from_f64(f64::from(x as f32));
     assert_eq!(via_f32.to_bits(), 0x3C00);
 }
+
+#[test]
+fn to_f32_4x4_matches_independent_decode_for_all_patterns_and_mixed_tiles() {
+    let independent_bits = |bits: u16| -> u32 {
+        let sign = u32::from(bits & 0x8000) << 16;
+        match (bits & 0x7C00) >> 10 {
+            0 => sign | (f32::from(bits & 0x03FF) * f32::from_bits(0x3380_0000)).to_bits(),
+            0x1F => sign | 0x7F80_0000 | (u32::from(bits & 0x03FF) << 13),
+            exp => sign | ((u32::from(exp) + 112) << 23) | (u32::from(bits & 0x03FF) << 13),
+        }
+    };
+
+    // Sweep every 16-pattern block across all 65,536 binary16 bit patterns
+    // (4,096 tiles), covering both fast normal tiles and slow boundary tiles.
+    let mut normal_tiles = 0_u32;
+    let mut special_tiles = 0_u32;
+    for base in (0_u32..=u32::from(u16::MAX)).step_by(16) {
+        let mut tile = [[F16::ZERO; 4]; 4];
+        let mut expect_all_normal = true;
+        for (r, row) in tile.iter_mut().enumerate() {
+            for (c, slot) in row.iter_mut().enumerate() {
+                let bits = (base + (r * 4 + c) as u32) as u16;
+                *slot = F16::from_bits(bits);
+                let exp = (bits >> 10) & 0x1F;
+                if exp == 0 || exp == 0x1F {
+                    expect_all_normal = false;
+                }
+            }
+        }
+        assert_eq!(F16::all_normal_4x4(tile), expect_all_normal);
+        if expect_all_normal {
+            normal_tiles += 1;
+        } else {
+            special_tiles += 1;
+        }
+        let got = F16::to_f32_4x4(tile);
+        for (r, (t_row, g_row)) in tile.iter().zip(&got).enumerate() {
+            for (c, (&h, &g)) in t_row.iter().zip(g_row).enumerate() {
+                let bits = h.to_bits();
+                assert_eq!(
+                    g.to_bits(),
+                    independent_bits(bits),
+                    "tile base={base:#06x} ({r},{c}) bits={bits:#06x}"
+                );
+            }
+        }
+    }
+    assert!(normal_tiles > 3_500);
+    assert!(special_tiles > 200);
+
+    // Inject each tricky special value (+0, -0, min/max subnormal, ±Inf,
+    // signaling/quiet NaN with both signs, smallest/largest normals) into every
+    // one of the 16 tile positions amidst 15 normal values.
+    let specials = [
+        0x0000_u16, // +0.0
+        0x8000,     // -0.0
+        0x0001,     // smallest +subnormal
+        0x8001,     // smallest -subnormal
+        0x03FF,     // largest +subnormal
+        0x83FF,     // largest -subnormal
+        0x0400,     // smallest +normal (fast path!)
+        0x8400,     // smallest -normal (fast path!)
+        0x7BFF,     // largest +normal (fast path!)
+        0xFBFF,     // largest -normal (fast path!)
+        0x7C00,     // +Inf
+        0xFC00,     // -Inf
+        0x7C01,     // +sNaN payload 1
+        0xFC01,     // -sNaN payload 1
+        0x7E00,     // +qNaN
+        0xFFFF,     // -qNaN all ones
+    ];
+    for &special in &specials {
+        let special_is_normal = {
+            let exp = (special >> 10) & 0x1F;
+            exp != 0 && exp != 0x1F
+        };
+        for pos in 0..16 {
+            let mut tile = [[F16::from_bits(0x3C00); 4]; 4];
+            tile[pos / 4][pos % 4] = F16::from_bits(special);
+            assert_eq!(
+                F16::all_normal_4x4(tile),
+                special_is_normal,
+                "special={special:#06x} pos={pos}"
+            );
+            let got = F16::to_f32_4x4(tile);
+            for (r, (t_row, g_row)) in tile.iter().zip(&got).enumerate() {
+                for (c, (&h, &g)) in t_row.iter().zip(g_row).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        independent_bits(h.to_bits()),
+                        "special={special:#06x} pos={pos} at ({r},{c})"
+                    );
+                }
+            }
+        }
+    }
+}

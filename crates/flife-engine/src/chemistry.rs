@@ -514,6 +514,83 @@ impl Chemistry {
         settle_efficiencies_trusted(self.toxicity_sensitivity, list, budget)
     }
 
+    /// Settle two 4-packet organisms simultaneously given already-resolved
+    /// composition references, keeping the fused dot-product, `tanh_4`, and
+    /// settlement loop out-of-line so callers stay compact with zero redundant
+    /// bounds checks or stack spills, while preserving 0-ULP bit-exact identity
+    /// with two sequential [`Chemistry::settle_indexed_slice`] calls.
+    ///
+    /// # Errors
+    /// Returns the first error encountered in organism A before organism B,
+    /// matching sequential evaluation.
+    #[inline(never)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "paired 2-organism chemistry settlement taking both organisms' affinities, grants, compositions, and budgets"
+    )]
+    pub(crate) fn settle_pair_4_refs(
+        &self,
+        aff_a: &[f64; CHANNELS],
+        grants_a: [f64; 4],
+        comps_a: [&[f64; CHANNELS]; 4],
+        budget_a: &mut EnergyBudget,
+        aff_b: &[f64; CHANNELS],
+        grants_b: [f64; 4],
+        comps_b: [&[f64; CHANNELS]; 4],
+        budget_b: &mut EnergyBudget,
+    ) -> Result<(UptakeSettlement, UptakeSettlement), CoreError> {
+        let (da, db) = dot4_channels_pair(
+            aff_a, comps_a[0], comps_a[1], comps_a[2], comps_a[3], aff_b, comps_b[0], comps_b[1],
+            comps_b[2], comps_b[3],
+        );
+        let args_a = [
+            self.gain * da[0] - self.threshold,
+            self.gain * da[1] - self.threshold,
+            self.gain * da[2] - self.threshold,
+            self.gain * da[3] - self.threshold,
+        ];
+        let resp_a = match tanh_4(args_a) {
+            Some(r) => r,
+            None => eval_tanh_4_fallback(args_a, da)?,
+        };
+        let max_eff = self.maximum_efficiency;
+        let settle_a = settle_4_efficiencies_trusted(
+            self.toxicity_sensitivity,
+            grants_a,
+            [
+                max_eff * resp_a[0],
+                max_eff * resp_a[1],
+                max_eff * resp_a[2],
+                max_eff * resp_a[3],
+            ],
+            budget_a,
+        )?;
+
+        let args_b = [
+            self.gain * db[0] - self.threshold,
+            self.gain * db[1] - self.threshold,
+            self.gain * db[2] - self.threshold,
+            self.gain * db[3] - self.threshold,
+        ];
+        let resp_b = match tanh_4(args_b) {
+            Some(r) => r,
+            None => eval_tanh_4_fallback(args_b, db)?,
+        };
+        let settle_b = settle_4_efficiencies_trusted(
+            self.toxicity_sensitivity,
+            grants_b,
+            [
+                max_eff * resp_b[0],
+                max_eff * resp_b[1],
+                max_eff * resp_b[2],
+                max_eff * resp_b[3],
+            ],
+            budget_b,
+        )?;
+
+        Ok((settle_a, settle_b))
+    }
+
     /// Settle two 4-packet organisms simultaneously against a deduplicated
     /// `compositions` table, interleaving their exact channel-order dot
     /// products via [`dot4_channels_pair`] to saturate all 4 FP add pipelines
@@ -523,6 +600,7 @@ impl Chemistry {
     /// # Errors
     /// Returns the first error encountered in organism A before organism B,
     /// matching sequential evaluation.
+    #[cfg(test)]
     #[inline]
     #[expect(
         clippy::too_many_arguments,
@@ -563,74 +641,38 @@ impl Chemistry {
             .get(packets_b[3].1 as usize)
             .ok_or_else(|| err_comp_oob(packets_b[3].1, compositions.len()))?;
 
-        let (da, db) = dot4_channels_pair(aff_a, a0, a1, a2, a3, aff_b, b0, b1, b2, b3);
-        let args_a = [
-            self.gain * da[0] - self.threshold,
-            self.gain * da[1] - self.threshold,
-            self.gain * da[2] - self.threshold,
-            self.gain * da[3] - self.threshold,
-        ];
-        let resp_a = match tanh_4(args_a) {
-            Some(r) => r,
-            None => [
-                tanh(args_a[0]).ok_or_else(|| err_nonfinite_dot(da[0]))?,
-                tanh(args_a[1]).ok_or_else(|| err_nonfinite_dot(da[1]))?,
-                tanh(args_a[2]).ok_or_else(|| err_nonfinite_dot(da[2]))?,
-                tanh(args_a[3]).ok_or_else(|| err_nonfinite_dot(da[3]))?,
-            ],
-        };
-        let max_eff = self.maximum_efficiency;
-        let settle_a = settle_4_efficiencies_trusted(
-            self.toxicity_sensitivity,
+        self.settle_pair_4_refs(
+            aff_a,
             [
                 packets_a[0].0,
                 packets_a[1].0,
                 packets_a[2].0,
                 packets_a[3].0,
             ],
-            [
-                max_eff * resp_a[0],
-                max_eff * resp_a[1],
-                max_eff * resp_a[2],
-                max_eff * resp_a[3],
-            ],
+            [a0, a1, a2, a3],
             budget_a,
-        )?;
-
-        let args_b = [
-            self.gain * db[0] - self.threshold,
-            self.gain * db[1] - self.threshold,
-            self.gain * db[2] - self.threshold,
-            self.gain * db[3] - self.threshold,
-        ];
-        let resp_b = match tanh_4(args_b) {
-            Some(r) => r,
-            None => [
-                tanh(args_b[0]).ok_or_else(|| err_nonfinite_dot(db[0]))?,
-                tanh(args_b[1]).ok_or_else(|| err_nonfinite_dot(db[1]))?,
-                tanh(args_b[2]).ok_or_else(|| err_nonfinite_dot(db[2]))?,
-                tanh(args_b[3]).ok_or_else(|| err_nonfinite_dot(db[3]))?,
-            ],
-        };
-        let settle_b = settle_4_efficiencies_trusted(
-            self.toxicity_sensitivity,
+            aff_b,
             [
                 packets_b[0].0,
                 packets_b[1].0,
                 packets_b[2].0,
                 packets_b[3].0,
             ],
-            [
-                max_eff * resp_b[0],
-                max_eff * resp_b[1],
-                max_eff * resp_b[2],
-                max_eff * resp_b[3],
-            ],
+            [b0, b1, b2, b3],
             budget_b,
-        )?;
-
-        Ok((settle_a, settle_b))
+        )
     }
+}
+
+#[cold]
+#[inline(never)]
+fn eval_tanh_4_fallback(args: [f64; 4], dots: [f64; 4]) -> Result<[f64; 4], CoreError> {
+    Ok([
+        tanh(args[0]).ok_or_else(|| err_nonfinite_dot(dots[0]))?,
+        tanh(args[1]).ok_or_else(|| err_nonfinite_dot(dots[1]))?,
+        tanh(args[2]).ok_or_else(|| err_nonfinite_dot(dots[2]))?,
+        tanh(args[3]).ok_or_else(|| err_nonfinite_dot(dots[3]))?,
+    ])
 }
 
 /// A heritable affinity direction `a` with `||a||₂` at most the run's limit,
@@ -791,6 +833,37 @@ pub fn settle_efficiencies(
     settle_efficiencies_trusted(toxicity_sensitivity, packets, budget)
 }
 
+#[cold]
+#[inline(never)]
+fn find_invalid_4_packet_err(grants: [f64; 4], efficiencies: [f64; 4]) -> CoreError {
+    for k in 0..4 {
+        let g = grants[k];
+        if !(0.0..f64::INFINITY).contains(&g) {
+            return err_invalid_grant(g);
+        }
+        let e = efficiencies[k];
+        if !(-1.0..=1.0).contains(&e) {
+            return err_invalid_efficiency(e);
+        }
+    }
+    err_invalid_grant(f64::NAN)
+}
+
+/// Nonnegative Neumaier compensated step, bit-identical to
+/// [`CompensatedSum::add`] whenever `sum >= 0.0` and `value >= 0.0` (so
+/// `sum.abs() >= value.abs()` reduces to `sum >= value` without `fabs`).
+#[inline(always)]
+fn neumaier_add_nonneg(sum: &mut f64, comp: &mut f64, value: f64) {
+    let s = *sum;
+    let total = s + value;
+    *comp += if s >= value {
+        (s - total) + value
+    } else {
+        (value - total) + s
+    };
+    *sum = total;
+}
+
 #[inline]
 fn settle_4_efficiencies_trusted(
     toxicity_sensitivity: f64,
@@ -798,32 +871,52 @@ fn settle_4_efficiencies_trusted(
     efficiencies: [f64; 4],
     budget: &mut EnergyBudget,
 ) -> Result<UptakeSettlement, CoreError> {
-    let (mut absorbed, mut gain, mut harm) = (
-        CompensatedSum::ZERO,
-        CompensatedSum::ZERO,
-        CompensatedSum::ZERO,
-    );
-    for k in 0..4 {
+    let valid = (grants[0] >= 0.0)
+        & (grants[0] < f64::INFINITY)
+        & (grants[1] >= 0.0)
+        & (grants[1] < f64::INFINITY)
+        & (grants[2] >= 0.0)
+        & (grants[2] < f64::INFINITY)
+        & (grants[3] >= 0.0)
+        & (grants[3] < f64::INFINITY)
+        & (efficiencies[0].abs() <= 1.0)
+        & (efficiencies[1].abs() <= 1.0)
+        & (efficiencies[2].abs() <= 1.0)
+        & (efficiencies[3].abs() <= 1.0);
+    if !valid {
+        return Err(find_invalid_4_packet_err(grants, efficiencies));
+    }
+
+    // For finite `x >= 0.0`, `CompensatedSum::ZERO.add(x)` produces
+    // `sum = 0.0 + x` and `comp = 0.0` bit-for-bit across all values including
+    // `-0.0`, `+0.0`, subnormals, and `f64::MAX`.
+    let mut abs_sum = grants[0] + 0.0;
+    let mut abs_comp = 0.0_f64;
+    let mut gain_sum = (efficiencies[0].max(0.0) * grants[0]) + 0.0;
+    let mut gain_comp = 0.0_f64;
+    let mut harm_sum = ((-efficiencies[0]).max(0.0) * grants[0]) + 0.0;
+    let mut harm_comp = 0.0_f64;
+
+    for k in 1..4 {
         let granted = grants[k];
         let efficiency = efficiencies[k];
-        if !granted.is_finite() || granted < 0.0 {
-            return Err(err_invalid_grant(granted));
-        }
-        if !(-1.0..=1.0).contains(&efficiency) {
-            return Err(err_invalid_efficiency(efficiency));
-        }
-        absorbed.add(granted);
-        gain.add(efficiency.max(0.0) * granted);
-        harm.add((-efficiency).max(0.0) * granted);
+        neumaier_add_nonneg(&mut abs_sum, &mut abs_comp, granted);
+        neumaier_add_nonneg(&mut gain_sum, &mut gain_comp, efficiency.max(0.0) * granted);
+        neumaier_add_nonneg(
+            &mut harm_sum,
+            &mut harm_comp,
+            (-efficiency).max(0.0) * granted,
+        );
     }
-    let gain = gain.value();
-    let requested_toxicity = toxicity_sensitivity * harm.value();
+
+    let gain = gain_sum + gain_comp;
+    let requested_toxicity = toxicity_sensitivity * (harm_sum + harm_comp);
     if gain > 0.0 {
         budget.credit(gain)?;
     }
     let toxicity = budget.pay(requested_toxicity)?;
     Ok(UptakeSettlement {
-        absorbed: absorbed.value(),
+        absorbed: abs_sum + abs_comp,
         gain,
         toxicity,
     })
@@ -1097,5 +1190,125 @@ mod tests {
             .settle_indexed_pair_4(&aff_a, bad_a, &mut ba, &aff_b, bad_b, &mut bb, &comps)
             .expect_err("oob must fail");
         assert!(format!("{err}").contains("99"));
+    }
+
+    #[test]
+    fn settle_4_efficiencies_trusted_matches_scalar_edge_cases_bit_for_bit() {
+        let edge_grants = [
+            0.0,
+            -0.0,
+            f64::from_bits(1), // smallest subnormal
+            f64::MIN_POSITIVE,
+            1.0e-12,
+            0.125,
+            1.0,
+            1.0e6,
+            1.0e150,
+            f64::MAX * 0.25,
+        ];
+        let edge_effs = [
+            -1.0,
+            -0.75,
+            -f64::from_bits(1),
+            -0.0,
+            0.0,
+            f64::from_bits(1),
+            0.5,
+            1.0,
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next_u64 = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        // 2,000 adversarial + pseudorandom 4-packet cases across kappa and budgets.
+        for case in 0..2_000 {
+            let (grants, effs) = if case < 400 {
+                let g =
+                    std::array::from_fn(|_| edge_grants[(next_u64() as usize) % edge_grants.len()]);
+                let e = std::array::from_fn(|_| edge_effs[(next_u64() as usize) % edge_effs.len()]);
+                (g, e)
+            } else {
+                let g =
+                    std::array::from_fn(|_| ((next_u64() >> 11) as f64) * 2.0_f64.powi(-53) * 10.0);
+                let e =
+                    std::array::from_fn(|_| ((next_u64() >> 11) as f64) * 2.0_f64.powi(-52) - 1.0);
+                (g, e)
+            };
+            let pairs = [
+                (grants[0], effs[0]),
+                (grants[1], effs[1]),
+                (grants[2], effs[2]),
+                (grants[3], effs[3]),
+            ];
+            let kappa = if case % 3 == 0 { 0.2 } else { 1.75 };
+            let start = if case % 5 == 0 { 0.001 } else { 5.0 };
+            let mut b_ref = EnergyBudget::new(start).expect("b_ref");
+            let mut b_fast = EnergyBudget::new(start).expect("b_fast");
+            let r_ref = settle_efficiencies(kappa, &pairs, &mut b_ref);
+            let r_fast = settle_4_efficiencies_trusted(kappa, grants, effs, &mut b_fast);
+            match (r_ref, r_fast) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(
+                        a.absorbed.to_bits(),
+                        b.absorbed.to_bits(),
+                        "case {case} absorbed"
+                    );
+                    assert_eq!(a.gain.to_bits(), b.gain.to_bits(), "case {case} gain");
+                    assert_eq!(
+                        a.toxicity.requested.to_bits(),
+                        b.toxicity.requested.to_bits(),
+                        "case {case} tox.req"
+                    );
+                    assert_eq!(
+                        a.toxicity.paid.to_bits(),
+                        b.toxicity.paid.to_bits(),
+                        "case {case} tox.paid"
+                    );
+                    assert_eq!(
+                        b_ref.remaining().to_bits(),
+                        b_fast.remaining().to_bits(),
+                        "case {case} remaining"
+                    );
+                    assert_eq!(
+                        b_ref.is_exhausted(),
+                        b_fast.is_exhausted(),
+                        "case {case} exh"
+                    );
+                }
+                (Err(ea), Err(eb)) => assert_eq!(format!("{ea}"), format!("{eb}"), "case {case}"),
+                (a, b) => panic!("case {case} mismatch: ref={a:?}, fast={b:?}"),
+            }
+        }
+
+        // Exact error ordering on invalid grants and efficiencies (grant before efficiency, index 0..4).
+        let bad_cases = [
+            ([-1e-300, 1.0, 1.0, 1.0], [0.0; 4]),
+            ([f64::NAN, 1.0, 1.0, 1.0], [2.0; 4]),
+            ([1.0, f64::INFINITY, 1.0, 1.0], [0.0, 2.0, 0.0, 0.0]),
+            ([1.0, 1.0, f64::NEG_INFINITY, 1.0], [0.0; 4]),
+            ([1.0, 1.0, 1.0, -0.5], [0.0; 4]),
+            ([1.0; 4], [1.0 + f64::EPSILON, 0.0, 0.0, 0.0]),
+            ([1.0; 4], [0.0, -1.0 - f64::EPSILON, 0.0, 0.0]),
+            ([1.0; 4], [0.0, 0.0, f64::NAN, 0.0]),
+            ([1.0; 4], [0.0, 0.0, 0.0, f64::INFINITY]),
+        ];
+        for (grants, effs) in bad_cases {
+            let pairs = [
+                (grants[0], effs[0]),
+                (grants[1], effs[1]),
+                (grants[2], effs[2]),
+                (grants[3], effs[3]),
+            ];
+            let mut b_ref = EnergyBudget::new(1.0).expect("b_ref");
+            let mut b_fast = EnergyBudget::new(1.0).expect("b_fast");
+            let e_ref = settle_efficiencies(0.2, &pairs, &mut b_ref).expect_err("ref err");
+            let e_fast = settle_4_efficiencies_trusted(0.2, grants, effs, &mut b_fast)
+                .expect_err("fast err");
+            assert_eq!(format!("{e_ref}"), format!("{e_fast}"));
+        }
     }
 }

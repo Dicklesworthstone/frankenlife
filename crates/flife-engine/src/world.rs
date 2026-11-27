@@ -7252,7 +7252,16 @@ fn spatial_chemistry_prepass_fused(
                 pkts: [(f64, u32); PACKETS_PER_ORGANISM],
                 n: usize,
             }
-            #[inline(always)]
+            #[cold]
+            #[inline(never)]
+            fn err_fused_fallback() -> CoreError {
+                CoreError::StateConflict {
+                    operation: "fused spatial chemistry prepass",
+                    detail: String::new(),
+                }
+            }
+
+            #[inline]
             fn load_org<'a>(
                 row_u32: u32,
                 ordered_slots: &[u32],
@@ -7265,49 +7274,30 @@ fn spatial_chemistry_prepass_fused(
                 let row_idx = row_u32 as usize;
                 let phys_slot = ordered_slots[row_idx] as usize;
                 let Some((energy, genome)) = population.chemistry_slot_read(phys_slot) else {
-                    return Err(CoreError::StateConflict {
-                        operation: "fused spatial chemistry prepass",
-                        detail: format!("slot {phys_slot} missing occupied state"),
-                    });
+                    return Err(err_fused_fallback());
                 };
                 let bucket = by_demand.bucket(row_idx);
                 if bucket.len() > PACKETS_PER_ORGANISM {
-                    return Err(CoreError::StateConflict {
-                        operation: "fused spatial chemistry prepass",
-                        detail: "bucket exceeded grid-cic packet count".to_owned(),
-                    });
+                    return Err(err_fused_fallback());
                 }
                 let mut pkts = [(0.0_f64, 0_u32); PACKETS_PER_ORGANISM];
                 let mut n = 0_usize;
                 for &at in bucket {
-                    let packet =
-                        granted
-                            .get(at as usize)
-                            .ok_or_else(|| CoreError::StateConflict {
-                                operation: "fused spatial chemistry prepass",
-                                detail: format!("missing grant packet {at}"),
-                            })?;
+                    let Some(packet) = granted.get(at as usize) else {
+                        return Err(err_fused_fallback());
+                    };
                     let cell = packet.cell;
                     if cell >= geom.total_cells {
-                        return Err(CoreError::LayoutMismatch {
-                            buffer: "field",
-                            detail: format!("cell {cell} is not in this field"),
-                        });
+                        return Err(err_fused_fallback());
                     }
                     let dx = (cell & geom.x_mask).wrapping_sub(geom.x0) & geom.x_mask;
                     let dy = (cell >> geom.x_shift).wrapping_sub(geom.y0) & geom.y_mask;
                     if dx >= geom.halo_w || dy >= geom.halo_h {
-                        return Err(CoreError::StateConflict {
-                            operation: "fused spatial chemistry prepass",
-                            detail: "grant cell fell outside spatial tile halo".to_owned(),
-                        });
+                        return Err(err_fused_fallback());
                     }
                     let local_idx = halo_map[dy * geom.halo_w + dx];
                     if (local_idx as usize) >= geom.tile_distinct {
-                        return Err(CoreError::StateConflict {
-                            operation: "fused spatial chemistry prepass",
-                            detail: "grant cell missing from halo composition map".to_owned(),
-                        });
+                        return Err(err_fused_fallback());
                     }
                     pkts[n] = (packet.granted, local_idx);
                     n += 1;
@@ -7354,14 +7344,25 @@ fn spatial_chemistry_prepass_fused(
                     geom,
                 )?;
                 if a.n == PACKETS_PER_ORGANISM && b.n == PACKETS_PER_ORGANISM {
-                    let (sa, sb) = rules.chemistry.settle_indexed_pair_4(
+                    let (sa, sb) = rules.chemistry.settle_pair_4_refs(
                         a.aff,
-                        a.pkts,
+                        [a.pkts[0].0, a.pkts[1].0, a.pkts[2].0, a.pkts[3].0],
+                        [
+                            &comps_ready[a.pkts[0].1 as usize],
+                            &comps_ready[a.pkts[1].1 as usize],
+                            &comps_ready[a.pkts[2].1 as usize],
+                            &comps_ready[a.pkts[3].1 as usize],
+                        ],
                         &mut a.budget,
                         b.aff,
-                        b.pkts,
+                        [b.pkts[0].0, b.pkts[1].0, b.pkts[2].0, b.pkts[3].0],
+                        [
+                            &comps_ready[b.pkts[0].1 as usize],
+                            &comps_ready[b.pkts[1].1 as usize],
+                            &comps_ready[b.pkts[2].1 as usize],
+                            &comps_ready[b.pkts[3].1 as usize],
+                        ],
                         &mut b.budget,
-                        comps_ready,
                     )?;
                     *out_a = (sa, a.budget);
                     *out_b = (sb, b.budget);

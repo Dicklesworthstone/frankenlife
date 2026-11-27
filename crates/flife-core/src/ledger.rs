@@ -1424,7 +1424,11 @@ fn transfer_creates_energy_error(quantity: &'static str, credited: f64, debited:
 /// `value` as a finite nonnegative energy, with `-0.0` folded to `0.0`.
 #[inline]
 fn energy(quantity: &'static str, value: f64) -> Result<f64, CoreError> {
-    if value.is_finite() && value >= 0.0 {
+    // `value >= 0.0 && value < f64::INFINITY` is bit-identical to
+    // `value.is_finite() && value >= 0.0` across all IEEE-754 `f64` patterns
+    // (including `NaN`, `±Inf`, `±0.0`, and subnormals) while compiling to two
+    // `fcmp`s instead of an `llvm.is.fpclass` bit-twiddling sequence.
+    if (0.0..f64::INFINITY).contains(&value) {
         Ok(value + 0.0)
     } else {
         Err(invalid_energy_error(quantity, value))

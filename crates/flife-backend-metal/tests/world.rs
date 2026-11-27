@@ -518,7 +518,9 @@ fn auto_takes_metal_only_up_to_its_worker_ceiling() {
         |workers: usize| format!("cpu (frankentorch population_affine_f32_into, {workers} lanes)");
     // The rule on both kinds of host, wherever this runs: the preset's
     // 4,096 organisms, just below the floor, at it, and the Desktop
-    // ecology preset's 100,000.
+    // ecology preset's 100,000. Each row is (workers, with a Metal device,
+    // without one). Where `TORCH_AT_SCALE`, `small` is the rule below the
+    // floor and `large` from it.
     use ControllerChoice::{Cpu, Metal, Torch};
     let small = [
         (1, Metal, Torch),
@@ -538,37 +540,20 @@ fn auto_takes_metal_only_up_to_its_worker_ceiling() {
         (workers, with_device, Torch)
     });
     // A host where torch is not faster at scale: torch only up to its own
-    // ceiling, at any size, and the reference above it.
-    let elsewhere = small.map(|(workers, with_device, _)| {
-        let torch_or_cpu = if workers <= AUTO_TORCH_MAX_WORKERS_ELSEWHERE {
-            Torch
-        } else {
-            Cpu
-        };
-        let with_device = if with_device == Metal {
-            Metal
-        } else {
-            torch_or_cpu
-        };
-        (workers, with_device, torch_or_cpu)
-    });
-    assert_eq!(
-        elsewhere.map(|(_, with_device, without)| (with_device, without)),
-        [
-            (Metal, Torch),
-            (Metal, Torch),
-            (Metal, Torch),
-            (Metal, Cpu),
-            (Metal, Cpu),
-            (Metal, Cpu),
-            (Cpu, Cpu),
-            (Cpu, Cpu),
-            (Cpu, Cpu),
-            (Cpu, Cpu),
-            (Cpu, Cpu),
-        ],
-        "the table for other hosts, spelled out"
-    );
+    // ceiling, at every size, and the reference above it.
+    let elsewhere = [
+        (1, Metal, Torch),
+        (2, Metal, Torch),
+        (AUTO_TORCH_MAX_WORKERS_ELSEWHERE, Metal, Torch),
+        (AUTO_TORCH_MAX_WORKERS_ELSEWHERE + 1, Metal, Cpu),
+        (8, Metal, Cpu),
+        (AUTO_METAL_MAX_WORKERS, Metal, Cpu),
+        (AUTO_METAL_MAX_WORKERS + 1, Cpu, Cpu),
+        (32, Cpu, Cpu),
+        (AUTO_TORCH_MAX_WORKERS, Cpu, Cpu),
+        (AUTO_TORCH_MAX_WORKERS + 1, Cpu, Cpu),
+        (128, Cpu, Cpu),
+    ];
     let torch_workers = if TORCH_AT_SCALE {
         AUTO_TORCH_MAX_WORKERS
     } else {
@@ -577,7 +562,7 @@ fn auto_takes_metal_only_up_to_its_worker_ceiling() {
     assert_eq!(
         TORCH_AT_SCALE,
         cfg!(all(target_os = "macos", target_arch = "aarch64")),
-        "the floor holds only where it was measured faster"
+        "the floor and the wider torch ceiling hold only where they were measured faster"
     );
     for (organisms, at_scale) in [
         (4_096, small),

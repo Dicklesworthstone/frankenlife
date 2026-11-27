@@ -491,10 +491,11 @@ settle at about 22,000 to 25,000 after an early bottleneck. Open it the same way
 `presets/desktop-world.toml` is the Desktop ecology profile's: 100,000 founders on 512 × 512 × 33 with F16
 weights, at the Interactive preset's energy per area, which FL-034's experiment E2 tested and adopted. All 8
 of E2's runs at its power settled at 91,664 to 99,361 live by tick 8,192. With all 100,000 founders alive, on
-16 workers of an M5 Ultra, it stepped at 9.8–10.2 ticks per second on `torch`, which `auto` takes there, against
-8.9–9.0 on the CPU reference (`tick_throughput`, ticks 32–160). Three rounds of host-side work (commits cb48588,
-31ea27b and c1ab2f8, each reaching the same tick-160 digest) then took it to 23.3–24.2 ticks per second with
-`--controllers metal` on 16 workers, over the same ticks on a shared host (bead flife-2je), from 8.7 before them.
+16 workers of an M5 Ultra, it stepped at 9.8–10.2 ticks per second on `torch`, which `auto` took there until
+`024cd5d`, against 8.9–9.0 on the CPU reference (`tick_throughput`, ticks 32–160). Three rounds of host-side work
+(commits cb48588, 31ea27b and c1ab2f8, each reaching the same tick-160 digest) then took it to 23.3–24.2 ticks per
+second with `--controllers metal` on 16 workers, over the same ticks on a shared host (bead flife-2je), from 8.7
+before them. Since `024cd5d` that is `auto`'s choice on 16 workers of a Mac.
 That is still short of 30, so it is a world to study, not yet one to watch at frame rate.
 
 `presets/confluent-world.toml` is the world the website's film shows: the contact model, below, at a finer
@@ -668,13 +669,13 @@ Every style renders the same world: nine styles of one 1,200-tick render all end
 population kernel on the world's own workers (FL-025, any host), and `cpu` keeps them on the CPU reference; `metal`
 refuses to run without a Metal device. `auto` (the default) takes Metal where the host has it and the world uses at
 most 16 CPU workers. With the F16 weights packed for the GPU (`6980c2f`) and the CPU's Phase 5 and fused chemistry
-running while the GPU evaluates (`99962d9`), Metal measured 1.04–1.77× `torch` on 16 workers across seven presets
-and 1.27–1.65× on eight (M5 Ultra under other load, 2026-11-26, not held to the 5% cv bar). Otherwise `auto` takes
-`torch` at up to 64 workers on Apple silicon, where it measured faster than the reference on 8, 12 and 16 workers,
-and at up to 4 elsewhere, where Linux x86-64 measured it faster only on one and four (below). On Apple silicon it
-also takes `torch` on any number of workers for a world of at least 25,000 organisms, where the controllers are
-most of the tick: on 16 workers of an M5 Ultra it measured 1.02–1.03× the reference at 25,000 and 1.09–1.15× at
-100,000 (`flife-backend-metal`'s contract has the runs). Whatever the choice and the `--cpu-workers` count, the
+running while the GPU evaluates (`99962d9`), Metal measured 1.04–1.77× `torch` on 16 workers across seven presets,
+and 1.27× (Desktop ecology) and 1.65× (Interactive) on eight (M5 Ultra under other load, 2026-11-26, not held to
+the 5% cv bar). Otherwise `auto` takes `torch` at up to 64 workers on Apple silicon, where it measured faster than
+the reference on 8, 12 and 16 workers, and at up to 4 elsewhere, where Linux x86-64 measured it faster only on one
+and four (below). On Apple silicon it also takes `torch` on any number of workers for a world of at least 25,000
+organisms, where the controllers are most of the tick: on 16 workers of an M5 Ultra it measured 1.02–1.03× the
+reference at 25,000 and 1.09–1.15× at 100,000 (`flife-backend-metal`'s contract has the runs). Whatever the choice and the `--cpu-workers` count, the
 world is the same bit for bit; the run's `start` record names the backend and `end` counts what it evaluated.
 Before `99962d9`, measured over 512 ticks of the preset on an M5 Ultra under other load (median of three
 interleaved runs, cv ≤ 2.5%), with all 4,096 founders alive:
@@ -706,10 +707,11 @@ against the reference:
 At 8 and 16 workers the samples varied by more than 5%, so those rows show no admissible difference. On one
 worker Metal is clearly faster than `torch`. On four it led by 5% while its own samples varied by 5.1%. So `auto`
 keeps Metal where the host has it. On Linux x86-64 (one invocation per worker count, every row's cv at most 4.5%)
-`torch` was 1.41× on one worker, 1.11× on four and 0.91× on eight. On 16 workers at `f938485` (2026-11-26) it was
-0.86× and 0.84× on the Desktop ecology preset's 100,089 organisms, with no block faster and every cv at most 2.9%,
-and no run on 16 or 8 workers showed it admissibly faster. So off Apple silicon `auto` takes `torch` at up to
-four workers (`flife-backend-cpu`'s and `flife-backend-metal`'s contracts have the rows).
+`torch` was 1.41× on one worker, 1.11× on four and 0.91× on eight. On 16 workers of a Threadripper PRO 5975WX at
+`f938485` (2026-11-26) it was 0.86× and 0.84× on the Desktop ecology preset's 100,089 organisms, with no block
+faster and every cv at most 2.9%, and no run on 16 or 8 workers there or on an EPYC 7282 showed it admissibly
+faster. So off Apple silicon `auto` takes `torch` at up to four workers (`flife-backend-cpu`'s and
+`flife-backend-metal`'s contracts have the rows).
 
 `flife render` encodes each frame's PNG on its own thread (up to four at once) while the world steps and the next
 frame draws. The files are byte-identical to encoding them one by one, and 128 ticks at every second tick, 1,280²,

@@ -151,9 +151,11 @@ faster at one and four workers on both hosts and slower at eight on Linux. On 16
 (2026-11-26) it was slower again on ts1: 0.86× and 0.84× on the Desktop ecology preset's 100,089 organisms, no
 block faster and every cv at most 2.9% (`flife-backend-metal`'s contract has all six rows). So off Apple silicon
 `auto` takes it where it does not take Metal at up to `AUTO_TORCH_MAX_WORKERS_ELSEWHERE` = 4 workers
-(`flife-backend-metal`). On Apple silicon, where it measured faster on 8, 12 and 16 workers, the ceiling is
-`AUTO_TORCH_MAX_WORKERS` = 64. Two and three workers were not measured. The ceiling assumes that they lie between
-one and four, where the ratio fell from 1.41× to 1.11× on Linux and from 1.62× to 1.26× on macOS.
+(`flife-backend-metal`). Two and three workers were not measured; that ceiling assumes they lie between one and
+four, where the ratio fell from 1.41× to 1.11× on Linux and from 1.62× to 1.26× on macOS. On Apple silicon the
+ceiling is `AUTO_TORCH_MAX_WORKERS` = 64: with `evaluate_flat_f32` and the persistent worker pool, `phase_profile`
+measured `torch` 1.11–1.42× the reference on 8, 12 and 16 workers on an M5 Ultra (2026-11-23; the constant's
+documentation has the rows). Above 16 workers it is not measured.
 
 **Validity domain.** The `dense-104-36-v1` catalog's shapes, the reference F32 profile, any CPU Rust targets.
 
@@ -168,5 +170,6 @@ one and four, where the ratio fell from 1.41× to 1.11× on Linux and from 1.62�
 - Off Apple silicon `auto` takes this backend at up to four workers. The crossover between four and eight workers
   is not measured more finely. The loss at eight is not profiled; the next gap gives the hypothesis
   for many workers.
-- At 16 workers the batched path is no faster than the reference's own lanes. Observing on the lanes, building the
+- At 16 workers on Linux x86-64 the batched path is slower than the reference's own lanes (0.84–0.93× on ts1,
+  2026-11-26), though on an M5 Ultra it measured 1.14–1.20× (2026-11-23). Observing on the lanes, building the
   jobs, evaluating and deciding each split the batch again, so a tick pays for three sets of threads.

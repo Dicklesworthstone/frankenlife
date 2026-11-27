@@ -181,7 +181,7 @@ about 1–3% of the all-Metal tick (the whole tick's frontier and profile, below
   selects `torch` up to `AUTO_TORCH_MAX_WORKERS` = 64 workers on Apple silicon (`TORCH_AT_SCALE`), where it
   measured faster than the reference on 8, 12 and 16 workers (2026-11-23), and up to
   `AUTO_TORCH_MAX_WORKERS_ELSEWHERE` = 4 on other hosts, where it measured faster only on one and four (Linux
-  x86-64, 2026-11-10) and slower on eight and sixteen (the table below).
+  x86-64, 2026-11-10) and slower on eight and, at 100,000 organisms, on sixteen (the table below).
 - On Apple silicon (`TORCH_AT_SCALE`, a build for macOS on aarch64) it also takes `torch` on any number of workers
   for a world of at least `AUTO_TORCH_MIN_ORGANISMS` = 25,000 organisms, counted live when its controllers are
   chosen. There the controllers are most of the tick.
@@ -199,8 +199,9 @@ about 1–3% of the all-Metal tick (the whole tick's frontier and profile, below
   measured faster; other hosts are unmeasured.
 - Linux x86-64 again at `f938485` (2026-11-26, RCH workers, `tick_throughput W 16 8 32 cpu,torch` on the clean
   tree, the same digests after every block, nothing deferred). Each row is one invocation; only the ratio within
-  a row compares. A row shows `torch` faster only if both cvs are at most 5% and the median of its 8 per-block
-  ratios is at least 1.02:
+  a row compares. A row is admissible only if both cvs are at most 5%. It then shows `torch` faster if the median
+  of its 8 per-block ratios is at least 1.02, and slower if that median is at most 0.98 (0.859 and 0.838 for the
+  two Desktop ecology rows):
 
   | Worker | W | World | reference | `torch` | Blocks faster | Admissible |
   |---|---|---|---|---|---|---|

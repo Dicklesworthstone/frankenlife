@@ -392,10 +392,9 @@ directory, with its pending commands and its checkpoint chain.
   otherwise `torch` at W ≤ 64 on Apple silicon and W ≤ 4 elsewhere, or, on Apple silicon, for a world of at least
   25,000 organisms. The Studio's default W is one per core up to 16, so on a Mac every world's controllers run on
   Metal by default; on Linux with more than 4 workers every world's controllers run on the reference. Before the
-  Phase 5–6 overlap (`99962d9`), with 16 workers Metal
-  measured slower in the Studio under FrankenManim `dfdc7d18` (72 against 119 ticks per second, one 12 s run each),
-  with presentation on the same GPU, and level under `f401a947` (132 against 120 at 960×540, 152 against 161 at
-  1,920×1,080, four interleaved 10 s runs each). It paces frames to `[presentation] frames_per_second` and prints `frankenlife.studio.v1` NDJSON records:
+  Phase 5–6 overlap (`99962d9`), with 16 workers Metal measured slower in the Studio under FrankenManim `dfdc7d18`
+  (72 against 119 ticks per second, one 12 s run each), with presentation on the same GPU, and level under
+  `f401a947` (132 against 120 at 960×540, 152 against 161 at 1,920×1,080, four interleaved 10 s runs each). It paces frames to `[presentation] frames_per_second` and prints `frankenlife.studio.v1` NDJSON records:
   - `open`, naming the window, the CPU workers, the controller backend, the style (`mapping`, its `meaning`,
     `look`, `particles`, `field` and `field_mapping`), the `projection` its affinity and composition colours are
     drawn through (plan §13.4's recorded matrix and scaling: `rows`, the 3 × 32 `matrix` of ±1, the `divisor`

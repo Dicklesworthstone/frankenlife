@@ -1874,8 +1874,11 @@ impl MetalBackend {
                                 operation: "metal binary16 wave upload",
                                 detail: format!("missing F16 shard ({g_topo}, {g_shard})"),
                             })?;
-                        *active_lease =
-                            Some((g_topo, g_shard, ShardWriteLease::F16(owner.write(lease_buf)?)));
+                        *active_lease = Some((
+                            g_topo,
+                            g_shard,
+                            ShardWriteLease::F16(owner.write(lease_buf)?),
+                        ));
                     }
                     let Some((_, _, ShardWriteLease::F16(lease))) = active_lease.as_mut() else {
                         return Err(CoreError::StateConflict {
@@ -2072,9 +2075,9 @@ impl MetalBackend {
                 )?;
             }
             if !pending_f16.is_empty()
-                && pending_f16.iter().any(|p| {
-                    p.topology == topology && p.shard_key == shard_key && p.local == local
-                })
+                && pending_f16
+                    .iter()
+                    .any(|p| p.topology == topology && p.shard_key == shard_key && p.local == local)
             {
                 flush_f16_wave(
                     buckets,
@@ -3860,12 +3863,14 @@ pub const AUTO_TORCH_MAX_WORKERS: usize = 64;
 /// hold: there FrankenTorch's CPU route measured faster than the reference
 /// only at one and four workers (Linux x86-64, 2026-11-10: 1.41x and 1.11x,
 /// and 0.91x at eight). Measured again on Linux x86-64 at `f938485`
-/// (2026-11-26, `tick_throughput 16 16 8 32`, founding worlds, the same
+/// (2026-11-26, `tick_throughput W 16 8 32`, founding worlds, the same
 /// digests): on an AMD Threadripper PRO 5975WX at 16 workers, 0.86x and
-/// 0.84x at 100,000 organisms (no block faster, every cv at most 2.9%) and
-/// 0.93x at 25,000 (no block faster, cv 3.6% and 5.2%); 1.04x at 4,096 on
-/// 8 workers and, on an AMD EPYC 7282, 1.09x at 25,000 and 1.05x at 4,096 on
-/// 16, each with a cv above 5%, so not admissibly faster.
+/// 0.84x on the Desktop ecology preset (100,000 organisms; no block faster,
+/// every cv at most 2.9%) and 0.93x on the Interactive preset (25,000; no
+/// block faster, cv 3.6% and 5.2%), and 1.04x on the reference preset on 8
+/// workers; on an AMD EPYC 7282 at 16 workers, 1.09x on the Interactive and
+/// 1.05x on the reference preset. Those last three each had a cv above 5%,
+/// so none is admissibly faster.
 pub const AUTO_TORCH_MAX_WORKERS_ELSEWHERE: usize = 4;
 
 /// The fewest organisms at which [`ControllerChoice::Auto`] takes
@@ -4178,7 +4183,10 @@ mod staging_tests {
             let written =
                 super::pack_f16_for_metal_into(&topo, &values, &mut slice_buf).expect("pack into");
             assert_eq!(written, want.len());
-            assert_eq!(slice_buf, want, "slice mismatch on {in_w}->{hidden:?}->{out_w}");
+            assert_eq!(
+                slice_buf, want,
+                "slice mismatch on {in_w}->{hidden:?}->{out_w}"
+            );
         }
     }
 }

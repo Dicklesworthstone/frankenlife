@@ -1158,3 +1158,43 @@ fn motion_clamping_and_settle_guard_overflow_and_nonfinite_intermediates() {
         ));
     }
 }
+
+#[test]
+fn acceleration_slice_catches_nonfinite_gradients_even_at_zero_response() {
+    let motion = Motion::new(step(1, 1), 0.0, 4.0, 4.0, 1.0, 2.0).expect("motion");
+    // All-zero response must still poison `sum` via `0.0 * ±Inf = NaN` and `0.0 * NaN = NaN`.
+    let zero_resp = MotionResponse::new([0.0; RESPONSE_TERMS], &motion).expect("zero response");
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for axis in 0..2 {
+            for slot in [0, 17, RESPONSE_TERMS - 1] {
+                let mut grad = [[0.0; 2]; RESPONSE_TERMS];
+                grad[slot][axis] = bad;
+                assert!(
+                    matches!(
+                        motion.acceleration(1.0, &zero_resp, &grad),
+                        Err(CoreError::NumericalInvalid {
+                            quantity: "sensor gradient",
+                            ..
+                        })
+                    ),
+                    "zero response must still refuse nonfinite gradient {bad} at slot {slot} axis {axis}"
+                );
+            }
+        }
+    }
+    // Cancellation of opposite infinities in two nonzero slots still poisons `sum` as NaN.
+    let mut pair_resp = [0.0; RESPONSE_TERMS];
+    pair_resp[3] = 0.5;
+    pair_resp[19] = 0.5;
+    let resp = MotionResponse::new(pair_resp, &motion).expect("pair");
+    let mut grad = [[0.25, -0.5]; RESPONSE_TERMS];
+    grad[3][0] = f64::INFINITY;
+    grad[19][0] = f64::NEG_INFINITY;
+    assert!(matches!(
+        motion.acceleration(1.0, &resp, &grad),
+        Err(CoreError::NumericalInvalid {
+            quantity: "sensor gradient",
+            ..
+        })
+    ));
+}

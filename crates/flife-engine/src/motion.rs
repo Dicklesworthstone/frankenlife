@@ -221,14 +221,15 @@ impl Motion {
             return Err(err_uptake_ratio(uptake_ratio));
         }
         let mut sum = [0.0_f64; 2];
-        let mut fin = [0.0_f64; 2];
-        // Iterate via slices so LLVM keeps a tight register-only loop instead
-        // of fully unrolling all 33 terms and spilling 64 doubles to the stack.
+        // Iterate via slices so LLVM keeps a tight register-only 2-wide loop
+        // (`ldr q` + `fmul.2d` + `fadd.2d`). Every finite `c` multiplied by a
+        // nonfinite gradient yields `NaN` or `±Inf` (including `0.0 * ±Inf = NaN`),
+        // which poisons `sum` monotonically, so checking `sum.is_finite()` catches
+        // every nonfinite gradient without a separate `fin` accumulator.
         for (&c, &g) in response.as_slice().iter().zip(gradients.as_slice()) {
-            fin = [fin[0] + g[0], fin[1] + g[1]];
             sum = [sum[0] + c * g[0], sum[1] + c * g[1]];
         }
-        if !(fin[0].is_finite() && fin[1].is_finite()) {
+        if !(sum[0].is_finite() && sum[1].is_finite()) {
             for &gradient in gradients {
                 if !gradient[0].is_finite() || !gradient[1].is_finite() {
                     return Err(err_nonfinite_gradient(gradient));

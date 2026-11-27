@@ -1,0 +1,177 @@
+{
+  "schema": "frankenlife.gallery.v1",
+  "purpose": "Provenance-backed visual gallery manifest covering all six categories required by plan §2.4 (FL-049; Gates G5 and G9). Large PNG/MP4 media stay in artifact storage (plan §18.5); every entry here is reproducible directly from the committed presets and camera paths.",
+  "four_claims_notice": "Visual entries establish presentation character only (Visual claim) alongside their paired honest raw G5 views. Scientific and ecological conclusions remain strictly scoped to the cited experiments (experiments/fl048/README.md, experiments/v2-emergence/README.md, experiments/showcase/README.md).",
+  "selection_procedure": "Each entry pairs one committed, validated preset (seed 42, zero hidden culling or automatic reseeding) with an aesthetic view and an identical-world raw Gate G5 view (unblended dots, zero bloom, linear greyscale field). Camera zoom and intervention commands are declared verbatim and never introduce hidden aesthetic fitness functions inside the world (plan §15.5).",
+  "qualified_commit": "5ee847f",
+  "host_verified": "Apple M5 Ultra (36 cores, 256 GiB, macOS 27.0.1, Metal Apple M5 Ultra)",
+  "entries": [
+    {
+      "id": "fl049-01-dense-world",
+      "category": "dense-world",
+      "title": "Confluent Contact-Adhesion Ecosystem (Dense World)",
+      "run_id": "fl049-2026-11-27-dense-confluent-s42",
+      "preset": "presets/confluent-world.toml",
+      "preset_sha256": "2e87041a3a293d32b0f4ee940a68decc1e3a45d1cc8989abadd989e357da8649",
+      "model": "field-ecology-v1-contact",
+      "seed": 42,
+      "checkpoint_or_tick": 64,
+      "verified_world_digest": "31c7038468ed16d20aeee4425340ce5342308f59e702d61e8515dcbc8f340964",
+      "aesthetic_view": {
+        "look": "sphere",
+        "color_mapping": "founder-lineage-energy-v1",
+        "field_mapping": "energy",
+        "camera": null,
+        "command": "flife render presets/confluent-world.toml --ticks 64 --every 64 --width 512 --height 512 --look sphere --color lineage-energy --out OUT/01_dense_world_aesthetic"
+      },
+      "raw_view": {
+        "look": "raw",
+        "color_mapping": "founder-lineage-v1",
+        "field_mapping": "energy",
+        "camera": null,
+        "command": "flife render presets/confluent-world.toml --ticks 64 --every 64 --width 512 --height 512 --look raw --color lineage --out OUT/01_dense_world_raw"
+      },
+      "ecological_reference": "experiments/showcase/README.md"
+    },
+    {
+      "id": "fl049-02-deep-zoom",
+      "category": "deep-zoom",
+      "title": "Tissue World 4x Toroidal Deep Zoom",
+      "run_id": "fl049-2026-11-27-zoom-tissue-s42",
+      "preset": "presets/tissue-world.toml",
+      "preset_sha256": "453cd65828481fd5a547a2bb9627fa9ca071494b08bd27644ec36a0dd211aece",
+      "model": "field-ecology-v1",
+      "seed": 42,
+      "checkpoint_or_tick": 64,
+      "verified_world_digest": "554d8588771ba4f1ef4ec807beedbdb77293aa46a4ba9db15e19d1cad9eceb53",
+      "aesthetic_view": {
+        "look": "glow",
+        "color_mapping": "founder-lineage-v1",
+        "field_mapping": "energy",
+        "camera": "gallery/cameras/deep-zoom-tissue.json",
+        "command": "flife render presets/tissue-world.toml --ticks 64 --every 64 --width 512 --height 512 --look glow --color lineage --camera gallery/cameras/deep-zoom-tissue.json --out OUT/02_deep_zoom_aesthetic"
+      },
+      "raw_view": {
+        "look": "raw",
+        "color_mapping": "founder-lineage-v1",
+        "field_mapping": "energy",
+        "camera": "gallery/cameras/deep-zoom-tissue.json",
+        "command": "flife render presets/tissue-world.toml --ticks 64 --every 64 --width 512 --height 512 --look raw --color lineage --camera gallery/cameras/deep-zoom-tissue.json --out OUT/02_deep_zoom_raw"
+      },
+      "ecological_reference": "experiments/showcase/README.md"
+    },
+    {
+      "id": "fl049-03-interacting-boundary",
+      "category": "interacting-boundary",
+      "title": "Colony World Chemical Affinity & Composition Boundary",
+      "run_id": "fl049-2026-11-27-boundary-colony-s42",
+      "preset": "presets/colony-world.toml",
+      "preset_sha256": "b2cd3c0e8e8a34ab4093f6d9def3b26b135fe86855d688bd9d9009da89a04940",
+      "model": "field-ecology-v1",
+      "seed": 42,
+      "checkpoint_or_tick": 64,
+      "verified_world_digest": "caa68b6531bb657435d76f1247f3f46bee196f96048d00b7f3ffea3427302d58",
+      "aesthetic_view": {
+        "look": "sphere",
+        "color_mapping": "affinity-projection-v1",
+        "field_mapping": "composition",
+        "camera": null,
+        "command": "flife render presets/colony-world.toml --ticks 64 --every 64 --width 512 --height 512 --look sphere --color affinity --field-mapping composition --out OUT/03_interacting_boundary_aesthetic"
+      },
+      "raw_view": {
+        "look": "raw",
+        "color_mapping": "affinity-projection-v1",
+        "field_mapping": "energy",
+        "camera": null,
+        "command": "flife render presets/colony-world.toml --ticks 64 --every 64 --width 512 --height 512 --look raw --color affinity --out OUT/03_interacting_boundary_raw"
+      },
+      "ecological_reference": "experiments/showcase/README.md"
+    },
+    {
+      "id": "fl049-04-perturbed-colony",
+      "category": "perturbed-colony",
+      "title": "Showcase World Perturbed Colony (Energy Pulse + Recycled Removal)",
+      "run_id": "fl049-2026-11-27-perturbed-showcase-s42",
+      "preset": "presets/showcase-world.toml",
+      "preset_sha256": "2e8bf20679394ea60176d2435e90c13bb8d3b8f7f495fb7fabe686618710eaab",
+      "model": "field-ecology-v1",
+      "seed": 42,
+      "checkpoint_or_tick": 96,
+      "interventions": [
+        "16:32,32:400.0 (inject energy)",
+        "32:20,20:8.0:recycle (remove disk with energy recycling)"
+      ],
+      "verified_checkpoint_tick64_digest": "f3906a66693b747cc50c90f88be1d242919505dd0bfc32457ddcdb787e192726",
+      "verified_world_digest": "6b7182ff4ec2c644f96ec911e4d50a9e893d25f0e7fe9cec2fe32f8e5372b13c",
+      "aesthetic_view": {
+        "look": "glow",
+        "color_mapping": "energy-lightness-v1",
+        "field_mapping": "energy",
+        "camera": null,
+        "command": "flife run presets/showcase-world.toml --ticks 64 --checkpoint-every 32 --run-dir RUN --inject 16:32,32:400.0 --remove 32:20,20:8.0:recycle && flife render --run-dir RUN --ticks 32 --every 32 --width 512 --height 512 --look glow --color energy --out OUT/04_perturbed_colony_aesthetic"
+      },
+      "raw_view": {
+        "look": "raw",
+        "color_mapping": "energy-lightness-v1",
+        "field_mapping": "energy",
+        "camera": null,
+        "command": "flife render --run-dir RUN --ticks 32 --every 32 --width 512 --height 512 --look raw --color energy --out OUT/04_perturbed_colony_raw"
+      },
+      "ecological_reference": "experiments/showcase/README.md"
+    },
+    {
+      "id": "fl049-05-lineage-view",
+      "category": "lineage-view",
+      "title": "Morphogenesis Tissue V2 Clonal Lineage & Epigenetic Cell-State View",
+      "run_id": "fl049-2026-11-27-lineage-morphogenesis-v2-s42",
+      "preset": "presets/morphogenesis-tissue-v2.toml",
+      "preset_sha256": "9fd2800e7d87ecf94e6e9b43fe41c88cd51f198b548c32c9eecb40ee22b565c6",
+      "model": "field-ecology-v2",
+      "seed": 42,
+      "checkpoint_or_tick": 64,
+      "verified_world_digest": "24030abcb783f1e0428a28ef31c2b253f6c29c66ba9433a6ba1217b7889f7bc9",
+      "aesthetic_view": {
+        "look": "sphere",
+        "color_mapping": "cell-state-v1",
+        "field_mapping": "energy",
+        "camera": null,
+        "command": "flife render presets/morphogenesis-tissue-v2.toml --ticks 64 --every 64 --width 512 --height 512 --look sphere --color cell-state --out OUT/05_lineage_view_aesthetic"
+      },
+      "raw_view": {
+        "look": "raw",
+        "color_mapping": "founder-lineage-v1",
+        "field_mapping": "energy",
+        "camera": null,
+        "command": "flife render presets/morphogenesis-tissue-v2.toml --ticks 64 --every 64 --width 512 --height 512 --look raw --color lineage --out OUT/05_lineage_view_raw"
+      },
+      "ecological_reference": "experiments/v2-emergence/README.md"
+    },
+    {
+      "id": "fl049-06-raw-field-view",
+      "category": "raw-field-view",
+      "title": "Supercolony V2 Honest Raw Field & Persistent Trail-Carrier Field",
+      "run_id": "fl049-2026-11-27-rawfield-supercolony-v2-s42",
+      "preset": "presets/supercolony-v2.toml",
+      "preset_sha256": "97c6edd11f4b772609277389dfb00dc4fc1fa9725370f62f0920bb55cddc9136",
+      "model": "field-ecology-v2",
+      "seed": 42,
+      "checkpoint_or_tick": 64,
+      "verified_world_digest": "fbe486653489bb4fcfe373205f30f8d266ef0575c654eb2d7967078ce65625c1",
+      "aesthetic_view": {
+        "look": "glow",
+        "color_mapping": "affinity-projection-v1",
+        "field_mapping": "trail-carrier",
+        "camera": null,
+        "command": "flife render presets/supercolony-v2.toml --ticks 64 --every 64 --width 512 --height 512 --look glow --color affinity --field-mapping trail-carrier --out OUT/06_raw_field_trails"
+      },
+      "raw_view": {
+        "look": "raw",
+        "color_mapping": "energy-lightness-v1",
+        "field_mapping": "energy",
+        "camera": null,
+        "command": "flife render presets/supercolony-v2.toml --ticks 64 --every 64 --width 512 --height 512 --look raw --color energy --field-mapping energy --out OUT/06_raw_field_raw"
+      },
+      "ecological_reference": "experiments/v2-emergence/README.md"
+    }
+  ]
+}

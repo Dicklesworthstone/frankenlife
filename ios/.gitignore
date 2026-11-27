@@ -1,0 +1,8 @@
+# Built binary XCFramework & synced upstream assets (rebuilt via ./build_rust_xcframework.sh)
+Frameworks/
+FrankenLife.xcodeproj/
+FrankenLife/Resources/Presets/
+FrankenLife/Resources/Shaders/*.txt
+FlifeIOSBridge/target/
+*.xcresult
+.DS_Store

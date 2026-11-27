@@ -1,0 +1,27 @@
+[workspace]
+
+[package]
+name = "flife-ios-bridge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Standalone C-ABI static library bridging FrankenLife Rust core + native iOS Metal compute to SwiftUI."
+
+[lib]
+name = "flife_ios_bridge"
+crate-type = ["staticlib"]
+
+[dependencies]
+flife-core = { path = "../../crates/flife-core" }
+flife-field = { path = "../../crates/flife-field" }
+flife-genome = { path = "../../crates/flife-genome" }
+flife-neural = { path = "../../crates/flife-neural" }
+flife-engine = { path = "../../crates/flife-engine" }
+flife-render = { path = "../../crates/flife-render" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = false

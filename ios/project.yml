@@ -1,0 +1,104 @@
+name: FrankenLife
+options:
+  bundleIdPrefix: com.frankenlife
+  deploymentTarget:
+    iOS: "18.0"
+  xcodeVersion: "16.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
+
+targets:
+  FrankenLife:
+    type: application
+    platform: iOS
+    sources:
+      - path: FrankenLife
+        excludes:
+          - "Tests/**"
+          - "Resources/Shaders/*.txt"
+          - "Resources/Presets/**"
+          - "Info.plist"
+      - path: FrankenLife/Resources/Shaders/softfloat64.metal.txt
+        buildPhase: resources
+      - path: FrankenLife/Resources/Shaders/controller.metal.txt
+        buildPhase: resources
+      - path: FrankenLife/Resources/Presets
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - framework: Frameworks/FlifeIOSBridge.xcframework
+        embed: false
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: QuartzCore.framework
+      - sdk: UIKit.framework
+    info:
+      path: FrankenLife/Info.plist
+      properties:
+        CFBundleDisplayName: FrankenLife
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        CADisableMinimumFrameDurationOnPhone: true
+        UIRequiresFullScreen: true
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+        UIRequiredDeviceCapabilities:
+          - arm64
+          - metal
+        UIStatusBarStyle: UIStatusBarStyleLightContent
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.frankenlife.ios
+        INFOPLIST_FILE: FrankenLife/Info.plist
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        MTL_FAST_MATH: YES
+        SWIFT_STRICT_CONCURRENCY: minimal
+        CLANG_ENABLE_MODULES: YES
+        CODE_SIGN_STYLE: Automatic
+
+  FrankenLifeTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: FrankenLife/Tests
+    dependencies:
+      - target: FrankenLife
+      - framework: Frameworks/FlifeIOSBridge.xcframework
+        embed: false
+      - sdk: Metal.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.frankenlife.ios.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/FrankenLife.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/FrankenLife"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        CODE_SIGN_STYLE: Automatic
+
+schemes:
+  FrankenLife:
+    build:
+      targets:
+        FrankenLife: all
+        FrankenLifeTests: [test]
+    test:
+      targets:
+        - FrankenLifeTests

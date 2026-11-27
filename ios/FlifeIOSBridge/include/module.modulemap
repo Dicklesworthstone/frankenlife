@@ -1,0 +1,4 @@
+module FlifeIOSBridge {
+    header "flife_ios.h"
+    export *
+}

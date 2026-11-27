@@ -645,7 +645,7 @@ route.
   peak heap, the texts' layout included, is 12.21 MiB of its 15.08 MiB reserved.
 
 **Validity domain.** CPU host epochs (FL-017, both `field-ecology-v1*` baseline views and `field-ecology-v2*` optional
-`V2-16` views when `v2-visual-mappings` is enabled). The FrankenManim 3D camera route at `fmn` rev `cba60d5c`, CPU and
+`V2-16` views when `v2-visual-mappings` is enabled). The FrankenManim 3D camera route at `fmn` rev `85294a96`, CPU and
 Metal. A view shows one image of the torus at zoom 1 to 4,096.
 
 **Known gaps.**
@@ -653,12 +653,12 @@ Metal. A view shows one image of the torus at zoom 1 to 4,096.
   textures are rebuilt on the CPU when what they show changes (a show of a new epoch, a restyle; hidden fields track
   display scale without rebuilding an unused texture, `Look::Raw`/`Look::Sphere` share identical field and density
   textures, and unchanged viewports reuse the cached periodic quad). A texture is uploaded once and kept on the device
-  while frames sample it. `FL-033` asked three upstream FrankenManim (`fmn-render`) additions; at `cba60d5c`:
+  while frames sample it. `FL-033` asked three upstream FrankenManim (`fmn-render`) additions; at `85294a96`:
   1. Done another way: `Texture::from_premultiplied_linear_unhashed`, keyed on its build instead of the CPU SHA-256 of
      every texel, builds the layers' textures. There is no in-place GPU texture update: a new epoch's texture is
      built on the CPU and uploaded whole.
   2. Done in part: `DotCloudDraw`. The halos and the dots are two clouds (a placed, zoomed view draws its visible dots
-     as true dots); the job compiles no dot, and the Metal route compiles them on its host threads where it derives
+     as true dots when at most a quarter of them are left); the job compiles no dot, and the Metal route compiles them on its host threads where it derives
      the frame. Their rows are still made on the host and uploaded with every frame: no device-resident dot buffer
      or GPU expansion.
   3. Not done: a shared-device Metal resource-lease bridge into `MetalRenderer` / `NativePreviewRenderer` accepting

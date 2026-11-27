@@ -36,7 +36,7 @@ and Linux x86_64 (AMD EPYC Genoa); see `franken-stack.lock` `[probes]`.
 window probes need macOS with a GPU and, for the window, a window server and the main thread.
 
 **Known gaps.** The window probe is not run in `cargo test`, because test threads are not the main thread. At the
-FL-043 repin (`franken_manim` `d1e1757b`, `frankentorch` `37e0d05e`) and FL-033's (`franken_manim` `48e4e2ee`, then `315a3058` and `cba60d5c`) and FL-034's (`85294a96`),
+FL-043 repin (`franken_manim` `d1e1757b`, `frankentorch` `37e0d05e`) and FL-033's (`franken_manim` `48e4e2ee`, then `315a3058` and `cba60d5c`) and FL-034's (`85294a96`, then `fc2342ee`),
 `native_window` is honestly recorded as
 `unverified` in `franken-stack.lock` (last qualified 2026-11-09 at `frankentorch` `71bbe52e`, `franken_manim`
 `2fe8d299`) because opening a real window takes operator focus. When run, it observes the window's own geometry and

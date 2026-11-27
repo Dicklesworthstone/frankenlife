@@ -1290,3 +1290,99 @@ fn headless_metrics_projects_render_epochs_only_on_due_and_final_ticks() {
         assert_eq!(sample.sampled.resources, reference.sampled.resources);
     }
 }
+
+/// Independent textbook reference for `morans_i`, `gini`, and `top_decile_share`
+/// verifying 0-ULP bit-exactness of the single-sort + hoisted-row-slice paths.
+#[test]
+fn resource_statistics_match_independent_reference_bit_for_bit() {
+    let ref_morans_i = |values: &[f64], [width, height]: [usize; 2]| -> Option<f64> {
+        let n = values.len();
+        if n == 0 || width.checked_mul(height) != Some(n) || values.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let mean = values.iter().sum::<f64>() / (n as f64);
+        let dev: Vec<f64> = values.iter().map(|v| v - mean).collect();
+        let var: f64 = dev.iter().map(|z| z * z).sum();
+        if !(var.is_finite() && var > 0.0) {
+            return None;
+        }
+        let mut cross = 0.0;
+        for y in 0..height {
+            for x in 0..width {
+                let z = dev[y * width + x];
+                let right = dev[y * width + (x + 1) % width];
+                let left = dev[y * width + (x + width - 1) % width];
+                let down = dev[((y + 1) % height) * width + x];
+                let up = dev[((y + height - 1) % height) * width + x];
+                cross += z * (right + left + down + up);
+            }
+        }
+        Some(cross / 4.0 / var)
+    };
+    let ref_top_decile = |values: &[f64]| -> Option<f64> {
+        if values.is_empty() || values.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return None;
+        }
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| b.total_cmp(a));
+        let total: f64 = sorted.iter().sum();
+        if !(total.is_finite() && total > 0.0) {
+            return None;
+        }
+        let top: f64 = sorted.iter().take(sorted.len().div_ceil(10)).sum();
+        Some(top / total)
+    };
+    let ref_gini = |values: &[f64]| -> Option<f64> {
+        if values.is_empty() || values.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return None;
+        }
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let n = sorted.len();
+        let total: f64 = sorted.iter().sum();
+        if !(total.is_finite() && total > 0.0) {
+            return None;
+        }
+        let weighted: f64 = sorted
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (2.0 * ((i + 1) as f64) - (n as f64) - 1.0) * v)
+            .sum();
+        Some(weighted / ((n as f64) * total))
+    };
+
+    let mut state = 0x5EED_CAFE_1234_5678_u64;
+    let mut next_u64 = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        state
+    };
+    for [w, h] in [[1, 1], [1, 7], [7, 1], [2, 2], [2, 3], [7, 5], [32, 24]] {
+        let mut vals = Vec::with_capacity(w * h);
+        for i in 0..(w * h) {
+            let v = match i % 9 {
+                0 => 0.0,
+                1 => -0.0,
+                2 => 1.5,
+                _ => ((next_u64() >> 11) as f64) * 1.0e-12,
+            };
+            vals.push(v);
+        }
+        assert_eq!(
+            morans_i(&vals, [w, h]).map(f64::to_bits),
+            ref_morans_i(&vals, [w, h]).map(f64::to_bits),
+            "morans_i mismatch on {w}x{h}"
+        );
+        assert_eq!(
+            gini(&vals).map(f64::to_bits),
+            ref_gini(&vals).map(f64::to_bits),
+            "gini mismatch on {w}x{h}"
+        );
+        assert_eq!(
+            top_decile_share(&vals).map(f64::to_bits),
+            ref_top_decile(&vals).map(f64::to_bits),
+            "top_decile_share mismatch on {w}x{h}"
+        );
+    }
+}

@@ -983,41 +983,63 @@ fn bin(x: f64, extent: f64, bins: usize) -> usize {
 /// four neighbours (`W = 4n`). `None` when the values do not vary.
 #[must_use]
 pub fn morans_i(values: &[f64], size: [usize; 2]) -> Option<f64> {
+    let mut deviations = Vec::with_capacity(values.len());
+    morans_i_with_scratch(values, size, &mut deviations)
+}
+
+/// [`morans_i`] reusing `deviations` scratch and hoisting periodic row slices
+/// to eliminate per-cell `% width`/`% height` divisions while keeping exact
+/// `(y, x)` accumulation order (`z * (right + left + down + up)`).
+fn morans_i_with_scratch(
+    values: &[f64],
+    size: [usize; 2],
+    deviations: &mut Vec<f64>,
+) -> Option<f64> {
     let [width, height] = size;
     let n = values.len();
     if n == 0 || width.checked_mul(height) != Some(n) || values.iter().any(|v| !v.is_finite()) {
         return None;
     }
     let mean = values.iter().sum::<f64>() / real(n);
-    let deviations: Vec<f64> = values.iter().map(|value| value - mean).collect();
+    deviations.clear();
+    deviations.extend(values.iter().map(|value| value - mean));
     let variance: f64 = deviations.iter().map(|z| z * z).sum();
     if !(variance.is_finite() && variance > 0.0) {
         return None;
     }
     let mut cross = 0.0;
     for y in 0..height {
-        for x in 0..width {
-            let z = deviations[y * width + x];
-            let right = deviations[y * width + (x + 1) % width];
-            let left = deviations[y * width + (x + width - 1) % width];
-            let down = deviations[((y + 1) % height) * width + x];
-            let up = deviations[((y + height - 1) % height) * width + x];
-            cross += z * (right + left + down + up);
+        let row = &deviations[y * width..(y + 1) * width];
+        let down_y = if y + 1 == height { 0 } else { y + 1 };
+        let up_y = if y == 0 { height - 1 } else { y - 1 };
+        let down_row = &deviations[down_y * width..(down_y + 1) * width];
+        let up_row = &deviations[up_y * width..(up_y + 1) * width];
+        if width == 1 {
+            let z = row[0];
+            cross += z * (z + z + down_row[0] + up_row[0]);
+        } else {
+            let last = width - 1;
+            let z0 = row[0];
+            cross += z0 * (row[1] + row[last] + down_row[0] + up_row[0]);
+            for ((((&z, &right), &left), &down), &up) in row[1..last]
+                .iter()
+                .zip(&row[2..width])
+                .zip(&row[0..last - 1])
+                .zip(&down_row[1..last])
+                .zip(&up_row[1..last])
+            {
+                cross += z * (right + left + down + up);
+            }
+            let zl = row[last];
+            cross += zl * (row[0] + row[last - 1] + down_row[last] + up_row[last]);
         }
     }
     Some(cross / 4.0 / variance)
 }
 
-/// The Gini coefficient of nonnegative `values`:
-/// `Σ_i (2i − n − 1) x_(i) / (n Σ x)` over the ascending order, `i` from 1.
-/// `None` when empty, negative, nonfinite, or summing to zero.
-#[must_use]
-pub fn gini(values: &[f64]) -> Option<f64> {
-    if values.is_empty() || values.iter().any(|v| !v.is_finite() || *v < 0.0) {
-        return None;
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(f64::total_cmp);
+/// Gini coefficient from values already validated finite and nonnegative and
+/// sorted ascending under [`f64::total_cmp`].
+fn gini_from_sorted_asc(sorted: &[f64]) -> Option<f64> {
     let n = sorted.len();
     let total: f64 = sorted.iter().sum();
     if !(total.is_finite() && total > 0.0) {
@@ -1031,6 +1053,31 @@ pub fn gini(values: &[f64]) -> Option<f64> {
     Some(weighted / (real(n) * total))
 }
 
+/// Top-decile share from values already validated finite and nonnegative and
+/// sorted ascending under [`f64::total_cmp`]. Iterates in reverse so the sum
+/// order is bit-identical to sorting descending under `b.total_cmp(a)`.
+fn top_decile_share_from_sorted_asc(sorted: &[f64]) -> Option<f64> {
+    let total: f64 = sorted.iter().rev().sum();
+    if !(total.is_finite() && total > 0.0) {
+        return None;
+    }
+    let top: f64 = sorted.iter().rev().take(sorted.len().div_ceil(10)).sum();
+    Some(top / total)
+}
+
+/// The Gini coefficient of nonnegative `values`:
+/// `Σ_i (2i − n − 1) x_(i) / (n Σ x)` over the ascending order, `i` from 1.
+/// `None` when empty, negative, nonfinite, or summing to zero.
+#[must_use]
+pub fn gini(values: &[f64]) -> Option<f64> {
+    if values.is_empty() || values.iter().any(|v| !v.is_finite() || *v < 0.0) {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable_by(f64::total_cmp);
+    gini_from_sorted_asc(&sorted)
+}
+
 /// The share of the sum of nonnegative `values` held by the largest tenth
 /// of them (rounded up). `None` when empty, negative, nonfinite, or summing
 /// to zero.
@@ -1040,7 +1087,7 @@ pub fn top_decile_share(values: &[f64]) -> Option<f64> {
         return None;
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| b.total_cmp(a));
+    sorted.sort_unstable_by(|a, b| b.total_cmp(a));
     let total: f64 = sorted.iter().sum();
     if !(total.is_finite() && total > 0.0) {
         return None;
@@ -1061,13 +1108,26 @@ fn resources(epoch: &Epoch) -> Resources {
     };
     let max_density = values.iter().copied().fold(0.0, f64::max);
     let size = texels.map(|t| usize::try_from(t).unwrap_or(0));
+    let mut scratch = Vec::new();
+    let (gini_val, top_decile) =
+        if values.is_empty() || values.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            (None, None)
+        } else {
+            scratch.extend_from_slice(&values);
+            scratch.sort_unstable_by(f64::total_cmp);
+            (
+                gini_from_sorted_asc(&scratch),
+                top_decile_share_from_sorted_asc(&scratch),
+            )
+        };
+    let moran = morans_i_with_scratch(&values, size, &mut scratch);
     Resources {
         texels,
         block: texture.block(),
         mean_density,
         max_density,
-        gini: gini(&values),
-        top_decile_share: top_decile_share(&values),
-        morans_i: morans_i(&values, size),
+        gini: gini_val,
+        top_decile_share: top_decile,
+        morans_i: moran,
     }
 }

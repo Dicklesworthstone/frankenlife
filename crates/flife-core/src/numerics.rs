@@ -875,10 +875,8 @@ fn tanh_poly17_4(a: [f64; 4]) -> [f64; 4] {
         let t = ai * ai;
         let t2 = t * t;
         let t4 = t2 * t2;
-        let lo =
-            (TANH_POLY17[0] + TANH_POLY17[1] * t) + (TANH_POLY17[2] + TANH_POLY17[3] * t) * t2;
-        let hi =
-            (TANH_POLY17[4] + TANH_POLY17[5] * t) + (TANH_POLY17[6] + TANH_POLY17[7] * t) * t2;
+        let lo = (TANH_POLY17[0] + TANH_POLY17[1] * t) + (TANH_POLY17[2] + TANH_POLY17[3] * t) * t2;
+        let hi = (TANH_POLY17[4] + TANH_POLY17[5] * t) + (TANH_POLY17[6] + TANH_POLY17[7] * t) * t2;
         let p = lo + hi * t4;
         *dst = ai + (ai * t) * p;
     }

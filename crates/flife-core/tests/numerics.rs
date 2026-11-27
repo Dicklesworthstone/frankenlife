@@ -1423,7 +1423,11 @@ fn tanh_poly17_boundary_and_timestep_seconds_power_of_two_bit_exact() {
         let got = tanh_f64_as_f32_4(mixed).expect("mixed");
         for (lane, &x) in mixed.iter().enumerate() {
             let want = (tanh(x).expect("tanh") as f32).to_bits();
-            assert_eq!(got[lane].to_bits(), want, "mixed mismatch {mixed:?}[{lane}]");
+            assert_eq!(
+                got[lane].to_bits(),
+                want,
+                "mixed mismatch {mixed:?}[{lane}]"
+            );
         }
     }
 
@@ -1431,10 +1435,19 @@ fn tanh_poly17_boundary_and_timestep_seconds_power_of_two_bit_exact() {
     // across power-of-two and non-power-of-two denominators, including `u64` overflow into `u128`.
     for &(num, den) in &[(1_u32, 128), (1, 1), (1, 64), (3, 128), (1, 60), (7, 100)] {
         let step = TimeStep::new(num, den).expect("step");
-        for &ticks in &[0_u64, 1, 2, 127, 128, 129, 1_000_000, u64::MAX / 2, u64::MAX] {
-            let oracle =
-                ((u128::from(ticks) * u128::from(step.numerator())) as f64)
-                    / f64::from(step.denominator());
+        for &ticks in &[
+            0_u64,
+            1,
+            2,
+            127,
+            128,
+            129,
+            1_000_000,
+            u64::MAX / 2,
+            u64::MAX,
+        ] {
+            let oracle = ((u128::from(ticks) * u128::from(step.numerator())) as f64)
+                / f64::from(step.denominator());
             let got = step.seconds(TickSpan::new(ticks));
             assert_eq!(
                 got.to_bits(),

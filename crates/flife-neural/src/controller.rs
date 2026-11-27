@@ -1042,7 +1042,9 @@ impl<'a> ReferenceController<'a> {
         }
         match self.parameters {
             Weights::F32(parameters) => self.evaluate_raw_f32(parameters, inputs, scratch, &mut ()),
-            Weights::F16(parameters) => self.evaluate_raw_f32(parameters, inputs, scratch, f16_tile),
+            Weights::F16(parameters) => {
+                self.evaluate_raw_f32(parameters, inputs, scratch, f16_tile)
+            }
         }
     }
 

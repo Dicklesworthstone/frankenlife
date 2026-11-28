@@ -2266,3 +2266,256 @@ fn per_shard_parallel_io_matches_single_worker_bit_for_bit_and_transitions_clean
     assert_eq!(b_bits, s_bits, "full-budget bit parity");
     Ok(())
 }
+
+#[test]
+fn three_phase_stage_submit_collect_matches_serial_bit_for_bit_and_enforces_transitions()
+-> Result<(), CoreError> {
+    let Some(mut serial) = backend(4_096) else {
+        return Ok(());
+    };
+    let Some(mut three_phase) = backend(4_096) else {
+        return Ok(());
+    };
+    serial.set_staging_workers(std::num::NonZeroUsize::new(1).expect("nonzero"));
+    three_phase.set_staging_workers(std::num::NonZeroUsize::new(4).expect("nonzero"));
+
+    let topology = DenseTopology::new(&[8])?;
+    let topologies = [topology];
+    // 16,384 jobs across 4 shards activates per-shard direct upload, parallel
+    // readback, and parallel `row_shard_loc` gather.
+    let raw_cases = cases(&topologies, 16_384);
+    let legacy_jobs = jobs(&topologies, &raw_cases, 0);
+    let mut flat_jobs: Vec<FlatControllerJob<'_>> = legacy_jobs
+        .iter()
+        .map(|job| FlatControllerJob {
+            genome: job.genome,
+            slot: job.slot,
+            controller: job.controller,
+        })
+        .collect();
+    // Reverse order so slots interleave across shards in non-trivial order.
+    flat_jobs.reverse();
+    let inputs_f32: Vec<f32> = legacy_jobs
+        .iter()
+        .rev()
+        .flat_map(|job| job.inputs.iter().map(|&v| v as f32))
+        .collect();
+    let all_finite = vec![1_u8; flat_jobs.len()];
+    let mut out_serial = FlatOutputs::default();
+    let mut out_split = FlatOutputs::default();
+
+    // 1. Cold + steady 3-phase per-shard I/O (direct write_gathered_rows +
+    //    GPU-only submit_per_shard_io + parallel readback & row_shard_loc gather).
+    for round in 0..2 {
+        serial.evaluate_flat_f32(
+            &flat_jobs,
+            SENSOR_WIDTH,
+            &inputs_f32,
+            &all_finite,
+            &mut out_serial,
+        )?;
+        assert!(three_phase.stage_flat_f32(
+            &flat_jobs,
+            SENSOR_WIDTH,
+            &inputs_f32,
+            &all_finite,
+            &mut out_split,
+        )?);
+        assert!(three_phase.submit_staged_flat_f32(&flat_jobs, SENSOR_WIDTH, &inputs_f32)?);
+        three_phase.collect_staged_flat_f32(&flat_jobs, SENSOR_WIDTH, &mut out_split)?;
+        assert_eq!(out_split.valid, out_serial.valid, "round {round} valid");
+        let s_bits: Vec<u32> = out_serial.values.iter().map(|v| v.to_bits()).collect();
+        let p_bits: Vec<u32> = out_split.values.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(p_bits, s_bits, "round {round} bits");
+    }
+    assert_eq!(three_phase.shards(), 4);
+
+    // 2. 3-phase global-mode path (small batch + partial nonfinite + empty batch).
+    let small = 512;
+    let mut partial_finite = vec![1_u8; small];
+    partial_finite[0] = 0;
+    partial_finite[255] = 0;
+    partial_finite[small - 1] = 0;
+    serial.evaluate_flat_f32(
+        &flat_jobs[..small],
+        SENSOR_WIDTH,
+        &inputs_f32[..small * SENSOR_WIDTH],
+        &partial_finite,
+        &mut out_serial,
+    )?;
+    assert!(three_phase.stage_flat_f32(
+        &flat_jobs[..small],
+        SENSOR_WIDTH,
+        &inputs_f32[..small * SENSOR_WIDTH],
+        &partial_finite,
+        &mut out_split,
+    )?);
+    assert!(three_phase.submit_staged_flat_f32(
+        &flat_jobs[..small],
+        SENSOR_WIDTH,
+        &inputs_f32[..small * SENSOR_WIDTH],
+    )?);
+    three_phase.collect_staged_flat_f32(&flat_jobs[..small], SENSOR_WIDTH, &mut out_split)?;
+    assert_eq!(out_split.valid, out_serial.valid);
+    for idx in 0..small {
+        let got = out_split
+            .row(idx)
+            .map(|r| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        let want = out_serial
+            .row(idx)
+            .map(|r| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(got, want, "global 3-phase partial row {idx}");
+    }
+
+    // Empty 3-phase batch must succeed cleanly.
+    assert!(three_phase.stage_flat_f32(&[], SENSOR_WIDTH, &[], &[], &mut out_split)?);
+    assert!(three_phase.submit_staged_flat_f32(&[], SENSOR_WIDTH, &[])?);
+    three_phase.collect_staged_flat_f32(&[], SENSOR_WIDTH, &mut out_split)?;
+    assert!(out_split.valid.is_empty());
+
+    // 3. Respect owner `leases_per_purpose = 1` during parallel per-shard readback.
+    let Ok(tight_owner) = flife_backend_metal::DeviceOwner::open(flife_backend_metal::Limits {
+        bytes: u64::MAX,
+        leases_per_purpose: 1,
+    }) else {
+        return Ok(());
+    };
+    let mut lease_capped = MetalBackend::with_owner(tight_owner, 4_096, BackendBudget::UNBOUNDED)?;
+    lease_capped.set_staging_workers(std::num::NonZeroUsize::new(4).expect("nonzero"));
+    let mut out_capped = FlatOutputs::default();
+    assert!(lease_capped.stage_flat_f32(
+        &flat_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &all_finite,
+        &mut out_capped,
+    )?);
+    assert!(lease_capped.submit_staged_flat_f32(&flat_jobs, SENSOR_WIDTH, &inputs_f32)?);
+    lease_capped.collect_staged_flat_f32(&flat_jobs, SENSOR_WIDTH, &mut out_capped)?;
+    serial.evaluate_flat_f32(
+        &flat_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &all_finite,
+        &mut out_serial,
+    )?;
+    assert_eq!(out_capped.valid, out_serial.valid);
+    let s_bits: Vec<u32> = out_serial.values.iter().map(|v| v.to_bits()).collect();
+    let c_bits: Vec<u32> = out_capped.values.iter().map(|v| v.to_bits()).collect();
+    assert_eq!(c_bits, s_bits, "leases_per_purpose=1 bit parity");
+
+    // 4. Invalid 3-phase transitions must return StateConflict and clear state:
+    //    (a) submit without stage
+    assert!(matches!(
+        three_phase.submit_staged_flat_f32(
+            &flat_jobs[..small],
+            SENSOR_WIDTH,
+            &inputs_f32[..small * SENSOR_WIDTH]
+        ),
+        Err(CoreError::StateConflict { .. })
+    ));
+
+    //    (b) collect before submit
+    assert!(three_phase.stage_flat_f32(
+        &flat_jobs[..small],
+        SENSOR_WIDTH,
+        &inputs_f32[..small * SENSOR_WIDTH],
+        &all_finite[..small],
+        &mut out_split,
+    )?);
+    assert!(matches!(
+        three_phase.collect_staged_flat_f32(&flat_jobs[..small], SENSOR_WIDTH, &mut out_split),
+        Err(CoreError::StateConflict { .. })
+    ));
+    assert!(out_split.valid.is_empty());
+
+    //    (c) double submit invalidates staged batch
+    assert!(three_phase.stage_flat_f32(
+        &flat_jobs[..small],
+        SENSOR_WIDTH,
+        &inputs_f32[..small * SENSOR_WIDTH],
+        &all_finite[..small],
+        &mut out_split,
+    )?);
+    assert!(three_phase.submit_staged_flat_f32(
+        &flat_jobs[..small],
+        SENSOR_WIDTH,
+        &inputs_f32[..small * SENSOR_WIDTH],
+    )?);
+    assert!(matches!(
+        three_phase.submit_staged_flat_f32(
+            &flat_jobs[..small],
+            SENSOR_WIDTH,
+            &inputs_f32[..small * SENSOR_WIDTH],
+        ),
+        Err(CoreError::StateConflict { .. })
+    ));
+    assert!(matches!(
+        three_phase.collect_staged_flat_f32(&flat_jobs[..small], SENSOR_WIDTH, &mut out_split),
+        Err(CoreError::StateConflict { .. })
+    ));
+
+    //    (d) finish_staged_flat_f32 after submit conflicts and clears outputs
+    assert!(three_phase.stage_flat_f32(
+        &flat_jobs[..small],
+        SENSOR_WIDTH,
+        &inputs_f32[..small * SENSOR_WIDTH],
+        &all_finite[..small],
+        &mut out_split,
+    )?);
+    assert!(three_phase.submit_staged_flat_f32(
+        &flat_jobs[..small],
+        SENSOR_WIDTH,
+        &inputs_f32[..small * SENSOR_WIDTH],
+    )?);
+    assert!(matches!(
+        three_phase.finish_staged_flat_f32(
+            &flat_jobs[..small],
+            SENSOR_WIDTH,
+            &inputs_f32[..small * SENSOR_WIDTH],
+            &mut out_split,
+        ),
+        Err(CoreError::StateConflict { .. })
+    ));
+    assert!(out_split.valid.is_empty());
+
+    //    (e) release_slots / forget between submit and collect invalidate batch
+    assert!(three_phase.stage_flat_f32(
+        &flat_jobs[..small],
+        SENSOR_WIDTH,
+        &inputs_f32[..small * SENSOR_WIDTH],
+        &all_finite[..small],
+        &mut out_split,
+    )?);
+    assert!(three_phase.submit_staged_flat_f32(
+        &flat_jobs[..small],
+        SENSOR_WIDTH,
+        &inputs_f32[..small * SENSOR_WIDTH],
+    )?);
+    three_phase.release_slots(&[flat_jobs[0].slot]);
+    assert!(matches!(
+        three_phase.collect_staged_flat_f32(&flat_jobs[..small], SENSOR_WIDTH, &mut out_split),
+        Err(CoreError::StateConflict { .. })
+    ));
+    assert!(out_split.valid.is_empty());
+
+    assert!(three_phase.stage_flat_f32(
+        &flat_jobs[..small],
+        SENSOR_WIDTH,
+        &inputs_f32[..small * SENSOR_WIDTH],
+        &all_finite[..small],
+        &mut out_split,
+    )?);
+    assert!(three_phase.submit_staged_flat_f32(
+        &flat_jobs[..small],
+        SENSOR_WIDTH,
+        &inputs_f32[..small * SENSOR_WIDTH],
+    )?);
+    three_phase.forget();
+    assert!(matches!(
+        three_phase.collect_staged_flat_f32(&flat_jobs[..small], SENSOR_WIDTH, &mut out_split),
+        Err(CoreError::StateConflict { .. })
+    ));
+    assert!(out_split.valid.is_empty());
+    Ok(())
+}

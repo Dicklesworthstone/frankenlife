@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::num::NonZeroUsize;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use flife_backend_cpu::CpuBackend;
 use flife_core::ids::GenomeId;
@@ -1174,9 +1175,12 @@ impl ShardParameters {
 }
 
 /// Per-shard device and host I/O staging buffers used when
-/// [`MetalBackend::stage_flat_f32`] parallelizes multi-shard input upload across
-/// independent `SharedBuffer`s (mutually exclusive with global
-/// `MetalBackend::{inputs, raw, faults}` so peak device bytes never grow).
+/// [`MetalBackend::stage_flat_f32`] parallelizes multi-shard input upload and
+/// output readback across independent `SharedBuffer`s (mutually exclusive with
+/// global `MetalBackend::{inputs, raw, faults}` so peak device bytes never
+/// grow). Inputs are gathered straight from the caller's slice into each
+/// shard's device buffer via [`DeviceOwner::write_gathered_rows`], so no
+/// per-shard host input copy is held.
 #[derive(Default)]
 struct ShardIo {
     capacity: usize,
@@ -1185,9 +1189,11 @@ struct ShardIo {
     inputs: Option<Owned<f32>>,
     raw: Option<Owned<f32>>,
     faults: Option<Owned<u32>>,
-    host_inputs: Vec<f32>,
     host_raw: Vec<f32>,
     host_faults: Vec<u32>,
+    /// Fallback per-shard local→global row map, allocated only when a batch
+    /// exceeds the packed `row_shard_loc` index range (`> 256` touched shards
+    /// or `>= 2^24` jobs in one shard).
     orig_rows: Vec<u32>,
 }
 
@@ -1220,7 +1226,6 @@ impl ShardIo {
 
     fn host_bytes(&self) -> u64 {
         total([
-            capacity_bytes(&self.host_inputs),
             capacity_bytes(&self.host_raw),
             capacity_bytes(&self.host_faults),
             capacity_bytes(&self.orig_rows),
@@ -1433,8 +1438,10 @@ enum ShardWriteLease {
 const PER_SHARD_IO_MIN_JOBS: usize = 16_384;
 
 /// Batch state prepared on the caller's full CPU worker budget by
-/// [`MetalBackend::stage_flat_f32`] and consumed on the off-CPU overlap thread
-/// by [`MetalBackend::finish_staged_flat_f32`].
+/// [`MetalBackend::stage_flat_f32`], submitted on the off-CPU overlap thread
+/// by [`MetalBackend::submit_staged_flat_f32`], and read back / gathered on
+/// the full CPU worker budget by [`MetalBackend::collect_staged_flat_f32`]
+/// (or completed in one call via [`MetalBackend::finish_staged_flat_f32`]).
 #[derive(Clone, Copy)]
 struct StagedFlatBatch {
     jobs_len: usize,
@@ -1443,6 +1450,8 @@ struct StagedFlatBatch {
     output_width: usize,
     all_dispatched: bool,
     per_shard_io: bool,
+    use_row_loc: bool,
+    submitted: bool,
 }
 
 /// [`MetalControllers`] behind the engine's controller port, with every
@@ -1486,6 +1495,10 @@ pub struct MetalBackend {
     packed_f16: Vec<u32>,
     values: Vec<f32>,
     flags: Vec<u32>,
+    /// Packed `((touched_idx as u32) << 24) | (local_row as u32)` inverse map
+    /// enabling lock-free parallel output gather across all CPU workers in
+    /// `collect_per_shard_io` (allocated only when per-shard I/O is active).
+    row_shard_loc: Vec<AtomicU32>,
     uploads: u64,
     /// Pending flat-F32 batch staged by [`ControllerBackend::stage_flat_f32`].
     staged_flat: Option<StagedFlatBatch>,
@@ -1590,6 +1603,7 @@ impl MetalBackend {
             packed_f16: Vec::new(),
             values: Vec::new(),
             flags: Vec::new(),
+            row_shard_loc: Vec::new(),
             uploads: 0,
             staged_flat: None,
             last_command: None,
@@ -3242,9 +3256,11 @@ impl MetalBackend {
                 .map(|shard| shard.io.device_bytes()),
         );
         let mut per_shard_rows = 0_usize;
+        let mut max_shard_jobs = 0_usize;
         let mut target_shard_io_dev = 0_u64;
         let mut shard_jobs_delta = 0_u64;
         let mut extra_host_bytes = 0_u64;
+        let mut extra_orig_rows_bytes = 0_u64;
         for &(topology, key) in &self.touched {
             let Some(shard) = self
                 .buckets
@@ -3258,6 +3274,7 @@ impl MetalBackend {
             if needed == 0 {
                 continue;
             }
+            max_shard_jobs = max_shard_jobs.max(needed);
             let keep_existing = shard.io.capacity >= needed
                 && shard.io.input_width == input_width
                 && shard.io.output_width == output_width
@@ -3305,20 +3322,28 @@ impl MetalBackend {
                     shard_jobs_delta.saturating_add(new_jobs.saturating_sub(old_jobs));
             }
             if self.budget != BackendBudget::UNBOUNDED {
-                let add_in = bytes_for::<f32>(in_elems)
-                    .saturating_sub(capacity_bytes(&shard.io.host_inputs));
                 let add_out =
                     bytes_for::<f32>(out_elems).saturating_sub(capacity_bytes(&shard.io.host_raw));
                 let add_flt =
                     bytes_for::<u32>(cap).saturating_sub(capacity_bytes(&shard.io.host_faults));
                 let add_map =
                     bytes_for::<u32>(cap).saturating_sub(capacity_bytes(&shard.io.orig_rows));
-                extra_host_bytes =
-                    extra_host_bytes.saturating_add(total([add_in, add_out, add_flt, add_map]));
+                extra_host_bytes = extra_host_bytes.saturating_add(total([add_out, add_flt]));
+                extra_orig_rows_bytes = extra_orig_rows_bytes.saturating_add(add_map);
             }
         }
         if per_shard_rows == 0 || per_shard_rows > global_rows {
             return false;
+        }
+        if self.budget != BackendBudget::UNBOUNDED {
+            let use_row_loc = self.touched.len() <= 256 && max_shard_jobs < (1 << 24);
+            if use_row_loc {
+                let add_loc = bytes_for::<AtomicU32>(count)
+                    .saturating_sub(capacity_bytes(&self.row_shard_loc));
+                extra_host_bytes = extra_host_bytes.saturating_add(add_loc);
+            } else {
+                extra_host_bytes = extra_host_bytes.saturating_add(extra_orig_rows_bytes);
+            }
         }
         let dims_delta = if self.dims.is_some() {
             0
@@ -3575,25 +3600,26 @@ fn unpack_outputs(
 }
 
 impl MetalBackend {
-    /// Upload per-shard job words, update `[input_width, output_width]` when
-    /// changed, upload `count * input_width` F32 inputs directly from either
-    /// `external_inputs` (zero-copy flat-F32 fast path) or `self.staged_inputs`,
-    /// and submit all touched shards in one Metal command buffer.
     /// Prepare per-shard device & host I/O buffers and gather + upload every
-    /// touched shard's `jobs` and `inputs` buffers concurrently across the
-    /// workspace worker pool (eliminating the single-core 166 MB `memmove`
-    /// bottleneck before `submit_batch` while keeping device bytes `<=` one
-    /// global power-of-two staging buffer).
+    /// touched shard's `inputs` (directly into Metal shared memory via
+    /// [`DeviceOwner::write_gathered_rows`], with zero intermediate host input
+    /// copy) and `jobs` buffers concurrently across the workspace worker pool.
+    ///
+    /// Returns whether the packed inverse row map `self.row_shard_loc` was
+    /// populated (`true` whenever `touched.len() <= 256` and every shard holds
+    /// `< 2^24` jobs), enabling parallel output gather in
+    /// [`Self::collect_per_shard_io`].
     #[expect(
         clippy::too_many_lines,
-        reason = "mutually-exclusive per-shard I/O allocation and parallel gather/upload"
+        reason = "mutually-exclusive per-shard I/O allocation and direct parallel upload"
     )]
     fn stage_per_shard_io(
         &mut self,
+        count: usize,
         inputs_f32: &[f32],
         input_width: usize,
         output_width: usize,
-    ) -> Result<(), CoreError> {
+    ) -> Result<bool, CoreError> {
         self.release_global_io();
         let _dims = self.ensure_dims(input_width, output_width)?;
         let owner = self.controllers.owner.clone();
@@ -3608,8 +3634,42 @@ impl MetalBackend {
             }
         }
 
+        let mut max_shard_jobs = 0_usize;
+        let mut total_staged = 0_usize;
+        for &(topology, key) in &self.touched {
+            if let Some(shard) = self
+                .buckets
+                .get(topology)
+                .and_then(Option::as_ref)
+                .and_then(|bucket| bucket.shards.get(key))
+            {
+                let needed = shard.staged.len() / JOB_WORDS;
+                max_shard_jobs = max_shard_jobs.max(needed);
+                total_staged = total_staged.saturating_add(needed);
+            }
+        }
+        if total_staged != count {
+            return Err(CoreError::StateConflict {
+                operation: "metal per-shard staging",
+                detail: format!(
+                    "staged job count {total_staged} disagrees with batch count {count}"
+                ),
+            });
+        }
+        let use_row_loc = self.touched.len() <= 256 && max_shard_jobs < (1 << 24);
+        if use_row_loc && self.row_shard_loc.len() < count {
+            let extra = count - self.row_shard_loc.len();
+            self.row_shard_loc.try_reserve_exact(extra).map_err(|_| {
+                CoreError::AllocationFailed {
+                    buffer: "metal per-shard row map",
+                    bytes: bytes_for::<AtomicU32>(count),
+                }
+            })?;
+            self.row_shard_loc.resize_with(count, || AtomicU32::new(0));
+        }
+
         // Pre-size device `jobs` and `io.{inputs, raw, faults}` plus host
-        // scratch sequentially (zero allocations in steady state).
+        // readback scratch sequentially (zero allocations in steady state).
         for idx in 0..self.touched.len() {
             let (topology, key) = self.touched[idx];
             let Some(shard) = self
@@ -3674,17 +3734,6 @@ impl MetalBackend {
                 shard.io.output_width = output_width;
             }
             let cap = shard.io.capacity;
-            let need_in = cap * input_width;
-            if shard.io.host_inputs.len() < need_in {
-                let extra = need_in - shard.io.host_inputs.len();
-                shard.io.host_inputs.try_reserve_exact(extra).map_err(|_| {
-                    CoreError::AllocationFailed {
-                        buffer: "metal shard host inputs",
-                        bytes: bytes_for::<f32>(need_in),
-                    }
-                })?;
-                shard.io.host_inputs.resize(need_in, 0.0);
-            }
             let need_out = cap * output_width;
             if shard.io.host_raw.len() < need_out {
                 let extra = need_out - shard.io.host_raw.len();
@@ -3706,7 +3755,7 @@ impl MetalBackend {
                 })?;
                 shard.io.host_faults.resize(cap, 0);
             }
-            if shard.io.orig_rows.len() < cap {
+            if !use_row_loc && shard.io.orig_rows.len() < cap {
                 let extra = cap - shard.io.orig_rows.len();
                 shard.io.orig_rows.try_reserve_exact(extra).map_err(|_| {
                     CoreError::AllocationFailed {
@@ -3718,67 +3767,134 @@ impl MetalBackend {
             }
         }
 
-        // Gather each touched shard's inputs, rewrite job[0] to the shard-local
-        // row index 0..n (saving global row in `orig_rows`), and upload both
-        // `jobs` and `shard.io.inputs` concurrently across all touched shards!
-        let mut active_shards: Vec<&mut DeviceShard> = Vec::with_capacity(self.touched.len());
-        for bucket in self.buckets.iter_mut().flatten() {
-            for shard in bucket.shards.values_mut() {
-                if !shard.staged.is_empty() {
-                    active_shards.push(shard);
+        // Gather each touched shard's inputs directly into Metal shared memory,
+        // record each global row's `(touched_idx, local_row)` inverse location
+        // (or `orig_rows` fallback), rewrite job[0] to shard-local row 0..n,
+        // and upload `jobs` concurrently across all touched shards.
+        let touched = &self.touched;
+        let row_locs: &[AtomicU32] = if use_row_loc {
+            &self.row_shard_loc[..count]
+        } else {
+            &[]
+        };
+        let mut active_shards: Vec<(usize, &mut DeviceShard)> = Vec::with_capacity(touched.len());
+        for (topology, bucket_opt) in self.buckets.iter_mut().enumerate() {
+            let Some(bucket) = bucket_opt.as_mut() else {
+                continue;
+            };
+            for (shard_idx, shard_opt) in bucket.shards.dense.iter_mut().enumerate() {
+                if let Some(shard) = shard_opt.as_mut()
+                    && !shard.staged.is_empty()
+                    && let Ok(touched_idx) = touched.binary_search(&(topology, shard_idx as u64))
+                {
+                    active_shards.push((touched_idx, shard));
                 }
             }
+            for (&shard_key, shard) in &mut bucket.shards.sparse {
+                if !shard.staged.is_empty()
+                    && let Ok(touched_idx) = touched.binary_search(&(topology, shard_key))
+                {
+                    active_shards.push((touched_idx, shard));
+                }
+            }
+        }
+        if active_shards.len() != touched.len() {
+            return Err(CoreError::StateConflict {
+                operation: "metal per-shard staging",
+                detail: format!(
+                    "active shard count {} disagrees with touched list {}",
+                    active_shards.len(),
+                    touched.len()
+                ),
+            });
         }
         let workers = self.staging_workers.min(active_shards.len()).max(1);
         pool::try_parallel_tasks(
             workers,
             "metal parallel shard io upload",
             &mut active_shards,
-            |_, shard| {
+            |_, (touched_idx, shard)| {
                 let n = shard.staged.len() / JOB_WORDS;
-                let orig_rows = &mut shard.io.orig_rows[..n];
-                let host_in = &mut shard.io.host_inputs[..n * input_width];
-                for (j, ((orig_slot, job_chunk), dst_row)) in orig_rows
-                    .iter_mut()
-                    .zip(shard.staged.as_chunks_mut::<JOB_WORDS>().0)
-                    .zip(host_in.chunks_exact_mut(input_width))
-                    .enumerate()
-                {
-                    let row_word = job_chunk[0];
-                    *orig_slot = row_word;
+                if let Some(in_buf) = shard.io.inputs.as_ref() {
+                    owner.write_gathered_rows(
+                        in_buf.buffer(),
+                        inputs_f32,
+                        input_width,
+                        shard
+                            .staged
+                            .as_chunks::<JOB_WORDS>()
+                            .0
+                            .iter()
+                            .map(|job_chunk| job_chunk[0] as usize),
+                    )?;
+                }
+                if use_row_loc {
                     #[expect(
                         clippy::cast_possible_truncation,
-                        reason = "j < n <= u32::MAX verified in place_and_stage"
+                        reason = "use_row_loc requires touched.len() <= 256, so touched_idx <= 255"
                     )]
+                    let prefix = (*touched_idx as u32) << 24;
+                    for (j, job_chunk) in shard
+                        .staged
+                        .as_chunks_mut::<JOB_WORDS>()
+                        .0
+                        .iter_mut()
+                        .enumerate()
                     {
-                        job_chunk[0] = j as u32;
+                        let row_word = job_chunk[0] as usize;
+                        let Some(slot) = row_locs.get(row_word) else {
+                            return Err(CoreError::StateConflict {
+                                operation: "metal per-shard staging",
+                                detail: format!(
+                                    "row index {row_word} out of bounds for {}",
+                                    row_locs.len()
+                                ),
+                            });
+                        };
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "use_row_loc requires j < n < (1 << 24)"
+                        )]
+                        let local_u32 = j as u32;
+                        slot.store(prefix | local_u32, Ordering::Relaxed);
+                        job_chunk[0] = local_u32;
                     }
-                    let src = (row_word as usize) * input_width;
-                    dst_row.copy_from_slice(&inputs_f32[src..src + input_width]);
+                } else {
+                    let orig_rows = &mut shard.io.orig_rows[..n];
+                    for (j, (orig_slot, job_chunk)) in orig_rows
+                        .iter_mut()
+                        .zip(shard.staged.as_chunks_mut::<JOB_WORDS>().0)
+                        .enumerate()
+                    {
+                        let row_word = job_chunk[0];
+                        *orig_slot = row_word;
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "j < n <= u32::MAX verified in place_and_stage"
+                        )]
+                        {
+                            job_chunk[0] = j as u32;
+                        }
+                    }
                 }
                 if let Some(words) = shard.jobs.as_ref() {
                     owner.write_slice(words.buffer(), 0, &shard.staged)?;
                 }
-                if let Some(in_buf) = shard.io.inputs.as_ref() {
-                    owner.write_slice(in_buf.buffer(), 0, host_in)?;
-                }
                 Ok(())
             },
-        )
+        )?;
+        Ok(use_row_loc)
     }
 
     /// Submit all touched shards using their per-shard `(inputs, raw, faults)`
-    /// buffers (zero host `memmove` before GPU launch!) and read back & scatter
-    /// outputs into `outputs`.
+    /// buffers in one Metal command buffer (pure GPU dispatch, zero host
+    /// readback or scatter, so off-CPU overlap finishes as soon as the GPU
+    /// command buffer completes).
     #[expect(
         clippy::too_many_lines,
-        reason = "inline/heap-spill per-shard Metal batch dispatch and scatter readback"
+        reason = "inline/heap-spill per-shard Metal batch dispatch"
     )]
-    fn submit_and_readback_per_shard(
-        &mut self,
-        output_width: usize,
-        outputs: &mut FlatOutputs,
-    ) -> Result<(), CoreError> {
+    fn submit_per_shard_io(&mut self) -> Result<(), CoreError> {
         let owner = self.controllers.owner.clone();
         let dims =
             self.dims
@@ -3909,53 +4025,238 @@ impl MetalBackend {
             owner.submit_batch(&kernels)?
         };
         self.last_command = Some((receipt.kernels, receipt.device_seconds));
+        Ok(())
+    }
 
+    /// Read back every touched shard's `(raw, faults)` buffers concurrently
+    /// across the workspace worker pool (respecting `leases_per_purpose`) and
+    /// gather outputs into `outputs` concurrently via `self.row_shard_loc` (or
+    /// sequential `orig_rows` fallback when `use_row_loc == false`).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "parallel per-shard readback plus parallel row-loc gather and fallback scatter"
+    )]
+    fn collect_per_shard_io(
+        &mut self,
+        output_width: usize,
+        use_row_loc: bool,
+        outputs: &mut FlatOutputs,
+    ) -> Result<(), CoreError> {
+        if output_width == 0 {
+            return Err(CoreError::StateConflict {
+                operation: "metal per-shard readback",
+                detail: "output width must be positive".to_owned(),
+            });
+        }
+        let owner = self.controllers.owner.clone();
+        let touched_len = self.touched.len();
         let total_rows = outputs.valid.len();
-        for idx in 0..touched_len {
-            let (topology, key) = self.touched[idx];
-            let Some(shard) = self
-                .buckets
-                .get_mut(topology)
-                .and_then(Option::as_mut)
-                .and_then(|bucket| bucket.shards.get_mut(key))
-            else {
-                continue;
-            };
-            let n = shard.staged.len() / JOB_WORDS;
-            if n == 0 {
-                continue;
+
+        // Step 1: parallel per-shard device readback across distinct buffers.
+        let mut active_shards: Vec<&mut DeviceShard> = Vec::with_capacity(touched_len);
+        for bucket in self.buckets.iter_mut().flatten() {
+            for shard in bucket.shards.values_mut() {
+                if !shard.staged.is_empty() {
+                    active_shards.push(shard);
+                }
             }
-            let (Some(raw_buf), Some(flt_buf)) = (
-                shard.io.raw.as_ref().map(Owned::buffer),
-                shard.io.faults.as_ref().map(Owned::buffer),
-            ) else {
-                return Err(CoreError::StateConflict {
-                    operation: "metal controller residency",
-                    detail: "per-shard readback buffer missing".to_owned(),
-                });
-            };
-            let host_raw = &mut shard.io.host_raw[..n * output_width];
-            let host_flt = &mut shard.io.host_faults[..n];
-            owner.read_back(raw_buf, host_raw)?;
-            owner.read_back(flt_buf, host_flt)?;
-            for (local, (&orig_row, &flag)) in shard.io.orig_rows[..n]
-                .iter()
-                .zip(host_flt.iter())
-                .enumerate()
-            {
-                let dst_row = orig_row as usize;
-                if dst_row >= total_rows {
+        }
+        if active_shards.len() != touched_len {
+            return Err(CoreError::StateConflict {
+                operation: "metal per-shard readback",
+                detail: format!(
+                    "active shard count {} disagrees with touched list {touched_len}",
+                    active_shards.len()
+                ),
+            });
+        }
+        let max_read_leases = usize::try_from(owner.limits().leases_per_purpose)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let read_workers = self
+            .staging_workers
+            .min(active_shards.len())
+            .min(max_read_leases)
+            .max(1);
+        pool::try_parallel_tasks(
+            read_workers,
+            "metal parallel shard readback",
+            &mut active_shards,
+            |_, shard| {
+                let n = shard.staged.len() / JOB_WORDS;
+                let (Some(raw_buf), Some(flt_buf)) = (
+                    shard.io.raw.as_ref().map(Owned::buffer),
+                    shard.io.faults.as_ref().map(Owned::buffer),
+                ) else {
+                    return Err(CoreError::StateConflict {
+                        operation: "metal controller residency",
+                        detail: "per-shard readback buffer missing".to_owned(),
+                    });
+                };
+                let raw_len = n.checked_mul(output_width).ok_or(CoreError::Overflow {
+                    quantity: "metal shard output elements",
+                })?;
+                let (Some(host_raw), Some(host_flt)) = (
+                    shard.io.host_raw.get_mut(..raw_len),
+                    shard.io.host_faults.get_mut(..n),
+                ) else {
                     return Err(CoreError::StateConflict {
                         operation: "metal per-shard readback",
-                        detail: format!("row index {dst_row} out of bounds for {total_rows}"),
+                        detail: "per-shard host readback buffer undersized".to_owned(),
                     });
+                };
+                owner.read_back(raw_buf, host_raw)?;
+                owner.read_back(flt_buf, host_flt)
+            },
+        )?;
+
+        // Step 2: parallel gather into `outputs.{values, valid}` via packed
+        // `row_shard_loc` (or sequential `orig_rows` fallback).
+        if use_row_loc {
+            let Some(locs) = self.row_shard_loc.get(..total_rows) else {
+                return Err(CoreError::StateConflict {
+                    operation: "metal per-shard readback",
+                    detail: format!(
+                        "row location map length {} < {total_rows}",
+                        self.row_shard_loc.len()
+                    ),
+                });
+            };
+            let mut shard_views: Vec<(&[f32], &[u32])> = Vec::with_capacity(touched_len);
+            for &(topology, key) in &self.touched {
+                let Some(shard) = self
+                    .buckets
+                    .get(topology)
+                    .and_then(Option::as_ref)
+                    .and_then(|bucket| bucket.shards.get(key))
+                else {
+                    return Err(CoreError::StateConflict {
+                        operation: "metal per-shard readback",
+                        detail: format!("touched shard ({topology}, {key}) missing"),
+                    });
+                };
+                let n = shard.staged.len() / JOB_WORDS;
+                let raw_len = n * output_width;
+                shard_views.push((&shard.io.host_raw[..raw_len], &shard.io.host_faults[..n]));
+            }
+            let shard_views_ref: &[(&[f32], &[u32])] = &shard_views;
+            let tile_count = self
+                .staging_workers
+                .saturating_mul(4)
+                .clamp(1, 128)
+                .min(total_rows.div_ceil(1024))
+                .max(1);
+            let tile_len = total_rows.div_ceil(tile_count);
+            struct GatherTile<'a> {
+                locs: &'a [AtomicU32],
+                dst_values: &'a mut [f32],
+                dst_valid: &'a mut [u8],
+            }
+            let mut tiles: Vec<GatherTile<'_>> = Vec::with_capacity(tile_count);
+            let mut rem_locs = locs;
+            let mut rem_vals = outputs.values.as_mut_slice();
+            let mut rem_valid = outputs.valid.as_mut_slice();
+            while !rem_valid.is_empty() {
+                let take = rem_valid.len().min(tile_len);
+                let (my_locs, next_locs) = rem_locs.split_at(take);
+                let (my_vals, next_vals) = rem_vals.split_at_mut(take * output_width);
+                let (my_valid, next_valid) = rem_valid.split_at_mut(take);
+                rem_locs = next_locs;
+                rem_vals = next_vals;
+                rem_valid = next_valid;
+                tiles.push(GatherTile {
+                    locs: my_locs,
+                    dst_values: my_vals,
+                    dst_valid: my_valid,
+                });
+            }
+            let gather_workers = self.staging_workers.min(tiles.len()).max(1);
+            pool::try_parallel_tasks(
+                gather_workers,
+                "metal parallel gather outputs",
+                &mut tiles,
+                |_, tile| {
+                    for ((loc_atom, dst_row), dst_ok) in tile
+                        .locs
+                        .iter()
+                        .zip(tile.dst_values.chunks_exact_mut(output_width))
+                        .zip(tile.dst_valid.iter_mut())
+                    {
+                        let packed = loc_atom.load(Ordering::Relaxed);
+                        let shard_slot = (packed >> 24) as usize;
+                        let local = (packed & 0x00FF_FFFF) as usize;
+                        let Some(&(raw_slice, flt_slice)) = shard_views_ref.get(shard_slot) else {
+                            return Err(CoreError::StateConflict {
+                                operation: "metal per-shard readback",
+                                detail: format!(
+                                    "shard slot {shard_slot} out of bounds for {}",
+                                    shard_views_ref.len()
+                                ),
+                            });
+                        };
+                        let Some(&flag) = flt_slice.get(local) else {
+                            return Err(CoreError::StateConflict {
+                                operation: "metal per-shard readback",
+                                detail: format!(
+                                    "local row {local} out of bounds for shard {shard_slot}"
+                                ),
+                            });
+                        };
+                        if flag == 0 {
+                            let src_start = local * output_width;
+                            let Some(src_row) = raw_slice.get(src_start..src_start + output_width)
+                            else {
+                                return Err(CoreError::StateConflict {
+                                    operation: "metal per-shard readback",
+                                    detail: format!(
+                                        "output slice {src_start} out of bounds for shard {shard_slot}"
+                                    ),
+                                });
+                            };
+                            dst_row.copy_from_slice(src_row);
+                            *dst_ok = 1;
+                        } else {
+                            *dst_ok = 0;
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+        } else {
+            for &(topology, key) in &self.touched {
+                let Some(shard) = self
+                    .buckets
+                    .get(topology)
+                    .and_then(Option::as_ref)
+                    .and_then(|bucket| bucket.shards.get(key))
+                else {
+                    continue;
+                };
+                let n = shard.staged.len() / JOB_WORDS;
+                if n == 0 {
+                    continue;
                 }
-                if flag == 0 {
-                    let src = local * output_width;
-                    let dst = dst_row * output_width;
-                    outputs.values[dst..dst + output_width]
-                        .copy_from_slice(&host_raw[src..src + output_width]);
-                    outputs.valid[dst_row] = 1;
+                let host_raw = &shard.io.host_raw[..n * output_width];
+                let host_flt = &shard.io.host_faults[..n];
+                for (local, (&orig_row, &flag)) in shard.io.orig_rows[..n]
+                    .iter()
+                    .zip(host_flt.iter())
+                    .enumerate()
+                {
+                    let dst_row = orig_row as usize;
+                    if dst_row >= total_rows {
+                        return Err(CoreError::StateConflict {
+                            operation: "metal per-shard readback",
+                            detail: format!("row index {dst_row} out of bounds for {total_rows}"),
+                        });
+                    }
+                    if flag == 0 {
+                        let src = local * output_width;
+                        let dst = dst_row * output_width;
+                        outputs.values[dst..dst + output_width]
+                            .copy_from_slice(&host_raw[src..src + output_width]);
+                        outputs.valid[dst_row] = 1;
+                    }
                 }
             }
         }
@@ -4380,6 +4681,8 @@ impl MetalBackend {
                 output_width: 0,
                 all_dispatched: true,
                 per_shard_io: false,
+                use_row_loc: false,
+                submitted: false,
             });
             return Ok(());
         };
@@ -4398,6 +4701,8 @@ impl MetalBackend {
                 output_width: fallback_width,
                 all_dispatched: false,
                 per_shard_io: false,
+                use_row_loc: false,
+                submitted: false,
             });
             return Ok(());
         };
@@ -4405,12 +4710,14 @@ impl MetalBackend {
             self.place_and_stage(jobs, Some(inputs_finite), (input_width, output_width))?;
         outputs.prepare(jobs.len(), output_width)?;
         let mut per_shard_io = false;
+        let mut use_row_loc = false;
         if count > 0 {
             if all_dispatched
                 && count == jobs.len()
                 && self.per_shard_io_fits(count, input_width, output_width)
             {
-                self.stage_per_shard_io(inputs_f32, input_width, output_width)?;
+                use_row_loc =
+                    self.stage_per_shard_io(count, inputs_f32, input_width, output_width)?;
                 per_shard_io = true;
             } else {
                 self.hold(count, input_width, output_width)?;
@@ -4441,24 +4748,31 @@ impl MetalBackend {
             output_width,
             all_dispatched,
             per_shard_io,
+            use_row_loc,
+            submitted: false,
         });
         Ok(())
     }
 
-    fn finish_staged_flat_f32_inner(
+    fn submit_staged_flat_f32_inner(
         &mut self,
         jobs: &[FlatControllerJob<'_>],
         input_width: usize,
         inputs_f32: &[f32],
-        outputs: &mut FlatOutputs,
     ) -> Result<(), CoreError> {
-        let staged = self
+        let mut staged = self
             .staged_flat
             .take()
             .ok_or_else(|| CoreError::StateConflict {
-                operation: "finish staged flat controller batch",
+                operation: "submit staged flat controller batch",
                 detail: "no staged flat batch pending".to_owned(),
             })?;
+        if staged.submitted {
+            return Err(CoreError::StateConflict {
+                operation: "submit staged flat controller batch",
+                detail: "staged flat batch was already submitted".to_owned(),
+            });
+        }
         let expected_inputs = jobs
             .len()
             .checked_mul(input_width)
@@ -4470,14 +4784,71 @@ impl MetalBackend {
             || inputs_f32.len() != expected_inputs
         {
             return Err(CoreError::StateConflict {
-                operation: "finish staged flat controller batch",
+                operation: "submit staged flat controller batch",
                 detail: format!(
-                    "batch shape changed between stage ({} x {}) and finish ({} x {}, {} inputs)",
+                    "batch shape changed between stage ({} x {}) and submit ({} x {}, {} inputs)",
                     staged.jobs_len,
                     staged.input_width,
                     jobs.len(),
                     input_width,
                     inputs_f32.len(),
+                ),
+            });
+        }
+        if staged.count > 0 {
+            if staged.per_shard_io {
+                self.submit_per_shard_io()?;
+            } else if staged.all_dispatched && staged.count == jobs.len() {
+                self.submit_staged_kernels(
+                    staged.count,
+                    staged.input_width,
+                    staged.output_width,
+                    Some(inputs_f32),
+                    false,
+                )?;
+            } else {
+                self.submit_staged_kernels(
+                    staged.count,
+                    staged.input_width,
+                    staged.output_width,
+                    None,
+                    false,
+                )?;
+            }
+        }
+        staged.submitted = true;
+        self.staged_flat = Some(staged);
+        Ok(())
+    }
+
+    fn collect_staged_flat_f32_inner(
+        &mut self,
+        jobs: &[FlatControllerJob<'_>],
+        input_width: usize,
+        outputs: &mut FlatOutputs,
+    ) -> Result<(), CoreError> {
+        let staged = self
+            .staged_flat
+            .take()
+            .ok_or_else(|| CoreError::StateConflict {
+                operation: "collect staged flat controller batch",
+                detail: "no submitted flat batch pending".to_owned(),
+            })?;
+        if !staged.submitted {
+            return Err(CoreError::StateConflict {
+                operation: "collect staged flat controller batch",
+                detail: "staged flat batch was not submitted before collect".to_owned(),
+            });
+        }
+        if jobs.len() != staged.jobs_len || input_width != staged.input_width {
+            return Err(CoreError::StateConflict {
+                operation: "collect staged flat controller batch",
+                detail: format!(
+                    "batch shape changed between stage ({} x {}) and collect ({} x {})",
+                    staged.jobs_len,
+                    staged.input_width,
+                    jobs.len(),
+                    input_width,
                 ),
             });
         }
@@ -4495,20 +4866,13 @@ impl MetalBackend {
             || outputs.valid.len() != jobs.len()
         {
             return Err(CoreError::StateConflict {
-                operation: "finish staged flat controller batch",
-                detail: "outputs buffer shape changed between stage and finish".to_owned(),
+                operation: "collect staged flat controller batch",
+                detail: "outputs buffer shape changed between stage and collect".to_owned(),
             });
         }
         if staged.per_shard_io {
-            self.submit_and_readback_per_shard(staged.output_width, outputs)?;
+            self.collect_per_shard_io(staged.output_width, staged.use_row_loc, outputs)?;
         } else if staged.all_dispatched && staged.count == jobs.len() {
-            self.submit_staged_kernels(
-                staged.count,
-                staged.input_width,
-                staged.output_width,
-                Some(inputs_f32),
-                false,
-            )?;
             self.read_back_results(staged.count, staged.output_width, Some(&mut outputs.values))?;
             for (dst, &flag) in outputs.valid[..staged.count]
                 .iter_mut()
@@ -4517,13 +4881,6 @@ impl MetalBackend {
                 *dst = u8::from(flag == 0);
             }
         } else {
-            self.submit_staged_kernels(
-                staged.count,
-                staged.input_width,
-                staged.output_width,
-                None,
-                false,
-            )?;
             self.read_back_results(staged.count, staged.output_width, None)?;
             for (&index, (row, &flag)) in self.dispatched.iter().zip(
                 self.values[..staged.count * staged.output_width]
@@ -4538,6 +4895,39 @@ impl MetalBackend {
             }
         }
         Ok(())
+    }
+
+    fn finish_staged_flat_f32_inner(
+        &mut self,
+        jobs: &[FlatControllerJob<'_>],
+        input_width: usize,
+        inputs_f32: &[f32],
+        outputs: &mut FlatOutputs,
+    ) -> Result<(), CoreError> {
+        if let Some(staged) = self.staged_flat
+            && !staged.submitted
+            && staged.count > 0
+            && jobs.len() == staged.jobs_len
+        {
+            let expected_outputs =
+                jobs.len()
+                    .checked_mul(staged.output_width)
+                    .ok_or(CoreError::Overflow {
+                        quantity: "flat controller outputs",
+                    })?;
+            if outputs.output_width != staged.output_width
+                || outputs.values.len() != expected_outputs
+                || outputs.valid.len() != jobs.len()
+            {
+                self.staged_flat = None;
+                return Err(CoreError::StateConflict {
+                    operation: "finish staged flat controller batch",
+                    detail: "outputs buffer shape changed between stage and finish".to_owned(),
+                });
+            }
+        }
+        self.submit_staged_flat_f32_inner(jobs, input_width, inputs_f32)?;
+        self.collect_staged_flat_f32_inner(jobs, input_width, outputs)
     }
 
     fn evaluate_flat_f32_inner(
@@ -4584,6 +4974,7 @@ impl ControllerBackend for MetalBackend {
             capacity_bytes(&self.packed_f16),
             capacity_bytes(&self.values),
             capacity_bytes(&self.flags),
+            capacity_bytes(&self.row_shard_loc),
         ]))
     }
 
@@ -4591,6 +4982,7 @@ impl ControllerBackend for MetalBackend {
         self.buckets.clear();
         self.touched.clear();
         self.packed_f16.clear();
+        self.row_shard_loc = Vec::new();
         self.shard_count = 0;
         self.held = 0;
         self.uploads = 0;
@@ -4665,6 +5057,33 @@ impl ControllerBackend for MetalBackend {
         outputs: &mut FlatOutputs,
     ) -> Result<(), CoreError> {
         let result = self.finish_staged_flat_f32_inner(jobs, input_width, inputs_f32, outputs);
+        if result.is_err() {
+            self.staged_flat = None;
+            outputs.clear();
+        }
+        result
+    }
+
+    fn submit_staged_flat_f32(
+        &mut self,
+        jobs: &[FlatControllerJob<'_>],
+        input_width: usize,
+        inputs_f32: &[f32],
+    ) -> Result<bool, CoreError> {
+        let result = self.submit_staged_flat_f32_inner(jobs, input_width, inputs_f32);
+        if result.is_err() {
+            self.staged_flat = None;
+        }
+        result.map(|()| true)
+    }
+
+    fn collect_staged_flat_f32(
+        &mut self,
+        jobs: &[FlatControllerJob<'_>],
+        input_width: usize,
+        outputs: &mut FlatOutputs,
+    ) -> Result<(), CoreError> {
+        let result = self.collect_staged_flat_f32_inner(jobs, input_width, outputs);
         if result.is_err() {
             self.staged_flat = None;
             outputs.clear();

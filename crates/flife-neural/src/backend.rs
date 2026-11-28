@@ -258,6 +258,52 @@ pub trait ControllerBackend: Debug + Send {
         })
     }
 
+    /// Optional off-CPU submission phase for a batch staged by
+    /// [`Self::stage_flat_f32`], separating pure device execution (which runs
+    /// on the single off-CPU overlap thread while CPU phases occupy the
+    /// remaining workers) from host readback and scatter/gather (which then
+    /// runs in [`Self::collect_staged_flat_f32`] across the full CPU worker
+    /// budget).
+    ///
+    /// Returning `Ok(true)` tells the engine that device execution finished
+    /// and [`Self::collect_staged_flat_f32`] must be called after overlap
+    /// ends. Returning `Ok(false)` (the default) tells the engine to invoke
+    /// [`Self::finish_staged_flat_f32`] instead.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] if called without a matching pending
+    /// staged batch (or if already submitted), or as
+    /// [`Self::evaluate_flat_f32`].
+    fn submit_staged_flat_f32(
+        &mut self,
+        _jobs: &[FlatControllerJob<'_>],
+        _input_width: usize,
+        _inputs_f32: &[f32],
+    ) -> Result<bool, CoreError> {
+        Ok(false)
+    }
+
+    /// Collect and unpack results from a batch previously submitted by
+    /// [`Self::submit_staged_flat_f32`] returning `Ok(true)`, using the
+    /// engine's full CPU worker budget for parallel device readback and
+    /// output gather into `outputs`.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] if called without a matching submitted
+    /// batch, or as [`Self::evaluate_flat_f32`]; clears `outputs` on failure.
+    fn collect_staged_flat_f32(
+        &mut self,
+        _jobs: &[FlatControllerJob<'_>],
+        _input_width: usize,
+        outputs: &mut FlatOutputs,
+    ) -> Result<(), CoreError> {
+        outputs.clear();
+        Err(CoreError::StateConflict {
+            operation: "collect staged flat controller batch",
+            detail: "backend does not have a submitted flat batch".to_owned(),
+        })
+    }
+
     /// Evaluate `jobs` from a contiguous row-major F32 input buffer
     /// (`inputs_f32.len() == jobs.len() * input_width`) with per-job finiteness
     /// flags (`inputs_finite.len() == jobs.len()`), writing contiguous row-major
@@ -551,7 +597,18 @@ mod tests {
                 .stage_flat_f32(&[], 0, &[], &[], &mut flat)
                 .expect("default stage")
         );
+        assert!(
+            !backend
+                .submit_staged_flat_f32(&[], 0, &[])
+                .expect("default submit")
+        );
         let err = backend.finish_staged_flat_f32(&[], 0, &[], &mut flat);
+        assert!(matches!(err, Err(CoreError::StateConflict { .. })));
+        assert!(flat.valid.is_empty());
+        assert!(flat.values.is_empty());
+        flat.prepare(2, 4).expect("prepare before collect");
+        flat.valid.fill(1);
+        let err = backend.collect_staged_flat_f32(&[], 0, &mut flat);
         assert!(matches!(err, Err(CoreError::StateConflict { .. })));
         assert!(flat.valid.is_empty());
         assert!(flat.values.is_empty());

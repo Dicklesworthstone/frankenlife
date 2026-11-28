@@ -1644,6 +1644,71 @@ impl DeviceOwner {
         Ok(())
     }
 
+    /// Gather contiguous `row_width`-element rows from `src` at each row index
+    /// yielded by `rows` and write them sequentially into `buffer` starting at
+    /// element `0`, under a single transient host write lease and single buffer
+    /// lock (avoiding an intermediate host staging copy).
+    ///
+    /// # Errors
+    /// As [`DeviceOwner::write_slice`], plus [`CoreError::Overflow`] or
+    /// [`CoreError::LayoutMismatch`] if any requested row lies outside `src`.
+    pub fn write_gathered_rows<T: Element>(
+        &self,
+        buffer: Buffer<T>,
+        src: &[T],
+        row_width: usize,
+        rows: impl Iterator<Item = usize>,
+    ) -> Result<(), CoreError> {
+        let memory = {
+            let mut table = self.shared.table();
+            let resident = table.resident(self.shared.id, buffer.handle)?;
+            if resident.retiring {
+                return Err(conflict(format!("{buffer:?} is retiring")));
+            }
+            if resident.writer.is_some() || resident.readers() > 0 {
+                return Err(conflict(format!(
+                    "{buffer:?} is {:?}: a writer needs it unread and unwritten",
+                    resident.state()
+                )));
+            }
+            resident.writer = Some(Writer::Host);
+            let memory = Arc::clone(&resident.memory);
+            table.write_leases += 1;
+            memory
+        };
+        let mut scoped = ScopedWrite {
+            shared: &self.shared,
+            handle: buffer.handle,
+            committed: false,
+        };
+        let mut guard = memory.write().unwrap_or_else(PoisonError::into_inner);
+        for (dst_row, src_row) in rows.enumerate() {
+            let src_start = src_row.checked_mul(row_width).ok_or(CoreError::Overflow {
+                quantity: "metal gathered input offset",
+            })?;
+            let src_end = src_start
+                .checked_add(row_width)
+                .ok_or(CoreError::Overflow {
+                    quantity: "metal gathered input end",
+                })?;
+            let slice = src
+                .get(src_start..src_end)
+                .ok_or_else(|| CoreError::LayoutMismatch {
+                    buffer: "metal gathered input source",
+                    detail: format!(
+                        "row {src_row} (width {row_width}) out of bounds for {} elements",
+                        src.len()
+                    ),
+                })?;
+            let dst_offset = dst_row.checked_mul(row_width).ok_or(CoreError::Overflow {
+                quantity: "metal gathered buffer offset",
+            })?;
+            T::write(&mut guard, dst_offset, slice).map_err(metal)?;
+        }
+        scoped.committed = true;
+        Ok(())
+    }
+
     /// The first `out.len()` elements of `buffer`, read under a readback
     /// lease without cloning the owner's `Arc`.
     ///
@@ -1993,5 +2058,51 @@ mod tests {
         let mut back = [0.0_f32; 4];
         owner.read_back(output, &mut back).expect("reads back");
         assert_eq!(back, [9.0_f32; 4]);
+    }
+
+    #[test]
+    fn write_gathered_rows_gathers_exact_rows_and_preserves_undefined_state_on_error() {
+        let Ok(owner) = DeviceOwner::open(Limits::UNBOUNDED) else {
+            return;
+        };
+        let dst = owner.zeroed::<f32>(9).expect("zeroed");
+        let src = [
+            10.0_f32, 11.0, 12.0, // row 0
+            20.0, 21.0, 22.0, // row 1
+            30.0, 31.0, 32.0, // row 2
+            40.0, 41.0, 42.0, // row 3
+        ];
+        owner
+            .write_gathered_rows(dst, &src, 3, [3_usize, 0, 2].into_iter())
+            .expect("valid gather");
+        assert_eq!(owner.state(dst).ok(), Some(ResourceState::Committed));
+        assert_eq!(owner.epoch(dst).ok().map(|e| e.get()), Some(1));
+        let mut back = [0.0_f32; 9];
+        owner.read_back(dst, &mut back).expect("read back");
+        assert_eq!(back, [40.0, 41.0, 42.0, 10.0, 11.0, 12.0, 30.0, 31.0, 32.0]);
+
+        // Mark undefined via failed command; out-of-bounds source or destination
+        // gather must fail without marking the buffer defined or bumping epoch.
+        let failed = Err(MetalError::CommandBuffer(CommandBufferState::Error));
+        owner
+            .bind_and_release(&[dst.writes()], &failed)
+            .expect("settle failed command");
+        assert_eq!(owner.state(dst).ok(), Some(ResourceState::Available));
+        assert_eq!(owner.epoch(dst).ok().map(|e| e.get()), Some(2));
+        assert!(
+            owner
+                .write_gathered_rows(dst, &src, 3, [0_usize, 99].into_iter())
+                .is_err(),
+            "out-of-bounds source row refused"
+        );
+        assert!(
+            owner
+                .write_gathered_rows(dst, &src, 3, [0_usize, 1, 2, 3].into_iter())
+                .is_err(),
+            "out-of-bounds destination rows refused"
+        );
+        assert_eq!(owner.state(dst).ok(), Some(ResourceState::Available));
+        assert_eq!(owner.epoch(dst).ok().map(|e| e.get()), Some(2));
+        assert_eq!(owner.usage().write_leases, 0);
     }
 }

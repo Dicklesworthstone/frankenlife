@@ -9809,20 +9809,32 @@ fn decide_batched_flat_f32(
                             "overlap controllers and phase 5-6",
                             || {
                                 if staged {
-                                    device.finish_staged_flat_f32(
+                                    match device.submit_staged_flat_f32(
                                         flat_jobs_ref,
                                         input_width,
                                         flat_in_f32_ref,
-                                        flat_outputs,
-                                    )
+                                    ) {
+                                        Ok(true) => Ok(true),
+                                        Ok(false) => device
+                                            .finish_staged_flat_f32(
+                                                flat_jobs_ref,
+                                                input_width,
+                                                flat_in_f32_ref,
+                                                flat_outputs,
+                                            )
+                                            .map(|()| false),
+                                        Err(error) => Err(error),
+                                    }
                                 } else {
-                                    device.evaluate_flat_f32(
-                                        flat_jobs_ref,
-                                        input_width,
-                                        flat_in_f32_ref,
-                                        flat_in_fin_ref,
-                                        flat_outputs,
-                                    )
+                                    device
+                                        .evaluate_flat_f32(
+                                            flat_jobs_ref,
+                                            input_width,
+                                            flat_in_f32_ref,
+                                            flat_in_fin_ref,
+                                            flat_outputs,
+                                        )
+                                        .map(|()| false)
                                 }
                             },
                             |cpu_workers| {
@@ -9839,7 +9851,15 @@ fn decide_batched_flat_f32(
                                 );
                             },
                         )?;
-                        eval_res
+                        match eval_res {
+                            Ok(true) => device.collect_staged_flat_f32(
+                                flat_jobs_ref,
+                                input_width,
+                                flat_outputs,
+                            ),
+                            Ok(false) => Ok(()),
+                            Err(error) => Err(error),
+                        }
                     }
                     Err(error) => Err(error),
                 }
@@ -10107,20 +10127,32 @@ fn decide_batched_flat_f32(
                         "overlap controllers and phase 5",
                         || {
                             if staged {
-                                device.finish_staged_flat_f32(
+                                match device.submit_staged_flat_f32(
                                     flat_jobs_ref,
                                     input_width,
                                     flat_in_f32_ref,
-                                    flat_outputs,
-                                )
+                                ) {
+                                    Ok(true) => Ok(true),
+                                    Ok(false) => device
+                                        .finish_staged_flat_f32(
+                                            flat_jobs_ref,
+                                            input_width,
+                                            flat_in_f32_ref,
+                                            flat_outputs,
+                                        )
+                                        .map(|()| false),
+                                    Err(error) => Err(error),
+                                }
                             } else {
-                                device.evaluate_flat_f32(
-                                    flat_jobs_ref,
-                                    input_width,
-                                    flat_in_f32_ref,
-                                    flat_in_fin_ref,
-                                    flat_outputs,
-                                )
+                                device
+                                    .evaluate_flat_f32(
+                                        flat_jobs_ref,
+                                        input_width,
+                                        flat_in_f32_ref,
+                                        flat_in_fin_ref,
+                                        flat_outputs,
+                                    )
+                                    .map(|()| false)
                             }
                         },
                         |cpu_workers| {
@@ -10137,7 +10169,13 @@ fn decide_batched_flat_f32(
                             );
                         },
                     )?;
-                    eval_res
+                    match eval_res {
+                        Ok(true) => {
+                            device.collect_staged_flat_f32(flat_jobs_ref, input_width, flat_outputs)
+                        }
+                        Ok(false) => Ok(()),
+                        Err(error) => Err(error),
+                    }
                 }
                 Err(error) => Err(error),
             }

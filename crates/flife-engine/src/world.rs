@@ -8324,8 +8324,8 @@ enum Batched {
 /// randomly thrashing the full multi-plane field.
 const SPATIAL_PASS1_MIN_ROWS: usize = 8_192;
 const SPATIAL_PASS1_MIN_CELLS: u64 = 32_768;
-const SPATIAL_NX: usize = 8;
-const SPATIAL_NY: usize = 8;
+const SPATIAL_NX: usize = 16;
+const SPATIAL_NY: usize = 16;
 const SPATIAL_TILES: usize = SPATIAL_NX * SPATIAL_NY;
 
 /// Per-tile counts produced by [`partition_spatial_tiles`].
@@ -8335,8 +8335,12 @@ struct SpatialPartition {
     total_due: usize,
 }
 
-/// Partition `rows` into 8×8 spatial macro-tiles (`SPATIAL_TILES = 64`),
-/// populating `spatial_tile_offsets`, `spatial_rows` (tile-grouped row indices),
+/// Partition `rows` into 16×16 spatial macro-tiles (`SPATIAL_TILES = 256`),
+/// keeping each tile's `(tile_w + 2) × (tile_h + 2)` halo L2-resident on both
+/// `512²` (`34×34 = 1,156` cells) and `1024²` (`66×66 = 4,356 <= 4,608` cells,
+/// activating fused L2 chemistry + GPU overlap at 400k Screenshot scale) while
+/// preserving exact containment inside `PyramidView`'s `8×4` coarse tiles.
+/// Populates `spatial_tile_offsets`, `spatial_rows` (tile-grouped row indices),
 /// and `row_to_spatial` (identity row -> spatial slot index).
 ///
 /// Returns `Ok(Some(partition))` when every organism's position is finite and
@@ -8397,19 +8401,19 @@ fn partition_spatial_tiles(
                 #[expect(
                     clippy::cast_possible_truncation,
                     clippy::cast_sign_loss,
-                    reason = "0 <= x < width and 0 <= y < height checked above, clamped to 0..8"
+                    reason = "0 <= x < width and 0 <= y < height checked above, clamped to 0..16"
                 )]
                 let tx = ((x * inv_w) as usize).min(SPATIAL_NX - 1);
                 #[expect(
                     clippy::cast_possible_truncation,
                     clippy::cast_sign_loss,
-                    reason = "0 <= x < width and 0 <= y < height checked above, clamped to 0..8"
+                    reason = "0 <= x < width and 0 <= y < height checked above, clamped to 0..16"
                 )]
                 let ty = ((y * inv_h) as usize).min(SPATIAL_NY - 1);
                 let tile = ty * SPATIAL_NX + tx;
                 #[expect(
                     clippy::cast_possible_truncation,
-                    reason = "tile < SPATIAL_TILES (64) <= u32::MAX"
+                    reason = "tile < SPATIAL_TILES (256) <= u32::MAX"
                 )]
                 {
                     *tile_out = tile as u32;

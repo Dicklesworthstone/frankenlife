@@ -537,4 +537,16 @@ fn communication_budget_accounts_for_all_phases_at_screenshot_scale() {
     assert_eq!(est4.len(), 5);
     // Faster interconnects must strictly reduce estimated communication ms.
     assert!(est4[4].total_comm_ms < est4[0].total_comm_ms);
+
+    // Ultra-coarse level clamp: a 4x4 grid split 4x2 (each tile owns 2 cells)
+    // with halo=2 can never report more remote cells than exist outside the tile.
+    let tiny = FieldGrid::new(4, 4, 4.0, 4.0).expect("4x4");
+    let tiny_part = TilePartition::new(tiny, 4, 2).expect("4x2");
+    for t in 0..tiny_part.tile_count() {
+        let owned = tiny_part.bounds(t).expect("bounds").cell_count() as u64;
+        assert!(
+            tiny_part.halo_cells_per_tile(t, 2) <= tiny.cell_count() - owned,
+            "tile {t} halo cells exceeded total remote cells on tiny coarse grid"
+        );
+    }
 }

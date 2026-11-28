@@ -8,18 +8,21 @@
 
 #![forbid(unsafe_code)]
 
+use std::future::Future;
 use std::io::Write;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use flife_cli::{
-    BranchOptions, CheckpointMode, ColorMapping, ControllerChoice, DiscoverOptions, Discovery,
-    ERROR_SCHEMA, EnsembleOptions, EnsembleOutcome, EnsembleStage, Experiment, FieldMapping,
-    Injection, InspectOptions, Introduction, Look, Material, Particles, Persistence, Removal,
-    ResumeOptions, RunOptions, ScheduledCommand, Selection, ShardSpec, Stop, StoreDurability,
-    Style, TransplantOptions, Until, Validation,
+    BranchOptions, CancelToken, CheckpointMode, ColorMapping, ControllerChoice, DiscoverOptions,
+    Discovery, ERROR_SCHEMA, EnsembleOptions, EnsembleOutcome, EnsembleStage, Experiment,
+    FieldMapping, Injection, InspectOptions, Introduction, Look, Material, Particles, Persistence,
+    Removal, ResumeOptions, RunOptions, ScheduledCommand, Selection, ShardSpec, Stop,
+    StoreDurability, Style, TransplantOptions, Until, Validation,
 };
 
 /// `flife discover`'s one record: the [`Discovery`] its bundle's
@@ -975,21 +978,24 @@ fn main() -> ExitCode {
                 Ok(experiment) => experiment,
                 Err(error) => return fail(error.kind(), error.to_string()),
             };
-            match flife_cli::run_ensemble(
-                &experiment,
-                &out,
-                &EnsembleOptions {
-                    cpu_workers,
-                    controllers,
-                    parallel,
-                    shard,
-                    stage,
-                    imports,
-                    report_only,
-                    cancel: None,
-                },
-                print,
-            ) {
+            let outcome = run_with_signal_cancel(|cancel| {
+                flife_cli::run_ensemble(
+                    &experiment,
+                    &out,
+                    &EnsembleOptions {
+                        cpu_workers,
+                        controllers,
+                        parallel,
+                        shard,
+                        stage,
+                        imports,
+                        report_only,
+                        cancel: Some(cancel),
+                    },
+                    print,
+                )
+            });
+            match outcome {
                 Ok(EnsembleOutcome::Complete(_) | EnsembleOutcome::Partial { .. }) => {
                     ExitCode::SUCCESS
                 }
@@ -1221,6 +1227,97 @@ fn capabilities(
         }
         Err(error) => fail(error.kind(), error.to_string()),
     }
+}
+
+/// Run `f` with a [`CancelToken`] triggered cleanly by `SIGINT` or `SIGTERM`
+/// via Asupersync's native signal stream (FL-057), with zero detached threads.
+fn run_with_signal_cancel<T>(f: impl FnOnce(CancelToken) -> T) -> T {
+    struct WakeOnDrop<'a> {
+        done: &'a AtomicBool,
+        wake: &'a asupersync::sync::Notify,
+    }
+    impl Drop for WakeOnDrop<'_> {
+        fn drop(&mut self) {
+            self.done.store(true, Ordering::Release);
+            self.wake.notify_waiters();
+        }
+    }
+
+    let cancel = CancelToken::new();
+    let Ok(rt) = asupersync::runtime::RuntimeBuilder::current_thread().build() else {
+        return f(cancel);
+    };
+    let sig_int = asupersync::signal::signal(asupersync::signal::SignalKind::interrupt()).ok();
+    let sig_term = asupersync::signal::signal(asupersync::signal::SignalKind::terminate()).ok();
+    if sig_int.is_none() && sig_term.is_none() {
+        return f(cancel);
+    }
+    let done = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new(asupersync::sync::Notify::new());
+    let cancel_w = cancel.clone();
+    let done_w = Arc::clone(&done);
+    let wake_w = Arc::clone(&wake);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            rt.block_on(async move {
+                let mut int_active = sig_int.is_some();
+                let mut term_active = sig_term.is_some();
+                let mut sig_int = sig_int;
+                let mut sig_term = sig_term;
+                let mut int_fut = std::pin::pin!(async {
+                    match &mut sig_int {
+                        Some(s) => s.recv().await,
+                        None => None,
+                    }
+                });
+                let mut term_fut = std::pin::pin!(async {
+                    match &mut sig_term {
+                        Some(s) => s.recv().await,
+                        None => None,
+                    }
+                });
+                let mut done_fut = std::pin::pin!(wake_w.notified());
+                std::future::poll_fn(|cx| {
+                    if done_w.load(Ordering::Acquire) {
+                        return std::task::Poll::Ready(());
+                    }
+                    if done_fut.as_mut().poll(cx).is_ready() || done_w.load(Ordering::Acquire) {
+                        return std::task::Poll::Ready(());
+                    }
+                    if int_active {
+                        match int_fut.as_mut().poll(cx) {
+                            std::task::Poll::Ready(Some(())) => {
+                                cancel_w.cancel();
+                                return std::task::Poll::Ready(());
+                            }
+                            std::task::Poll::Ready(None) => int_active = false,
+                            std::task::Poll::Pending => {}
+                        }
+                    }
+                    if term_active {
+                        match term_fut.as_mut().poll(cx) {
+                            std::task::Poll::Ready(Some(())) => {
+                                cancel_w.cancel();
+                                return std::task::Poll::Ready(());
+                            }
+                            std::task::Poll::Ready(None) => term_active = false,
+                            std::task::Poll::Pending => {}
+                        }
+                    }
+                    if !int_active && !term_active {
+                        return std::task::Poll::Ready(());
+                    }
+                    std::task::Poll::Pending
+                })
+                .await;
+            });
+        });
+        let _guard = WakeOnDrop {
+            done: &done,
+            wake: &wake,
+        };
+        f(cancel)
+    })
 }
 
 fn load(path: &PathBuf, overrides: &[FeatureOverride]) -> Result<ValidatedConfig, ExitCode> {

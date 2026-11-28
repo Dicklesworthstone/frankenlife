@@ -688,3 +688,65 @@ fn cpu_reference_spatial_decide_and_fused_chemistry_match_serial_and_hold_footpr
         assert_eq!(parallel.controller_report().batched, 0);
     }
 }
+
+/// A `1024 × 1024` field (Screenshot-scale grid geometry) with `>= 8,192`
+/// organisms uses `16 × 16` spatial macro-tiles (`64 × 64` cells, `66 × 66 =
+/// 4,356 <= 4,608` halo cells) so fused L2 Phase-6 chemistry executes on
+/// `1024²` with zero heap growth and bit-for-bit identical digests to serial
+/// `w = 1`.
+#[test]
+fn screenshot_grid_1024_spatial_fused_chemistry_matches_serial_and_holds_footprint() {
+    let toml = PRESET
+        .replace("grid_width = 128", "grid_width = 1024")
+        .replace("grid_height = 128", "grid_height = 1024")
+        .replace("width = 128.0", "width = 1024.0")
+        .replace("height = 128.0", "height = 1024.0")
+        .replace("initial_count = 4096", "initial_count = 8192")
+        .replace("maximum_count = 16384", "maximum_count = 9216")
+        .replace("hidden_widths = [64, 32]", "hidden_widths = [8]")
+        .replace(
+            "maximum_total_bytes = 2147483648",
+            "maximum_total_bytes = 4294967296",
+        );
+    let cfg = ValidatedConfig::from_toml(&toml).expect("1024^2 spatial config");
+
+    let mut serial = World::found(
+        &cfg,
+        Arrangement::FreeList,
+        NumericalProfile::reference_f32().expect("profile"),
+    )
+    .expect("serial 1024^2 world");
+    let mut parallel = World::found(
+        &cfg,
+        Arrangement::FreeList,
+        NumericalProfile::reference_f32().expect("profile"),
+    )
+    .expect("parallel 1024^2 world");
+    parallel
+        .set_cpu_workers(NonZeroUsize::new(4).expect("4"))
+        .expect("4 workers");
+
+    let founded = parallel.allocated();
+    let bound = parallel.footprint();
+    assert_eq!(founded.field, bound.field);
+    assert_eq!(founded.scratch, bound.scratch);
+
+    for tick in 1..=2 {
+        assert!(matches!(
+            serial.step().expect("serial step"),
+            Stepped::Published(_)
+        ));
+        assert!(matches!(
+            parallel.step().expect("parallel step"),
+            Stepped::Published(_)
+        ));
+        let now = parallel.allocated();
+        assert_eq!(now.field, founded.field, "tick {tick} field grew");
+        assert_eq!(now.scratch, founded.scratch, "tick {tick} scratch grew");
+        assert_eq!(
+            parallel.digest(),
+            serial.digest(),
+            "tick {tick}: 1024x1024 16x16-tile fused chemistry diverged from serial"
+        );
+    }
+}

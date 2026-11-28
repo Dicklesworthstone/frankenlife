@@ -266,10 +266,17 @@ impl TilePartition {
         let w = b.width() as u64;
         let h = b.height() as u64;
         let r = u64::from(halo);
-        // Only axes actually split across devices require remote halo transfers.
+        // Only axes actually split across devices require remote halo transfers,
+        // and no tile can ever receive more unique remote cells than exist
+        // outside its own interior on the grid.
         let hx = if self.tiles_x > 1 { r } else { 0 };
         let hy = if self.tiles_y > 1 { r } else { 0 };
-        (w + 2 * hx) * (h + 2 * hy) - w * h
+        let owned = w.saturating_mul(h);
+        let apron = (w + 2 * hx)
+            .saturating_mul(h + 2 * hy)
+            .saturating_sub(owned);
+        let max_remote = self.grid.cell_count().saturating_sub(owned);
+        apron.min(max_remote)
     }
 }
 
@@ -1510,8 +1517,9 @@ pub struct CommBudgetBreakdown {
     pub devices: usize,
     /// Field transport halo bytes/tick (all devices combined).
     pub transport_halo_bytes: u64,
-    /// Multi-level sensor pyramid halo bytes/tick (`1`-cell halo at every level
-    /// `0..=pyramid_levels` for bilinear derivative sampling).
+    /// Multi-level sensor pyramid halo bytes/tick (`2`-cell halo at every level
+    /// `0..=pyramid_levels` for central-difference derivatives and bilinear
+    /// interpolation).
     pub pyramid_halo_bytes: u64,
     /// Boundary uptake demand + grant + energy-halo bytes/tick.
     pub uptake_boundary_bytes: u64,

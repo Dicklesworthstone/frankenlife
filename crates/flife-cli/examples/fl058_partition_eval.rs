@@ -376,7 +376,7 @@ fn main() {
             planes: FIELD_PLANES,
             substeps: 1,
             halo_mode: HaloMode::PerSubstep,
-            pyramid_levels: 5,
+            pyramid_levels: 4,
             boundary_demand_packets_per_tick: demand_400k,
             boundary_deposit_packets_per_tick: dep_400k,
             migrated_organisms_per_tick: mig_400k,

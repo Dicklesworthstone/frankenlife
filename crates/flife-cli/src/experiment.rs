@@ -2795,12 +2795,12 @@ fn run_stage_supervised(
         });
     }
 
+    let worker_count = options.parallel.get().min(pending.len());
+    let effective_parallel = NonZeroUsize::new(worker_count).unwrap_or(NonZeroUsize::MIN);
     let run_opts = ExperimentOptions {
-        cpu_workers: per_job_workers(options.cpu_workers, options.parallel),
+        cpu_workers: per_job_workers(options.cpu_workers, effective_parallel),
         controllers: options.controllers,
     };
-
-    let worker_count = options.parallel.get().min(pending.len());
     if worker_count <= 1 {
         let mut executed = 0_usize;
         let mut cancelled = 0_usize;
@@ -2864,7 +2864,8 @@ fn run_stage_supervised(
             .map_err(|error| CoreError::MissingCapability {
                 capability: format!("an Asupersync ensemble supervisor runtime: {error}"),
             })?;
-    let (tx, mut rx) = mpsc::channel::<WorkerMsg>(pending.len().max(1));
+    let channel_cap = pending.len().saturating_add(worker_count).max(1);
+    let (tx, mut rx) = mpsc::channel::<WorkerMsg>(channel_cap);
     let queue = Arc::new(Mutex::new(VecDeque::from(pending)));
     let mut executed = 0_usize;
     let mut cancelled = 0_usize;
@@ -2890,7 +2891,7 @@ fn run_stage_supervised(
                     if cancel_worker.load(Ordering::Acquire) {
                         break;
                     }
-                    match run_one_cancellable(
+                    let msg = match run_one_cancellable(
                         experiment,
                         job,
                         runs_dir,
@@ -2898,9 +2899,7 @@ fn run_stage_supervised(
                         host,
                         Some(Arc::clone(&cancel_worker)),
                     ) {
-                        Ok(Some(ran)) => {
-                            let _ = tx_worker.try_send(WorkerMsg::Completed(Box::new(ran)));
-                        }
+                        Ok(Some(ran)) => WorkerMsg::Completed(Box::new(ran)),
                         Ok(None) => {
                             let _ = tx_worker.try_send(WorkerMsg::Cancelled);
                             break;
@@ -2910,6 +2909,10 @@ fn run_stage_supervised(
                             let _ = tx_worker.try_send(WorkerMsg::Error(error));
                             break;
                         }
+                    };
+                    if tx_worker.try_send(msg).is_err() {
+                        cancel_worker.store(true, Ordering::Release);
+                        break;
                     }
                 }
             });

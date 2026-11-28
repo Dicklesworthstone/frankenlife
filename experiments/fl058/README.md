@@ -13,7 +13,7 @@
 The measured evidence establishes both sides cleanly:
 1. **Correctness & wire feasibility are proven (`Observed`):**
    - Exact synchronous 2D spatial domain decomposition reproduces global single-device transport, uptake (including 4-way corner Appendix C.1 ties and `INV-04`), and deposits (`INV-03`) **`0 ULP` bit-for-bit**, with zero stale boundaries (`crates/flife-field/tests/partition_evaluation.rs`, 5/5 passing).
-   - At `400,000` organisms (`1024×1024×33`, `presets/screenshot-world.toml`), synchronous inter-device wire traffic across a `2×2` (`4`-device) partition is **`6.11 MB/tick`** (**`1.53 MB/device/tick`** across `6` barriers/tick) — **`1.87 ms/tick` (`5.6%` of a `30 Hz` tick)** on `10GbE TCP`, **`0.35 ms/tick` (`1.06%`)** on `80Gbps Thunderbolt 5`, **`0.18 ms/tick` (`0.54%`)** on `100GbE RDMA`, and **`0.052 ms/tick` (`0.16%`)** on `400GbE InfiniBand NDR`.
+   - At `400,000` organisms (`1024×1024×33`, `presets/screenshot-world.toml`, `maximum_scale_world_units = 16.0` → `5` pyramid levels `0..=4`), synchronous inter-device wire traffic across a `2×2` (`4`-device) partition is **`6.04 MB/tick`** (**`1.51 MB/device/tick`** across `6` barriers/tick) — **`1.85 ms/tick` (`5.6%` of a `30 Hz` tick)** on `10GbE TCP`, **`0.35 ms/tick` (`1.05%`)** on `80Gbps Thunderbolt 5`, **`0.18 ms/tick` (`0.54%`)** on `100GbE RDMA`, and **`0.052 ms/tick` (`0.15%`)** on `400GbE InfiniBand NDR`.
 2. **Single-device limit is NOT reached at `400k` — and ecological clustering cuts static multi-device speedup nearly in half (`Observed`):**
    - On Apple M5 Ultra (`256 GiB` unified memory), `presets/screenshot-world.toml` (`400k` organisms, `3.995B` independent F16 parameters) uses **`19.71 GiB` peak RSS (`7.7%` of RAM)**, Metal GPU neural sweeps already run at **`14.54 ms/tick` (`68.8 sweeps/s`, `549.4 GB/s`)**, and single-device `transport_on` (`1024×1024×33`) runs in **`5.68 ms/tick`** (`8` workers). The current `6.46 t/s` end-to-end ceiling (`experiments/fl045/README.md`) is host CPU field/sensor/uptake/settle work, **not** single-GPU memory or bandwidth exhaustion.
    - Once ecological selection clusters organisms around moving food sources (`reference-small-world`, tick `512`), a static 2D grid partition exhibits **`1.78×` (`2×2`) to `1.92×` (`4×2`) peak load imbalance**, capping effective `4`-device neural speedup at `~2.2×` unless dynamic load-balanced repartitioning (e.g. orthogonal recursive bisection) is also added.
@@ -75,13 +75,13 @@ On a shared-memory workstation, plane-parallel `transport_on` (`5.68 ms` at `8` 
 | `2×2` (`4`) | `3.04 MB` | `760 KB` | Pyramid halo (`70.3%`) | `1.17 ms` (`3.5%`) | `0.25 ms` (`0.75%`) | `0.11 ms` (`0.34%`) | `0.035 ms` (`0.10%`) | `0.008 ms` |
 | `4×2` (`8`) | `4.57 MB` | `571 KB` | Pyramid halo (`70.6%`) | `1.00 ms` (`3.0%`) | `0.23 ms` (`0.68%`) | `0.098 ms` (`0.29%`) | `0.031 ms` (`0.09%`) | `0.007 ms` |
 
-#### B. `screenshot-world` (`1024×1024×33`, `400k` F16 organisms, `Derived` via `2×` seam-perimeter scaling of `desktop-world` at constant areal density, `6` barriers/tick)
+#### B. `screenshot-world` (`1024×1024×33`, `400k` F16 organisms, `5` pyramid levels `0..=4`, `Derived` via `2×` seam-perimeter scaling of `desktop-world` at constant areal density, `6` barriers/tick)
 
 | Layout (`Devices`) | Total Wire / Tick | Per-Device / Tick | Breakdown (`Trans / Pyr / Upt / Dep / Mig`) | `10GbE TCP` | `80Gbps TB5` | `100GbE RDMA` | `400GbE IB` | `NVLink / UF` |
 |---|---:|---:|---|---:|---:|---:|---:|---:|
-| `2×1` (`2`) | `3.03 MB` | `1.51 MB` | `0.54 / 2.13 / 0.12 / 0.22 / 0.02 MB` | `1.86 ms` (`5.6%`) | `0.35 ms` (`1.06%`) | `0.18 ms` (`0.54%`) | `0.052 ms` (`0.15%`) | `0.010 ms` |
-| `2×2` (`4`) | `6.11 MB` | `1.53 MB` | `1.08 / 4.31 / 0.24 / 0.44 / 0.04 MB` | `1.87 ms` (`5.6%`) | `0.35 ms` (`1.06%`) | `0.18 ms` (`0.54%`) | `0.052 ms` (`0.16%`) | `0.010 ms` |
-| `4×2` (`8`) | `9.17 MB` | `1.15 MB` | `1.63 / 6.49 / 0.34 / 0.63 / 0.08 MB` | `1.52 ms` (`4.6%`) | `0.30 ms` (`0.91%`) | `0.15 ms` (`0.44%`) | `0.043 ms` (`0.13%`) | `0.009 ms` |
+| `2×1` (`2`) | `2.99 MB` | `1.50 MB` | `0.54 / 2.10 / 0.12 / 0.22 / 0.02 MB` | `1.84 ms` (`5.5%`) | `0.35 ms` (`1.05%`) | `0.18 ms` (`0.53%`) | `0.051 ms` (`0.15%`) | `0.010 ms` |
+| `2×2` (`4`) | `6.04 MB` | `1.51 MB` | `1.08 / 4.23 / 0.24 / 0.44 / 0.04 MB` | `1.85 ms` (`5.6%`) | `0.35 ms` (`1.05%`) | `0.18 ms` (`0.54%`) | `0.052 ms` (`0.15%`) | `0.010 ms` |
+| `4×2` (`8`) | `9.05 MB` | `1.13 MB` | `1.63 / 6.37 / 0.34 / 0.63 / 0.08 MB` | `1.51 ms` (`4.5%`) | `0.30 ms` (`0.90%`) | `0.15 ms` (`0.44%`) | `0.043 ms` (`0.13%`) | `0.009 ms` |
 
 *(Percentages show fraction of a `30 t/s` = `33.33 ms` tick budget consumed purely by synchronous inter-device communication.)*
 
@@ -89,6 +89,6 @@ On a shared-memory workstation, plane-parallel `transport_on` (`5.68 ms` at `8` 
 
 ## 4. Architectural Conclusion & Future Crossover Trigger
 
-1. **Key surprise from measurement:** **Sensor-pyramid halos (`70%` of wire traffic)** — not organism genome migration (`< 2%` observed, `< 17%` even at theoretical `v_max`) — dominate multi-device wire bandwidth. Because every coarse level `0..=5` requires a `2`-cell halo across `33` F32 planes for central-difference gradients, pyramid halos cost `~4×` more bytes than field transport halos.
+1. **Key surprise from measurement:** **Sensor-pyramid halos (`70%` of wire traffic)** — not organism genome migration (`< 2%` observed, `< 17%` even at theoretical `v_max`) — dominate multi-device wire bandwidth. Because every coarse level `0..=4` requires a `2`-cell halo across `33` F32 planes for central-difference gradients, pyramid halos cost `~4×` more bytes than field transport halos.
 2. **Immediate engineering priority (do NOT build multi-machine single-world yet):** Single-device M5 Ultra holds `400k` organisms in `7.7%` of RAM and sweeps all `4.0B` independent F16 parameters on Metal in `14.54 ms/tick`. Moving the remaining host CPU field/sensor/uptake/settle phases onto the single GPU closes the gap to `30 t/s` without paying `6` cross-device barriers or `1.8–1.9×` ecological spatial load imbalance.
 3. **Trigger to promote FL-058 to a production distributed single-world backend (plan §24.2):** Revisit only when a concrete experiment requires either **`> 1.5M` live independent organisms (`> 30 GiB` active F16 weights exceeding single-GPU bandwidth at `30 Hz`)** or **memory beyond a single host**, paired with **dynamic spatial load-balancing** (orthogonal recursive bisection) and **`≥ 80 Gbps` RDMA / Thunderbolt 5 / NVLink** interconnects.

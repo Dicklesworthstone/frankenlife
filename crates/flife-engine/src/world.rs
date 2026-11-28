@@ -3206,9 +3206,14 @@ impl World {
                 compositions,
                 packet_compositions,
                 spatial_uptake,
+                working,
+                crowding_counts,
+                from,
                 run_fused_chem: settle_state.backend.is_none(),
                 uptake_result: None,
                 fused_chem_done: false,
+                working_result: None,
+                working_spatial: false,
             });
         let evaluated = decide_with(
             rules,
@@ -3226,12 +3231,19 @@ impl World {
             controllers,
             overlap.as_mut(),
         )?;
-        let (precomputed_uptake, precomputed_fused_chem) = match overlap {
+        let (
+            precomputed_uptake,
+            precomputed_fused_chem,
+            precomputed_working,
+            precomputed_working_spatial,
+        ) = match overlap {
             Some(ov) => (
                 ov.uptake_result,
                 ov.fused_chem_done && !row_to_spatial.is_empty(),
+                ov.working_result,
+                ov.working_spatial,
             ),
-            None => (None, false),
+            None => (None, false, None, false),
         };
         let (sensed, sensed_state, sensed_trail, sensed_crowding, sensed_notch_delta) =
             match watch.organism {
@@ -3276,155 +3288,21 @@ impl World {
             });
         }
         let decision_count = decisions.len();
-        if rows.len() >= 512 && lanes.len() > 1 {
-            let placeholder = Working {
-                committed: CommittedRow::from_organism(&rows[0]),
-                budget: EnergyBudget::new(0.0)?,
-                vitality: Vitality::new(),
-                decision_index: 0,
-                basal_multiplier: 1.0,
-                local_crowding: 0,
-                position: [0.0, 0.0],
-                velocity: [0.0, 0.0],
-                cooldown_deadline: Tick::new(0),
-                secretory_readiness: 0.0,
-                emission_cooldown_deadline: Tick::new(0),
-                emitted: false,
-                emission_paid: 0.0,
-                lysed_residual: 0.0,
-                intent: None,
-            };
-            set_len_reuse(working, rows.len(), placeholder);
-            let tile_count = lanes
-                .len()
-                .saturating_mul(4)
-                .min(64)
-                .min(rows.len().div_ceil(512))
-                .max(1);
-            let tile_len = rows.len().div_ceil(tile_count);
-            struct GatherTile<'a> {
-                start: usize,
-                rows: &'a [Organism],
-                spatial_map: &'a [u32],
-                out: &'a mut [Working],
-            }
-            let mut tiles: Vec<GatherTile<'_>> = rows
-                .chunks(tile_len)
-                .zip(working.chunks_mut(tile_len))
-                .enumerate()
-                .map(|(idx, (row_c, out_c))| {
-                    let start = idx * tile_len;
-                    let end = start + row_c.len();
-                    GatherTile {
-                        start,
-                        rows: row_c,
-                        spatial_map: if spatial_decisions {
-                            &row_to_spatial[start..end]
-                        } else {
-                            &[]
-                        },
-                        out: out_c,
-                    }
-                })
-                .collect();
-            flife_core::pool::try_parallel_tasks(
-                lanes.len(),
-                "gather decisions",
-                &mut tiles,
-                |_, tile| {
-                    let mapped = !tile.spatial_map.is_empty();
-                    for (i, (organism, slot)) in
-                        tile.rows.iter().zip(tile.out.iter_mut()).enumerate()
-                    {
-                        let dec_idx = if mapped {
-                            tile.spatial_map[i]
-                        } else {
-                            #[expect(
-                                clippy::cast_possible_truncation,
-                                reason = "decisions.len() <= u32::MAX checked above"
-                            )]
-                            {
-                                (tile.start + i) as u32
-                            }
-                        };
-                        if (dec_idx as usize) >= decision_count {
-                            return Err(CoreError::StateConflict {
-                                operation: "gather decisions",
-                                detail: format!(
-                                    "decision index {dec_idx} out of bounds for {decision_count}"
-                                ),
-                            });
-                        }
-                        let basal_multiplier =
-                            rules
-                                .v2
-                                .basal_multiplier(organism.birth_tick, from, rules.step)?;
-                        let local_crowding =
-                            crowding_counts.get(tile.start + i).copied().unwrap_or(0);
-                        slot.committed = CommittedRow::from_organism(organism);
-                        slot.budget = EnergyBudget::new(organism.energy)?;
-                        slot.vitality = Vitality::new();
-                        slot.decision_index = dec_idx;
-                        slot.basal_multiplier = basal_multiplier;
-                        slot.local_crowding = local_crowding;
-                        slot.position = organism.position;
-                        slot.velocity = organism.velocity;
-                        slot.cooldown_deadline = organism.cooldown_deadline;
-                        slot.secretory_readiness = organism.secretory_readiness;
-                        slot.emission_cooldown_deadline = organism.emission_cooldown_deadline;
-                        slot.emitted = false;
-                        slot.emission_paid = 0.0;
-                        slot.lysed_residual = 0.0;
-                        slot.intent = None;
-                    }
-                    Ok(())
-                },
-            )?;
+        if precomputed_working_spatial == spatial_decisions
+            && let Some(result) = precomputed_working
+        {
+            result?;
         } else {
-            working.clear();
-            for (row_index, organism) in rows.iter().enumerate() {
-                let dec_idx = if spatial_decisions {
-                    row_to_spatial[row_index]
-                } else {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "decisions.len() <= u32::MAX checked above"
-                    )]
-                    {
-                        row_index as u32
-                    }
-                };
-                if (dec_idx as usize) >= decision_count {
-                    return Err(CoreError::StateConflict {
-                        operation: "gather decisions",
-                        detail: format!(
-                            "decision index {dec_idx} out of bounds for {decision_count}"
-                        ),
-                    });
-                }
-                let basal_multiplier =
-                    rules
-                        .v2
-                        .basal_multiplier(organism.birth_tick, from, rules.step)?;
-                let local_crowding = crowding_counts.get(row_index).copied().unwrap_or(0);
-                working.push(Working {
-                    committed: CommittedRow::from_organism(organism),
-                    budget: EnergyBudget::new(organism.energy)?,
-                    vitality: Vitality::new(),
-                    decision_index: dec_idx,
-                    basal_multiplier,
-                    local_crowding,
-                    position: organism.position,
-                    velocity: organism.velocity,
-                    cooldown_deadline: organism.cooldown_deadline,
-                    secretory_readiness: organism.secretory_readiness,
-                    emission_cooldown_deadline: organism.emission_cooldown_deadline,
-                    emitted: false,
-                    emission_paid: 0.0,
-                    lysed_residual: 0.0,
-                    intent: None,
-                });
-            }
+            gather_working_rows(
+                rules,
+                rows,
+                crowding_counts,
+                row_to_spatial,
+                from,
+                decision_count,
+                working,
+                lanes.len(),
+            )?;
         }
 
         // Phase 5: requests from the observation field, resolved per cell,
@@ -5819,9 +5697,10 @@ fn demands_on_lanes(
     )
 }
 
-/// CPU Phase 5 (uptake + demand grouping) and optional Phase 6 fused spatial
-/// chemistry prepass state that can overlap behind an off-CPU controller
-/// backend (e.g. Metal GPU) because neither depends on Phase 4 decisions.
+/// CPU Phase 5 (uptake + demand grouping), optional Phase 6 fused spatial
+/// chemistry prepass, and Phase 7 `Working` row gathering that can overlap
+/// behind an off-CPU controller backend (e.g. Metal GPU) because none of them
+/// depend on Phase 4 controller outputs.
 struct OverlapPhase56<'a> {
     observed: &'a FieldState,
     demands: &'a mut Vec<Demand>,
@@ -5830,14 +5709,197 @@ struct OverlapPhase56<'a> {
     compositions: &'a mut Vec<[f64; CHANNELS]>,
     packet_compositions: &'a mut Vec<u32>,
     spatial_uptake: &'a mut Vec<(UptakeSettlement, EnergyBudget)>,
+    working: &'a mut Vec<Working>,
+    crowding_counts: &'a [u32],
+    from: Tick,
     run_fused_chem: bool,
     uptake_result: Option<Result<UptakeSummary, CoreError>>,
     fused_chem_done: bool,
+    working_result: Option<Result<(), CoreError>>,
+    working_spatial: bool,
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "runs Phase 5 uptake and optional Phase 6 fused chemistry prepass on CPU while off-CPU controllers execute"
+    clippy::too_many_lines,
+    reason = "initializes Working rows in identity order with spatial or linear decision indices"
+)]
+fn gather_working_rows(
+    rules: &Rules,
+    rows: &[Organism],
+    crowding_counts: &[u32],
+    row_to_spatial: &[u32],
+    from: Tick,
+    decision_count: usize,
+    working: &mut Vec<Working>,
+    workers: usize,
+) -> Result<(), CoreError> {
+    let spatial_decisions = !row_to_spatial.is_empty();
+    if spatial_decisions && row_to_spatial.len() != rows.len() {
+        return Err(CoreError::StateConflict {
+            operation: "gather decisions",
+            detail: format!(
+                "{} spatial decision indices for {} organisms",
+                row_to_spatial.len(),
+                rows.len()
+            ),
+        });
+    }
+    if u32::try_from(decision_count).is_err() {
+        return Err(CoreError::Overflow {
+            quantity: "decision indices",
+        });
+    }
+    if rows.len() >= 512 && workers > 1 {
+        let placeholder = Working {
+            committed: CommittedRow::from_organism(&rows[0]),
+            budget: EnergyBudget::new(0.0)?,
+            vitality: Vitality::new(),
+            decision_index: 0,
+            basal_multiplier: 1.0,
+            local_crowding: 0,
+            position: [0.0, 0.0],
+            velocity: [0.0, 0.0],
+            cooldown_deadline: Tick::new(0),
+            secretory_readiness: 0.0,
+            emission_cooldown_deadline: Tick::new(0),
+            emitted: false,
+            emission_paid: 0.0,
+            lysed_residual: 0.0,
+            intent: None,
+        };
+        set_len_reuse(working, rows.len(), placeholder);
+        let tile_count = workers
+            .saturating_mul(4)
+            .min(64)
+            .min(rows.len().div_ceil(512))
+            .max(1);
+        let tile_len = rows.len().div_ceil(tile_count);
+        struct GatherTile<'a> {
+            start: usize,
+            rows: &'a [Organism],
+            spatial_map: &'a [u32],
+            out: &'a mut [Working],
+        }
+        let mut tiles: Vec<GatherTile<'_>> = rows
+            .chunks(tile_len)
+            .zip(working.chunks_mut(tile_len))
+            .enumerate()
+            .map(|(idx, (row_c, out_c))| {
+                let start = idx * tile_len;
+                let end = start + row_c.len();
+                GatherTile {
+                    start,
+                    rows: row_c,
+                    spatial_map: if spatial_decisions {
+                        &row_to_spatial[start..end]
+                    } else {
+                        &[]
+                    },
+                    out: out_c,
+                }
+            })
+            .collect();
+        flife_core::pool::try_parallel_tasks(
+            workers,
+            "gather decisions",
+            &mut tiles,
+            |_, tile| {
+                let mapped = !tile.spatial_map.is_empty();
+                for (i, (organism, slot)) in tile.rows.iter().zip(tile.out.iter_mut()).enumerate() {
+                    let dec_idx = if mapped {
+                        tile.spatial_map[i]
+                    } else {
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "decision_count <= u32::MAX checked above"
+                        )]
+                        {
+                            (tile.start + i) as u32
+                        }
+                    };
+                    if (dec_idx as usize) >= decision_count {
+                        return Err(CoreError::StateConflict {
+                            operation: "gather decisions",
+                            detail: format!(
+                                "decision index {dec_idx} out of bounds for {decision_count}"
+                            ),
+                        });
+                    }
+                    let basal_multiplier =
+                        rules
+                            .v2
+                            .basal_multiplier(organism.birth_tick, from, rules.step)?;
+                    let local_crowding = crowding_counts.get(tile.start + i).copied().unwrap_or(0);
+                    slot.committed = CommittedRow::from_organism(organism);
+                    slot.budget = EnergyBudget::new(organism.energy)?;
+                    slot.vitality = Vitality::new();
+                    slot.decision_index = dec_idx;
+                    slot.basal_multiplier = basal_multiplier;
+                    slot.local_crowding = local_crowding;
+                    slot.position = organism.position;
+                    slot.velocity = organism.velocity;
+                    slot.cooldown_deadline = organism.cooldown_deadline;
+                    slot.secretory_readiness = organism.secretory_readiness;
+                    slot.emission_cooldown_deadline = organism.emission_cooldown_deadline;
+                    slot.emitted = false;
+                    slot.emission_paid = 0.0;
+                    slot.lysed_residual = 0.0;
+                    slot.intent = None;
+                }
+                Ok(())
+            },
+        )?;
+    } else {
+        working.clear();
+        for (row_index, organism) in rows.iter().enumerate() {
+            let dec_idx = if spatial_decisions {
+                row_to_spatial[row_index]
+            } else {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "decision_count <= u32::MAX checked above"
+                )]
+                {
+                    row_index as u32
+                }
+            };
+            if (dec_idx as usize) >= decision_count {
+                return Err(CoreError::StateConflict {
+                    operation: "gather decisions",
+                    detail: format!("decision index {dec_idx} out of bounds for {decision_count}"),
+                });
+            }
+            let basal_multiplier =
+                rules
+                    .v2
+                    .basal_multiplier(organism.birth_tick, from, rules.step)?;
+            let local_crowding = crowding_counts.get(row_index).copied().unwrap_or(0);
+            working.push(Working {
+                committed: CommittedRow::from_organism(organism),
+                budget: EnergyBudget::new(organism.energy)?,
+                vitality: Vitality::new(),
+                decision_index: dec_idx,
+                basal_multiplier,
+                local_crowding,
+                position: organism.position,
+                velocity: organism.velocity,
+                cooldown_deadline: organism.cooldown_deadline,
+                secretory_readiness: organism.secretory_readiness,
+                emission_cooldown_deadline: organism.emission_cooldown_deadline,
+                emitted: false,
+                emission_paid: 0.0,
+                lysed_residual: 0.0,
+                intent: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "runs Phase 5 uptake, optional Phase 6 fused chemistry prepass, and Phase 7 working row gather on CPU while off-CPU controllers execute"
 )]
 fn run_overlapped_phase56(
     rules: &Rules,
@@ -5896,6 +5958,17 @@ fn run_overlapped_phase56(
             ov.spatial_uptake,
         );
     }
+    ov.working_spatial = !row_to_spatial.is_empty();
+    ov.working_result = Some(gather_working_rows(
+        rules,
+        rows,
+        ov.crowding_counts,
+        row_to_spatial,
+        ov.from,
+        rows.len(),
+        ov.working,
+        cpu_workers,
+    ));
 }
 
 /// The watched organism's observation in the step from `from` to `to`,
@@ -9723,33 +9796,53 @@ fn decide_batched_flat_f32(
                 let flat_jobs_ref: &[FlatControllerJob<'_>] = &flat_jobs;
                 let flat_in_f32_ref: &[f32] = flat_inputs_f32;
                 let flat_in_fin_ref: &[u8] = flat_inputs_finite;
-                let (eval_res, ()) = flife_core::pool::overlap_off_cpu(
-                    worker_budget,
-                    "overlap controllers and phase 5-6",
-                    || {
-                        device.evaluate_flat_f32(
-                            flat_jobs_ref,
-                            input_width,
-                            flat_in_f32_ref,
-                            flat_in_fin_ref,
-                            flat_outputs,
-                        )
-                    },
-                    |cpu_workers| {
-                        run_overlapped_phase56(
-                            rules,
-                            population,
-                            rows,
-                            spatial_rows,
-                            row_to_spatial,
-                            spatial_tile_offsets,
-                            lanes,
-                            cpu_workers,
-                            ov,
-                        );
-                    },
-                )?;
-                eval_res
+                match device.stage_flat_f32(
+                    flat_jobs_ref,
+                    input_width,
+                    flat_in_f32_ref,
+                    flat_in_fin_ref,
+                    flat_outputs,
+                ) {
+                    Ok(staged) => {
+                        let (eval_res, ()) = flife_core::pool::overlap_off_cpu(
+                            worker_budget,
+                            "overlap controllers and phase 5-6",
+                            || {
+                                if staged {
+                                    device.finish_staged_flat_f32(
+                                        flat_jobs_ref,
+                                        input_width,
+                                        flat_in_f32_ref,
+                                        flat_outputs,
+                                    )
+                                } else {
+                                    device.evaluate_flat_f32(
+                                        flat_jobs_ref,
+                                        input_width,
+                                        flat_in_f32_ref,
+                                        flat_in_fin_ref,
+                                        flat_outputs,
+                                    )
+                                }
+                            },
+                            |cpu_workers| {
+                                run_overlapped_phase56(
+                                    rules,
+                                    population,
+                                    rows,
+                                    spatial_rows,
+                                    row_to_spatial,
+                                    spatial_tile_offsets,
+                                    lanes,
+                                    cpu_workers,
+                                    ov,
+                                );
+                            },
+                        )?;
+                        eval_res
+                    }
+                    Err(error) => Err(error),
+                }
             } else {
                 device.evaluate_flat_f32(
                     &flat_jobs,
@@ -10001,33 +10094,53 @@ fn decide_batched_flat_f32(
             let flat_jobs_ref: &[FlatControllerJob<'_>] = &flat_jobs;
             let flat_in_f32_ref: &[f32] = flat_inputs_f32;
             let flat_in_fin_ref: &[u8] = flat_inputs_finite;
-            let (eval_res, ()) = flife_core::pool::overlap_off_cpu(
-                worker_budget,
-                "overlap controllers and phase 5",
-                || {
-                    device.evaluate_flat_f32(
-                        flat_jobs_ref,
-                        input_width,
-                        flat_in_f32_ref,
-                        flat_in_fin_ref,
-                        flat_outputs,
-                    )
-                },
-                |cpu_workers| {
-                    run_overlapped_phase56(
-                        rules,
-                        population,
-                        rows,
-                        spatial_rows,
-                        row_to_spatial,
-                        spatial_tile_offsets,
-                        lanes,
-                        cpu_workers,
-                        ov,
-                    );
-                },
-            )?;
-            eval_res
+            match device.stage_flat_f32(
+                flat_jobs_ref,
+                input_width,
+                flat_in_f32_ref,
+                flat_in_fin_ref,
+                flat_outputs,
+            ) {
+                Ok(staged) => {
+                    let (eval_res, ()) = flife_core::pool::overlap_off_cpu(
+                        worker_budget,
+                        "overlap controllers and phase 5",
+                        || {
+                            if staged {
+                                device.finish_staged_flat_f32(
+                                    flat_jobs_ref,
+                                    input_width,
+                                    flat_in_f32_ref,
+                                    flat_outputs,
+                                )
+                            } else {
+                                device.evaluate_flat_f32(
+                                    flat_jobs_ref,
+                                    input_width,
+                                    flat_in_f32_ref,
+                                    flat_in_fin_ref,
+                                    flat_outputs,
+                                )
+                            }
+                        },
+                        |cpu_workers| {
+                            run_overlapped_phase56(
+                                rules,
+                                population,
+                                rows,
+                                spatial_rows,
+                                row_to_spatial,
+                                spatial_tile_offsets,
+                                lanes,
+                                cpu_workers,
+                                ov,
+                            );
+                        },
+                    )?;
+                    eval_res
+                }
+                Err(error) => Err(error),
+            }
         } else {
             device.evaluate_flat_f32(
                 &flat_jobs,

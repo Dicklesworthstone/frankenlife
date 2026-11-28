@@ -1937,3 +1937,332 @@ fn parallel_place_and_stage_matches_serial_across_steady_newborns_and_fallback()
     assert_eq!(parallel.resident_genomes(), serial.resident_genomes());
     Ok(())
 }
+
+#[test]
+fn stage_and_finish_flat_f32_matches_evaluate_bit_for_bit_across_shards() -> Result<(), CoreError> {
+    let Some(mut direct) = backend(128) else {
+        return Ok(());
+    };
+    let Some(mut split) = backend(128) else {
+        return Ok(());
+    };
+    split.set_staging_workers(std::num::NonZeroUsize::new(4).expect("nonzero"));
+    direct.set_staging_workers(std::num::NonZeroUsize::new(4).expect("nonzero"));
+
+    let topology = DenseTopology::new(&[16])?;
+    let topologies = [topology];
+    // 520 slots across 5 shards (128 slots/shard) exercises parallel shard job upload.
+    let raw_cases = cases(&topologies, 520);
+    let legacy_jobs = jobs(&topologies, &raw_cases, 0);
+    let flat_jobs: Vec<FlatControllerJob<'_>> = legacy_jobs
+        .iter()
+        .map(|job| FlatControllerJob {
+            genome: job.genome,
+            slot: job.slot,
+            controller: job.controller,
+        })
+        .collect();
+    let inputs_f32: Vec<f32> = legacy_jobs
+        .iter()
+        .flat_map(|job| job.inputs.iter().map(|&v| v as f32))
+        .collect();
+    let all_finite = vec![1_u8; flat_jobs.len()];
+
+    let mut out_direct = FlatOutputs::default();
+    let mut out_split = FlatOutputs::default();
+
+    // 1. Cold-start multi-shard upload + steady-state full dispatch.
+    for round in 0..2 {
+        direct.evaluate_flat_f32(
+            &flat_jobs,
+            SENSOR_WIDTH,
+            &inputs_f32,
+            &all_finite,
+            &mut out_direct,
+        )?;
+        assert!(split.stage_flat_f32(
+            &flat_jobs,
+            SENSOR_WIDTH,
+            &inputs_f32,
+            &all_finite,
+            &mut out_split,
+        )?);
+        split.finish_staged_flat_f32(&flat_jobs, SENSOR_WIDTH, &inputs_f32, &mut out_split)?;
+        assert_eq!(out_split.output_width, out_direct.output_width);
+        assert_eq!(out_split.valid, out_direct.valid, "round {round} valid");
+        let direct_bits: Vec<u32> = out_direct.values.iter().map(|v| v.to_bits()).collect();
+        let split_bits: Vec<u32> = out_split.values.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(split_bits, direct_bits, "round {round} bits");
+    }
+    assert_eq!(split.shards(), 5);
+    assert_eq!(split.uploads(), direct.uploads());
+
+    // 2. Partial nonfinite deferral via split stage/finish path.
+    let mut partial_finite = all_finite.clone();
+    partial_finite[0] = 0;
+    partial_finite[255] = 0;
+    partial_finite[519] = 0;
+    direct.evaluate_flat_f32(
+        &flat_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &partial_finite,
+        &mut out_direct,
+    )?;
+    assert!(split.stage_flat_f32(
+        &flat_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &partial_finite,
+        &mut out_split,
+    )?);
+    split.finish_staged_flat_f32(&flat_jobs, SENSOR_WIDTH, &inputs_f32, &mut out_split)?;
+    assert_eq!(out_split.valid, out_direct.valid);
+    for idx in 0..flat_jobs.len() {
+        let got = out_split
+            .row(idx)
+            .map(|r| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        let want = out_direct
+            .row(idx)
+            .map(|r| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(got, want, "partial row {idx}");
+    }
+
+    // 3. Invalid transitions must fail cleanly and clear outputs:
+    //    (a) finish without preceding stage
+    assert!(matches!(
+        split.finish_staged_flat_f32(&flat_jobs, SENSOR_WIDTH, &inputs_f32, &mut out_split),
+        Err(CoreError::StateConflict { .. })
+    ));
+    assert!(out_split.valid.is_empty());
+
+    //    (b) release_slots invalidates a pending staged batch
+    assert!(split.stage_flat_f32(
+        &flat_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &all_finite,
+        &mut out_split,
+    )?);
+    split.release_slots(&[flat_jobs[0].slot]);
+    assert!(matches!(
+        split.finish_staged_flat_f32(&flat_jobs, SENSOR_WIDTH, &inputs_f32, &mut out_split),
+        Err(CoreError::StateConflict { .. })
+    ));
+    assert!(out_split.valid.is_empty());
+
+    //    (c) forget invalidates a pending staged batch
+    assert!(split.stage_flat_f32(
+        &flat_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &all_finite,
+        &mut out_split,
+    )?);
+    split.forget();
+    assert!(matches!(
+        split.finish_staged_flat_f32(&flat_jobs, SENSOR_WIDTH, &inputs_f32, &mut out_split),
+        Err(CoreError::StateConflict { .. })
+    ));
+    assert!(out_split.valid.is_empty());
+    Ok(())
+}
+
+#[test]
+fn per_shard_parallel_io_matches_single_worker_bit_for_bit_and_transitions_cleanly()
+-> Result<(), CoreError> {
+    // 16,384 jobs across 4 shards (4,096 slots/shard) activates the per-shard
+    // parallel I/O fast path on multi-worker `stage_flat_f32` while `serial`
+    // (`staging_workers = 1`) uses global I/O staging.
+    let Some(mut serial) = backend(4_096) else {
+        return Ok(());
+    };
+    let Some(mut parallel) = backend(4_096) else {
+        return Ok(());
+    };
+    serial.set_staging_workers(std::num::NonZeroUsize::new(1).expect("nonzero"));
+    parallel.set_staging_workers(std::num::NonZeroUsize::new(4).expect("nonzero"));
+
+    let topology = DenseTopology::new(&[8])?;
+    let topologies = [topology];
+    let raw_cases = cases(&topologies, 16_384);
+    let legacy_jobs = jobs(&topologies, &raw_cases, 0);
+    let flat_jobs: Vec<FlatControllerJob<'_>> = legacy_jobs
+        .iter()
+        .map(|job| FlatControllerJob {
+            genome: job.genome,
+            slot: job.slot,
+            controller: job.controller,
+        })
+        .collect();
+    let inputs_f32: Vec<f32> = legacy_jobs
+        .iter()
+        .flat_map(|job| job.inputs.iter().map(|&v| v as f32))
+        .collect();
+    let all_finite = vec![1_u8; flat_jobs.len()];
+    let mut out_serial = FlatOutputs::default();
+    let mut out_parallel = FlatOutputs::default();
+
+    // 1. Cold upload + steady-state full dispatch (exercises per-shard parallel I/O).
+    for round in 0..2 {
+        serial.evaluate_flat_f32(
+            &flat_jobs,
+            SENSOR_WIDTH,
+            &inputs_f32,
+            &all_finite,
+            &mut out_serial,
+        )?;
+        assert!(parallel.stage_flat_f32(
+            &flat_jobs,
+            SENSOR_WIDTH,
+            &inputs_f32,
+            &all_finite,
+            &mut out_parallel,
+        )?);
+        parallel.finish_staged_flat_f32(
+            &flat_jobs,
+            SENSOR_WIDTH,
+            &inputs_f32,
+            &mut out_parallel,
+        )?;
+        assert_eq!(out_parallel.valid, out_serial.valid, "round {round}");
+        let s_bits: Vec<u32> = out_serial.values.iter().map(|v| v.to_bits()).collect();
+        let p_bits: Vec<u32> = out_parallel.values.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(p_bits, s_bits, "round {round} bits");
+    }
+    assert_eq!(parallel.shards(), 4);
+    assert!(
+        parallel.owner().usage().bytes <= serial.owner().usage().bytes,
+        "per-shard device I/O ({}) must not exceed global device I/O ({})",
+        parallel.owner().usage().bytes,
+        serial.owner().usage().bytes,
+    );
+
+    // 2. Transition from per-shard I/O -> nonfinite global I/O -> back to per-shard I/O.
+    let mut partial_finite = all_finite.clone();
+    partial_finite[0] = 0;
+    partial_finite[8_192] = 0;
+    serial.evaluate_flat_f32(
+        &flat_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &partial_finite,
+        &mut out_serial,
+    )?;
+    assert!(parallel.stage_flat_f32(
+        &flat_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &partial_finite,
+        &mut out_parallel,
+    )?);
+    parallel.finish_staged_flat_f32(&flat_jobs, SENSOR_WIDTH, &inputs_f32, &mut out_parallel)?;
+    assert_eq!(out_parallel.valid, out_serial.valid);
+    for idx in [0_usize, 1, 4_096, 8_192, 16_383] {
+        let got = out_parallel
+            .row(idx)
+            .map(|r| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        let want = out_serial
+            .row(idx)
+            .map(|r| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(got, want, "partial row {idx}");
+    }
+
+    // Back to per-shard full dispatch after global fallback.
+    serial.evaluate_flat_f32(
+        &flat_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &all_finite,
+        &mut out_serial,
+    )?;
+    assert!(parallel.stage_flat_f32(
+        &flat_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &all_finite,
+        &mut out_parallel,
+    )?);
+    parallel.finish_staged_flat_f32(&flat_jobs, SENSOR_WIDTH, &inputs_f32, &mut out_parallel)?;
+    let s_bits: Vec<u32> = out_serial.values.iter().map(|v| v.to_bits()).collect();
+    let p_bits: Vec<u32> = out_parallel.values.iter().map(|v| v.to_bits()).collect();
+    assert_eq!(p_bits, s_bits, "return to per-shard I/O");
+
+    // 3. Tight BackendBudget enforcement:
+    //    (a) With budget tight enough to force partial shard deferral, every
+    //        dispatched row matches `serial` bit-for-bit and `resident_bytes()`
+    //        stays strictly within `budget.bytes`.
+    let partial_budget = BackendBudget {
+        bytes: serial.resident_bytes() + 1_024 * 1_024,
+        organisms: 16_384,
+    };
+    let Some(mut partial_bounded) = MetalBackend::with_budget(4_096, partial_budget).ok() else {
+        return Ok(());
+    };
+    partial_bounded.set_staging_workers(std::num::NonZeroUsize::new(4).expect("nonzero"));
+    let mut out_partial = FlatOutputs::default();
+    assert!(partial_bounded.stage_flat_f32(
+        &flat_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &all_finite,
+        &mut out_partial,
+    )?);
+    partial_bounded.finish_staged_flat_f32(
+        &flat_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &mut out_partial,
+    )?;
+    assert!(
+        partial_bounded.resident_bytes() <= partial_bounded.budget().bytes,
+        "partial resident_bytes {} exceeded tight budget {}",
+        partial_bounded.resident_bytes(),
+        partial_bounded.budget().bytes
+    );
+    let mut matched_rows = 0_usize;
+    for idx in 0..flat_jobs.len() {
+        if let Some(got) = out_partial.row(idx) {
+            let want = out_serial.row(idx).expect("serial valid");
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "tight-budget dispatched row {idx}"
+            );
+            matched_rows += 1;
+        }
+    }
+    assert!(matched_rows > 0, "expected at least one shard admitted");
+
+    //    (b) With full-4-shard budget (`serial.resident_bytes() + staging_bytes`),
+    //        all 4 shards admit, `resident_bytes() <= budget.bytes` holds, and
+    //        every one of the 16,384 rows matches `serial` bit-for-bit.
+    let full_budget = BackendBudget {
+        bytes: serial.resident_bytes() + flife_backend_metal::staging_bytes(16_384, 4),
+        organisms: 16_384,
+    };
+    let Some(mut full_bounded) = MetalBackend::with_budget(4_096, full_budget).ok() else {
+        return Ok(());
+    };
+    full_bounded.set_staging_workers(std::num::NonZeroUsize::new(4).expect("nonzero"));
+    let mut out_bounded = FlatOutputs::default();
+    assert!(full_bounded.stage_flat_f32(
+        &flat_jobs,
+        SENSOR_WIDTH,
+        &inputs_f32,
+        &all_finite,
+        &mut out_bounded,
+    )?);
+    full_bounded.finish_staged_flat_f32(&flat_jobs, SENSOR_WIDTH, &inputs_f32, &mut out_bounded)?;
+    assert!(full_bounded.shards() >= 4);
+    assert!(
+        full_bounded.resident_bytes() <= full_bounded.budget().bytes,
+        "resident_bytes {} exceeded full budget {}",
+        full_bounded.resident_bytes(),
+        full_bounded.budget().bytes
+    );
+    assert_eq!(out_bounded.valid, out_serial.valid);
+    let b_bits: Vec<u32> = out_bounded.values.iter().map(|v| v.to_bits()).collect();
+    assert_eq!(b_bits, s_bits, "full-budget bit parity");
+    Ok(())
+}

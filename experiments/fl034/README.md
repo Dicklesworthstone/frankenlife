@@ -300,10 +300,11 @@ The tick-8,941 checkpoint, branched and resumed headless with CPU controllers by
 So the Metal controllers keep parity while the renderer shares the GPU, and presentation leaves the world
 unchanged (plan §7.5).
 
-Three engine commits came after these builds, all on 2026-11-27: commit:cdd7209 restructures the per-packet
-chemistry, commit:8ccced1 cuts the spatial chemistry into 16 × 16 tiles instead of 8 × 8, and commit:09082ba splits
-the Metal backend's staging and uploads its shards in parallel. Each run below has its tallies equal to the rows
-above at every 1,024 ticks (Interactive) or 256 ticks (Desktop):
+Four engine commits came after these builds, all on 2026-11-27: commit:cdd7209 restructures the per-packet
+chemistry, commit:8ccced1 cuts the spatial chemistry into 16 × 16 tiles instead of 8 × 8, commit:09082ba splits
+the Metal backend's staging and uploads its shards in parallel, and commit:d1e1df3 changes the worker pool's
+wakeups, the deposit and the bins and fuses single-substep transport. Each run below has its tallies equal to the
+rows above at every 1,024 ticks (Interactive) or 256 ticks (Desktop):
 
 - A release `flife` built at 17:23, after cdd7209, ends the Interactive world at `595e2d90…3167b` with CPU
   controllers on 16 workers.
@@ -311,8 +312,16 @@ above at every 1,024 ticks (Interactive) or 256 ticks (Desktop):
   world there with Metal and with CPU controllers, and the Desktop world at `4f7f1cf1…e7e8c9` with Metal
   controllers, all on 16 workers (20:28–20:49, load averages 107 to 261). That Desktop run also gives the Metal row
   a build whose revision is known.
+- A release `flife` built at 20:42 from d1e1df3's simulation sources (sha256 `8e20b60b…`) gives the same results
+  in the same three runs (20:50–21:07, load averages 106 to 220). With CPU controllers on 8 workers it ends both
+  worlds there too (`check-evolved-worlds.sh`, below; 21:07–21:37).
 
-No simulation crate changed from 09082ba to commit:8df5da3.
+No simulation crate changed from d1e1df3 to commit:5c2d386.
+
+To check another build, `experiments/fl034/check-evolved-worlds.sh FLIFE OUT_DIR [CONTROLLERS] [WORKERS]` runs
+both worlds for 8,192 ticks and compares them with these rows checkpoint by checkpoint. It prints EQUAL, or the
+first checkpoint where a world parts. A short probe misses such changes: d8a88aa's cone contraction left the
+Interactive world unchanged through tick 4,135.
 
 # FL-034 G6: the two profiles in a window (to run)
 

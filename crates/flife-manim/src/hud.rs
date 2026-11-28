@@ -17,16 +17,19 @@
 //! from drawable pixels ([`hud_scene_point`]), so the text keeps its place
 //! and size on screen whatever the pan or zoom.
 
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::{Mutex, PoisonError};
 
 use flife_core::CoreError;
 use fmn_core::color::LinearRgba;
 use fmn_core::types::Vec3;
 use fmn_geom::earclip::triangulate;
 use fmn_render::{SurfaceMesh, SurfaceVertex};
+use fmn_text::font::FaceKey;
 use fmn_text::layout::layout_text_with_style;
 use fmn_text::markup::CharStyle;
-use fmn_text::{FontBook, SANS_FAMILY, TextRequest, glyph_quadpath};
+use fmn_text::{FontBook, PlacedTextGlyph, SANS_FAMILY, TextRequest, glyph_quadpath};
 
 use crate::Viewport;
 
@@ -96,7 +99,43 @@ pub const HUD_MAX_SWATCHES: usize = 32;
 /// FrankenManim's bundled font book, loaded once.
 pub struct HudFont {
     book: FontBook,
+    /// The ink of each glyph the last text set, by everything it depends
+    /// on. The Studio sets its overlay again every frame and most of it is
+    /// unchanged (only the tick and the clock move), so a glyph at the same
+    /// place and em is not outlined and triangulated again: the memo gives
+    /// the same rings and triangles a fresh outline would. It holds only the
+    /// last text's glyphs.
+    inks: Mutex<HashMap<GlyphKey, GlyphInk>>,
 }
+
+/// What a glyph's flattened rings and triangles depend on: its face, glyph
+/// and character ([`glyph_quadpath`]), its placement and size, and the
+/// block's top and em ([`HudFont::text_with_swatches`]'s `place`), the
+/// numbers by their bits.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GlyphKey {
+    family: String,
+    face: FaceKey,
+    gid: u16,
+    ch: char,
+    bits: [u64; 5],
+}
+
+impl GlyphKey {
+    fn new(glyph: &PlacedTextGlyph, top: f64, em_pixels: f64) -> Self {
+        Self {
+            family: glyph.face.family.clone(),
+            face: glyph.face.key,
+            gid: glyph.gid,
+            ch: glyph.ch,
+            bits: [glyph.x, glyph.y, glyph.size, top, em_pixels].map(f64::to_bits),
+        }
+    }
+}
+
+/// A glyph's rings, in drawable pixels, and their triangles; `None` when
+/// the glyph is refused (no outline, or no triangulation).
+type GlyphInk = Option<(Vec<Vec<[f64; 2]>>, Vec<[u32; 3]>)>;
 
 impl std::fmt::Debug for HudFont {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -131,7 +170,10 @@ impl HudFont {
         let book = FontBook::bundled().map_err(|error| CoreError::MissingCapability {
             capability: format!("FrankenManim's bundled fonts: {error}"),
         })?;
-        Ok(Self { book })
+        Ok(Self {
+            book,
+            inks: Mutex::new(HashMap::new()),
+        })
     }
 
     /// `text`'s lines (`\n` breaks them) at an em of `em_pixels` drawable
@@ -196,6 +238,10 @@ impl HudFont {
         let mut ink = [0.0_f64, 0.0];
         let mut scratch = Vec::new();
         let mut colors = swatches.iter().take(HUD_MAX_SWATCHES);
+        // The last text's inks; this text's replace them once it is set.
+        let mut last =
+            std::mem::take(&mut *self.inks.lock().unwrap_or_else(PoisonError::into_inner));
+        let mut inks = HashMap::with_capacity(layout.glyphs.len());
         for (index, glyph) in layout.glyphs.iter().enumerate() {
             if glyph.ch.is_whitespace() {
                 continue;
@@ -206,27 +252,12 @@ impl HudFont {
             } else {
                 None
             };
-            let Ok(path) = glyph_quadpath(&self.book, glyph) else {
-                out.refused += 1;
-                continue;
+            let key = GlyphKey::new(glyph, top, em_pixels);
+            let glyph_ink = match last.remove(&key) {
+                Some(memo) => memo,
+                None => self.glyph_ink(glyph, &place, &mut scratch, em_pixels)?,
             };
-            let rings: Vec<Vec<[f64; 2]>> = path
-                .subpaths()
-                .into_iter()
-                .map(|subpath| flatten_subpath(subpath, &place, &mut scratch))
-                .filter(|ring| ring.len() >= 3)
-                .collect();
-            if rings
-                .iter()
-                .flatten()
-                .any(|vertex| !vertex[0].is_finite() || !vertex[1].is_finite())
-            {
-                return Err(CoreError::NumericalInvalid {
-                    quantity: "overlay em",
-                    detail: format!("{em_pixels} drawable pixels overflows glyph coordinates"),
-                });
-            }
-            let Some(triangles) = triangulate_rings(&rings) else {
+            let Some((rings, triangles)) = &*inks.entry(key).or_insert(glyph_ink) else {
                 out.refused += 1;
                 continue;
             };
@@ -246,7 +277,7 @@ impl HudFont {
                 out.swatches
                     .push((out.vertices.len()..out.vertices.len() + vertices, color));
             }
-            for ring in &rings {
+            for ring in rings {
                 let start = out.vertices.len();
                 for &vertex in ring {
                     ink = [ink[0].max(vertex[0]), ink[1].max(vertex[1])];
@@ -261,6 +292,7 @@ impl HudFont {
             );
             out.glyphs += 1;
         }
+        *self.inks.lock().unwrap_or_else(PoisonError::into_inner) = inks;
         out.size = [
             (layout.width * em_pixels).max(ink[0]),
             ((layout.height + layout.depth) * em_pixels).max(ink[1]),
@@ -272,6 +304,51 @@ impl HudFont {
             });
         }
         Ok(out)
+    }
+
+    /// `glyph`'s outline flattened at `place` into rings of at least three
+    /// vertices, and their triangles; `None` when the glyph has no outline
+    /// or its rings do not triangulate (a refused glyph).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] when a vertex is not finite: an em
+    /// too large for the glyph's coordinates.
+    fn glyph_ink(
+        &self,
+        glyph: &PlacedTextGlyph,
+        place: &impl Fn(Vec3) -> [f64; 2],
+        scratch: &mut Vec<[f64; 2]>,
+        em_pixels: f64,
+    ) -> Result<GlyphInk, CoreError> {
+        let Ok(path) = glyph_quadpath(&self.book, glyph) else {
+            return Ok(None);
+        };
+        let rings: Vec<Vec<[f64; 2]>> = path
+            .subpaths()
+            .into_iter()
+            .map(|subpath| flatten_subpath(subpath, place, scratch))
+            .filter(|ring| ring.len() >= 3)
+            .collect();
+        if rings
+            .iter()
+            .flatten()
+            .any(|vertex| !vertex[0].is_finite() || !vertex[1].is_finite())
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "overlay em",
+                detail: format!("{em_pixels} drawable pixels overflows glyph coordinates"),
+            });
+        }
+        Ok(triangulate_rings(&rings).map(|triangles| (rings, triangles)))
+    }
+
+    /// The glyphs the memo holds: the last text's.
+    #[cfg(test)]
+    fn inks_held(&self) -> usize {
+        self.inks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 }
 
@@ -631,4 +708,62 @@ pub fn hud_glyphs(viewport: &Viewport, text: &HudText) -> Result<Option<SurfaceM
     let mut indices = reserve("overlay glyph indices", 3 * text.triangles.len())?;
     indices.extend(text.triangles.iter().flatten());
     mesh(vertices, indices, "overlay glyphs").map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An overlay as the Studio sets one each frame: the tick and the frame
+    /// rate move, the rest stays.
+    fn frame_text(tick: &str, fps: u32) -> String {
+        format!(
+            "running · tick {tick}\n21.3 ticks/s · 0.71× real time · {fps} fps\n\
+             {HUD_SWATCH} lineage  {HUD_SWATCH} energy"
+        )
+    }
+
+    #[test]
+    fn a_text_set_from_the_memo_is_the_text_set_fresh() {
+        let warm = HudFont::bundled().expect("bundled fonts");
+        let swatches = [LinearRgba {
+            r: 0.9,
+            g: 0.2,
+            b: 0.1,
+            a: 1.0,
+        }];
+        let frames = [
+            ("10,112", 19, 26.0),
+            ("10,113", 19, 26.0),
+            ("10,113", 20, 26.0),
+            ("9", 20, 26.0),
+            ("10,113", 19, 26.0),
+            // Another em places every glyph again.
+            ("10,113", 19, 13.0),
+        ];
+        for (tick, fps, em) in frames {
+            let text = frame_text(tick, fps);
+            let fresh = HudFont::bundled()
+                .expect("bundled fonts")
+                .text_with_swatches(&text, em, &swatches)
+                .expect("set fresh");
+            let memo = warm
+                .text_with_swatches(&text, em, &swatches)
+                .expect("set from the memo");
+            assert_eq!(memo, fresh, "{text:?} at {em}");
+            assert!(fresh.glyphs() > 40 && fresh.refused() == 0 && fresh.left_out() == 0);
+            // Only this text's glyphs are held.
+            assert_eq!(warm.inks_held(), fresh.glyphs(), "{text:?} at {em}");
+        }
+    }
+
+    #[test]
+    fn an_empty_text_leaves_the_memo() {
+        let font = HudFont::bundled().expect("bundled fonts");
+        let text = font.text(&frame_text("1", 30), 26.0).expect("set");
+        let held = font.inks_held();
+        assert_eq!(held, text.glyphs());
+        assert!(font.text(" \n ", 26.0).expect("set").is_empty());
+        assert_eq!(font.inks_held(), held);
+    }
 }

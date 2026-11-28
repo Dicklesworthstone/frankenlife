@@ -281,9 +281,29 @@ typedef struct FlifeParityResult {
 } FlifeParityResult;
 
 /* =========================================================================
+ * Pause Status (read without a new epoch: a paused world publishes none)
+ * ========================================================================= */
+
+typedef struct FlifePauseStatus {
+    bool is_playing;
+    bool is_capacity_paused;
+    /* The last step was refused: the device had `available_bytes` free and the
+     * step needs `needed_bytes` (its births staging and reserve, plan §19.4). */
+    bool is_memory_short;
+    uint64_t available_bytes;
+    uint64_t needed_bytes;
+} FlifePauseStatus;
+
+/* =========================================================================
  * Session Lifecycle & Simulation Controls
  * ========================================================================= */
 
+/* Founds the world and admits it under its configuration's memory budget
+ * (FL-043, as `flife run` does). Fails, with the reason in `err_buf`, when the
+ * budget is exceeded or when the device (os_proc_available_memory) has less
+ * free than one step needs. The Metal backend holds at most the admission's
+ * backend term and leaves the device a step's memory; a shard that does not
+ * fit is evaluated on the reference, which gives the same bits. */
 FlifeSession *flife_session_create(
     const char *config_toml,
     const FlifeMetalVtable *metal_opt,
@@ -299,6 +319,13 @@ void flife_session_set_playing(FlifeSession *session, bool playing);
 bool flife_session_pause_and_quiesce(FlifeSession *session, uint32_t timeout_ms);
 void flife_session_step_once(FlifeSession *session);
 void flife_session_set_target_tps(FlifeSession *session, double target_tps);
+/* A step the device cannot hold is not taken: the world pauses at that
+ * unchanged boundary (is_capacity_paused and is_memory_short) until played or
+ * stepped again, when the check is made afresh. */
+bool flife_session_pause_status(FlifeSession *session, FlifePauseStatus *out_status);
+/* For tests: report `bytes` as the memory the device leaves this process, in
+ * place of os_proc_available_memory; 0 restores the platform's figure. */
+void flife_set_available_memory_override(uint64_t bytes);
 
 /* Zero-copy latest epoch acquisition (returns NULL if no newer epoch than last_seen_epoch_id). */
 FlifeEpochHandle *flife_session_acquire_latest_epoch(
@@ -342,7 +369,10 @@ bool flife_session_remove_organisms(
     uint32_t disposition
 );
 
-/* Pure read-only inspection, watch, follow, and region measurement (INV-09). */
+/* Pure read-only inspection, watch, follow, and region measurement (INV-09).
+ * `flife_session_inspect_organism` returns `true` when the worker answered the
+ * query (inspect `out_info->found` to distinguish alive vs dead/absent) and
+ * `false` only on invalid input, shutdown, or query timeout. */
 bool flife_session_inspect_organism(
     FlifeSession *session,
     uint64_t organism_id,

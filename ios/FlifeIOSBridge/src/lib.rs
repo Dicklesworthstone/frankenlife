@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use flife_core::binary16::F16;
 use flife_core::ids::{GenomeId, OrganismId, RenderEpoch};
+use flife_core::memory::MemoryAdmission;
 use flife_core::pool;
 use flife_core::{CoreError, RunConfig, V2Feature, validate};
 use flife_engine::{
@@ -52,6 +53,75 @@ const fn forward_threads(widest_hidden: usize) -> u32 {
         FORWARD_THREADS_COMPACT
     } else {
         FORWARD_THREADS_WIDE
+    }
+}
+
+/* =========================================================================
+ * Device Memory (plan §19.4: "Use device memory limits and actual
+ * allocation results. On unified-memory systems, CPU and GPU allocations
+ * compete with the operating system and other applications.")
+ * ========================================================================= */
+
+const MIB: u64 = 1 << 20;
+
+/// The figure a test reports in place of the platform's
+/// ([`flife_set_available_memory_override`]); zero when none.
+static AVAILABLE_MEMORY_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "ios")]
+unsafe extern "C" {
+    /// `<os/proc.h>` (iOS 13+): the bytes this process can still allocate
+    /// before iOS ends it; zero where no limit applies.
+    fn os_proc_available_memory() -> usize;
+}
+
+/// The bytes this process can still allocate before the OS ends it, or
+/// `None` where the platform gives no figure.
+fn available_memory() -> Option<u64> {
+    let forced = AVAILABLE_MEMORY_OVERRIDE.load(Ordering::Relaxed);
+    if forced != 0 {
+        return Some(forced);
+    }
+    #[cfg(target_os = "ios")]
+    {
+        // SAFETY: a libSystem query with no arguments or preconditions.
+        let bytes = unsafe { os_proc_available_memory() };
+        if bytes != 0 {
+            return Some(u64::try_from(bytes).unwrap_or(u64::MAX));
+        }
+    }
+    None
+}
+
+/// A device with less memory free than a step needs.
+#[derive(Debug, Clone, Copy)]
+struct Shortfall {
+    available: u64,
+    needed: u64,
+}
+
+/// What a world must find free on the device before it takes a step: its
+/// admission's births term (what one step holds while it runs) and its
+/// reserve.
+#[derive(Debug, Clone, Copy)]
+struct DeviceFloor {
+    bytes: u64,
+}
+
+impl DeviceFloor {
+    fn of(admission: &MemoryAdmission) -> Self {
+        Self {
+            bytes: admission.births.saturating_add(admission.reserve),
+        }
+    }
+
+    /// The shortfall when the device has less free than this floor and
+    /// `extra` bytes; `None` when it has enough or gives no figure.
+    fn shortfall(self, extra: u64) -> Option<Shortfall> {
+        let needed = self.bytes.saturating_add(extra);
+        available_memory()
+            .filter(|&available| available < needed)
+            .map(|available| Shortfall { available, needed })
     }
 }
 
@@ -562,6 +632,10 @@ struct IosMetalControllerBackend {
     cpu_workers: usize,
     buckets: Vec<Option<IosMetalBucket>>,
     held_bytes: u64,
+    /// The admission's backend term (FL-043): the most the shards hold.
+    budget_bytes: u64,
+    /// What the device must keep free for the world's steps.
+    floor: DeviceFloor,
     last_gpu_ns: u64,
     packed_f16: Vec<u32>,
     pending_uploads: Vec<PendingShardUpload>,
@@ -582,7 +656,14 @@ impl std::fmt::Debug for IosMetalControllerBackend {
 }
 
 impl IosMetalControllerBackend {
-    fn new(vtable: FlifeMetalVtable, cpu_workers: usize) -> Result<Self, CoreError> {
+    /// A backend holding at most `budget_bytes` of shards and leaving the
+    /// device `floor` free.
+    fn new(
+        vtable: FlifeMetalVtable,
+        cpu_workers: usize,
+        budget_bytes: u64,
+        floor: DeviceFloor,
+    ) -> Result<Self, CoreError> {
         if vtable.alloc_shard.is_none()
             || vtable.free_shard.is_none()
             || vtable.write_shard.is_none()
@@ -602,6 +683,8 @@ impl IosMetalControllerBackend {
             cpu_workers: cpu_workers.max(1),
             buckets: Vec::new(),
             held_bytes: 0,
+            budget_bytes,
+            floor,
             last_gpu_ns: 0,
             packed_f16: Vec::new(),
             pending_uploads: Vec::new(),
@@ -1098,6 +1181,16 @@ impl IosMetalControllerBackend {
                         quantity: "ios metal shard bytes",
                     })?
                     .max(16);
+                // FL-043 and plan §19.4: a shard that would pass the backend's
+                // budget, or leave the device less free than a step needs, is
+                // not made (a growing shard's old copy is held until it is
+                // copied). Its jobs run on the reference, which gives the same
+                // bits.
+                if self.held_bytes.saturating_add(new_bytes) > self.budget_bytes
+                    || self.floor.shortfall(new_bytes).is_some()
+                {
+                    continue;
+                }
                 let (new_handle, new_contents) = match self.alloc_device_shard(new_bytes) {
                     Ok(pair) => pair,
                     Err(_) => continue, // defer gracefully if device memory tight
@@ -1497,6 +1590,9 @@ struct LiveTelemetry {
     metal_active: bool,
     is_playing: bool,
     is_capacity_paused: bool,
+    /// Why the last step was refused, when the device had too little memory
+    /// free for it (plan §19.4).
+    memory_short: Option<Shortfall>,
 }
 
 type InspectReplySlot = Arc<(Mutex<Option<Option<OrganismSnapshot>>>, Condvar)>;
@@ -1622,6 +1718,7 @@ fn process_sync_queries(world: &World, queries: Vec<SyncQuery>) {
 fn worker_loop(
     mut world: World,
     mut publisher: Publisher,
+    floor: DeviceFloor,
     control: Arc<(Mutex<SharedControl>, Condvar)>,
     telemetry: Arc<Mutex<LiveTelemetry>>,
     running: Arc<AtomicBool>,
@@ -1630,7 +1727,7 @@ fn worker_loop(
     let mut prev_device_ns = 0_u64;
 
     loop {
-        let (should_step, target_tps, interventions, watch_upd, follow_upd, queries) = {
+        let (should_step, memory_short, target_tps, interventions, watch_upd, follow_upd, queries) = {
             let (lock, cvar) = &*control;
             let mut guard = match lock.lock() {
                 Ok(g) => g,
@@ -1676,13 +1773,21 @@ fn worker_loop(
                 process_sync_queries(&world, pending_q);
                 break;
             }
-            let do_step = if guard.step_requests > 0 {
+            let mut do_step = if guard.step_requests > 0 {
                 guard.step_requests -= 1;
                 guard.capacity_paused = false;
                 true
             } else {
                 guard.playing && !guard.capacity_paused
             };
+            // Plan §19.4: a step the device cannot hold is not taken. The
+            // world pauses at this unchanged boundary, its interventions kept.
+            let memory_short = if do_step { floor.shortfall(0) } else { None };
+            if memory_short.is_some() {
+                guard.capacity_paused = true;
+                guard.playing = false;
+                do_step = false;
+            }
             if do_step {
                 guard.worker_stepping = true;
             }
@@ -1697,6 +1802,7 @@ fn worker_loop(
             let queries = std::mem::take(&mut guard.queries);
             (
                 do_step,
+                memory_short,
                 target_tps,
                 interventions,
                 watch_upd,
@@ -1704,6 +1810,14 @@ fn worker_loop(
                 queries,
             )
         };
+
+        if let Some(short) = memory_short
+            && let Ok(mut tel) = telemetry.lock()
+        {
+            tel.is_playing = false;
+            tel.is_capacity_paused = true;
+            tel.memory_short = Some(short);
+        }
 
         if let Some(w) = watch_upd {
             world.watch(w);
@@ -1780,6 +1894,7 @@ fn worker_loop(
                 tel.metal_active = ctrl.backend.is_some() && ctrl.failure.is_none();
                 tel.is_playing = is_playing_now;
                 tel.is_capacity_paused = cap_paused_now;
+                tel.memory_short = None;
             }
 
             if target_tps > 0.0 {
@@ -1850,15 +1965,6 @@ pub unsafe extern "C" fn flife_session_create(
 
         let _ = world.trace_ancestry();
 
-        let mut metal_attached = false;
-        if !metal_opt.is_null() {
-            let vtable = unsafe { *metal_opt };
-            if let Ok(backend) = IosMetalControllerBackend::new(vtable, workers.get()) {
-                world.set_controller_backend(Some(Box::new(backend)));
-                metal_attached = true;
-            }
-        }
-
         let cfg = validated.config();
         let dt_seconds =
             f64::from(cfg.world.tick_numerator) / f64::from(cfg.world.tick_denominator);
@@ -1890,6 +1996,39 @@ pub unsafe extern "C" fn flife_session_create(
         let feed = publisher.feed();
         let viewer = feed.viewer(DISPLAY_PAIR).map_err(|e| e.to_string())?;
 
+        // FL-043 and plan §19.4: admit the world under its configuration's
+        // budget as `flife run` does, the publisher's slots its render term,
+        // before its backend is installed; then refuse it if the device has
+        // less memory free than a step needs. The backend holds at most what
+        // the admission grants it.
+        let metal_vtable = (!metal_opt.is_null()).then(|| unsafe { *metal_opt });
+        let render_bytes = publisher.reserved_bytes();
+        let admission = if metal_vtable.is_some() {
+            world.admit_memory_flat_f32(0, render_bytes)
+        } else {
+            world.admit_memory(false, 0, render_bytes)
+        }
+        .map_err(|e| e.to_string())?;
+        let floor = DeviceFloor::of(&admission);
+        if let Some(short) = floor.shortfall(0) {
+            return Err(format!(
+                "{} needs {} MiB free to take a step, and this device has {} MiB left for \
+                 FrankenLife. Choose a smaller world.",
+                cfg.name,
+                short.needed / MIB,
+                short.available / MIB
+            ));
+        }
+
+        let mut metal_attached = false;
+        if let Some(vtable) = metal_vtable
+            && let Ok(backend) =
+                IosMetalControllerBackend::new(vtable, workers.get(), admission.backend, floor)
+        {
+            world.set_controller_backend(Some(Box::new(backend)));
+            metal_attached = true;
+        }
+
         let telemetry = Arc::new(Mutex::new(LiveTelemetry {
             metal_active: metal_attached,
             is_playing: true,
@@ -1903,7 +2042,7 @@ pub unsafe extern "C" fn flife_session_create(
         let worker = thread::Builder::new()
             .name("flife-sim-worker".to_owned())
             .stack_size(8 * 1024 * 1024)
-            .spawn(move || worker_loop(world, publisher, c_clone, t_clone, r_clone))
+            .spawn(move || worker_loop(world, publisher, floor, c_clone, t_clone, r_clone))
             .map_err(|e| format!("failed to spawn simulation thread: {e}"))?;
 
         Ok(Box::new(FlifeSession {
@@ -1974,8 +2113,54 @@ pub unsafe extern "C" fn flife_session_set_playing(session: *mut FlifeSession, p
         t.is_playing = playing;
         if playing {
             t.is_capacity_paused = false;
+            t.memory_short = None;
         }
     }
+}
+
+/// Where a session's stepping stands. A paused world publishes no new epoch
+/// (`Publisher::offer` keeps an unchanged world's), so a pause reaches the
+/// UI only through this read.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FlifePauseStatus {
+    pub is_playing: bool,
+    pub is_capacity_paused: bool,
+    pub is_memory_short: bool,
+    pub available_bytes: u64,
+    pub needed_bytes: u64,
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flife_session_pause_status(
+    session: *mut FlifeSession,
+    out_status: *mut FlifePauseStatus,
+) -> bool {
+    if session.is_null() || out_status.is_null() {
+        return false;
+    }
+    let s = unsafe { &*session };
+    let Ok(tel) = s.telemetry.lock() else {
+        return false;
+    };
+    let short = tel.memory_short;
+    unsafe {
+        *out_status = FlifePauseStatus {
+            is_playing: tel.is_playing,
+            is_capacity_paused: tel.is_capacity_paused,
+            is_memory_short: short.is_some(),
+            available_bytes: short.map_or(0, |sf| sf.available),
+            needed_bytes: short.map_or(0, |sf| sf.needed),
+        };
+    }
+    true
+}
+
+/// For tests: report `bytes` as the memory the device leaves this process,
+/// in place of the platform's figure; zero restores the platform's.
+#[unsafe(no_mangle)]
+pub extern "C" fn flife_set_available_memory_override(bytes: u64) {
+    AVAILABLE_MEMORY_OVERRIDE.store(bytes, Ordering::Relaxed);
 }
 
 #[unsafe(no_mangle)]
@@ -2392,13 +2577,12 @@ pub unsafe extern "C" fn flife_session_inspect_organism(
         match guard.take().flatten() {
             Some(snap) => {
                 fill_organism_info(&snap, out);
-                true
             }
             None => {
                 *out = FlifeOrganismInfo::default();
-                false
             }
         }
+        true
     }));
     result.unwrap_or(false)
 }
@@ -2641,8 +2825,17 @@ pub unsafe extern "C" fn flife_verify_metal_parity(
 
         let mut world_metal = World::found_on(&validated, Arrangement::Compact, profile, workers)
             .map_err(|e| e.to_string())?;
-        let backend =
-            IosMetalControllerBackend::new(vtable, workers.get()).map_err(|e| e.to_string())?;
+        // The backend a session would have: the admission's budget and floor.
+        let admission = world_metal
+            .admit_memory_flat_f32(0, 0)
+            .map_err(|e| e.to_string())?;
+        let backend = IosMetalControllerBackend::new(
+            vtable,
+            workers.get(),
+            admission.backend,
+            DeviceFloor::of(&admission),
+        )
+        .map_err(|e| e.to_string())?;
         world_metal.set_controller_backend(Some(Box::new(backend)));
 
         let mut world_cpu = World::found_on(&validated, Arrangement::Compact, profile, workers)
@@ -2665,8 +2858,8 @@ pub unsafe extern "C" fn flife_verify_metal_parity(
             let dm = world_metal.digest();
             let dc = world_cpu.digest();
             if dm != dc {
-                write_c_array(&mut out.metal_digest_hex, &format!("{dm}"));
-                write_c_array(&mut out.cpu_digest_hex, &format!("{dc}"));
+                write_c_array(&mut out.metal_digest_hex, &dm.to_hex());
+                write_c_array(&mut out.cpu_digest_hex, &dc.to_hex());
                 out.success = true;
                 out.digest_matched = false;
                 out.mismatch_tick = u64::from(t);
@@ -2678,8 +2871,10 @@ pub unsafe extern "C" fn flife_verify_metal_parity(
 
         let dm = world_metal.digest();
         let dc = world_cpu.digest();
-        write_c_array(&mut out.metal_digest_hex, &format!("{dm}"));
-        write_c_array(&mut out.cpu_digest_hex, &format!("{dc}"));
+        // The bare 64 hex digits: the fields hold 65 bytes, and the
+        // `sha256:`-prefixed display form would lose its last 7 digits.
+        write_c_array(&mut out.metal_digest_hex, &dm.to_hex());
+        write_c_array(&mut out.cpu_digest_hex, &dc.to_hex());
 
         let cr = world_metal.controller_report();
         if let Some(fail) = &cr.failure {

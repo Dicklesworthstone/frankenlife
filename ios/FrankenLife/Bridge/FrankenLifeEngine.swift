@@ -800,7 +800,8 @@ final class FrankenLifeEngine {
     private func refreshSelectedOrganism() {
         guard let ptr = sessionPtr, let targetId = renderer.readCamera().selectedOrganismId else { return }
         var info = FlifeOrganismInfo()
-        if flife_session_inspect_organism(ptr, targetId, &info), info.found {
+        let answered = flife_session_inspect_organism(ptr, targetId, &info)
+        if answered && info.found {
             selectedOrganism = buildOrganismDetail(from: info)
             // Ensure reticle position is populated even when paused
             let pos = SIMD2<Float>(Float(info.pos_x), Float(info.pos_y))
@@ -810,7 +811,10 @@ final class FrankenLifeEngine {
                     cam.selectedPrevPos = pos
                 }
             }
-        } else if isFollowingSelected, let heirId = telemetry.followedOrganismId, telemetry.followedAlive, heirId != targetId {
+        } else if answered && !info.found && isFollowingSelected,
+                  let heirId = telemetry.followedOrganismId,
+                  telemetry.followedAlive,
+                  heirId != targetId {
             // Smoothly hand off inspector selection to followed heir and inspect immediately!
             let posPair = renderer.positionPair(forOrganismId: heirId)
             renderer.mutateCamera { cam in
@@ -822,11 +826,12 @@ final class FrankenLifeEngine {
             }
             flife_session_set_watch(ptr, true, heirId)
             var heirInfo = FlifeOrganismInfo()
-            if flife_session_inspect_organism(ptr, heirId, &heirInfo), heirInfo.found {
+            if flife_session_inspect_organism(ptr, heirId, &heirInfo) && heirInfo.found {
                 selectedOrganism = buildOrganismDetail(from: heirInfo)
             }
-        } else if !isFollowingSelected && selectedOrganism != nil {
-            // Selected organism died while not following; close stale ghost inspector cleanly.
+        } else if answered && !info.found && !isFollowingSelected && selectedOrganism != nil {
+            // Confirmed by worker that selected organism died while not following; close inspector cleanly.
+            // (If `!answered`, the query merely timed out during a heavy tick — keep inspector open.)
             dismissInspector()
         }
     }
@@ -991,9 +996,15 @@ final class FrankenLifeEngine {
         // Sync capacity-pause or numerical fault state honestly into UI controls
         if snap.isCapacityPaused && !wasCapPaused {
             isPlaying = false
-            statusBanner = snap.faulted
-                ? "Simulation halted due to a numerical fault (INV-01/03)"
-                : "Paused at population capacity (INV-12) — remove organisms or switch preset"
+            if snap.faulted {
+                statusBanner = "Simulation halted due to a numerical fault (INV-01/03)"
+            } else if snap.isMemoryShort {
+                let mib: (UInt64) -> UInt64 = { $0 >> 20 }
+                statusBanner = "Paused, world unchanged: the next tick needs \(mib(snap.memoryNeededBytes)) MiB free "
+                    + "and this device has \(mib(snap.memoryAvailableBytes)) MiB. Remove organisms or switch preset."
+            } else {
+                statusBanner = "Paused at population capacity (INV-12) — remove organisms or switch preset"
+            }
             isStatusBannerError = snap.faulted
         }
 

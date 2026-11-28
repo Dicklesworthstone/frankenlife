@@ -33,3 +33,38 @@ cd ios && xcodebuild test \
   -destination 'platform=iOS Simulator,name=FrankenLife iPhone 18 Pro Max' \
   -only-testing:FrankenLifeTests/FrankenLifeMetalParityTests
 ```
+
+## Memory on a phone
+
+A world is admitted as `flife run` admits it (FL-043, plan §19.4): its configuration's `maximum_total_bytes` must cover every term but the controller backend's, and the Metal backend holds at most what those leave. Where the device reports a per-app limit (`os_proc_available_memory`; the simulator reports none), the bridge also keeps free what one step needs (the admission's births staging and its reserve):
+
+- It refuses to found a world when the device has less than that free, and says how much each side has.
+- It makes no Metal parameter shard that would leave less than that free or pass the backend's budget. That shard's organisms are evaluated on the reference, which gives the same bits; only speed changes.
+- It takes no step the device cannot hold. The world pauses at that unchanged boundary and the banner gives the figures; play or step to check again.
+
+The bundled presets are desktop presets. Their declared budgets are 2–64 GiB, mostly an allocated genome quota (up to 18 GiB) that a world fills only if its genomes grow that far. What four of them held after founding and two ticks, measured with the desktop `flife` on Metal controllers and 4 workers on an M5 Ultra Mac (process peak footprint, `/usr/bin/time -l`):
+
+| Preset | Founders | Peak footprint | Of it, Metal shards |
+|---|---:|---:|---:|
+| reference-small-world | 4,096 | 0.62 GiB | 0.16 GiB |
+| tissue-world | 10,954 | 0.83 GiB | 0.26 GiB |
+| interactive-world | 25,000 | 2.61 GiB | 1.02 GiB |
+| desktop-world | 100,000 | 5.09 GiB | 1.98 GiB |
+
+The app's renderer adds its own buffers, and a world's genomes grow as it evolves.
+
+## What has been checked
+
+Observed on 2026-11-27 with the iOS sources of the commit that adds this section and the engine at 87baba7, on an M5 Ultra Mac in the iOS 27.1 simulator "FrankenLife iPhone 18 Pro Max" (Xcode 27.1). The bridge is built for `aarch64-apple-ios-sim` there, so its Rust ran on the Mac's CPU and its Metal on the Mac's GPU. All 10 XCTests passed, about 5 s each time, in the Debug configuration (`xcodebuild test` as above) and in Release (add `-configuration Release ENABLE_TESTABILITY=YES`; Release does not otherwise allow `@testable import`):
+
+- Metal and CPU controllers give the same world at every tick of reference-small-world (12 ticks), tissue-world (6) and supercolony-v2 (4). Those worlds are the desktop's: a release `flife run` with CPU controllers on 4 workers ends at the same digests (`35f0a219…e7742820`, `7bc1e183…1d1ebcbc`, `9578835d…dd25d469`).
+- reference-small-world reaches `flife capabilities`' pinned digest after 8 ticks (`82e0720d…144df71e`, "the world every qualified host reaches") on both routes. It reaches it again when no Metal shard may be made and all 32,768 evaluations run on the reference.
+- A device with 1 MiB free refuses to found that world. A session whose device runs short pauses with its world unchanged, and steps again once memory returns.
+
+Not checked yet: any physical iPhone (its GPU, its memory limit and the app on screen), runs longer than 12 ticks, and the larger presets past founding. To qualify a phone, run the same tests on it with your signing team:
+
+```bash
+cd ios && xcodebuild test -project FrankenLife.xcodeproj -scheme FrankenLife \
+  -destination 'platform=iOS,name=<your iPhone>' -allowProvisioningUpdates DEVELOPMENT_TEAM=<team id> \
+  -only-testing:FrankenLifeTests/FrankenLifeMetalParityTests
+```

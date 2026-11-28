@@ -1,5 +1,6 @@
 import XCTest
 import Metal
+import os
 import FlifeIOSBridge
 @testable import FrankenLife
 
@@ -21,8 +22,11 @@ final class FrankenLifeMetalParityTests: XCTestCase {
         throw XCTSkip("Preset \(stem).toml not found in test bundle")
     }
 
-    private func verifyParity(presetStem: String, ticks: UInt32) throws {
+    @discardableResult
+    private func verifyParity(presetStem: String, ticks: UInt32, expectBatched: Bool = true) throws -> FlifeParityResult {
         let engine = try MetalControllerEngine(bundle: Bundle.main)
+        // The vtable's ctx is unretained: Swift may free a local after its last use, before Rust is done with it.
+        defer { withExtendedLifetime(engine) {} }
         let toml = try loadPresetTOML(presetStem)
 
         var vtable = engine.makeVtable()
@@ -38,12 +42,109 @@ final class FrankenLifeMetalParityTests: XCTestCase {
             "SHA-256 World::digest() MISMATCH on \(presetStem) at tick \(result.mismatch_tick)! Metal=\(cArrayToString(result.metal_digest_hex)) CPU=\(cArrayToString(result.cpu_digest_hex))"
         )
         XCTAssertEqual(result.ticks_verified, UInt64(ticks), "Expected all \(ticks) ticks verified")
-        XCTAssertGreaterThan(result.metal_batched, 0, "Expected Metal GPU to batch-evaluate organisms!")
+        if expectBatched {
+            XCTAssertGreaterThan(result.metal_batched, 0, "Expected Metal GPU to batch-evaluate organisms!")
+        }
 
         let gpuMs = Double(result.metal_device_ns) * 1e-6
         let metalWallMs = Double(result.metal_wall_ns) * 1e-6
         let cpuWallMs = Double(result.cpu_wall_ns) * 1e-6
-        print("[G4 iOS Metal Parity PASS] \(presetStem): \(ticks) ticks, live=\(result.live_final), batched=\(result.metal_batched), deferred=\(result.metal_deferred), GPU=\(String(format: "%.2f", gpuMs))ms, wall Metal=\(String(format: "%.1f", metalWallMs))ms vs CPU=\(String(format: "%.1f", cpuWallMs))ms, digest=\(cArrayToString(result.metal_digest_hex).prefix(16))")
+        print("[G4 iOS Metal Parity PASS] \(presetStem): \(ticks) ticks, live=\(result.live_final), batched=\(result.metal_batched), deferred=\(result.metal_deferred), GPU=\(String(format: "%.2f", gpuMs))ms, wall Metal=\(String(format: "%.1f", metalWallMs))ms vs CPU=\(String(format: "%.1f", cpuWallMs))ms, digest=\(cArrayToString(result.metal_digest_hex))")
+        return result
+    }
+
+    /// `flife capabilities`' PRESET_DIGEST (crates/flife-cli/src/capabilities.rs): reference-small-world after
+    /// 8 ticks, "the world every qualified host reaches, on every route and any number of workers". Change it
+    /// only with that constant.
+    private static let qualifiedReferenceDigest =
+        "82e0720d65135e2adaeae0ab58e26ce38a167d089d9f78e9cf8a29c8144df71e"
+
+    func testReferenceWorldReachesTheQualifiedDigestOnBothRoutes() throws {
+        let result = try verifyParity(presetStem: "reference-small-world", ticks: 8)
+        XCTAssertEqual(cArrayToString(result.cpu_digest_hex), Self.qualifiedReferenceDigest)
+        XCTAssertEqual(cArrayToString(result.metal_digest_hex), Self.qualifiedReferenceDigest)
+    }
+
+    func testMetalShardsThatDoNotFitRunOnTheReferenceUnchanged() throws {
+        // 1 MiB free is below any step's floor, so no Metal shard may be made: every job runs on the reference.
+        flife_set_available_memory_override(1 << 20)
+        defer { flife_set_available_memory_override(0) }
+        let result = try verifyParity(presetStem: "reference-small-world", ticks: 8, expectBatched: false)
+        XCTAssertEqual(result.metal_batched, 0, "No shard fits, so nothing may be batched on the GPU")
+        XCTAssertGreaterThan(result.metal_deferred, 0)
+        XCTAssertEqual(cArrayToString(result.metal_digest_hex), Self.qualifiedReferenceDigest)
+    }
+
+    func testFoundingIsRefusedWhenTheDeviceCannotHoldAStep() throws {
+        print("[iOS memory] os_proc_available_memory() = \(os_proc_available_memory()) bytes")
+        let engine = try MetalControllerEngine(bundle: Bundle.main)
+        defer { withExtendedLifetime(engine) {} }
+        let toml = try loadPresetTOML("reference-small-world")
+        var vtable = engine.makeVtable()
+        var errBuf = [CChar](repeating: 0, count: 512)
+        flife_set_available_memory_override(1 << 20)
+        defer { flife_set_available_memory_override(0) }
+        let session = toml.withCString { cToml in
+            flife_session_create(cToml, &vtable, 4, &errBuf, errBuf.count)
+        }
+        if let session { flife_session_destroy(session) }
+        XCTAssertNil(session, "A device with 1 MiB free must refuse the world")
+        let message = String(decoding: errBuf.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        XCTAssertTrue(message.contains("this device has 1 MiB left"), "Unexpected refusal: \(message)")
+    }
+
+    func testSteppingPausesUnchangedWhenDeviceMemoryRunsShort() throws {
+        let engine = try MetalControllerEngine(bundle: Bundle.main)
+        defer { withExtendedLifetime(engine) {} }
+        let toml = try loadPresetTOML("reference-small-world")
+        var vtable = engine.makeVtable()
+        var errBuf = [CChar](repeating: 0, count: 512)
+        guard let session = toml.withCString({ cToml in
+            flife_session_create(cToml, &vtable, 4, &errBuf, errBuf.count)
+        }) else {
+            XCTFail("flife_session_create failed")
+            return
+        }
+        defer { flife_session_destroy(session) }
+        defer { flife_set_available_memory_override(0) }
+
+        func latestTick() -> UInt64? {
+            var view = FlifeEpochView()
+            guard let h = flife_session_acquire_latest_epoch(session, 0, &view) else { return nil }
+            flife_epoch_release(h)
+            return view.tick
+        }
+        func waitFor(_ condition: () -> Bool) -> Bool {
+            for _ in 0..<80 {
+                if condition() { return true }
+                Thread.sleep(forTimeInterval: 0.025)
+            }
+            return false
+        }
+
+        flife_session_set_playing(session, false)
+        flife_session_step_once(session)
+        flife_session_step_once(session)
+        XCTAssertTrue(waitFor { latestTick() == 2 }, "Session never published tick 2")
+
+        // The device now has 1 MiB free: the requested step is refused and the world stays at tick 2.
+        flife_set_available_memory_override(1 << 20)
+        flife_session_step_once(session)
+        var status = FlifePauseStatus()
+        XCTAssertTrue(waitFor { flife_session_pause_status(session, &status) && status.is_memory_short })
+        XCTAssertTrue(status.is_capacity_paused)
+        XCTAssertFalse(status.is_playing)
+        XCTAssertEqual(status.available_bytes, 1 << 20)
+        XCTAssertGreaterThan(status.needed_bytes, status.available_bytes)
+        Thread.sleep(forTimeInterval: 0.1)
+        XCTAssertEqual(latestTick(), 2, "A refused step must leave the world unchanged")
+
+        // Memory back: the next requested step is taken.
+        flife_set_available_memory_override(0)
+        flife_session_step_once(session)
+        XCTAssertTrue(waitFor { latestTick() == 3 }, "Session should step once memory is available")
+        XCTAssertTrue(flife_session_pause_status(session, &status))
+        XCTAssertFalse(status.is_memory_short)
     }
 
     func testMetalParityReferenceSmallWorldF32() throws {
@@ -63,6 +164,7 @@ final class FrankenLifeMetalParityTests: XCTestCase {
 
     func testLiveSessionLifecycleAndInspection() throws {
         let engine = try MetalControllerEngine(bundle: Bundle.main)
+        defer { withExtendedLifetime(engine) {} }
         let toml = try loadPresetTOML("reference-small-world")
         var vtable = engine.makeVtable()
         var errBuf = [CChar](repeating: 0, count: 512)

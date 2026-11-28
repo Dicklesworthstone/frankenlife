@@ -139,6 +139,10 @@ struct LiveTelemetrySnapshot: Sendable {
     var metalActive: Bool = false
     var isPlaying: Bool = true
     var isCapacityPaused: Bool = false
+    /// The last step was refused: the device had `memoryAvailableBytes` free and the step needs `memoryNeededBytes`.
+    var isMemoryShort: Bool = false
+    var memoryAvailableBytes: UInt64 = 0
+    var memoryNeededBytes: UInt64 = 0
     var hasCellStates: Bool = false
     var hasPolarities: Bool = false
     var hasTrailEnergy: Bool = false
@@ -158,8 +162,7 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
 
     // Render pipelines
     private let fieldPipeline: MTLRenderPipelineState
-    private let organismGlowPipeline: MTLRenderPipelineState
-    private let organismOpaquePipeline: MTLRenderPipelineState
+    private let organismPipeline: MTLRenderPipelineState
     private let bloomPrefilterPipeline: MTLRenderPipelineState
     private let bloomDownPipeline: MTLRenderPipelineState
     private let bloomUpPipeline: MTLRenderPipelineState
@@ -205,8 +208,11 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
     private var cachedComponents: [Int8] = []
 
     // Offscreen HDR scene & Dual-Kawase bloom pyramid textures
+    // Separate downsample (`bloomMips`: 1/2, 1/4, 1/8) and upsample (`bloomUpMips`: 1/2, 1/4)
+    // targets guarantee zero read/write render-target aliasing hazards on Apple TBDR GPUs.
     private var sceneTexture: MTLTexture?
     private var bloomMips: [MTLTexture] = []
+    private var bloomUpMips: [MTLTexture] = []
     private var offscreenSize: (Int, Int) = (0, 0)
 
     // Session & epoch synchronization
@@ -249,36 +255,29 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
             vert: String,
             frag: String,
             format: MTLPixelFormat,
-            blending: Bool,
-            additive: Bool = false
+            blending: Bool
         ) throws -> MTLRenderPipelineState {
             let desc = MTLRenderPipelineDescriptor()
             desc.vertexFunction = library.makeFunction(name: vert)
             desc.fragmentFunction = library.makeFunction(name: frag)
             desc.colorAttachments[0].pixelFormat = format
             if blending {
+                // `organism_fragment` emits premultiplied alpha across Glow, Sphere, and Raw looks
+                // so dense clusters preserve rich chromatic saturation without white washout.
                 let att = desc.colorAttachments[0]!
                 att.isBlendingEnabled = true
                 att.rgbBlendOperation = .add
                 att.alphaBlendOperation = .add
-                if additive {
-                    att.sourceRGBBlendFactor = .one
-                    att.destinationRGBBlendFactor = .oneMinusSourceAlpha
-                    att.sourceAlphaBlendFactor = .one
-                    att.destinationAlphaBlendFactor = .oneMinusSourceAlpha
-                } else {
-                    att.sourceRGBBlendFactor = .one
-                    att.destinationRGBBlendFactor = .oneMinusSourceAlpha
-                    att.sourceAlphaBlendFactor = .one
-                    att.destinationAlphaBlendFactor = .oneMinusSourceAlpha
-                }
+                att.sourceRGBBlendFactor = .one
+                att.destinationRGBBlendFactor = .oneMinusSourceAlpha
+                att.sourceAlphaBlendFactor = .one
+                att.destinationAlphaBlendFactor = .oneMinusSourceAlpha
             }
             return try device.makeRenderPipelineState(descriptor: desc)
         }
 
         self.fieldPipeline = try makePipe(vert: "fullscreen_vertex", frag: "field_fragment", format: hdrFormat, blending: false)
-        self.organismGlowPipeline = try makePipe(vert: "organism_vertex", frag: "organism_fragment", format: hdrFormat, blending: true, additive: true)
-        self.organismOpaquePipeline = try makePipe(vert: "organism_vertex", frag: "organism_fragment", format: hdrFormat, blending: true, additive: false)
+        self.organismPipeline = try makePipe(vert: "organism_vertex", frag: "organism_fragment", format: hdrFormat, blending: true)
         self.bloomPrefilterPipeline = try makePipe(vert: "fullscreen_vertex", frag: "bloom_prefilter_fragment", format: hdrFormat, blending: false)
         self.bloomDownPipeline = try makePipe(vert: "fullscreen_vertex", frag: "bloom_downsample_fragment", format: hdrFormat, blending: false)
         self.bloomUpPipeline = try makePipe(vert: "fullscreen_vertex", frag: "bloom_upsample_fragment", format: hdrFormat, blending: false)
@@ -430,11 +429,13 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
         sceneDesc.storageMode = .private
         sceneTexture = device.makeTexture(descriptor: sceneDesc)
 
-        // 3-level Dual-Kawase HDR Bloom pyramid (1/2, 1/4, 1/8)
+        // 3-level Dual-Kawase HDR Bloom downsample pyramid (1/2, 1/4, 1/8) plus
+        // 2 dedicated upsample targets (1/2, 1/4) so no pass reads its own render target.
         bloomMips.removeAll()
+        bloomUpMips.removeAll()
         var bw = max(w / 2, 2)
         var bh = max(h / 2, 2)
-        for _ in 0..<3 {
+        for level in 0..<3 {
             let desc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .rgba16Float,
                 width: bw,
@@ -445,6 +446,9 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
             desc.storageMode = .private
             if let tex = device.makeTexture(descriptor: desc) {
                 bloomMips.append(tex)
+            }
+            if level < 2, let upTex = device.makeTexture(descriptor: desc) {
+                bloomUpMips.append(upTex)
             }
             bw = max(bw / 2, 2)
             bh = max(bh / 2, 2)
@@ -514,6 +518,20 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
         lastFieldChannelUploaded = channel
     }
 
+    /// Reads whether the session is playing or paused (for population capacity or device memory). A paused world
+    /// publishes no new epoch, so a pause reaches the HUD only through this read.
+    private func refreshPauseStatus(_ ptr: OpaquePointer) {
+        var status = FlifePauseStatus()
+        guard flife_session_pause_status(ptr, &status) else { return }
+        stateLock.lock()
+        latestTelemetry.isPlaying = status.is_playing
+        latestTelemetry.isCapacityPaused = status.is_capacity_paused
+        latestTelemetry.isMemoryShort = status.is_memory_short
+        latestTelemetry.memoryAvailableBytes = status.available_bytes
+        latestTelemetry.memoryNeededBytes = status.needed_bytes
+        stateLock.unlock()
+    }
+
     private func ingestLatestEpochIfAvailable(now: CFTimeInterval, currentStyle: RenderStyleState) {
         stateLock.lock()
         let ptr = sessionPtr
@@ -521,6 +539,8 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
         stateLock.unlock()
 
         guard let ptr else { return }
+        // Runs last, after any epoch below: a paused world publishes no new epoch.
+        defer { refreshPauseStatus(ptr) }
         var view = FlifeEpochView()
         guard let handle = flife_session_acquire_latest_epoch(ptr, seen, &view) else {
             // Even when paused, refresh component texture into the next guaranteed-idle slot!
@@ -947,7 +967,7 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
 
             // 2. Single-draw-call Instanced SDF Organisms (tiled seamlessly across torus!)
             if currentOrganismCount > 0, let orgBuf = organismBuffers[activeOrganismSlot] {
-                enc.setRenderPipelineState(currentStyle.lookMode == 0 ? organismGlowPipeline : organismOpaquePipeline)
+                enc.setRenderPipelineState(organismPipeline)
                 enc.setVertexBytes(&uniforms, length: MemoryLayout<MetalFrameUniforms>.stride, index: 0)
                 enc.setVertexBuffer(orgBuf, offset: 0, index: 1)
                 enc.setFragmentBytes(&uniforms, length: MemoryLayout<MetalFrameUniforms>.stride, index: 0)
@@ -961,18 +981,18 @@ final class MetalWorldRenderer: NSObject, MTKViewDelegate {
             enc.endEncoding()
         }
 
-        // PASS 3: Dual-Kawase HDR Bloom (Glow look only!)
+        // PASS 3: Dual-Kawase HDR Bloom (Glow look only! Dedicated upsample targets avoid read/write aliasing.)
         var finalBloomTex: MTLTexture = sceneTex
-        if currentStyle.lookMode == 0 && currentStyle.bloomStrength > 0.005 && bloomMips.count == 3 {
-            // Prefilter -> mip 0
+        if currentStyle.lookMode == 0 && currentStyle.bloomStrength > 0.005 && bloomMips.count == 3 && bloomUpMips.count == 2 {
+            // Prefilter -> mip 0 (1/2)
             encodeFullscreenPass(cmdBuf: cmdBuf, label: "BloomPrefilter", target: bloomMips[0], pipeline: bloomPrefilterPipeline, tex0: sceneTex, tex1: nil)
-            // Downsample 0 -> 1 -> 2
+            // Downsample 0 -> 1 -> 2 (1/4, 1/8)
             encodeFullscreenPass(cmdBuf: cmdBuf, label: "BloomDown1", target: bloomMips[1], pipeline: bloomDownPipeline, tex0: bloomMips[0], tex1: nil)
             encodeFullscreenPass(cmdBuf: cmdBuf, label: "BloomDown2", target: bloomMips[2], pipeline: bloomDownPipeline, tex0: bloomMips[1], tex1: nil)
-            // Upsample 2 -> 1 -> 0
-            encodeFullscreenPass(cmdBuf: cmdBuf, label: "BloomUp1", target: bloomMips[1], pipeline: bloomUpPipeline, tex0: bloomMips[2], tex1: bloomMips[1])
-            encodeFullscreenPass(cmdBuf: cmdBuf, label: "BloomUp0", target: bloomMips[0], pipeline: bloomUpPipeline, tex0: bloomMips[1], tex1: bloomMips[0])
-            finalBloomTex = bloomMips[0]
+            // Upsample 2 + 1 -> up 1 (1/4), then up 1 + 0 -> up 0 (1/2)
+            encodeFullscreenPass(cmdBuf: cmdBuf, label: "BloomUp1", target: bloomUpMips[1], pipeline: bloomUpPipeline, tex0: bloomMips[2], tex1: bloomMips[1])
+            encodeFullscreenPass(cmdBuf: cmdBuf, label: "BloomUp0", target: bloomUpMips[0], pipeline: bloomUpPipeline, tex0: bloomUpMips[1], tex1: bloomMips[0])
+            finalBloomTex = bloomUpMips[0]
         }
 
         // PASS 4: Composite + EDR Tone Mapping + Precision Vector Overlays -> Display Drawable

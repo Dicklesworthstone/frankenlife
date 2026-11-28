@@ -346,6 +346,22 @@ pub fn transport_on(
             detail: "no transport scratch".to_owned(),
         });
     }
+    // Single-substep fast path: fuse stencil + decay into one write pass per
+    // plane (eliminating a full 264 MB DRAM read/write decay sweep on 1024²)
+    // and split moment planes into row bands so 33 planes never suffer a
+    // `33 mod 32 = 1` / `33 mod 16 = 1` single-plane straggler tail.
+    if plan.substeps <= 1 {
+        let energy = transport_on_single_substep(
+            &coefficients,
+            plan.decay_factor,
+            planes,
+            cells,
+            source,
+            target,
+            worker_budget,
+        )?;
+        return Ok(report(plan, energy_before, energy));
+    }
     struct PlaneTask<'a> {
         plane: usize,
         source: &'a [f32],
@@ -581,6 +597,307 @@ fn transport_plane(
         decay(target, plan.decay_factor);
     }
     None
+}
+
+/// Single-substep parallel transport across all `planes`: runs the full energy
+/// plane first (single-pass fused stencil + exact sequential F64 energy sums)
+/// and splits each moment plane into row bands with fused stencil + decay.
+fn transport_on_single_substep(
+    coefficients: &Coefficients,
+    decay_factor: f64,
+    planes: usize,
+    cells: usize,
+    source: &[f32],
+    target: &mut [f32],
+    worker_budget: usize,
+) -> Result<EnergyTerms, CoreError> {
+    let width = coefficients.width;
+    let height = coefficients.height;
+    let moment_bands = if worker_budget <= 1 {
+        1
+    } else if height >= 64 {
+        4
+    } else if height >= 16 {
+        2
+    } else {
+        1
+    };
+    enum SingleSubstepTask<'a> {
+        Energy {
+            source: &'a [f32],
+            target: &'a mut [f32],
+            terms: Option<EnergyTerms>,
+        },
+        MomentBand {
+            source: &'a [f32],
+            target_band: &'a mut [f32],
+            row_start: usize,
+        },
+    }
+    let mut tasks = Vec::with_capacity(1 + planes.saturating_sub(1) * moment_bands);
+    let mut energy_task: Option<SingleSubstepTask<'_>> = None;
+    let mut moment_tasks: Vec<SingleSubstepTask<'_>> =
+        Vec::with_capacity(planes.saturating_sub(1) * moment_bands);
+    for (plane, (src_plane, dst_plane)) in source
+        .chunks_exact(cells)
+        .zip(target.chunks_exact_mut(cells))
+        .enumerate()
+    {
+        if plane == ENERGY_PLANE as usize {
+            energy_task = Some(SingleSubstepTask::Energy {
+                source: src_plane,
+                target: dst_plane,
+                terms: None,
+            });
+        } else if moment_bands == 1 {
+            moment_tasks.push(SingleSubstepTask::MomentBand {
+                source: src_plane,
+                target_band: dst_plane,
+                row_start: 0,
+            });
+        } else {
+            let rows_per_band = height.div_ceil(moment_bands);
+            let mut rem = dst_plane;
+            let mut row_start = 0_usize;
+            while row_start < height {
+                let band_rows = (height - row_start).min(rows_per_band);
+                let (band, rest) = rem.split_at_mut(band_rows * width);
+                rem = rest;
+                moment_tasks.push(SingleSubstepTask::MomentBand {
+                    source: src_plane,
+                    target_band: band,
+                    row_start,
+                });
+                row_start += band_rows;
+            }
+        }
+    }
+    if let Some(et) = energy_task {
+        tasks.push(et);
+    }
+    tasks.extend(moment_tasks);
+    flife_core::pool::parallel_tasks(
+        worker_budget,
+        "transport",
+        &mut tasks,
+        |_, task| match task {
+            SingleSubstepTask::Energy {
+                source,
+                target,
+                terms,
+            } => {
+                *terms = Some(transport_energy_single_substep(
+                    coefficients,
+                    decay_factor,
+                    source,
+                    target,
+                ));
+            }
+            SingleSubstepTask::MomentBand {
+                source,
+                target_band,
+                row_start,
+            } => {
+                stencil_rows_band_decayed(
+                    coefficients,
+                    source,
+                    target_band,
+                    *row_start,
+                    decay_factor,
+                );
+            }
+        },
+    )?;
+    tasks
+        .into_iter()
+        .find_map(|task| match task {
+            SingleSubstepTask::Energy { terms, .. } => terms,
+            SingleSubstepTask::MomentBand { .. } => None,
+        })
+        .ok_or_else(missing_plane)
+}
+
+/// Single-substep five-point stencil and optional decay fused row-by-row for
+/// the energy plane: computes each row's diffused values into `target` using
+/// the exact vectorized stencil, then immediately sums `transported`, applies
+/// `decay_factor`, and sums `decay_removed` / `after` in strict ascending cell
+/// order while the row is hot in L1D (0-ULP bit-identical to `stencil_rows`
+/// followed by `energy_terms`).
+fn transport_energy_single_substep(
+    coefficients: &Coefficients,
+    decay_factor: f64,
+    source: &[f32],
+    target: &mut [f32],
+) -> EnergyTerms {
+    let Coefficients {
+        center,
+        r_x,
+        r_y,
+        width,
+        height,
+    } = *coefficients;
+    let cells = width.checked_mul(height);
+    if !matches!(cells, Some(c) if width > 0 && source.len() == c && target.len() == c) {
+        stencil_checked(coefficients, source, target);
+        return energy_terms(decay_factor, target);
+    }
+    let value = |c: f32, w: f32, e: f32, s: f32, n: f32| {
+        (center * f64::from(c)
+            + r_x * (f64::from(w) + f64::from(e))
+            + r_y * (f64::from(s) + f64::from(n))) as f32
+    };
+    let mut transported = 0.0_f64;
+    let mut decay_removed = 0.0_f64;
+    let mut after_sum = 0.0_f64;
+    let apply_decay = decay_factor != 1.0;
+    for (y, out) in target.chunks_exact_mut(width).enumerate() {
+        let south = if y == 0 { height - 1 } else { y - 1 };
+        let north = if y + 1 == height { 0 } else { y + 1 };
+        let row = &source[y * width..][..width];
+        let row_south = &source[south * width..][..width];
+        let row_north = &source[north * width..][..width];
+        let edge = |x: usize| {
+            let west = if x == 0 { width - 1 } else { x - 1 };
+            let east = if x + 1 == width { 0 } else { x + 1 };
+            value(row[x], row[west], row[east], row_south[x], row_north[x])
+        };
+        out[0] = edge(0);
+        if width > 1 {
+            out[width - 1] = edge(width - 1);
+        }
+        if width > 2 {
+            let inner = 1..width - 1;
+            for (((((slot, &c), &w), &e), &s), &n) in out[inner.clone()]
+                .iter_mut()
+                .zip(&row[inner.clone()])
+                .zip(&row[..width - 2])
+                .zip(&row[2..])
+                .zip(&row_south[inner.clone()])
+                .zip(&row_north[inner])
+            {
+                *slot = value(c, w, e, s, n);
+            }
+        }
+        if apply_decay {
+            for slot in out.iter_mut() {
+                let before = f64::from(*slot);
+                transported += before;
+                let after = (before * decay_factor) as f32;
+                let after_f64 = f64::from(after);
+                decay_removed += before - after_f64;
+                after_sum += after_f64;
+                *slot = after;
+            }
+        } else {
+            for &v in out.iter() {
+                let before = f64::from(v);
+                transported += before;
+                after_sum += before;
+            }
+        }
+    }
+    EnergyTerms {
+        transported,
+        decay_removed,
+        after: after_sum,
+    }
+}
+
+/// Single-substep five-point stencil and optional decay fused into one write
+/// pass over a contiguous row band `[row_start .. row_start + band_rows)` of a
+/// moment plane (0-ULP bit-identical to `stencil_rows` followed by `decay`,
+/// rounding to F32 after diffusion and again after decay).
+fn stencil_rows_band_decayed(
+    coefficients: &Coefficients,
+    source: &[f32],
+    target_band: &mut [f32],
+    row_start: usize,
+    decay_factor: f64,
+) {
+    let Coefficients {
+        center,
+        r_x,
+        r_y,
+        width,
+        height,
+    } = *coefficients;
+    if width == 0 || height == 0 || target_band.is_empty() {
+        return;
+    }
+    if decay_factor == 1.0 {
+        let value = |c: f32, w: f32, e: f32, s: f32, n: f32| {
+            (center * f64::from(c)
+                + r_x * (f64::from(w) + f64::from(e))
+                + r_y * (f64::from(s) + f64::from(n))) as f32
+        };
+        for (local_y, out) in target_band.chunks_exact_mut(width).enumerate() {
+            let y = row_start + local_y;
+            let south = if y == 0 { height - 1 } else { y - 1 };
+            let north = if y + 1 == height { 0 } else { y + 1 };
+            let row = &source[y * width..][..width];
+            let row_south = &source[south * width..][..width];
+            let row_north = &source[north * width..][..width];
+            let edge = |x: usize| {
+                let west = if x == 0 { width - 1 } else { x - 1 };
+                let east = if x + 1 == width { 0 } else { x + 1 };
+                value(row[x], row[west], row[east], row_south[x], row_north[x])
+            };
+            out[0] = edge(0);
+            if width > 1 {
+                out[width - 1] = edge(width - 1);
+            }
+            if width > 2 {
+                let inner = 1..width - 1;
+                for (((((slot, &c), &w), &e), &s), &n) in out[inner.clone()]
+                    .iter_mut()
+                    .zip(&row[inner.clone()])
+                    .zip(&row[..width - 2])
+                    .zip(&row[2..])
+                    .zip(&row_south[inner.clone()])
+                    .zip(&row_north[inner])
+                {
+                    *slot = value(c, w, e, s, n);
+                }
+            }
+        }
+    } else {
+        let value = |c: f32, w: f32, e: f32, s: f32, n: f32| {
+            let diffused = (center * f64::from(c)
+                + r_x * (f64::from(w) + f64::from(e))
+                + r_y * (f64::from(s) + f64::from(n))) as f32;
+            (f64::from(diffused) * decay_factor) as f32
+        };
+        for (local_y, out) in target_band.chunks_exact_mut(width).enumerate() {
+            let y = row_start + local_y;
+            let south = if y == 0 { height - 1 } else { y - 1 };
+            let north = if y + 1 == height { 0 } else { y + 1 };
+            let row = &source[y * width..][..width];
+            let row_south = &source[south * width..][..width];
+            let row_north = &source[north * width..][..width];
+            let edge = |x: usize| {
+                let west = if x == 0 { width - 1 } else { x - 1 };
+                let east = if x + 1 == width { 0 } else { x + 1 };
+                value(row[x], row[west], row[east], row_south[x], row_north[x])
+            };
+            out[0] = edge(0);
+            if width > 1 {
+                out[width - 1] = edge(width - 1);
+            }
+            if width > 2 {
+                let inner = 1..width - 1;
+                for (((((slot, &c), &w), &e), &s), &n) in out[inner.clone()]
+                    .iter_mut()
+                    .zip(&row[inner.clone()])
+                    .zip(&row[..width - 2])
+                    .zip(&row[2..])
+                    .zip(&row_south[inner.clone()])
+                    .zip(&row_north[inner])
+                {
+                    *slot = value(c, w, e, s, n);
+                }
+            }
+        }
+    }
 }
 
 /// Decay the diffused energy plane and take its sums, in cell order.
@@ -2200,6 +2517,78 @@ mod tests {
             let fast: Vec<u32> = fast.iter().map(|v| v.to_bits()).collect();
             let checked: Vec<u32> = checked.iter().map(|v| v.to_bits()).collect();
             assert_eq!(fast, checked, "flux {width} x {height}");
+        }
+    }
+
+    #[test]
+    fn single_substep_fused_band_transport_matches_serial_bit_for_bit() {
+        use flife_core::TimeStep;
+
+        use crate::footprint::BufferLimits;
+        use crate::grid::FieldGrid;
+        use crate::state::FieldState;
+        use crate::transport::{TransportPlan, TransportScratch, transport, transport_on};
+
+        let limits = BufferLimits::host();
+        let step = TimeStep::new(1, 128).expect("timestep");
+        for (width, height) in [(17_u32, 19_u32), (64, 64), (73, 65)] {
+            let grid =
+                FieldGrid::new(width, height, f64::from(width), f64::from(height)).expect("grid");
+            let mut current = FieldState::zeroed(grid, &limits).expect("state");
+            let cells = (width as usize) * (height as usize);
+            for p in 0..current.planes() as usize {
+                let seed = ((width as u64) * 131 + (height as u64) * 17 + p as u64 + 1) * 997;
+                let vals = plane(cells, seed);
+                let dst = &mut current.as_mut_slice()[p * cells..(p + 1) * cells];
+                if p == 0 {
+                    for (slot, v) in dst.iter_mut().zip(vals) {
+                        *slot = v.abs();
+                    }
+                } else {
+                    dst.copy_from_slice(&vals);
+                }
+            }
+            for decay in [0.0_f64, 0.01, 0.37] {
+                let plan = TransportPlan::new(&grid, step, 0.15, decay).expect("plan");
+                assert_eq!(plan.substeps(), 1);
+                let mut serial_next = FieldState::zeroed(grid, &limits).expect("serial next");
+                let mut serial_scratch = TransportScratch::new(&grid, &limits).expect("scratch");
+                let serial_report =
+                    transport(&plan, &current, &mut serial_next, &mut serial_scratch)
+                        .expect("serial transport");
+                for workers in [1_usize, 4, 16, 32] {
+                    let mut par_next = FieldState::zeroed(grid, &limits).expect("par next");
+                    let mut scratches: Vec<TransportScratch> = (0..workers)
+                        .map(|_| TransportScratch::new(&grid, &limits).expect("scratch"))
+                        .collect();
+                    let par_report = transport_on(&plan, &current, &mut par_next, &mut scratches)
+                        .expect("parallel transport");
+                    assert_eq!(
+                        par_report.energy_before.to_bits(),
+                        serial_report.energy_before.to_bits(),
+                        "{width}x{height} decay={decay} w={workers}"
+                    );
+                    assert_eq!(
+                        par_report.energy_transported.to_bits(),
+                        serial_report.energy_transported.to_bits(),
+                        "{width}x{height} decay={decay} w={workers}"
+                    );
+                    assert_eq!(
+                        par_report.decay_removed.to_bits(),
+                        serial_report.decay_removed.to_bits(),
+                        "{width}x{height} decay={decay} w={workers}"
+                    );
+                    assert_eq!(
+                        par_report.energy_after.to_bits(),
+                        serial_report.energy_after.to_bits(),
+                        "{width}x{height} decay={decay} w={workers}"
+                    );
+                    let got: Vec<u32> = par_next.as_slice().iter().map(|v| v.to_bits()).collect();
+                    let want: Vec<u32> =
+                        serial_next.as_slice().iter().map(|v| v.to_bits()).collect();
+                    assert_eq!(got, want, "{width}x{height} decay={decay} w={workers}");
+                }
+            }
         }
     }
 }

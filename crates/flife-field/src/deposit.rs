@@ -1155,7 +1155,7 @@ pub fn apply_deposit_streams_to_carrier_on(
     } else {
         workers
             .saturating_mul(4)
-            .min(64)
+            .min(256)
             .min(total_items / (PACKETS_PER_RUN / 2).max(1))
             .max(base_runs)
     };
@@ -1436,7 +1436,7 @@ pub fn apply_deposits_to_carrier_on(
     } else {
         workers
             .saturating_mul(4)
-            .min(64)
+            .min(256)
             .min(items / (PACKETS_PER_RUN / 2).max(1))
             .max(base_runs)
     };
@@ -1845,10 +1845,11 @@ struct Run<'a> {
 }
 
 /// Occupied cells accumulated before flushing moment writes plane-by-plane
-/// in [`reduce_run`]. Flushing 32 cells per plane avoids 32-way L1D
-/// cache-set thrashing on power-of-two grids (e.g. 512² where planes are
-/// 1 MiB apart) while writing bit-identical F32 values.
-const REDUCE_BATCH: usize = 32;
+/// in [`reduce_run`]. Flushing 64 cells per plane in channel-major
+/// `[[f64; REDUCE_BATCH]; M]` layout (`16 KiB` for 32 channels, well inside
+/// L1D) halves 4-MiB plane jumps on 1024² and lets [`flush_moment_batch_const`]
+/// read four contiguous `f64` updates per quad with zero stride.
+const REDUCE_BATCH: usize = 64;
 
 /// Flush `count` pre-scaled cell updates into `moments`, one plane at a time.
 /// Classifies contiguous 4-cell quads once before the plane loop so dense
@@ -1859,7 +1860,7 @@ fn flush_moment_batch_const<const M: usize>(
     moments: &mut [&mut [f32]],
     count: usize,
     cell_at: &[usize; REDUCE_BATCH],
-    accum: &[[f64; M]; REDUCE_BATCH],
+    accum: &[[f64; REDUCE_BATCH]; M],
 ) {
     let quads = count / 4;
     let tail_start = quads * 4;
@@ -1878,15 +1879,15 @@ fn flush_moment_batch_const<const M: usize>(
             *kind = 1;
         }
     }
-    for (channel, plane_slot) in moments.iter_mut().take(M).enumerate() {
+    for (plane_slot, ch_acc) in moments.iter_mut().take(M).zip(accum.iter()) {
         let plane: &mut [f32] = plane_slot;
         let plane_len = plane.len();
         for (q, &kind) in quad_kind.iter().enumerate().take(quads) {
             let b = q * 4;
-            let a0 = accum[b][channel];
-            let a1 = accum[b + 1][channel];
-            let a2 = accum[b + 2][channel];
-            let a3 = accum[b + 3][channel];
+            let a0 = ch_acc[b];
+            let a1 = ch_acc[b + 1];
+            let a2 = ch_acc[b + 2];
+            let a3 = ch_acc[b + 3];
             let all_nonzero = (a0 != 0.0) & (a1 != 0.0) & (a2 != 0.0) & (a3 != 0.0);
             if kind == 2 && all_nonzero {
                 let i0 = cell_at[b];
@@ -1915,7 +1916,7 @@ fn flush_moment_batch_const<const M: usize>(
                 }
             }
             for k in 0..4 {
-                let added = accum[b + k][channel];
+                let added = ch_acc[b + k];
                 if added != 0.0
                     && let Some(slot) = plane.get_mut(cell_at[b + k])
                 {
@@ -1924,7 +1925,7 @@ fn flush_moment_batch_const<const M: usize>(
             }
         }
         for b in tail_start..count {
-            let added = accum[b][channel];
+            let added = ch_acc[b];
             if added != 0.0
                 && let Some(slot) = plane.get_mut(cell_at[b])
             {
@@ -1953,7 +1954,8 @@ fn reduce_run_const_inner<const M: usize, const HAS_SEQ: bool>(
     let mut occupied = 0_usize;
     let mut batch_len = 0_usize;
     let mut cell_at = [0_usize; REDUCE_BATCH];
-    let mut accum = [[0.0_f64; M]; REDUCE_BATCH];
+    let mut accum = [[0.0_f64; REDUCE_BATCH]; M];
+    let mut moment = [0.0_f64; M];
     let cell_base = run.cell_base;
     let energy_len = run.energy.len();
     let mut received_iter = run.received.iter_mut();
@@ -1980,7 +1982,7 @@ fn reduce_run_const_inner<const M: usize, const HAS_SEQ: bool>(
 
         if slice.len() == 1 {
             // Fast path for single-packet cells: compute `after`, `received`,
-            // and `factor` before touching `accum[batch_len]`, then fuse
+            // and `factor` before touching `accum`, then fuse
             // `(amount * component) * factor` in registers in one pass
             // (preserving exact IEEE-754 order and skipping the 32-ch loop
             // entirely when `factor == 0.0`).
@@ -2002,10 +2004,9 @@ fn reduce_run_const_inner<const M: usize, const HAS_SEQ: bool>(
             occupied += 1;
 
             if factor != 0.0 {
-                let moment = &mut accum[batch_len];
                 let dir = &directions[packet.entry][..M];
-                for (slot, &component) in moment.iter_mut().zip(dir) {
-                    *slot = (total * component) * factor;
+                for (ch_row, &component) in accum.iter_mut().zip(dir) {
+                    ch_row[batch_len] = (total * component) * factor;
                 }
                 cell_at[batch_len] = at;
                 batch_len += 1;
@@ -2022,7 +2023,6 @@ fn reduce_run_const_inner<const M: usize, const HAS_SEQ: bool>(
             continue;
         }
 
-        let moment = &mut accum[batch_len];
         let mut total = 0.0_f64;
         moment.fill(0.0);
         for &ord_u in slice {
@@ -2050,8 +2050,8 @@ fn reduce_run_const_inner<const M: usize, const HAS_SEQ: bool>(
         occupied += 1;
 
         if factor != 0.0 {
-            for slot in moment.iter_mut() {
-                *slot *= factor;
+            for (ch_row, &m) in accum.iter_mut().zip(&moment) {
+                ch_row[batch_len] = m * factor;
             }
             cell_at[batch_len] = at;
             batch_len += 1;
@@ -2107,7 +2107,7 @@ fn reduce_run(
             let mut occupied = 0_usize;
             let mut batch_len = 0_usize;
             let mut cell_at = [0_usize; REDUCE_BATCH];
-            let mut accum = [[0.0_f64; CHANNELS]; REDUCE_BATCH];
+            let mut accum = [[0.0_f64; REDUCE_BATCH]; CHANNELS];
             let cell_base = run.cell_base;
 
             for &cell_u32 in run.occupied_cells {
@@ -2161,11 +2161,10 @@ fn reduce_run(
                 occupied += 1;
 
                 if factor != 0.0 {
-                    for slot in moment.iter_mut().take(moment_count) {
-                        *slot *= factor;
+                    for (ch_row, &m) in accum.iter_mut().zip(&moment).take(moment_count) {
+                        ch_row[batch_len] = m * factor;
                     }
                     cell_at[batch_len] = at;
-                    accum[batch_len] = moment;
                     batch_len += 1;
                     if batch_len == REDUCE_BATCH {
                         flush_moment_batch_const::<CHANNELS>(

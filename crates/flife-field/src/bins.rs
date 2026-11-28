@@ -191,8 +191,8 @@ impl Bins {
         workers: usize,
         bucket_of: &(impl Fn(usize) -> usize + Sync),
     ) -> Result<(), CoreError> {
-        const STRIPES: usize = 64;
-        const STACK_STRIPE_BUCKETS: usize = 4_096;
+        const STRIPES: usize = 128;
+        const STACK_STRIPE_BUCKETS: usize = 8_192;
 
         for (count, limit) in [(buckets, self.buckets_limit), (items, self.items_limit)] {
             if count > limit {
@@ -216,7 +216,7 @@ impl Bins {
 
         let stripe_width = buckets.div_ceil(STRIPES).max(1);
         let stripe_count = buckets.div_ceil(stripe_width);
-        let chunk_count = workers.min(items.div_ceil(4_096)).clamp(1, 32);
+        let chunk_count = workers.min(items.div_ceil(4_096)).clamp(1, 64);
         let chunk_len = items.div_ceil(chunk_count);
 
         // Pass 1: per-chunk coarse stripe histograms + exact lowest-index bounds check.
@@ -263,16 +263,39 @@ impl Bins {
             stripe_bases[s + 1] = stripe_bases[s] + sum;
         }
 
-        // Transient `(bucket, item)` buffer grouped into 64 contiguous L1-friendly stripes.
-        let mut staged: Vec<(u32, u32)> = Vec::new();
-        staged
-            .try_reserve_exact(items)
-            .map_err(|_| CoreError::AllocationFailed {
-                buffer: self.name,
-                bytes: u64::try_from(items.saturating_mul(std::mem::size_of::<(u32, u32)>()))
-                    .unwrap_or(u64::MAX),
-            })?;
-        staged.resize(items, (0, 0));
+        // Per-stripe `(bucket, item)` buffers (~60–100 KiB each at 400k),
+        // allocated and zeroed in parallel from per-thread malloc magazines
+        // instead of one 12.8 MB `_xzm_malloc_large_huge` + single-thread zeroing.
+        let name = self.name;
+        let mut stripe_bufs: Vec<Vec<(u32, u32)>> = (0..stripe_count).map(|_| Vec::new()).collect();
+        {
+            let mut alloc_tasks: Vec<(&mut Vec<(u32, u32)>, usize)> = stripe_bufs
+                .iter_mut()
+                .enumerate()
+                .map(|(s, buf)| (buf, stripe_bases[s + 1] - stripe_bases[s]))
+                .collect();
+            flife_core::pool::try_parallel_tasks(
+                workers,
+                "bins stripe alloc",
+                &mut alloc_tasks,
+                |_, (buf, len)| {
+                    if *len > 0 {
+                        buf.try_reserve_exact(*len)
+                            .map_err(|_| CoreError::AllocationFailed {
+                                buffer: name,
+                                bytes: u64::try_from(len.saturating_mul(std::mem::size_of::<(
+                                    u32,
+                                    u32,
+                                )>(
+                                )))
+                                .unwrap_or(u64::MAX),
+                            })?;
+                        buf.resize(*len, (0, 0));
+                    }
+                    Ok(())
+                },
+            )?;
+        }
 
         // Pass 2: parallel scatter of `(bucket, item)` into disjoint per-(chunk, stripe) slices.
         {
@@ -289,8 +312,8 @@ impl Bins {
                     dsts: Vec::with_capacity(stripe_count),
                 })
                 .collect();
-            let mut rem = staged.as_mut_slice();
-            for s in 0..stripe_count {
+            for (s, buf) in stripe_bufs.iter_mut().enumerate() {
+                let mut rem = buf.as_mut_slice();
                 for (chunk, task) in chunk_counts.iter().zip(&mut scatter_tasks) {
                     let count = chunk.counts[s];
                     let (slice, tail) = rem.split_at_mut(count);
@@ -328,7 +351,7 @@ impl Bins {
             )?;
         }
 
-        // Pass 3: 64 independent L1-resident local counting sorts directly into
+        // Pass 3: 128 independent L1-resident local counting sorts directly into
         // disjoint slices of `self.offsets[1..=buckets]` and `self.order[..items]`.
         self.offsets[0] = 0;
         self.order.resize(items, 0);
@@ -344,12 +367,11 @@ impl Bins {
         let mut stripe_tasks = Vec::with_capacity(stripe_count);
         let mut rem_offsets = &mut self.offsets[1..=buckets];
         let mut rem_order = self.order.as_mut_slice();
-        for s in 0..stripe_count {
+        for (s, buf) in stripe_bufs.iter().enumerate() {
             let bucket_base = s * stripe_width;
             let bucket_len = (buckets - bucket_base).min(stripe_width);
             let item_base = stripe_bases[s];
-            let item_end = stripe_bases[s + 1];
-            let item_len = item_end - item_base;
+            let item_len = buf.len();
             let (off_slice, off_tail) = rem_offsets.split_at_mut(bucket_len);
             rem_offsets = off_tail;
             let (ord_slice, ord_tail) = rem_order.split_at_mut(item_len);
@@ -357,15 +379,13 @@ impl Bins {
             stripe_tasks.push(StripeTask {
                 bucket_base,
                 item_base,
-                staged: &staged[item_base..item_end],
+                staged: buf.as_slice(),
                 offsets_out: off_slice,
                 order_out: ord_slice,
                 occupied: Vec::new(),
                 largest: 0,
             });
         }
-
-        let name = self.name;
         flife_core::pool::try_parallel_tasks(
             workers,
             "bins stripe sort",

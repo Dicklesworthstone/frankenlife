@@ -137,10 +137,152 @@ impl<'scope> WorkerScope<'scope, '_> {
         }
     }
 
+    /// Spawn `count` identical worker closures via O(log P) binary-tree fanout
+    /// so the calling thread performs at most two Rayon wakeups before joining
+    /// the work itself (avoiding O(P) sequential `pthread_cond_signal` stalls).
+    fn spawn_clones<F>(&self, count: usize, f: &'scope F)
+    where
+        F: Fn() + Sync,
+    {
+        match self.inner {
+            Some(scope) => spawn_clones_rayon(scope, count, f),
+            None => {
+                for _ in 0..count {
+                    f();
+                }
+            }
+        }
+    }
+
+    /// Spawn one task per lane in `lanes` via O(log P) binary-tree fanout so
+    /// the calling thread performs at most two Rayon wakeups before running its
+    /// own lane.
+    fn spawn_lanes<L, F>(&self, lanes: &'scope mut [L], f: &'scope F)
+    where
+        L: Send,
+        F: Fn(&mut L) + Sync,
+    {
+        match self.inner {
+            Some(scope) => spawn_lanes_rayon(scope, lanes, f),
+            None => {
+                for lane in lanes {
+                    f(lane);
+                }
+            }
+        }
+    }
+
+    /// Spawn one indexed task per item in `items` via O(log P) binary-tree fanout.
+    fn spawn_indexed<T, F>(&self, start_index: usize, items: &'scope mut [T], f: &'scope F)
+    where
+        T: Send,
+        F: Fn(usize, &mut T) + Sync,
+    {
+        match self.inner {
+            Some(scope) => spawn_indexed_rayon(scope, start_index, items, f),
+            None => {
+                for (offset, item) in items.iter_mut().enumerate() {
+                    f(start_index + offset, item);
+                }
+            }
+        }
+    }
+
     /// Whether this scope is backed by a multi-thread private pool (`workers >= 2`).
     #[must_use]
     pub const fn is_parallel(&self) -> bool {
         self.inner.is_some()
+    }
+}
+
+fn spawn_clones_rayon<'scope, F>(scope: &rayon::Scope<'scope>, count: usize, f: &'scope F)
+where
+    F: Fn() + Sync,
+{
+    match count {
+        0 => {}
+        1 => scope.spawn(move |_| f()),
+        _ => {
+            let left = count / 2;
+            let right = count - left;
+            scope.spawn(move |s| {
+                spawn_clones_rayon(s, left - 1, f);
+                f();
+            });
+            scope.spawn(move |s| {
+                spawn_clones_rayon(s, right - 1, f);
+                f();
+            });
+        }
+    }
+}
+
+fn spawn_lanes_rayon<'scope, L, F>(
+    scope: &rayon::Scope<'scope>,
+    lanes: &'scope mut [L],
+    f: &'scope F,
+) where
+    L: Send,
+    F: Fn(&mut L) + Sync,
+{
+    match lanes.len() {
+        0 => {}
+        1 => {
+            if let Some(only) = lanes.first_mut() {
+                scope.spawn(move |_| f(only));
+            }
+        }
+        len => {
+            let (left, right) = lanes.split_at_mut(len / 2);
+            scope.spawn(move |s| {
+                if let Some((head, tail)) = left.split_first_mut() {
+                    spawn_lanes_rayon(s, tail, f);
+                    f(head);
+                }
+            });
+            scope.spawn(move |s| {
+                if let Some((head, tail)) = right.split_first_mut() {
+                    spawn_lanes_rayon(s, tail, f);
+                    f(head);
+                }
+            });
+        }
+    }
+}
+
+fn spawn_indexed_rayon<'scope, T, F>(
+    scope: &rayon::Scope<'scope>,
+    start_index: usize,
+    items: &'scope mut [T],
+    f: &'scope F,
+) where
+    T: Send,
+    F: Fn(usize, &mut T) + Sync,
+{
+    match items.len() {
+        0 => {}
+        1 => {
+            if let Some(only) = items.first_mut() {
+                scope.spawn(move |_| f(start_index, only));
+            }
+        }
+        len => {
+            let mid = len / 2;
+            let (left, right) = items.split_at_mut(mid);
+            let right_start = start_index + mid;
+            scope.spawn(move |s| {
+                if let Some((head, tail)) = left.split_first_mut() {
+                    spawn_indexed_rayon(s, start_index + 1, tail, f);
+                    f(start_index, head);
+                }
+            });
+            scope.spawn(move |s| {
+                if let Some((head, tail)) = right.split_first_mut() {
+                    spawn_indexed_rayon(s, right_start + 1, tail, f);
+                    f(right_start, head);
+                }
+            });
+        }
     }
 }
 
@@ -292,10 +434,7 @@ where
     };
     let f = &f;
     scope_workers(workers, operation, |scope| {
-        for (offset, item) in tail.iter_mut().enumerate() {
-            let index = offset + 1;
-            scope.spawn(move || f(index, item));
-        }
+        scope.spawn_indexed(1, tail, f);
         f(0, head);
     })
 }
@@ -331,19 +470,18 @@ where
     let Some((head, tail)) = items.split_first_mut() else {
         return Ok(());
     };
-    let mut tail_results: Vec<Result<(), CoreError>> = (0..tail.len()).map(|_| Ok(())).collect();
+    let mut tail_pairs: Vec<(&mut T, Result<(), CoreError>)> =
+        tail.iter_mut().map(|item| (item, Ok(()))).collect();
     let f = &f;
+    let run_pair = |index: usize, (item, slot): &mut (&mut T, Result<(), CoreError>)| {
+        *slot = f(index, item);
+    };
     let head_result = scope_workers(workers, operation, |scope| {
-        for (offset, (item, slot)) in tail.iter_mut().zip(tail_results.iter_mut()).enumerate() {
-            let index = offset + 1;
-            scope.spawn(move || {
-                *slot = f(index, item);
-            });
-        }
+        scope.spawn_indexed(1, &mut tail_pairs, &run_pair);
         f(0, head)
     })?;
     head_result?;
-    for result in tail_results {
+    for (_, result) in tail_pairs {
         result?;
     }
     Ok(())
@@ -398,9 +536,7 @@ where
         }
     };
     scope_workers(workers, operation, |scope| {
-        for _ in 1..active {
-            scope.spawn(drain);
-        }
+        scope.spawn_clones(active - 1, &drain);
         drain();
     })
 }
@@ -451,9 +587,7 @@ where
         }
     };
     scope_workers(workers, operation, |scope| {
-        for _ in 1..active {
-            scope.spawn(drain);
-        }
+        scope.spawn_clones(active - 1, &drain);
         drain();
     })?;
     for result in results {
@@ -522,11 +656,8 @@ where
             *slot = f(index, task, lane);
         }
     };
-    let drain_with = &drain_with;
     scope_workers(workers, operation, |scope| {
-        for lane in rest_lanes.iter_mut().take(active - 1) {
-            scope.spawn(move || drain_with(lane));
-        }
+        scope.spawn_lanes(&mut rest_lanes[..active - 1], &drain_with);
         drain_with(first_lane);
     })?;
     for result in results {
@@ -537,8 +668,9 @@ where
 
 /// Target work-stealing tiles per worker for chunked parallel loops.
 const TILES_PER_WORKER: usize = 4;
-/// Upper cap on work-stealing tiles so queue pops stay sub-microsecond.
-const MAX_WORK_TILES: usize = 64;
+/// Upper cap on work-stealing tiles so queue pops stay sub-microsecond while
+/// giving 32–64 worker machines 4+ dynamic tiles per worker.
+const MAX_WORK_TILES: usize = 256;
 
 /// Split `slice` into contiguous tiles (each at least `min_chunk.max(1)`
 /// elements, except possibly the final tile) and invoke `f(start_index, tile)`
@@ -1121,5 +1253,65 @@ mod tests {
         let (ok_a, ok_b) =
             overlap_off_cpu(workers, "after panic", || 7, |w| w).expect("pool healthy after panic");
         assert_eq!((ok_a, ok_b), (7, workers - 1));
+    }
+
+    #[test]
+    fn binary_tree_fanout_completes_every_task_lane_and_lowest_error() {
+        for workers in [1_usize, 2, 3, 5, 16, 32] {
+            let mut items: Vec<usize> = vec![0; 197];
+            parallel_tasks(workers, "fanout tasks", &mut items, |idx, slot| {
+                *slot = idx.wrapping_mul(17) ^ 0x5A;
+            })
+            .expect("parallel_tasks");
+            for (idx, &val) in items.iter().enumerate() {
+                assert_eq!(val, idx.wrapping_mul(17) ^ 0x5A, "w={workers} idx={idx}");
+            }
+
+            let mut lanes = vec![0_usize; workers];
+            let mut tasks: Vec<usize> = vec![0; 133];
+            try_parallel_tasks_with_lanes(
+                workers,
+                "fanout lanes",
+                &mut lanes,
+                &mut tasks,
+                |idx, slot, lane| {
+                    *slot = idx + 1;
+                    *lane += 1;
+                    Ok(())
+                },
+            )
+            .expect("try_parallel_tasks_with_lanes");
+            assert_eq!(lanes.iter().sum::<usize>(), 133);
+            for (idx, &val) in tasks.iter().enumerate() {
+                assert_eq!(val, idx + 1);
+            }
+
+            let mut indexed: Vec<usize> = vec![0; 65];
+            parallel_for_each_mut(workers, "fanout indexed", &mut indexed, |idx, slot| {
+                *slot = idx * 3 + 1;
+            })
+            .expect("parallel_for_each_mut");
+            for (idx, &val) in indexed.iter().enumerate() {
+                assert_eq!(val, idx * 3 + 1);
+            }
+
+            // Deterministic lowest-index error reporting across binary-tree fanout.
+            let mut err_items: Vec<usize> = (0..40).collect();
+            let err = try_parallel_for_each_mut(workers, "fanout err", &mut err_items, |idx, _| {
+                if idx == 13 || idx == 29 {
+                    Err(CoreError::StateConflict {
+                        operation: "fanout err",
+                        detail: format!("err-{idx}"),
+                    })
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("expected lowest-index error");
+            assert!(
+                err.to_string().contains("err-13"),
+                "w={workers} expected err-13, got {err}"
+            );
+        }
     }
 }

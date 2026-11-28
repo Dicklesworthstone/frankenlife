@@ -3495,7 +3495,7 @@ impl World {
             let tile_count = lanes
                 .len()
                 .saturating_mul(4)
-                .min(64)
+                .min(256)
                 .min(working.len().div_ceil(512))
                 .max(1);
             let tile_len = working.len().div_ceil(tile_count);
@@ -3751,7 +3751,7 @@ impl World {
             let tile_count = lanes
                 .len()
                 .saturating_mul(4)
-                .min(64)
+                .min(256)
                 .min(working.len().div_ceil(512))
                 .max(1);
             let tile_len = working.len().div_ceil(tile_count);
@@ -5771,7 +5771,7 @@ fn gather_working_rows(
         set_len_reuse(working, rows.len(), placeholder);
         let tile_count = workers
             .saturating_mul(4)
-            .min(64)
+            .min(256)
             .min(rows.len().div_ceil(512))
             .max(1);
         let tile_len = rows.len().div_ceil(tile_count);

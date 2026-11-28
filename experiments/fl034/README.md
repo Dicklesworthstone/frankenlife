@@ -300,10 +300,19 @@ The tick-8,941 checkpoint, branched and resumed headless with CPU controllers by
 So the Metal controllers keep parity while the renderer shares the GPU, and presentation leaves the world
 unchanged (plan §7.5).
 
-commit:cdd7209 (2026-11-27, which restructures the per-packet chemistry) came after these builds. It is checked at
-25k only. A release `flife` built at 17:23, after it, ends the Interactive world at the same `595e2d90…3167b`
-with CPU controllers on 16 workers, its tallies equal every 1,024 ticks. No simulation crate changed from
-cdd7209 to 3b53147. The 100k rows predate it.
+Three engine commits came after these builds, all on 2026-11-27: commit:cdd7209 restructures the per-packet
+chemistry, commit:8ccced1 cuts the spatial chemistry into 16 × 16 tiles instead of 8 × 8, and commit:09082ba splits
+the Metal backend's staging and uploads its shards in parallel. Each run below has its tallies equal to the rows
+above at every 1,024 ticks (Interactive) or 256 ticks (Desktop):
+
+- A release `flife` built at 17:23, after cdd7209, ends the Interactive world at `595e2d90…3167b` with CPU
+  controllers on 16 workers.
+- A release `flife` built at 20:00 from 09082ba's simulation sources (sha256 `3b03ea53…`) ends the Interactive
+  world there with Metal and with CPU controllers, and the Desktop world at `4f7f1cf1…e7e8c9` with Metal
+  controllers, all on 16 workers (20:28–20:49, load averages 107 to 261). That Desktop run also gives the Metal row
+  a build whose revision is known.
+
+No simulation crate changed from 09082ba to commit:8df5da3.
 
 # FL-034 G6: the two profiles in a window (to run)
 

@@ -300,11 +300,12 @@ The tick-8,941 checkpoint, branched and resumed headless with CPU controllers by
 So the Metal controllers keep parity while the renderer shares the GPU, and presentation leaves the world
 unchanged (plan §7.5).
 
-Four engine commits came after these builds, all on 2026-11-27: commit:cdd7209 restructures the per-packet
+Five engine commits came after these builds, all on 2026-11-27: commit:cdd7209 restructures the per-packet
 chemistry, commit:8ccced1 cuts the spatial chemistry into 16 × 16 tiles instead of 8 × 8, commit:09082ba splits
-the Metal backend's staging and uploads its shards in parallel, and commit:d1e1df3 changes the worker pool's
-wakeups, the deposit and the bins and fuses single-substep transport. Each run below has its tallies equal to the
-rows above at every 1,024 ticks (Interactive) or 256 ticks (Desktop):
+the Metal backend's staging and uploads its shards in parallel, commit:d1e1df3 changes the worker pool's wakeups,
+the deposit and the bins and fuses single-substep transport, and commit:06911d7 splits the Metal controllers'
+submit from their collect. Each run below has its tallies equal to the rows above at every 1,024 ticks
+(Interactive) or 256 ticks (Desktop):
 
 - A release `flife` built at 17:23, after cdd7209, ends the Interactive world at `595e2d90…3167b` with CPU
   controllers on 16 workers.
@@ -315,8 +316,13 @@ rows above at every 1,024 ticks (Interactive) or 256 ticks (Desktop):
 - A release `flife` built at 20:42 from d1e1df3's simulation sources (sha256 `8e20b60b…`) gives the same results
   in the same three runs (20:50–21:07, load averages 106 to 220). With CPU controllers on 8 workers it ends both
   worlds there too (`check-evolved-worlds.sh`, below; 21:07–21:37).
+- A release `flife` built from commit:0fa85fb, after 06911d7, on Linux (an rch worker: AMD Threadripper PRO
+  5975WX, x86_64; sha256 `244f1a18…`) ends both worlds there with CPU controllers on 16 workers
+  (`check-evolved-worlds.sh`, 2026-11-28 10:40–11:01). It is the first run on another host and architecture: the
+  CPU route computes the Mac's bits on x86_64, as `flife-core`'s host-independent numerics intend. 06911d7's Metal
+  route is not covered: Linux has no Metal, and no Mac release `flife` has been built since 06911d7.
 
-No simulation crate changed from d1e1df3 to commit:5c2d386.
+No simulation crate changed from 0fa85fb to commit:2219ec0.
 
 To check another build, `experiments/fl034/check-evolved-worlds.sh FLIFE OUT_DIR [CONTROLLERS] [WORKERS]` runs
 both worlds for 8,192 ticks and compares them with these rows checkpoint by checkpoint. It prints EQUAL, or the
